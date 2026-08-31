@@ -1,0 +1,38 @@
+schema_version = "1.1"
+artifacts = ["/logs/artifacts/model.patch"]
+
+[task]
+name = "afterquery/reliable-sponsored-listing-lifecycle"
+
+[metadata]
+task_id = "reliable-sponsored-listing-lifecycle"
+display_title = "Reliable Sponsored Listing Lifecycle"
+display_description = "Make sponsored listings behave consistently across schedules, impressions, overlaps, and expiration."
+category = "enhancement"
+language = "typescript"
+repository_url = "https://github.com/dawit2119/Rate_eat"
+base_commit_hash = "220d10014c0bac8a924aa5ed50a989b1bab19a94"
+
+[agent]
+timeout_sec = 5400
+
+[verifier]
+environment_mode = "separate"
+timeout_sec = 1800
+
+[verifier.environment]
+build_timeout_sec = 1800
+cpus = 2
+memory_mb = 8192
+storage_mb = 20480
+allow_internet = false
+
+[environment]
+build_timeout_sec = 1800
+docker_image = "us-docker.pkg.dev/afterquery-compute/compute-images/gold-repo-rate-eat-gzfioe:v8"
+os = "linux"
+cpus = 2
+memory_mb = 8192
+storage_mb = 20480
+gpus = 0
+allow_internet = false

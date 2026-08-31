@@ -1,0 +1,1886 @@
+diff --git a/rateeat_backend/migrations/20260827090000-create-featured-restaurant-snapshots.js b/rateeat_backend/migrations/20260827090000-create-featured-restaurant-snapshots.js
+new file mode 100644
+index 000000000..947edd6f9
+--- /dev/null
++++ b/rateeat_backend/migrations/20260827090000-create-featured-restaurant-snapshots.js
+@@ -0,0 +1,133 @@
++"use strict";
++
++module.exports = {
++  up: async (queryInterface, Sequelize) => {
++    await queryInterface.createTable(
++      "featured_restaurant_snapshots",
++      {
++        id: {
++          type: Sequelize.UUID,
++          allowNull: false,
++          primaryKey: true,
++        },
++        listing_ids: {
++          type: Sequelize.JSONB,
++          allowNull: false,
++        },
++        availability: {
++          type: Sequelize.STRING(16),
++          allowNull: false,
++        },
++        page_limit: {
++          type: Sequelize.INTEGER,
++          allowNull: false,
++        },
++        current_position: {
++          type: Sequelize.INTEGER,
++          allowNull: false,
++          defaultValue: -1,
++        },
++        expires_at: {
++          type: Sequelize.DATE,
++          allowNull: false,
++        },
++        createdAt: {
++          type: Sequelize.DATE,
++          allowNull: false,
++        },
++        updatedAt: {
++          type: Sequelize.DATE,
++          allowNull: false,
++        },
++      }
++    );
++
++    await queryInterface.addIndex(
++      "featured_restaurant_snapshots",
++      ["expires_at"],
++      {
++        name:
++          "featured_restaurant_snapshots_expires_at",
++      }
++    );
++
++    await queryInterface.createTable(
++      "featured_restaurant_page_requests",
++      {
++        request_id: {
++          type: Sequelize.UUID,
++          allowNull: false,
++          primaryKey: true,
++        },
++        snapshot_id: {
++          type: Sequelize.UUID,
++          allowNull: false,
++        },
++        availability: {
++          type: Sequelize.STRING(16),
++          allowNull: false,
++        },
++        page_limit: {
++          type: Sequelize.INTEGER,
++          allowNull: false,
++        },
++        cursor_token: {
++          type: Sequelize.TEXT,
++          allowNull: true,
++        },
++        response_body: {
++          type: Sequelize.JSONB,
++          allowNull: false,
++        },
++        expires_at: {
++          type: Sequelize.DATE,
++          allowNull: false,
++        },
++        createdAt: {
++          type: Sequelize.DATE,
++          allowNull: false,
++        },
++        updatedAt: {
++          type: Sequelize.DATE,
++          allowNull: false,
++        },
++      }
++    );
++
++    await queryInterface.addIndex(
++      "featured_restaurant_page_requests",
++      ["snapshot_id"],
++      {
++        name:
++          "featured_restaurant_page_requests_snapshot",
++      }
++    );
++
++    await queryInterface.addIndex(
++      "featured_restaurant_page_requests",
++      ["expires_at"],
++      {
++        name:
++          "featured_restaurant_page_requests_expires_at",
++      }
++    );
++
++    await queryInterface.sequelize.query(`
++      CREATE UNIQUE INDEX
++        featured_restaurant_page_requests_cursor_unique
++      ON featured_restaurant_page_requests
++        (snapshot_id, cursor_token)
++      WHERE cursor_token IS NOT NULL
++    `);
++  },
++
++  down: async (queryInterface) => {
++    await queryInterface.dropTable(
++      "featured_restaurant_page_requests"
++    );
++
++    await queryInterface.dropTable(
++      "featured_restaurant_snapshots"
++    );
++  },
++};
+diff --git a/rateeat_backend/src/constants/featured-restaurant-availability.constants.ts b/rateeat_backend/src/constants/featured-restaurant-availability.constants.ts
+new file mode 100644
+index 000000000..204ec967b
+--- /dev/null
++++ b/rateeat_backend/src/constants/featured-restaurant-availability.constants.ts
+@@ -0,0 +1,32 @@
++export const FEATURED_RESTAURANT_AVAILABILITY_BROWSE = "browse" as const;
++export const FEATURED_RESTAURANT_AVAILABILITY_ORDERABLE = "orderable" as const;
++export const FEATURED_RESTAURANT_AVAILABILITY_VALUES = [
++  FEATURED_RESTAURANT_AVAILABILITY_BROWSE,
++  FEATURED_RESTAURANT_AVAILABILITY_ORDERABLE,
++] as const;
++export const FEATURED_RESTAURANT_DEFAULT_AVAILABILITY =
++  FEATURED_RESTAURANT_AVAILABILITY_BROWSE;
++export const FEATURED_RESTAURANT_MIN_LIMIT = 1;
++export const FEATURED_RESTAURANT_MAX_LIMIT = 20;
++export const FEATURED_RESTAURANT_INVALID_AVAILABILITY_MESSAGE =
++  "availability must be browse or orderable";
++export const FEATURED_RESTAURANT_INVALID_LIMIT_MESSAGE =
++  "limit must be a whole number from 1 to 20";
++export const FEATURED_RESTAURANT_INVALID_CURSOR_MESSAGE =
++  "cursor is invalid";
++export const FEATURED_RESTAURANT_CURSOR_REQUIRES_LIMIT_MESSAGE =
++  "cursor requires limit";
++export const FEATURED_RESTAURANT_INTERNAL_AVAILABILITY_FIELDS = [
++  "is_permanently_closed",
++  "is_order_service_available",
++  "is_order_service_online",
++] as const;
++
++export const FEATURED_RESTAURANT_INVALID_REQUEST_ID_MESSAGE =
++  "requestId is invalid";
++
++export const FEATURED_RESTAURANT_REQUEST_ID_REQUIRES_LIMIT_MESSAGE =
++  "requestId requires limit";
++
++export const FEATURED_RESTAURANT_LIMIT_REQUIRES_REQUEST_ID_MESSAGE =
++  "limit requires requestId";
+diff --git a/rateeat_backend/src/controllers/sponsored_listing.controller.ts b/rateeat_backend/src/controllers/sponsored_listing.controller.ts
+index 2d5cb31bc..7ad31e09f 100644
+--- a/rateeat_backend/src/controllers/sponsored_listing.controller.ts
++++ b/rateeat_backend/src/controllers/sponsored_listing.controller.ts
+@@ -12,119 +12,206 @@ import redisClient from "../utils/redis.utils";
+ import asyncAwaitHandler from "../middlewares/async-handler";
+ import "dotenv/config";
+ import { FileRequest } from "../middlewares/upload-image";
++import {
++  filterFeaturedListingsByRestaurantAvailability,
++  selectFeaturedRestaurantListings,
++} from "../services/featured-restaurant-availability.service";
++import { decorateFeaturedRestaurantListing } from "../services/featured-restaurant-display.service";
++import {
++  decodeFeaturedRestaurantCursor,
++  paginateFeaturedRestaurantListings,
++} from "../services/featured-restaurant-cursor.service";
++import { parseFeaturedRestaurantQuery } from "../utils/featured-restaurant-availability.utils";
+ 
+ // @desc Get all active sponsored listings
+ // @route GET /api/v1/sponsored-listing
+ const getSponsoredListings = asyncAwaitHandler(
+-  async (req: Request, res: Response, next: NextFunction) => {
+-    const now = new Date();
+-    const listingInterval = parseInt(
+-      process.env.LISTING_INTERVAL_SECONDS || "600",
+-      10
+-    );
+-
+-    const listings = await SponsoredListing.findAll({
+-      where: {
+-        status: "Active",
+-      },
+-      include: [
+-        {
+-          model: Restaurant,
+-          as: "restaurant",
+-          attributes: ["name"],
+-          include: [
+-            {
+-              model: RestaurantLocation,
+-              as: "restaurant_locations",
+-              attributes: ["latitude", "longitude", "description"],
+-            },
+-          ],
+-        },
+-      ],
+-      attributes: [
+-        "id",
+-        "restaurant_id",
+-        "start_date",
+-        "end_date",
+-        "image_url",
+-        "impressions",
+-        "priority",
+-        "max_impressions",
+-        "discount_info",
+-      ],
+-    });
+-
+-    const weightedListings: any[] = [];
+-    listings.forEach((listing: any) => {
+-      const weight = Math.pow(2, Math.min(listing.priority, 10));
+-      for (let i = 0; i < weight; i++) {
+-        weightedListings.push(listing);
+-      }
+-    });
++  async (
++    req: Request,
++    res: Response,
++    next: NextFunction
++  ) => {
++    const parsedQuery =
++      parseFeaturedRestaurantQuery(
++        req.query
++      );
++
++    if (
++      parsedQuery.ok === false
++    ) {
++      return res
++        .status(
++          parsedQuery.status
++        )
++        .json({
++          success: false,
++          message:
++            parsedQuery.message,
++        });
++    }
+ 
+-    const totalListings = weightedListings.length;
+-    const timeBasedIndex =
+-      Math.floor(now.getTime() / 1000 / listingInterval) % totalListings;
++    let cursorPayload;
+ 
+-    const orderedListings = [];
+-    const usedListings: Set<any> = new Set();
++    if (
++      parsedQuery.query.cursor !==
++      undefined
++    ) {
++      const parsedCursor =
++        decodeFeaturedRestaurantCursor(
++          parsedQuery.query.cursor
++        );
+ 
+-    for (let i = 0; i < totalListings; i++) {
+-      const index = (timeBasedIndex + i) % totalListings;
+-      const currentListing = weightedListings[index];
+-      if (!usedListings.has(currentListing.id)) {
+-        orderedListings.push(currentListing);
+-        usedListings.add(currentListing.id);
++      if (
++        parsedCursor.ok === false
++      ) {
++        return res
++          .status(400)
++          .json({
++            success: false,
++            message:
++              parsedCursor.message,
++          });
+       }
+-      if (orderedListings.length === listings.length) break;
++
++      cursorPayload =
++        parsedCursor.value;
+     }
+ 
+-    const activeListings = await Promise.all(
+-      orderedListings.map(async (listing: any) => {
+-        const restaurantId = listing.restaurant_id;
+-        let restaurantImage = await RestaurantImage.findOne({
++    const now = new Date();
++
++    const listings =
++      await SponsoredListing.findAll(
++        {
+           where: {
+-            restaurant_id: restaurantId,
+-            is_leading: true,
++            status: "Active",
+           },
+-        });
+-        if (!restaurantImage) {
+-          restaurantImage = await RestaurantImage.findOne({
+-            where: {
+-              restaurant_id: restaurantId,
+-              is_leading: false,
++          include: [
++            {
++              model: Restaurant,
++              as: "restaurant",
++              attributes: [
++                "name",
++                "is_permanently_closed",
++                "is_order_service_available",
++                "is_order_service_online",
++              ],
++              include: [
++                {
++                  model:
++                    RestaurantLocation,
++                  as:
++                    "restaurant_locations",
++                  attributes: [
++                    "latitude",
++                    "longitude",
++                    "description",
++                  ],
++                },
++              ],
+             },
+-          });
++          ],
++          attributes: [
++            "id",
++            "restaurant_id",
++            "start_date",
++            "end_date",
++            "image_url",
++            "impressions",
++            "priority",
++            "max_impressions",
++            "discount_info",
++          ],
+         }
++      );
+ 
+-        const remainingTime = Math.max(
+-          0,
+-          new Date(listing.end_date).getTime() - now.getTime()
++    const featuredListings =
++      selectFeaturedRestaurantListings(
++        listings as any,
++        {
++          availability:
++            parsedQuery.query
++              .availability,
++        }
++      );
++
++    if (
++      parsedQuery.query.limit !==
++      undefined
++    ) {
++      const paginationListings =
++        cursorPayload ===
++        undefined
++          ? featuredListings
++          : filterFeaturedListingsByRestaurantAvailability(
++              listings as any,
++              {
++                availability:
++                  parsedQuery.query
++                    .availability,
++              }
++            );
++
++      const page =
++        await paginateFeaturedRestaurantListings(
++          {
++            listings:
++              paginationListings,
++            limit:
++              parsedQuery.query
++                .limit,
++            availability:
++              parsedQuery.query
++                .availability,
++            cursor:
++              cursorPayload,
++            rawCursor:
++              parsedQuery.query
++                .cursor,
++            requestId:
++              parsedQuery.query
++                .requestId!,
++            now,
++          }
+         );
+-        const seconds = Math.floor((remainingTime / 1000) % 60);
+-        const minutes = Math.floor((remainingTime / (1000 * 60)) % 60);
+-        const hours = Math.floor((remainingTime / (1000 * 60 * 60)) % 24);
+-        const days = Math.floor(remainingTime / (1000 * 60 * 60 * 24));
+-
+-        return {
+-          ...listing.toJSON(),
+-          remainingTime: {
+-            days,
+-            hours,
+-            minutes,
+-            seconds,
+-          },
+-          restaurant_logo: restaurantImage ? restaurantImage.url : null,
+-        };
+-      })
+-    );
+ 
+-    res.status(200).json({ success: true, data: activeListings });
++      if (
++        page.ok === false
++      ) {
++        return res
++          .status(400)
++          .json({
++            success: false,
++            message:
++              page.message,
++          });
++      }
++
++      return res
++        .status(200)
++        .json(page.body);
++    }
++
++    const activeListings =
++      await Promise.all(
++        featuredListings.map(
++          (listing: any) =>
++            decorateFeaturedRestaurantListing(
++              listing,
++              now
++            )
++        )
++      );
++
++    return res
++      .status(200)
++      .json({
++        success: true,
++        data:
++          activeListings,
++      });
+   }
+ );
+ 
+-// @desc Create a new sponsored listing
+-// @route POST /api/v1/sponsored-listing
+ const createSponsoredListing = asyncAwaitHandler(
+   async (req: FileRequest, res: Response, next: NextFunction) => {
+     const {
+diff --git a/rateeat_backend/src/services/featured-restaurant-availability.service.ts b/rateeat_backend/src/services/featured-restaurant-availability.service.ts
+new file mode 100644
+index 000000000..5df565ffc
+--- /dev/null
++++ b/rateeat_backend/src/services/featured-restaurant-availability.service.ts
+@@ -0,0 +1,111 @@
++import {
++  FEATURED_RESTAURANT_INTERNAL_AVAILABILITY_FIELDS,
++} from "../constants/featured-restaurant-availability.constants";
++import {
++  FeaturedListingShape,
++  FeaturedRestaurantDisplayDecoration,
++  FeaturedRestaurantPublicShape,
++  FeaturedRestaurantSelectionOptions,
++} from "../types/featured-restaurant-availability.types";
++import {
++  compareFeaturedListings,
++  isFeaturedRestaurantEligible,
++} from "../utils/featured-restaurant-availability.utils";
++const listingRestaurant = (
++  listing: FeaturedListingShape
++): FeaturedRestaurantPublicShape | null | undefined =>
++  listing.restaurant;
++export const filterFeaturedListingsByRestaurantAvailability = (
++  listings: FeaturedListingShape[],
++  options: FeaturedRestaurantSelectionOptions
++): FeaturedListingShape[] =>
++  listings.filter((listing) =>
++    isFeaturedRestaurantEligible(
++      listingRestaurant(listing),
++      options.availability
++    )
++  );
++export const collapseFeaturedListingsByRestaurant = (
++  listings: FeaturedListingShape[]
++): FeaturedListingShape[] => {
++  const winners =
++    new Map<string, FeaturedListingShape>();
++  for (const listing of listings) {
++    const restaurantId =
++      String(listing.restaurant_id);
++    const current =
++      winners.get(restaurantId);
++    if (!current) {
++      winners.set(restaurantId, listing);
++      continue;
++    }
++    if (
++      compareFeaturedListings(
++        listing,
++        current
++      ) < 0
++    ) {
++      winners.set(restaurantId, listing);
++    }
++  }
++  return Array.from(winners.values());
++};
++export const selectFeaturedRestaurantListings = (
++  listings: FeaturedListingShape[],
++  options: FeaturedRestaurantSelectionOptions
++): FeaturedListingShape[] => {
++  const eligible =
++    filterFeaturedListingsByRestaurantAvailability(
++      listings,
++      options
++    );
++  return collapseFeaturedListingsByRestaurant(
++    eligible
++  ).sort(compareFeaturedListings);
++};
++const serializedListing = (
++  listing: FeaturedListingShape
++): Record<string, unknown> => {
++  if (typeof listing.toJSON === "function") {
++    return listing.toJSON();
++  }
++  return { ...listing };
++};
++const removeInternalRestaurantAvailability = (
++  restaurant: unknown
++): unknown => {
++  if (
++    !restaurant ||
++    typeof restaurant !== "object" ||
++    Array.isArray(restaurant)
++  ) {
++    return restaurant;
++  }
++  const publicRestaurant = {
++    ...(restaurant as Record<string, unknown>),
++  };
++  for (
++    const field of
++    FEATURED_RESTAURANT_INTERNAL_AVAILABILITY_FIELDS
++  ) {
++    delete publicRestaurant[field];
++  }
++  return publicRestaurant;
++};
++export const buildFeaturedRestaurantResponse = (
++  listing: FeaturedListingShape,
++  decoration: FeaturedRestaurantDisplayDecoration
++): Record<string, unknown> => {
++  const serialized =
++    serializedListing(listing);
++  return {
++    ...serialized,
++    restaurant:
++      removeInternalRestaurantAvailability(
++        serialized.restaurant
++      ),
++    remainingTime: decoration.remainingTime,
++    restaurant_logo:
++      decoration.restaurant_logo,
++  };
++};
+diff --git a/rateeat_backend/src/services/featured-restaurant-cursor.service.ts b/rateeat_backend/src/services/featured-restaurant-cursor.service.ts
+new file mode 100644
+index 000000000..0ad9c6ec4
+--- /dev/null
++++ b/rateeat_backend/src/services/featured-restaurant-cursor.service.ts
+@@ -0,0 +1,830 @@
++import {
++  createHmac,
++  randomUUID,
++  timingSafeEqual,
++} from "crypto";
++import {
++  QueryTypes,
++  Transaction,
++} from "sequelize";
++
++import {
++  FEATURED_RESTAURANT_INVALID_CURSOR_MESSAGE,
++  FEATURED_RESTAURANT_INVALID_REQUEST_ID_MESSAGE,
++} from "../constants/featured-restaurant-availability.constants";
++import SponsoredListing from "../models/SponsoredListing/SponsoredListing";
++import {
++  FeaturedListingShape,
++  FeaturedRestaurantAvailability,
++  FeaturedRestaurantCursorPayload,
++  FeaturedRestaurantLimitedResponseBody,
++  FeaturedRestaurantPageResult,
++} from "../types/featured-restaurant-availability.types";
++import {
++  decorateFeaturedRestaurantListing,
++} from "./featured-restaurant-display.service";
++
++const CURSOR_VERSION = 3 as const;
++const MAX_CURSOR_LENGTH = 512;
++const SNAPSHOT_TTL_MS =
++  15 * 60 * 1000;
++
++type SnapshotRow = {
++  id: string;
++  listingIds: string[];
++  availability:
++    FeaturedRestaurantAvailability;
++  pageLimit: number;
++  currentPosition: number;
++  expiresAt: Date | string;
++};
++
++type RequestRow = {
++  requestId: string;
++  snapshotId: string;
++  availability:
++    FeaturedRestaurantAvailability;
++  pageLimit: number;
++  cursorToken: string | null;
++  responseBody:
++    | FeaturedRestaurantLimitedResponseBody
++    | string;
++  expiresAt: Date | string;
++};
++
++type RequestBinding = {
++  requestId: string;
++  availability:
++    FeaturedRestaurantAvailability;
++  limit: number;
++  rawCursor?: string;
++  now: Date;
++};
++
++const invalidCursor = () => ({
++  ok: false as const,
++  message:
++    FEATURED_RESTAURANT_INVALID_CURSOR_MESSAGE,
++});
++
++const invalidRequest = () => ({
++  ok: false as const,
++  message:
++    FEATURED_RESTAURANT_INVALID_REQUEST_ID_MESSAGE,
++});
++
++const cursorSecret = (): string =>
++  process.env.JWT_SECRET ||
++  "rateeat-featured-restaurant-cursor";
++
++const sign = (
++  value: string
++): string =>
++  createHmac(
++    "sha256",
++    cursorSecret()
++  )
++    .update(value)
++    .digest("base64url");
++
++const signaturesEqual = (
++  left: string,
++  right: string
++): boolean => {
++  const leftBuffer =
++    Buffer.from(left, "utf8");
++
++  const rightBuffer =
++    Buffer.from(right, "utf8");
++
++  return (
++    leftBuffer.length ===
++      rightBuffer.length &&
++    timingSafeEqual(
++      leftBuffer,
++      rightBuffer
++    )
++  );
++};
++
++const encodeCursor = (
++  payload:
++    FeaturedRestaurantCursorPayload
++): string => {
++  const encoded = Buffer.from(
++    JSON.stringify(payload),
++    "utf8"
++  ).toString("base64url");
++
++  return `${encoded}.${sign(encoded)}`;
++};
++
++export const createFeaturedRestaurantCursor = (
++  snapshotId: string,
++  position: number
++): string =>
++  encodeCursor({
++    v: CURSOR_VERSION,
++    snapshotId,
++    position,
++  });
++
++export const decodeFeaturedRestaurantCursor = (
++  cursor: string
++):
++  | {
++      ok: true;
++      value:
++        FeaturedRestaurantCursorPayload;
++    }
++  | {
++      ok: false;
++      message: string;
++    } => {
++  if (
++    !cursor ||
++    cursor.length > MAX_CURSOR_LENGTH
++  ) {
++    return invalidCursor();
++  }
++
++  const parts = cursor.split(".");
++
++  if (
++    parts.length !== 2 ||
++    !parts[0] ||
++    !parts[1]
++  ) {
++    return invalidCursor();
++  }
++
++  const [encoded, signature] =
++    parts;
++
++  const expected =
++    sign(encoded);
++
++  if (
++    !signaturesEqual(
++      signature,
++      expected
++    )
++  ) {
++    return invalidCursor();
++  }
++
++  let decoded: unknown;
++
++  try {
++    decoded = JSON.parse(
++      Buffer.from(
++        encoded,
++        "base64url"
++      ).toString("utf8")
++    );
++  } catch {
++    return invalidCursor();
++  }
++
++  if (
++    !decoded ||
++    typeof decoded !== "object" ||
++    Array.isArray(decoded)
++  ) {
++    return invalidCursor();
++  }
++
++  const candidate =
++    decoded as Partial<
++      FeaturedRestaurantCursorPayload
++    >;
++
++  if (
++    candidate.v !==
++      CURSOR_VERSION ||
++    typeof candidate.snapshotId !==
++      "string" ||
++    !candidate.snapshotId ||
++    !Number.isInteger(
++      candidate.position
++    ) ||
++    (candidate.position as number) <
++      0
++  ) {
++    return invalidCursor();
++  }
++
++  return {
++    ok: true,
++    value: {
++      v: CURSOR_VERSION,
++      snapshotId:
++        candidate.snapshotId,
++      position:
++        candidate.position as number,
++    },
++  };
++};
++
++const db = () => {
++  const sequelize =
++    SponsoredListing.sequelize;
++
++  if (!sequelize) {
++    throw new Error(
++      "SponsoredListing model is not initialized"
++    );
++  }
++
++  return sequelize;
++};
++
++const parseStoredBody = (
++  value:
++    | FeaturedRestaurantLimitedResponseBody
++    | string
++): FeaturedRestaurantLimitedResponseBody => {
++  if (
++    typeof value === "string"
++  ) {
++    return JSON.parse(
++      value
++    ) as FeaturedRestaurantLimitedResponseBody;
++  }
++
++  return value;
++};
++
++const loadRequest = async (
++  requestId: string,
++  transaction?: Transaction
++): Promise<RequestRow | null> => {
++  const rows =
++    await db().query<RequestRow>(
++      `
++        SELECT
++          request_id AS "requestId",
++          snapshot_id AS "snapshotId",
++          availability,
++          page_limit AS "pageLimit",
++          cursor_token AS "cursorToken",
++          response_body AS "responseBody",
++          expires_at AS "expiresAt"
++        FROM featured_restaurant_page_requests
++        WHERE request_id = :requestId
++        LIMIT 1
++      `,
++      {
++        replacements: {
++          requestId,
++        },
++        type: QueryTypes.SELECT,
++        transaction,
++      }
++    );
++
++  return rows[0] ?? null;
++};
++
++const replay = (
++  row: RequestRow,
++  binding: RequestBinding
++): FeaturedRestaurantPageResult => {
++  if (
++    new Date(
++      row.expiresAt
++    ).getTime() <=
++    binding.now.getTime()
++  ) {
++    return binding.rawCursor
++      ? invalidCursor()
++      : invalidRequest();
++  }
++
++  if (
++    row.availability !==
++      binding.availability ||
++    Number(row.pageLimit) !==
++      binding.limit ||
++    (row.cursorToken ?? undefined) !==
++      binding.rawCursor
++  ) {
++    return invalidRequest();
++  }
++
++  return {
++    ok: true,
++    body:
++      parseStoredBody(
++        row.responseBody
++      ),
++  };
++};
++
++const createSnapshot = async (
++  listings:
++    FeaturedListingShape[],
++  availability:
++    FeaturedRestaurantAvailability,
++  limit: number,
++  now: Date,
++  transaction: Transaction
++): Promise<SnapshotRow> => {
++  const snapshot: SnapshotRow = {
++    id: randomUUID(),
++    listingIds:
++      listings.map(
++        ({ id }) =>
++          String(id)
++      ),
++    availability,
++    pageLimit: limit,
++    currentPosition: -1,
++    expiresAt: new Date(
++      now.getTime() +
++        SNAPSHOT_TTL_MS
++    ),
++  };
++
++  await db().query(
++    `
++      INSERT INTO featured_restaurant_snapshots (
++        id,
++        listing_ids,
++        availability,
++        page_limit,
++        current_position,
++        expires_at,
++        "createdAt",
++        "updatedAt"
++      )
++      VALUES (
++        :id,
++        CAST(:listingIds AS JSONB),
++        :availability,
++        :pageLimit,
++        -1,
++        :expiresAt,
++        :now,
++        :now
++      )
++    `,
++    {
++      replacements: {
++        id: snapshot.id,
++        listingIds:
++          JSON.stringify(
++            snapshot.listingIds
++          ),
++        availability,
++        pageLimit: limit,
++        expiresAt:
++          snapshot.expiresAt,
++        now,
++      },
++      transaction,
++    }
++  );
++
++  return snapshot;
++};
++
++const loadSnapshotForUpdate =
++  async (
++    id: string,
++    transaction: Transaction
++  ): Promise<
++    SnapshotRow | null
++  > => {
++    const rows =
++      await db().query<SnapshotRow>(
++        `
++          SELECT
++            id,
++            listing_ids AS "listingIds",
++            availability,
++            page_limit AS "pageLimit",
++            current_position AS "currentPosition",
++            expires_at AS "expiresAt"
++          FROM featured_restaurant_snapshots
++          WHERE id = :id
++          FOR UPDATE
++        `,
++        {
++          replacements: {
++            id,
++          },
++          type: QueryTypes.SELECT,
++          transaction,
++        }
++      );
++
++    return rows[0] ?? null;
++  };
++
++const advanceSnapshot = async (
++  id: string,
++  position: number,
++  now: Date,
++  transaction: Transaction
++) => {
++  await db().query(
++    `
++      UPDATE featured_restaurant_snapshots
++      SET
++        current_position = :position,
++        "updatedAt" = :now
++      WHERE id = :id
++    `,
++    {
++      replacements: {
++        id,
++        position,
++        now,
++      },
++      transaction,
++    }
++  );
++};
++
++const persistRequest = async ({
++  binding,
++  snapshot,
++  body,
++  transaction,
++}: {
++  binding: RequestBinding;
++  snapshot: SnapshotRow;
++  body:
++    FeaturedRestaurantLimitedResponseBody;
++  transaction: Transaction;
++}) => {
++  await db().query(
++    `
++      INSERT INTO featured_restaurant_page_requests (
++        request_id,
++        snapshot_id,
++        availability,
++        page_limit,
++        cursor_token,
++        response_body,
++        expires_at,
++        "createdAt",
++        "updatedAt"
++      )
++      VALUES (
++        :requestId,
++        :snapshotId,
++        :availability,
++        :pageLimit,
++        :cursorToken,
++        CAST(:responseBody AS JSONB),
++        :expiresAt,
++        :now,
++        :now
++      )
++    `,
++    {
++      replacements: {
++        requestId:
++          binding.requestId,
++        snapshotId:
++          snapshot.id,
++        availability:
++          binding.availability,
++        pageLimit:
++          binding.limit,
++        cursorToken:
++          binding.rawCursor ??
++          null,
++        responseBody:
++          JSON.stringify(body),
++        expiresAt:
++          snapshot.expiresAt,
++        now:
++          binding.now,
++      },
++      transaction,
++    }
++  );
++};
++
++const snapshotValid = (
++  snapshot: SnapshotRow,
++  binding: RequestBinding
++) =>
++  snapshot.availability ===
++    binding.availability &&
++  Number(
++    snapshot.pageLimit
++  ) === binding.limit &&
++  new Date(
++    snapshot.expiresAt
++  ).getTime() >
++    binding.now.getTime();
++
++const buildPage = ({
++  snapshot,
++  listings,
++  limit,
++  start,
++}: {
++  snapshot: SnapshotRow;
++  listings:
++    FeaturedListingShape[];
++  limit: number;
++  start: number;
++}) => {
++  const listingById =
++    new Map(
++      listings.map(
++        (listing) => [
++          String(listing.id),
++          listing,
++        ]
++      )
++    );
++
++  const page:
++    FeaturedListingShape[] = [];
++
++  let position = start;
++  let lastExamined =
++    start - 1;
++
++  while (
++    position <
++      snapshot.listingIds.length &&
++    page.length < limit
++  ) {
++    lastExamined = position;
++
++    const listing =
++      listingById.get(
++        snapshot.listingIds[
++          position
++        ]
++      );
++
++    if (listing) {
++      page.push(listing);
++    }
++
++    position += 1;
++  }
++
++  let hasMore = false;
++
++  if (
++    page.length === limit
++  ) {
++    while (
++      position <
++      snapshot.listingIds.length
++    ) {
++      const listing =
++        listingById.get(
++          snapshot.listingIds[
++            position
++          ]
++        );
++
++      if (listing) {
++        hasMore = true;
++        break;
++      }
++
++      lastExamined =
++        position;
++
++      position += 1;
++    }
++  }
++
++  return {
++    page,
++    lastExamined,
++    hasMore,
++  };
++};
++
++const isUniqueViolation = (
++  error: unknown
++): boolean => {
++  const candidate =
++    error as {
++      parent?: {
++        code?: string;
++      };
++      original?: {
++        code?: string;
++      };
++    };
++
++  return (
++    candidate.parent?.code ===
++      "23505" ||
++    candidate.original?.code ===
++      "23505"
++  );
++};
++
++export const paginateFeaturedRestaurantListings =
++  async ({
++    listings,
++    limit,
++    availability,
++    cursor,
++    rawCursor,
++    requestId,
++    now,
++  }: {
++    listings:
++      FeaturedListingShape[];
++    limit: number;
++    availability:
++      FeaturedRestaurantAvailability;
++    cursor?:
++      FeaturedRestaurantCursorPayload;
++    rawCursor?: string;
++    requestId: string;
++    now: Date;
++  }): Promise<
++    FeaturedRestaurantPageResult
++  > => {
++    const binding:
++      RequestBinding = {
++      requestId,
++      availability,
++      limit,
++      rawCursor,
++      now,
++    };
++
++    try {
++      return await db().transaction(
++        async (
++          transaction
++        ) => {
++          const existing =
++            await loadRequest(
++              requestId,
++              transaction
++            );
++
++          if (existing) {
++            return replay(
++              existing,
++              binding
++            );
++          }
++
++          let snapshot:
++            | SnapshotRow
++            | null;
++
++          if (cursor) {
++            snapshot =
++              await loadSnapshotForUpdate(
++                cursor.snapshotId,
++                transaction
++              );
++
++            if (
++              !snapshot ||
++              !snapshotValid(
++                snapshot,
++                binding
++              )
++            ) {
++              return invalidCursor();
++            }
++
++            const afterLock =
++              await loadRequest(
++                requestId,
++                transaction
++              );
++
++            if (afterLock) {
++              return replay(
++                afterLock,
++                binding
++              );
++            }
++
++            if (
++              Number(
++                snapshot.currentPosition
++              ) !==
++                cursor.position ||
++              cursor.position >=
++                snapshot.listingIds
++                  .length
++            ) {
++              return invalidCursor();
++            }
++          } else {
++            snapshot =
++              await createSnapshot(
++                listings,
++                availability,
++                limit,
++                now,
++                transaction
++              );
++          }
++
++          const start =
++            cursor
++              ? cursor.position + 1
++              : 0;
++
++          const {
++            page,
++            lastExamined,
++            hasMore,
++          } = buildPage({
++            snapshot,
++            listings,
++            limit,
++            start,
++          });
++
++          const nextCursor =
++            hasMore
++              ? createFeaturedRestaurantCursor(
++                  snapshot.id,
++                  lastExamined
++                )
++              : null;
++
++          const data =
++            await Promise.all(
++              page.map(
++                (listing) =>
++                  decorateFeaturedRestaurantListing(
++                    listing,
++                    now
++                  )
++              )
++            );
++
++          const body:
++            FeaturedRestaurantLimitedResponseBody =
++            {
++              success: true,
++              data,
++              nextCursor,
++            };
++
++          await persistRequest({
++            binding,
++            snapshot,
++            body,
++            transaction,
++          });
++
++          if (
++            lastExamined >= 0
++          ) {
++            await advanceSnapshot(
++              snapshot.id,
++              lastExamined,
++              now,
++              transaction
++            );
++          }
++
++          return {
++            ok: true as const,
++            body,
++          };
++        }
++      );
++    } catch (error) {
++      if (
++        !isUniqueViolation(
++          error
++        )
++      ) {
++        throw error;
++      }
++
++      const existing =
++        await loadRequest(
++          requestId
++        );
++
++      if (existing) {
++        return replay(
++          existing,
++          binding
++        );
++      }
++
++      return rawCursor
++        ? invalidCursor()
++        : invalidRequest();
++    }
++  };
+diff --git a/rateeat_backend/src/services/featured-restaurant-display.service.ts b/rateeat_backend/src/services/featured-restaurant-display.service.ts
+new file mode 100644
+index 000000000..0638a9720
+--- /dev/null
++++ b/rateeat_backend/src/services/featured-restaurant-display.service.ts
+@@ -0,0 +1,50 @@
++import { RestaurantImage } from "../models";
++import {
++  FeaturedListingShape,
++  FeaturedRestaurantDisplayDecoration,
++} from "../types/featured-restaurant-availability.types";
++import { buildFeaturedRestaurantResponse } from "./featured-restaurant-availability.service";
++export const calculateFeaturedRemainingTime = (
++  endDate: Date | string,
++  now: Date
++): FeaturedRestaurantDisplayDecoration["remainingTime"] => {
++  const remainingTime = Math.max(
++    0,
++    new Date(endDate).getTime() - now.getTime()
++  );
++  return {
++    days: Math.floor(remainingTime / (1000 * 60 * 60 * 24)),
++    hours: Math.floor((remainingTime / (1000 * 60 * 60)) % 24),
++    minutes: Math.floor((remainingTime / (1000 * 60)) % 60),
++    seconds: Math.floor((remainingTime / 1000) % 60),
++  };
++};
++export const findFeaturedRestaurantLogo = async (
++  restaurantId: string
++): Promise<string | null> => {
++  let restaurantImage = await RestaurantImage.findOne({
++    where: {
++      restaurant_id: restaurantId,
++      is_leading: true,
++    },
++  });
++  if (!restaurantImage) {
++    restaurantImage = await RestaurantImage.findOne({
++      where: {
++        restaurant_id: restaurantId,
++        is_leading: false,
++      },
++    });
++  }
++  return restaurantImage ? restaurantImage.url : null;
++};
++export const decorateFeaturedRestaurantListing = async (
++  listing: FeaturedListingShape,
++  now: Date
++): Promise<Record<string, unknown>> => {
++  const restaurantLogo = await findFeaturedRestaurantLogo(listing.restaurant_id);
++  return buildFeaturedRestaurantResponse(listing, {
++    remainingTime: calculateFeaturedRemainingTime(listing.end_date, now),
++    restaurant_logo: restaurantLogo,
++  });
++};
+diff --git a/rateeat_backend/src/types/featured-restaurant-availability.types.ts b/rateeat_backend/src/types/featured-restaurant-availability.types.ts
+new file mode 100644
+index 000000000..d1ee24161
+--- /dev/null
++++ b/rateeat_backend/src/types/featured-restaurant-availability.types.ts
+@@ -0,0 +1,76 @@
++import {
++  FEATURED_RESTAURANT_AVAILABILITY_BROWSE,
++  FEATURED_RESTAURANT_AVAILABILITY_ORDERABLE,
++} from "../constants/featured-restaurant-availability.constants";
++export type FeaturedRestaurantAvailability =
++  | typeof FEATURED_RESTAURANT_AVAILABILITY_BROWSE
++  | typeof FEATURED_RESTAURANT_AVAILABILITY_ORDERABLE;
++export type FeaturedRestaurantQuery = {
++  availability: FeaturedRestaurantAvailability;
++  limit?: number;
++  cursor?: string;
++  requestId?: string;
++};
++export type FeaturedRestaurantQueryResult =
++  | {
++      ok: true;
++      query: FeaturedRestaurantQuery;
++    }
++  | {
++      ok: false;
++      status: 400;
++      message: string;
++    };
++export type FeaturedRestaurantAvailabilityState = {
++  is_permanently_closed?: boolean | null;
++  is_order_service_available?: boolean | null;
++  is_order_service_online?: boolean | null;
++};
++export type FeaturedRestaurantPublicShape =
++  FeaturedRestaurantAvailabilityState & {
++    id?: string;
++    name?: string;
++    restaurant_locations?: unknown[];
++    [key: string]: unknown;
++  };
++export type FeaturedListingShape = {
++  id: string;
++  restaurant_id: string;
++  priority?: number | null;
++  end_date: Date | string;
++  restaurant?: FeaturedRestaurantPublicShape | null;
++  toJSON?: () => Record<string, unknown>;
++  [key: string]: unknown;
++};
++export type FeaturedRestaurantSelectionOptions = {
++  availability: FeaturedRestaurantAvailability;
++};
++export type FeaturedRestaurantDisplayDecoration = {
++  remainingTime: {
++    days: number;
++    hours: number;
++    minutes: number;
++    seconds: number;
++  };
++  restaurant_logo: string | null;
++};
++export type FeaturedRestaurantCursorPayload = {
++  v: 3;
++  snapshotId: string;
++  position: number;
++};
++export type FeaturedRestaurantLimitedResponseBody = {
++  success: true;
++  data: Record<string, unknown>[];
++  nextCursor: string | null;
++};
++
++export type FeaturedRestaurantPageResult =
++  | {
++      ok: true;
++      body: FeaturedRestaurantLimitedResponseBody;
++    }
++  | {
++      ok: false;
++      message: string;
++    };
+diff --git a/rateeat_backend/src/utils/featured-restaurant-availability.utils.ts b/rateeat_backend/src/utils/featured-restaurant-availability.utils.ts
+new file mode 100644
+index 000000000..334fdf0c2
+--- /dev/null
++++ b/rateeat_backend/src/utils/featured-restaurant-availability.utils.ts
+@@ -0,0 +1,308 @@
++import {
++  FEATURED_RESTAURANT_AVAILABILITY_BROWSE,
++  FEATURED_RESTAURANT_AVAILABILITY_ORDERABLE,
++  FEATURED_RESTAURANT_CURSOR_REQUIRES_LIMIT_MESSAGE,
++  FEATURED_RESTAURANT_DEFAULT_AVAILABILITY,
++  FEATURED_RESTAURANT_INVALID_AVAILABILITY_MESSAGE,
++  FEATURED_RESTAURANT_INVALID_CURSOR_MESSAGE,
++  FEATURED_RESTAURANT_INVALID_LIMIT_MESSAGE,
++  FEATURED_RESTAURANT_MAX_LIMIT,
++  FEATURED_RESTAURANT_MIN_LIMIT,
++  FEATURED_RESTAURANT_INVALID_REQUEST_ID_MESSAGE,
++  FEATURED_RESTAURANT_LIMIT_REQUIRES_REQUEST_ID_MESSAGE,
++  FEATURED_RESTAURANT_REQUEST_ID_REQUIRES_LIMIT_MESSAGE,
++} from "../constants/featured-restaurant-availability.constants";
++import {
++  FeaturedListingShape,
++  FeaturedRestaurantAvailability,
++  FeaturedRestaurantAvailabilityState,
++  FeaturedRestaurantQueryResult,
++} from "../types/featured-restaurant-availability.types";
++
++const invalid = (message: string) => ({
++  ok: false as const,
++  message,
++});
++
++export const parseFeaturedRestaurantAvailability = (
++  value: unknown
++):
++  | { ok: true; value: FeaturedRestaurantAvailability }
++  | { ok: false; message: string } => {
++  if (value === undefined) {
++    return {
++      ok: true,
++      value: FEATURED_RESTAURANT_DEFAULT_AVAILABILITY,
++    };
++  }
++
++  if (
++    value === FEATURED_RESTAURANT_AVAILABILITY_BROWSE ||
++    value === FEATURED_RESTAURANT_AVAILABILITY_ORDERABLE
++  ) {
++    return {
++      ok: true,
++      value,
++    };
++  }
++
++  return invalid(FEATURED_RESTAURANT_INVALID_AVAILABILITY_MESSAGE);
++};
++
++export const parseFeaturedRestaurantLimit = (
++  value: unknown
++):
++  | { ok: true; value?: number }
++  | { ok: false; message: string } => {
++  if (value === undefined) return { ok: true };
++
++  if (
++    typeof value !== "string" &&
++    typeof value !== "number"
++  ) {
++    return invalid(FEATURED_RESTAURANT_INVALID_LIMIT_MESSAGE);
++  }
++
++  const raw = String(value);
++
++  if (!/^\d+$/.test(raw)) {
++    return invalid(FEATURED_RESTAURANT_INVALID_LIMIT_MESSAGE);
++  }
++
++  const parsed = Number(raw);
++
++  if (
++    !Number.isSafeInteger(parsed) ||
++    parsed < FEATURED_RESTAURANT_MIN_LIMIT ||
++    parsed > FEATURED_RESTAURANT_MAX_LIMIT
++  ) {
++    return invalid(FEATURED_RESTAURANT_INVALID_LIMIT_MESSAGE);
++  }
++
++  return {
++    ok: true,
++    value: parsed,
++  };
++};
++
++export const parseFeaturedRestaurantCursorQuery = (
++  value: unknown
++):
++  | { ok: true; value?: string }
++  | { ok: false; message: string } => {
++  if (value === undefined) return { ok: true };
++
++  return typeof value === "string" && value.length > 0
++    ? { ok: true, value }
++    : invalid(FEATURED_RESTAURANT_INVALID_CURSOR_MESSAGE);
++};
++
++const FEATURED_REQUEST_ID_PATTERN =
++  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
++
++export const parseFeaturedRestaurantRequestId = (
++  value: unknown
++):
++  | { ok: true; value?: string }
++  | { ok: false; message: string } => {
++  if (value === undefined) {
++    return { ok: true };
++  }
++
++  if (
++    typeof value !== "string" ||
++    !FEATURED_REQUEST_ID_PATTERN.test(value)
++  ) {
++    return {
++      ok: false,
++      message:
++        FEATURED_RESTAURANT_INVALID_REQUEST_ID_MESSAGE,
++    };
++  }
++
++  return {
++    ok: true,
++    value: value.toLowerCase(),
++  };
++};
++
++export const parseFeaturedRestaurantQuery = (query: {
++  availability?: unknown;
++  limit?: unknown;
++  cursor?: unknown;
++  requestId?: unknown;
++}): FeaturedRestaurantQueryResult => {
++  const availability =
++    parseFeaturedRestaurantAvailability(
++      query.availability
++    );
++
++  if (availability.ok === false) {
++    return {
++      ok: false,
++      status: 400,
++      message: availability.message,
++    };
++  }
++
++  const limit =
++    parseFeaturedRestaurantLimit(
++      query.limit
++    );
++
++  if (limit.ok === false) {
++    return {
++      ok: false,
++      status: 400,
++      message: limit.message,
++    };
++  }
++
++  const cursor =
++    parseFeaturedRestaurantCursorQuery(
++      query.cursor
++    );
++
++  if (cursor.ok === false) {
++    return {
++      ok: false,
++      status: 400,
++      message: cursor.message,
++    };
++  }
++
++  const requestId =
++    parseFeaturedRestaurantRequestId(
++      query.requestId
++    );
++
++  if (requestId.ok === false) {
++    return {
++      ok: false,
++      status: 400,
++      message: requestId.message,
++    };
++  }
++
++  if (
++    cursor.value !== undefined &&
++    limit.value === undefined
++  ) {
++    return {
++      ok: false,
++      status: 400,
++      message:
++        FEATURED_RESTAURANT_CURSOR_REQUIRES_LIMIT_MESSAGE,
++    };
++  }
++
++  if (
++    requestId.value !== undefined &&
++    limit.value === undefined
++  ) {
++    return {
++      ok: false,
++      status: 400,
++      message:
++        FEATURED_RESTAURANT_REQUEST_ID_REQUIRES_LIMIT_MESSAGE,
++    };
++  }
++
++  if (
++    limit.value !== undefined &&
++    requestId.value === undefined
++  ) {
++    return {
++      ok: false,
++      status: 400,
++      message:
++        FEATURED_RESTAURANT_LIMIT_REQUIRES_REQUEST_ID_MESSAGE,
++    };
++  }
++
++  return {
++    ok: true,
++    query: {
++      availability:
++        availability.value,
++      limit: limit.value,
++      cursor: cursor.value,
++      requestId: requestId.value,
++    },
++  };
++};
++
++
++export const isFeaturedRestaurantEligible = (
++  restaurant:
++    | FeaturedRestaurantAvailabilityState
++    | null
++    | undefined,
++  availability: FeaturedRestaurantAvailability
++): boolean => {
++  if (
++    !restaurant ||
++    restaurant.is_permanently_closed === true
++  ) {
++    return false;
++  }
++
++  if (
++    availability ===
++    FEATURED_RESTAURANT_AVAILABILITY_BROWSE
++  ) {
++    return true;
++  }
++
++  return (
++    restaurant.is_order_service_available === true &&
++    restaurant.is_order_service_online === true
++  );
++};
++
++export const featuredListingPriority = (
++  listing: FeaturedListingShape
++): number => {
++  const value = Number(listing.priority ?? 0);
++
++  return Number.isFinite(value)
++    ? value
++    : 0;
++};
++
++export const featuredListingEndTimestamp = (
++  listing: FeaturedListingShape
++): number => {
++  const value =
++    new Date(listing.end_date).getTime();
++
++  return Number.isFinite(value)
++    ? value
++    : Number.POSITIVE_INFINITY;
++};
++
++export const compareFeaturedListings = (
++  left: FeaturedListingShape,
++  right: FeaturedListingShape
++): number => {
++  const priority =
++    featuredListingPriority(right) -
++    featuredListingPriority(left);
++
++  if (priority) return priority;
++
++  const end =
++    featuredListingEndTimestamp(left) -
++    featuredListingEndTimestamp(right);
++
++  return end ||
++    String(left.id).localeCompare(String(right.id));
++};
++
++export const preferredFeaturedListing = (
++  current: FeaturedListingShape,
++  candidate: FeaturedListingShape
++): FeaturedListingShape =>
++  compareFeaturedListings(candidate, current) < 0
++    ? candidate
++    : current;

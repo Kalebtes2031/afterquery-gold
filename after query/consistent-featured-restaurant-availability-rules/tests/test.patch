@@ -1,0 +1,877 @@
+diff --git a/rateeat_backend/src/__tests__/db_setup.ts b/rateeat_backend/src/__tests__/db_setup.ts
+index e60a6e1f2..0f3fc4217 100644
+--- a/rateeat_backend/src/__tests__/db_setup.ts
++++ b/rateeat_backend/src/__tests__/db_setup.ts
+@@ -17,6 +17,7 @@ import {
+   ItemVideo,
+   UserLocation,
+   RestaurantLocation,
++  Neighborhood,
+   ItemReviewImage,
+   ItemReviewVideo,
+   RestaurantReview,
+@@ -116,6 +117,7 @@ class Database {
+           ItemVideo,
+           UserLocation,
+           RestaurantLocation,
++          Neighborhood,
+           ItemReviewImage,
+           ItemReviewVideo,
+           RestaurantReview,
+diff --git a/rateeat_backend/src/__tests__/unit/sponsored_listing_impression_behavior.test.ts b/rateeat_backend/src/__tests__/unit/sponsored_listing_impression_behavior.test.ts
+new file mode 100644
+index 000000000..1827d8ea4
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/sponsored_listing_impression_behavior.test.ts
+@@ -0,0 +1,512 @@
++import { NextFunction, Request, Response } from "express";
++import { Op } from "sequelize";
++
++import Database from "../db_setup";
++import { Restaurant } from "../../models";
++import SponsoredListing from "../../models/SponsoredListing/SponsoredListing";
++
++import {
++  expireSponsoredListings,
++  trackImpression,
++} from "../../controllers/sponsored_listing.controller";
++
++const NOW = new Date("2030-02-10T12:00:00.000Z");
++
++const LISTING_ID = "55555555-5555-4555-8555-555555555555";
++
++const RESTAURANT_ID = "66666666-6666-4666-8666-666666666666";
++
++const MISSING_LISTING_ID = "99999999-9999-4999-8999-999999999998";
++
++const responseFor = () => {
++  const response: any = {
++    statusCode: 200,
++    body: undefined,
++  };
++
++  response.status = jest.fn((statusCode: number) => {
++    response.statusCode = statusCode;
++    return response;
++  });
++
++  response.json = jest.fn((body: unknown) => {
++    /*
++     * Match the observable HTTP representation rather than exposing
++     * Sequelize model instances directly to assertions.
++     */
++    response.body = JSON.parse(JSON.stringify(body));
++    return response;
++  });
++
++  return response as Response & {
++    statusCode: number;
++    body: any;
++  };
++};
++
++const executeImpression = async (listingId = LISTING_ID) => {
++  const res = responseFor();
++
++  const next = jest.fn((error?: unknown) => {
++    if (error) {
++      throw error;
++    }
++  }) as unknown as NextFunction;
++
++  await trackImpression(
++    {
++      params: {
++        listingId,
++      },
++    } as unknown as Request,
++    res,
++    next
++  );
++
++  return {
++    res,
++    next: next as unknown as jest.Mock,
++  };
++};
++
++const createListing = async (overrides: Record<string, unknown> = {}) =>
++  SponsoredListing.create({
++    id: LISTING_ID,
++    restaurant_id: RESTAURANT_ID,
++    start_date: new Date("2030-02-01T00:00:00.000Z"),
++    end_date: new Date("2030-02-20T00:00:00.000Z"),
++    impressions: 2,
++    max_impressions: 5,
++    status: "Active",
++    priority: 1,
++    rotation_interval: 5,
++    image_url: "https://images.example/impression.jpg",
++    ...overrides,
++  } as any);
++
++beforeAll(async () => {
++  const sequelize = await Database.getInstance();
++
++  /*
++   * Connect before fixing the clock so Sequelize establishes its pool with
++   * real timers. The fixed Date makes exact lifecycle boundaries deterministic.
++   */
++  jest.useFakeTimers({
++    doNotFake: ["nextTick", "setImmediate"],
++  });
++
++  jest.setSystemTime(NOW);
++
++  await SponsoredListing.destroy({
++    where: {
++      restaurant_id: RESTAURANT_ID,
++    },
++  });
++
++  await Restaurant.destroy({
++    where: {
++      id: RESTAURANT_ID,
++    },
++  });
++
++  /*
++   * Use direct persistence for unrelated setup so these tests depend only on
++   * sponsored-listing behavior, not restaurant controller behavior.
++   */
++  await sequelize.getQueryInterface().bulkInsert("restaurants", [
++    {
++      id: RESTAURANT_ID,
++      name: "Impression Lifecycle Cafe",
++      currency: "ETB",
++      createdAt: NOW,
++      updatedAt: NOW,
++    },
++  ]);
++});
++
++afterAll(async () => {
++  await SponsoredListing.destroy({
++    where: {
++      restaurant_id: RESTAURANT_ID,
++    },
++  });
++
++  await Restaurant.destroy({
++    where: {
++      id: RESTAURANT_ID,
++    },
++  });
++
++  jest.useRealTimers();
++
++  await Database.close();
++});
++
++beforeEach(async () => {
++  await SponsoredListing.destroy({
++    where: {
++      restaurant_id: RESTAURANT_ID,
++    },
++  });
++});
++
++describe("sponsored listing impression lifecycle", () => {
++  describe("impression eligibility", () => {
++    it("returns the sponsored-listing 404 message for an unknown listing", async () => {
++      const { res } = await executeImpression(MISSING_LISTING_ID);
++
++      expect(res.statusCode).toBe(404);
++
++      expect(res.body).toEqual({
++        success: false,
++        message: "Sponsored listing not found",
++      });
++    });
++
++    it("rejects an impression before the listing has started", async () => {
++      const listing = await createListing({
++        start_date: new Date("2030-02-11T00:00:00.000Z"),
++        end_date: new Date("2030-02-20T00:00:00.000Z"),
++        impressions: 1,
++      });
++
++      const { res } = await executeImpression();
++
++      await listing.reload();
++
++      expect(res.statusCode).toBe(409);
++
++      expect(res.body).toEqual({
++        success: false,
++        message: "Sponsored listing has not started yet",
++      });
++
++      expect(listing.impressions).toBe(1);
++      expect(listing.status).toBe("Active");
++    });
++
++    it("expires an ended Active listing without counting another impression", async () => {
++      const listing = await createListing({
++        end_date: new Date("2030-02-10T11:00:00.000Z"),
++        impressions: 2,
++        max_impressions: 5,
++      });
++
++      const { res } = await executeImpression();
++
++      await listing.reload();
++
++      expect(res.statusCode).toBe(200);
++      expect(res.body.success).toBe(true);
++
++      expect(res.body.message).toBe("Listing expired");
++
++      expect(res.body.data.id).toBe(LISTING_ID);
++      expect(res.body.data.impressions).toBe(2);
++      expect(res.body.data.status).toBe("Expired");
++
++      expect(listing.impressions).toBe(2);
++      expect(listing.status).toBe("Expired");
++    });
++
++    it("treats an impression at the exact end time as expired", async () => {
++      const listing = await createListing({
++        end_date: new Date(NOW),
++        impressions: 3,
++        max_impressions: 8,
++      });
++
++      const { res } = await executeImpression();
++
++      await listing.reload();
++
++      expect(res.statusCode).toBe(200);
++      expect(res.body.message).toBe("Listing expired");
++
++      expect(res.body.data.impressions).toBe(3);
++      expect(res.body.data.status).toBe("Expired");
++
++      expect(listing.impressions).toBe(3);
++      expect(listing.status).toBe("Expired");
++    });
++
++    it("does not count another impression for a listing already marked Expired", async () => {
++      const listing = await createListing({
++        status: "Expired",
++        impressions: 1,
++        max_impressions: 10,
++      });
++
++      const { res } = await executeImpression();
++
++      await listing.reload();
++
++      expect(res.statusCode).toBe(200);
++      expect(res.body.message).toBe("Listing expired");
++
++      expect(res.body.data.id).toBe(LISTING_ID);
++      expect(res.body.data.impressions).toBe(1);
++      expect(res.body.data.status).toBe("Expired");
++
++      expect(listing.impressions).toBe(1);
++      expect(listing.status).toBe("Expired");
++    });
++
++    it("returns the expired listing data when its budget was already exhausted", async () => {
++      const listing = await createListing({
++        impressions: 5,
++        max_impressions: 5,
++        status: "Active",
++      });
++
++      const { res } = await executeImpression();
++
++      await listing.reload();
++
++      expect(res.statusCode).toBe(200);
++      expect(res.body.success).toBe(true);
++      expect(res.body.message).toBe("Listing expired");
++
++      expect(res.body.data.id).toBe(LISTING_ID);
++      expect(res.body.data.impressions).toBe(5);
++      expect(res.body.data.max_impressions).toBe(5);
++      expect(res.body.data.status).toBe("Expired");
++
++      expect(listing.impressions).toBe(5);
++      expect(listing.status).toBe("Expired");
++    });
++
++    it("counts an impression at the exact start time", async () => {
++      const listing = await createListing({
++        start_date: new Date(NOW),
++        end_date: new Date("2030-02-20T00:00:00.000Z"),
++        impressions: 1,
++        max_impressions: 5,
++      });
++
++      const { res } = await executeImpression();
++
++      await listing.reload();
++
++      expect(res.statusCode).toBe(200);
++      expect(res.body.success).toBe(true);
++
++      expect(res.body.data.id).toBe(LISTING_ID);
++      expect(res.body.data.impressions).toBe(2);
++      expect(res.body.data.status).toBe("Active");
++
++      expect(listing.impressions).toBe(2);
++      expect(listing.status).toBe("Active");
++    });
++
++    it("preserves a normal successful impression below the cap", async () => {
++      const listing = await createListing({
++        impressions: 2,
++        max_impressions: 5,
++      });
++
++      const { res } = await executeImpression();
++
++      await listing.reload();
++
++      expect(res.statusCode).toBe(200);
++      expect(res.body.success).toBe(true);
++
++      expect(res.body.data.id).toBe(LISTING_ID);
++      expect(res.body.data.impressions).toBe(3);
++      expect(res.body.data.status).toBe("Active");
++
++      expect(listing.impressions).toBe(3);
++      expect(listing.status).toBe("Active");
++    });
++
++    it("counts the impression that reaches the cap and then expires the listing", async () => {
++      const listing = await createListing({
++        impressions: 4,
++        max_impressions: 5,
++      });
++
++      const { res } = await executeImpression();
++
++      await listing.reload();
++
++      expect(res.statusCode).toBe(200);
++      expect(res.body.success).toBe(true);
++
++      expect(res.body.data.id).toBe(LISTING_ID);
++      expect(res.body.data.impressions).toBe(5);
++      expect(res.body.data.max_impressions).toBe(5);
++      expect(res.body.data.status).toBe("Expired");
++
++      expect(listing.impressions).toBe(5);
++      expect(listing.status).toBe("Expired");
++    });
++
++    it("does not exceed the impression cap when requests arrive concurrently", async () => {
++      const listing = await createListing({
++        impressions: 9,
++        max_impressions: 10,
++        status: "Active",
++      });
++
++      const [first, second] = await Promise.all([
++        executeImpression(),
++        executeImpression(),
++      ]);
++
++      await listing.reload();
++
++      expect(listing.impressions).toBe(10);
++      expect(listing.status).toBe("Expired");
++
++      const responses = [first.res.body, second.res.body];
++
++      expect(
++        responses.filter((body) => body.message === "Listing expired")
++      ).toHaveLength(1);
++    });
++
++    it("records only the remaining budget across several concurrent impressions", async () => {
++      const listing = await createListing({
++        impressions: 8,
++        max_impressions: 10,
++        status: "Active",
++      });
++
++      const results = await Promise.all([
++        executeImpression(),
++        executeImpression(),
++        executeImpression(),
++      ]);
++
++      await listing.reload();
++
++      expect(listing.impressions).toBe(10);
++      expect(listing.status).toBe("Expired");
++
++      expect(results.every(({ res }) => res.statusCode === 200)).toBe(true);
++
++      expect(
++        results.filter(({ res }) => res.body.message === "Listing expired")
++      ).toHaveLength(1);
++    });
++
++    it("never increments a listing that starts with impressions above its cap", async () => {
++      const listing = await createListing({
++        impressions: 8,
++        max_impressions: 5,
++      });
++
++      const { res } = await executeImpression();
++
++      await listing.reload();
++
++      expect(res.statusCode).toBe(200);
++      expect(res.body.message).toBe("Listing expired");
++
++      expect(res.body.data.impressions).toBe(8);
++      expect(res.body.data.status).toBe("Expired");
++
++      expect(listing.impressions).toBe(8);
++      expect(listing.status).toBe("Expired");
++    });
++  });
++
++  describe("expiration sweep", () => {
++    it("expires an Active listing whose impression budget is exhausted", async () => {
++      const row = await createListing({
++        start_date: new Date("2030-02-01T00:00:00.000Z"),
++        end_date: new Date("2030-03-01T00:00:00.000Z"),
++        impressions: 10,
++        max_impressions: 10,
++        status: "Active",
++      });
++
++      await expireSponsoredListings();
++
++      await row.reload();
++
++      expect(row.status).toBe("Expired");
++    });
++
++    it("expires an Active listing exactly when its end time is reached", async () => {
++      const row = await createListing({
++        end_date: new Date(NOW),
++        impressions: 1,
++        max_impressions: 10,
++        status: "Active",
++      });
++
++      await expireSponsoredListings();
++
++      await row.reload();
++
++      expect(row.status).toBe("Expired");
++    });
++
++    it("preserves expiration of an Active listing whose end time is in the past", async () => {
++      const row = await createListing({
++        end_date: new Date("2030-02-09T00:00:00.000Z"),
++        impressions: 1,
++        max_impressions: 10,
++        status: "Active",
++      });
++
++      await expireSponsoredListings();
++
++      await row.reload();
++
++      expect(row.status).toBe("Expired");
++    });
++
++    it("does not expire an Active listing that still has time and budget", async () => {
++      const row = await createListing({
++        end_date: new Date("2030-03-01T00:00:00.000Z"),
++        impressions: 3,
++        max_impressions: 10,
++        status: "Active",
++      });
++
++      await expireSponsoredListings();
++
++      await row.reload();
++
++      expect(row.status).toBe("Active");
++    });
++
++    it("leaves an already Expired listing unchanged during the sweep", async () => {
++      const row = await createListing({
++        end_date: new Date("2030-01-10T11:00:00.000Z"),
++        impressions: 1,
++        max_impressions: 10,
++        status: "Active",
++      });
++
++      // First sweep moves the listing into the Expired state.
++      await expireSponsoredListings();
++      await row.reload();
++
++      expect(row.status).toBe("Expired");
++
++      // Running cleanup again should leave that state unchanged.
++      await expireSponsoredListings();
++      await row.reload();
++
++      expect(row.status).toBe("Expired");
++    });
++  });
++  it("expires an Active listing whose impressions are above its budget", async () => {
++    const row = await createListing({
++      end_date: new Date("2030-03-01T00:00:00.000Z"),
++      impressions: 11,
++      max_impressions: 10,
++      status: "Active",
++    });
++
++    await expireSponsoredListings();
++
++    await row.reload();
++
++    expect(row.status).toBe("Expired");
++  });
++});
+diff --git a/rateeat_backend/src/__tests__/unit/sponsored_listing_schedule_behavior.test.ts b/rateeat_backend/src/__tests__/unit/sponsored_listing_schedule_behavior.test.ts
+new file mode 100644
+index 000000000..a3dc7479c
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/sponsored_listing_schedule_behavior.test.ts
+@@ -0,0 +1,333 @@
++import { NextFunction, Request, Response } from "express";
++import Database from "../db_setup";
++import { Restaurant, RestaurantImage } from "../../models";
++import SponsoredListing from "../../models/SponsoredListing/SponsoredListing";
++
++import {
++  expireSponsoredListings,
++  getSponsoredListings,
++} from "../../controllers/sponsored_listing.controller";
++
++const NOW = new Date("2030-01-10T12:00:00.000Z");
++
++const RESTAURANT_ID = "11111111-1111-4111-8111-111111111111";
++
++const LISTING_ID = "33333333-3333-4333-8333-333333333333";
++
++const responseFor = () => {
++  const response: any = {
++    statusCode: 200,
++    body: undefined,
++  };
++
++  response.status = jest.fn((statusCode: number) => {
++    response.statusCode = statusCode;
++    return response;
++  });
++
++  response.json = jest.fn((body: unknown) => {
++    /*
++     * Serialize the same way an HTTP response would, rather than exposing
++     * Sequelize instances to the assertions.
++     */
++    response.body = JSON.parse(JSON.stringify(body));
++    return response;
++  });
++
++  return response as Response & {
++    statusCode: number;
++    body: any;
++  };
++};
++
++const execute = async (handler: any, req: Partial<Request> = {}) => {
++  const res = responseFor();
++
++  const next = jest.fn((error?: unknown) => {
++    if (error) {
++      throw error;
++    }
++  }) as unknown as NextFunction;
++
++  await handler(req as Request, res, next);
++
++  return {
++    res,
++    next: next as unknown as jest.Mock,
++  };
++};
++
++const createListing = async (overrides: Record<string, unknown> = {}) =>
++  SponsoredListing.create({
++    id: LISTING_ID,
++    restaurant_id: RESTAURANT_ID,
++    start_date: new Date("2030-01-10T00:00:00.000Z"),
++    end_date: new Date("2030-01-20T00:00:00.000Z"),
++    impressions: 2,
++    max_impressions: 10,
++    status: "Active",
++    priority: 2,
++    rotation_interval: 5,
++    image_url: "https://images.example/listing.jpg",
++    discount_info: "10% off",
++    ...overrides,
++  } as any);
++
++beforeAll(async () => {
++  const sequelize = await Database.getInstance();
++
++  /*
++   * Establish the DB connection before fake timers are enabled. The fixed
++   * clock makes exact start/end boundary tests deterministic.
++   */
++  jest.useFakeTimers({
++    doNotFake: ["nextTick", "setImmediate"],
++  });
++
++  jest.setSystemTime(NOW);
++
++  await SponsoredListing.destroy({
++    where: {
++      restaurant_id: RESTAURANT_ID,
++    },
++  });
++
++  await RestaurantImage.destroy({
++    where: {
++      restaurant_id: RESTAURANT_ID,
++    },
++  });
++
++  await Restaurant.destroy({
++    where: {
++      id: RESTAURANT_ID,
++    },
++  });
++
++  /*
++   * Insert test restaurants directly so setup does not depend on restaurant
++   * controller hooks or unrelated API behavior.
++   */
++  await sequelize.getQueryInterface().bulkInsert("restaurants", [
++    {
++      id: RESTAURANT_ID,
++      name: "Lifecycle Cafe",
++      currency: "ETB",
++      createdAt: NOW,
++      updatedAt: NOW,
++    },
++  ]);
++});
++
++afterAll(async () => {
++  await SponsoredListing.destroy({
++    where: {
++      restaurant_id: RESTAURANT_ID,
++    },
++  });
++
++  await RestaurantImage.destroy({
++    where: {
++      restaurant_id: RESTAURANT_ID,
++    },
++  });
++
++  await Restaurant.destroy({
++    where: {
++      id: RESTAURANT_ID,
++    },
++  });
++
++  jest.useRealTimers();
++
++  await Database.close();
++});
++
++beforeEach(async () => {
++  await SponsoredListing.destroy({
++    where: {
++      restaurant_id: RESTAURANT_ID,
++    },
++  });
++
++  await RestaurantImage.destroy({
++    where: {
++      restaurant_id: RESTAURANT_ID,
++    },
++  });
++});
++
++describe("sponsored listing schedule lifecycle", () => {
++  describe("display eligibility", () => {
++    it("hides an Active listing whose schedule has not started", async () => {
++      await createListing({
++        start_date: new Date("2030-01-11T00:00:00.000Z"),
++      });
++
++      const { res } = await execute(getSponsoredListings);
++
++      expect(res.statusCode).toBe(200);
++
++      expect(res.body).toEqual({
++        success: true,
++        data: [],
++      });
++    });
++
++    it("hides an Active listing after its end time", async () => {
++      await createListing({
++        start_date: new Date("2030-01-01T00:00:00.000Z"),
++        end_date: new Date("2030-01-10T11:59:59.000Z"),
++      });
++
++      const { res } = await execute(getSponsoredListings);
++
++      expect(res.statusCode).toBe(200);
++      expect(res.body.data).toEqual([]);
++    });
++
++    it("treats the end time as exclusive", async () => {
++      await createListing({
++        start_date: new Date("2030-01-01T00:00:00.000Z"),
++        end_date: new Date(NOW),
++      });
++
++      const { res } = await execute(getSponsoredListings);
++
++      expect(res.statusCode).toBe(200);
++      expect(res.body.data).toEqual([]);
++    });
++
++    it("hides an Active listing whose impression budget is exhausted", async () => {
++      await createListing({
++        impressions: 10,
++        max_impressions: 10,
++      });
++
++      const { res } = await execute(getSponsoredListings);
++
++      expect(res.statusCode).toBe(200);
++      expect(res.body.data).toEqual([]);
++    });
++
++    it("hides a listing after it has expired", async () => {
++      const listing = await createListing({
++        status: "Active",
++        start_date: new Date("2030-01-01T00:00:00.000Z"),
++        end_date: new Date("2030-01-10T11:00:00.000Z"),
++        impressions: 2,
++        max_impressions: 10,
++      });
++
++      await expireSponsoredListings();
++      await listing.reload();
++
++      expect(listing.status).toBe("Expired");
++
++      const { res } = await execute(getSponsoredListings);
++
++      expect(res.statusCode).toBe(200);
++      expect(res.body.data).toEqual([]);
++    });
++
++    it("keeps the existing response shape for a currently eligible listing", async () => {
++      await createListing({
++        start_date: new Date(NOW),
++        end_date: new Date("2030-01-11T12:00:00.000Z"),
++        impressions: 1,
++      });
++
++      await RestaurantImage.create({
++        restaurant_id: RESTAURANT_ID,
++        url: "https://images.example/logo.jpg",
++        is_leading: true,
++      } as any);
++
++      const { res } = await execute(getSponsoredListings);
++
++      expect(res.statusCode).toBe(200);
++      expect(res.body.success).toBe(true);
++      expect(res.body.data).toHaveLength(1);
++
++      expect(Object.keys(res.body).sort()).toEqual(["data", "success"]);
++
++      expect(Object.keys(res.body.data[0]).sort()).toEqual(
++        [
++          "discount_info",
++          "end_date",
++          "id",
++          "image_url",
++          "impressions",
++          "max_impressions",
++          "priority",
++          "remainingTime",
++          "restaurant",
++          "restaurant_id",
++          "restaurant_logo",
++          "start_date",
++        ].sort()
++      );
++
++      expect(Object.keys(res.body.data[0].restaurant).sort()).toEqual(
++        ["name", "restaurant_locations"].sort()
++      );
++
++      expect(res.body.data[0]).toEqual(
++        expect.objectContaining({
++          id: LISTING_ID,
++          restaurant_id: RESTAURANT_ID,
++          impressions: 1,
++          max_impressions: 10,
++          restaurant_logo: "https://images.example/logo.jpg",
++        })
++      );
++
++      expect(res.body.data[0].remainingTime).toEqual({
++        days: 1,
++        hours: 0,
++        minutes: 0,
++        seconds: 0,
++      });
++    });
++
++    it("falls back to a non-leading restaurant image", async () => {
++      await createListing();
++
++      await RestaurantImage.create({
++        restaurant_id: RESTAURANT_ID,
++        url: "https://images.example/fallback.jpg",
++        is_leading: false,
++      } as any);
++
++      const { res } = await execute(getSponsoredListings);
++
++      expect(res.statusCode).toBe(200);
++
++      expect(res.body.data[0].restaurant_logo).toBe(
++        "https://images.example/fallback.jpg"
++      );
++    });
++
++    it("returns an empty successful response when no listing is eligible", async () => {
++      const { res } = await execute(getSponsoredListings);
++
++      expect(res.statusCode).toBe(200);
++
++      expect(res.body).toEqual({
++        success: true,
++        data: [],
++      });
++    });
++    it("hides an Active listing whose impressions are above its budget", async () => {
++      await createListing({
++        impressions: 11,
++        max_impressions: 10,
++      });
++
++      const { res } = await execute(getSponsoredListings);
++
++      expect(res.statusCode).toBe(200);
++      expect(res.body.data).toEqual([]);
++    });
++  });
++});

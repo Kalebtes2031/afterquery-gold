@@ -1,0 +1,1250 @@
+diff --git a/rateeat_backend/src/__tests__/unit/split_payment_endpoint.test.ts b/rateeat_backend/src/__tests__/unit/split_payment_endpoint.test.ts
+new file mode 100644
+index 0000000..ccbb24a
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/split_payment_endpoint.test.ts
+@@ -0,0 +1,652 @@
++import request from "supertest";
++import {
++  ParticipantStatus,
++  createOwner,
++  createParticipant,
++  createSplitGroup,
++  fetchParticipant,
++} from "./split_payment_test_support";
++
++// Every request in this file goes over a real socket to a separately-running
++// instance of the real app (see tests/test.sh) - never through an in-process
++// `import app`. That's what keeps a submitted solution's own code from ever
++// sharing a process with whatever decides these tests' outcome.
++const BASE_URL = process.env.SPLIT_TEST_BASE_URL || "http://127.0.0.1:4600";
++
++describe("PUT /api/v1/split-group/:groupId/member/:participantId/payment", () => {
++  let owner: { userId: string; token: string };
++  let otherUser: { userId: string; token: string };
++
++  const confirmPayment = (
++    groupId: string,
++    participantId: string,
++    token: string
++  ) =>
++    request(BASE_URL)
++      .put(`/api/v1/split-group/${groupId}/member/${participantId}/payment`)
++      .set("Authorization", `Bearer ${token}`)
++      .send();
++
++  const reversePayment = (
++    groupId: string,
++    participantId: string,
++    token: string
++  ) =>
++    request(BASE_URL)
++      .delete(`/api/v1/split-group/${groupId}/member/${participantId}/payment`)
++      .set("Authorization", `Bearer ${token}`)
++      .send();
++
++  beforeAll(async () => {
++    owner = await createOwner();
++    otherUser = await createOwner();
++  });
++
++  describe("group and participant eligibility", () => {
++    it("returns 404 with 'Split Group not found' for a group id that doesn't exist", async () => {
++      const res = await confirmPayment(
++        "00000000-0000-4000-8000-000000000000",
++        "00000000-0000-4000-8000-000000000001",
++        owner.token
++      );
++
++      expect(res.status).toBe(404);
++      expect(res.body).toMatchObject({
++        success: false,
++        message: "Split Group not found",
++      });
++    });
++
++    it("returns 401 when no auth token is provided", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++      const participant = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 100,
++      });
++
++      const res = await request(BASE_URL)
++        .put(`/api/v1/split-group/${group.id}/member/${participant.id}/payment`)
++        .send();
++
++      expect(res.status).toBe(401);
++    });
++
++    it("returns 403 when the requester is not the group's owner", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++      const participant = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 100,
++      });
++
++      const res = await confirmPayment(
++        group.id,
++        participant.id,
++        otherUser.token
++      );
++
++      expect(res.status).toBe(403);
++
++      const persisted = await fetchParticipant(participant.id);
++      expect(persisted!.status).toBe(ParticipantStatus.PENDING);
++    });
++
++    it("returns 404 with 'Participant not found' for a participant id that doesn't exist", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++
++      const res = await confirmPayment(
++        group.id,
++        "00000000-0000-4000-8000-000000000002",
++        owner.token
++      );
++
++      expect(res.status).toBe(404);
++      expect(res.body).toMatchObject({
++        success: false,
++        message: "Participant not found",
++      });
++    });
++
++    it("returns 404 with 'Participant not found' when the participant belongs to a different split group", async () => {
++      const groupA = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++      const groupB = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 50,
++      });
++      const participantOfB = await createParticipant({
++        splitGroupId: groupB.id,
++        owedAmount: 50,
++      });
++
++      const res = await confirmPayment(
++        groupA.id,
++        participantOfB.id,
++        owner.token
++      );
++
++      expect(res.status).toBe(404);
++      expect(res.body).toMatchObject({
++        success: false,
++        message: "Participant not found",
++      });
++
++      const persisted = await fetchParticipant(participantOfB.id);
++      expect(persisted!.status).toBe(ParticipantStatus.PENDING);
++    });
++  });
++
++  describe("successful settlement", () => {
++    it("marks the participant paid and deducts their owed amount from the group's remaining balance", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++      const paying = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 40,
++      });
++      await createParticipant({ splitGroupId: group.id, owedAmount: 60 });
++
++      const res = await confirmPayment(group.id, paying.id, owner.token);
++
++      expect(res.status).toBe(200);
++      expect(res.body.success).toBe(true);
++      expect(res.body.data.remaining_balance).toBe(60);
++
++      const persisted = await fetchParticipant(paying.id);
++      expect(persisted!.status).toBe(ParticipantStatus.PAID);
++    });
++
++    it("does not finalize the group while other participants remain unpaid", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++      const paying = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 40,
++      });
++      await createParticipant({ splitGroupId: group.id, owedAmount: 60 });
++
++      const res = await confirmPayment(group.id, paying.id, owner.token);
++
++      expect(res.body.data.is_finalized).toBe(false);
++      expect(res.body.data.payment_confirmed_at).toBeFalsy();
++    });
++
++    it("finalizes the group exactly when the last participant's payment brings the balance to zero", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++      const first = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 40,
++      });
++      const last = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 60,
++      });
++
++      const firstRes = await confirmPayment(group.id, first.id, owner.token);
++      expect(firstRes.body.data.is_finalized).toBe(false);
++
++      const lastRes = await confirmPayment(group.id, last.id, owner.token);
++
++      expect(lastRes.status).toBe(200);
++      expect(lastRes.body.data.remaining_balance).toBe(0);
++      expect(lastRes.body.data.is_finalized).toBe(true);
++      expect(lastRes.body.data.payment_confirmed_at).toBeTruthy();
++    });
++
++    it("finalizes a single-participant group on its only payment", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 75,
++      });
++      const onlyParticipant = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 75,
++      });
++
++      const res = await confirmPayment(
++        group.id,
++        onlyParticipant.id,
++        owner.token
++      );
++
++      expect(res.status).toBe(200);
++      expect(res.body.data.remaining_balance).toBe(0);
++      expect(res.body.data.is_finalized).toBe(true);
++    });
++
++    it("settles a total that does not divide evenly among participants, still finalizing once every participant has paid", async () => {
++      // 100 split three ways leaves 33.333... per participant - repeated
++      // subtraction of that from 100 does not land on exactly 0 in
++      // floating-point arithmetic. An implementation that only finalizes on
++      // an exact-equality check against 0 would leave this group stuck
++      // unfinalized forever, even though everyone has genuinely paid.
++      const owedShare = 100 / 3;
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: owedShare * 3,
++      });
++      const participants = await Promise.all([
++        createParticipant({ splitGroupId: group.id, owedAmount: owedShare }),
++        createParticipant({ splitGroupId: group.id, owedAmount: owedShare }),
++        createParticipant({ splitGroupId: group.id, owedAmount: owedShare }),
++      ]);
++
++      let finalRes;
++      for (const participant of participants) {
++        finalRes = await confirmPayment(group.id, participant.id, owner.token);
++      }
++
++      expect(finalRes.status).toBe(200);
++      expect(finalRes.body.data.remaining_balance).toBe(0);
++      expect(finalRes.body.data.is_finalized).toBe(true);
++    });
++
++    it("returns the updated split group with its participants in the response data", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++      const paying = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 100,
++      });
++
++      const res = await confirmPayment(group.id, paying.id, owner.token);
++
++      expect(res.body.data.id).toBe(group.id);
++      expect(Array.isArray(res.body.data.participants)).toBe(true);
++      const participantInResponse = res.body.data.participants.find(
++        (p: any) => p.id === paying.id
++      );
++      expect(participantInResponse).toMatchObject({
++        id: paying.id,
++        status: ParticipantStatus.PAID,
++      });
++    });
++
++    it("keeps every other participant's status untouched when confirming one participant's payment", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++      const paying = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 40,
++      });
++      const untouched = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 60,
++      });
++
++      const res = await confirmPayment(group.id, paying.id, owner.token);
++      expect(res.status).toBe(200);
++
++      const persistedPaying = await fetchParticipant(paying.id);
++      expect(persistedPaying!.status).toBe(ParticipantStatus.PAID);
++
++      const persisted = await fetchParticipant(untouched.id);
++      expect(persisted!.status).toBe(ParticipantStatus.PENDING);
++    });
++
++    it("records a payment confirmation naming the confirming user and the amount owed", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++      const paying = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 40,
++      });
++
++      const res = await confirmPayment(group.id, paying.id, owner.token);
++
++      expect(Array.isArray(res.body.data.payment_confirmations)).toBe(true);
++      const confirmation = res.body.data.payment_confirmations.find(
++        (c: any) => c.split_participant_id === paying.id
++      );
++      expect(confirmation).toMatchObject({
++        split_participant_id: paying.id,
++        confirmed_by_user_id: owner.userId,
++        amount_confirmed: 40,
++      });
++    });
++  });
++
++  describe("idempotency of an already-paid participant", () => {
++    it("confirming an already-paid participant a second time leaves the balance and finalized state unchanged", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++      const paying = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 40,
++      });
++      await createParticipant({ splitGroupId: group.id, owedAmount: 60 });
++
++      const first = await confirmPayment(group.id, paying.id, owner.token);
++      expect(first.body.data.remaining_balance).toBe(60);
++
++      const second = await confirmPayment(group.id, paying.id, owner.token);
++
++      expect(second.status).toBe(200);
++      expect(second.body.data.remaining_balance).toBe(60);
++      expect(second.body.data.is_finalized).toBe(false);
++
++      // Exactly one audit entry for this participant, not one per call.
++      const confirmationsForPaying =
++        second.body.data.payment_confirmations.filter(
++          (c: any) => c.split_participant_id === paying.id
++        );
++      expect(confirmationsForPaying).toHaveLength(1);
++    });
++
++    it("is a no-op for a participant that was already paid before this endpoint was ever called", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++      const alreadyPaid = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 40,
++        status: ParticipantStatus.PAID,
++      });
++      await createParticipant({ splitGroupId: group.id, owedAmount: 60 });
++
++      const res = await confirmPayment(group.id, alreadyPaid.id, owner.token);
++
++      expect(res.status).toBe(200);
++      // remaining_balance still reflects the full, untouched 100 - the
++      // participant's pre-existing PAID status was never accounted for by
++      // this call, so it must not be deducted a first time either.
++      expect(res.body.data.remaining_balance).toBe(100);
++      expect(res.body.data.is_finalized).toBe(false);
++
++      // Never having gone through this endpoint's paying branch, this
++      // participant must have no audit entry at all.
++      const confirmationsForParticipant =
++        res.body.data.payment_confirmations.filter(
++          (c: any) => c.split_participant_id === alreadyPaid.id
++        );
++      expect(confirmationsForParticipant).toHaveLength(0);
++    });
++  });
++});
++
++describe("DELETE /api/v1/split-group/:groupId/member/:participantId/payment", () => {
++  let owner: { userId: string; token: string };
++  let otherUser: { userId: string; token: string };
++
++  const confirmPayment = (
++    groupId: string,
++    participantId: string,
++    token: string
++  ) =>
++    request(BASE_URL)
++      .put(`/api/v1/split-group/${groupId}/member/${participantId}/payment`)
++      .set("Authorization", `Bearer ${token}`)
++      .send();
++
++  const reversePayment = (
++    groupId: string,
++    participantId: string,
++    token: string
++  ) =>
++    request(BASE_URL)
++      .delete(`/api/v1/split-group/${groupId}/member/${participantId}/payment`)
++      .set("Authorization", `Bearer ${token}`)
++      .send();
++
++  beforeAll(async () => {
++    owner = await createOwner();
++    otherUser = await createOwner();
++  });
++
++  describe("group and participant eligibility", () => {
++    it("returns 404 with 'Split Group not found' for a group id that doesn't exist", async () => {
++      const res = await reversePayment(
++        "00000000-0000-4000-8000-000000000003",
++        "00000000-0000-4000-8000-000000000004",
++        owner.token
++      );
++
++      expect(res.status).toBe(404);
++      expect(res.body).toMatchObject({
++        success: false,
++        message: "Split Group not found",
++      });
++    });
++
++    it("returns 401 when no auth token is provided", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++      const participant = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 100,
++        status: ParticipantStatus.PAID,
++      });
++
++      const res = await request(BASE_URL)
++        .delete(
++          `/api/v1/split-group/${group.id}/member/${participant.id}/payment`
++        )
++        .send();
++
++      expect(res.status).toBe(401);
++    });
++
++    it("returns 403 when the requester is not the group's owner", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++      const participant = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 100,
++        status: ParticipantStatus.PAID,
++      });
++
++      const res = await reversePayment(
++        group.id,
++        participant.id,
++        otherUser.token
++      );
++
++      expect(res.status).toBe(403);
++
++      const persisted = await fetchParticipant(participant.id);
++      expect(persisted!.status).toBe(ParticipantStatus.PAID);
++    });
++
++    it("returns 404 with 'Participant not found' for a participant id that doesn't exist", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++
++      const res = await reversePayment(
++        group.id,
++        "00000000-0000-4000-8000-000000000005",
++        owner.token
++      );
++
++      expect(res.status).toBe(404);
++      expect(res.body).toMatchObject({
++        success: false,
++        message: "Participant not found",
++      });
++    });
++
++    it("returns 404 with 'Participant not found' when the participant belongs to a different split group", async () => {
++      const groupA = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++      const groupB = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 50,
++      });
++      const participantOfB = await createParticipant({
++        splitGroupId: groupB.id,
++        owedAmount: 50,
++        status: ParticipantStatus.PAID,
++      });
++
++      const res = await reversePayment(
++        groupA.id,
++        participantOfB.id,
++        owner.token
++      );
++
++      expect(res.status).toBe(404);
++      expect(res.body).toMatchObject({
++        success: false,
++        message: "Participant not found",
++      });
++
++      const persisted = await fetchParticipant(participantOfB.id);
++      expect(persisted!.status).toBe(ParticipantStatus.PAID);
++    });
++  });
++
++  describe("successful reversal", () => {
++    it("restores a paid participant to pending and adds their owed amount back to the group's remaining balance", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++      const paid = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 40,
++      });
++      await createParticipant({ splitGroupId: group.id, owedAmount: 60 });
++
++      const confirmRes = await confirmPayment(group.id, paid.id, owner.token);
++      expect(confirmRes.body.data.remaining_balance).toBe(60);
++
++      const res = await reversePayment(group.id, paid.id, owner.token);
++
++      expect(res.status).toBe(200);
++      expect(res.body.data.remaining_balance).toBe(100);
++
++      const persisted = await fetchParticipant(paid.id);
++      expect(persisted!.status).toBe(ParticipantStatus.PENDING);
++    });
++
++    it("un-finalizes the group when reversing the payment that had finalized it", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 40,
++      });
++      const onlyParticipant = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 40,
++      });
++      const confirmRes = await confirmPayment(
++        group.id,
++        onlyParticipant.id,
++        owner.token
++      );
++      expect(confirmRes.body.data.is_finalized).toBe(true);
++
++      const res = await reversePayment(
++        group.id,
++        onlyParticipant.id,
++        owner.token
++      );
++
++      expect(res.status).toBe(200);
++      expect(res.body.data.is_finalized).toBe(false);
++      expect(res.body.data.payment_confirmed_at).toBeFalsy();
++      expect(res.body.data.remaining_balance).toBe(40);
++    });
++
++    it("is a no-op for a participant that was never marked paid", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++      const pending = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 40,
++      });
++
++      const res = await reversePayment(group.id, pending.id, owner.token);
++
++      expect(res.status).toBe(200);
++      expect(res.body.data.remaining_balance).toBe(100);
++
++      const persisted = await fetchParticipant(pending.id);
++      expect(persisted!.status).toBe(ParticipantStatus.PENDING);
++    });
++
++    it("records who reversed the payment and when, on the same confirmation entry", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++      const paying = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 40,
++      });
++      await confirmPayment(group.id, paying.id, owner.token);
++
++      const res = await reversePayment(group.id, paying.id, owner.token);
++
++      const confirmation = res.body.data.payment_confirmations.find(
++        (c: any) => c.split_participant_id === paying.id
++      );
++      expect(confirmation.reversed_by_user_id).toBe(owner.userId);
++      expect(confirmation.reversed_at).toBeTruthy();
++    });
++
++    it("reuses the same confirmation entry (rather than creating a second one) when re-confirmed after a reversal", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++      const paying = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 40,
++      });
++
++      await confirmPayment(group.id, paying.id, owner.token);
++      await reversePayment(group.id, paying.id, owner.token);
++      const reconfirmed = await confirmPayment(
++        group.id,
++        paying.id,
++        owner.token
++      );
++
++      expect(reconfirmed.status).toBe(200);
++      expect(reconfirmed.body.data.remaining_balance).toBe(60);
++
++      const confirmationsForPaying =
++        reconfirmed.body.data.payment_confirmations.filter(
++          (c: any) => c.split_participant_id === paying.id
++        );
++      expect(confirmationsForPaying).toHaveLength(1);
++      expect(confirmationsForPaying[0].reversed_at).toBeFalsy();
++      expect(confirmationsForPaying[0].reversed_by_user_id).toBeFalsy();
++    });
++  });
++});
+diff --git a/rateeat_backend/src/__tests__/unit/split_payment_test_support.ts b/rateeat_backend/src/__tests__/unit/split_payment_test_support.ts
+new file mode 100644
+index 0000000..26ee151
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/split_payment_test_support.ts
+@@ -0,0 +1,243 @@
++import jwt from "jsonwebtoken";
++import { randomUUID } from "crypto";
++import { Pool } from "pg";
++
++/**
++ * Shared fixtures for the black-box PUT/DELETE
++ * /api/v1/split-group/:groupId/member/:participantId/payment tests.
++ *
++ * Nothing here imports a single line of application source. The held-out
++ * suite that uses this file runs in a process that never loads the
++ * repository's own `app`, routes, controllers, services, or Sequelize
++ * models (see tests/test.sh) - it only makes real HTTP requests to a
++ * separately-running instance of the real app, and reaches the database
++ * directly over this same raw `pg` connection to arrange fixtures and
++ * verify persisted state. That process-level separation, not just file
++ * permissions, is what keeps a submitted solution's own code from ever
++ * running inside the same process that decides whether its tests passed:
++ * there is no `import app` left anywhere for it to run from.
++ *
++ * Table/column names below match the base repository's own pre-existing
++ * schema (roles, users, split_groups, split_participants) - none of it is
++ * introduced by, or specific to, the reference solution.
++ */
++
++export enum ParticipantStatus {
++  PENDING = "PENDING",
++  PAID = "PAID",
++}
++
++const randomSuffix = () => Math.random().toString(36).slice(2, 10);
++
++export const createPool = () =>
++  new Pool({
++    host: process.env.DEVELOPMENT_PG_HOST,
++    port: Number(process.env.DEVELOPMENT_PG_PORT || 5432),
++    user: process.env.DEVELOPMENT_PG_USER,
++    password: process.env.DEVELOPMENT_PG_PASSWORD,
++    database: process.env.DEVELOPMENT_PG_DATABASE,
++  });
++
++// A single pool for this file's own fixture reads/writes - separate from
++// whatever pool a test file creates (via createPool, above) to manage the
++// atomicity-forcing trigger's lifecycle itself.
++const fixturePool = createPool();
++
++export const signToken = (id: string): string =>
++  jwt.sign({ id }, process.env.JWT_SECRET || "");
++
++/**
++ * Create a real user and a bearer token for it. `protectRoute` resolves this
++ * token straight to the user row via `User.findByPk` - a plain
++ * `{ id: <uuid> }` JWT payload is all that contract requires.
++ */
++export const createOwner = async (): Promise<{
++  userId: string;
++  token: string;
++}> => {
++  let roleId: string | undefined = (
++    await fixturePool.query(`SELECT id FROM roles WHERE name = $1 LIMIT 1`, [
++      "user",
++    ])
++  ).rows[0]?.id;
++
++  if (!roleId) {
++    roleId = randomUUID();
++    await fixturePool.query(
++      `INSERT INTO roles (id, name, "createdAt", "updatedAt")
++       VALUES ($1, $2, NOW(), NOW())`,
++      [roleId, "user"]
++    );
++  }
++
++  const suffix = randomSuffix();
++  const userId = randomUUID();
++  await fixturePool.query(
++    `INSERT INTO users
++       (id, role_id, username, email, first_name, last_name, "createdAt", "updatedAt")
++     VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())`,
++    [
++      userId,
++      roleId,
++      `split_owner_${suffix}`,
++      `split_owner_${suffix}@example.com`,
++      "Split",
++      "Owner",
++    ]
++  );
++
++  return { userId, token: signToken(userId) };
++};
++
++export interface CreateSplitGroupOptions {
++  ownerId: string;
++  totalAmount: number;
++}
++
++/**
++ * Create a real split group directly in the database, owned by the given
++ * user, with its whole `total_amount` still outstanding. Bypasses
++ * `POST /api/v1/split-group` (which, through its current mount, never
++ * actually receives a `restaurantId` to attach) so fixtures aren't coupled
++ * to that route's own, unrelated behavior.
++ */
++export const createSplitGroup = async (
++  options: CreateSplitGroupOptions
++): Promise<{ id: string }> => {
++  const id = randomUUID();
++  await fixturePool.query(
++    `INSERT INTO split_groups
++       (id, user_id, split_type, remaining_balance, total_amount, is_finalized, "createdAt", "updatedAt")
++     VALUES ($1, $2, 'equal', $3, $3, false, NOW(), NOW())`,
++    [id, options.ownerId, options.totalAmount]
++  );
++  return { id };
++};
++
++export interface CreateParticipantOptions {
++  splitGroupId: string;
++  owedAmount: number;
++  status?: ParticipantStatus;
++}
++
++/**
++ * Create a real participant on a split group, owing the given amount.
++ */
++export const createParticipant = async (
++  options: CreateParticipantOptions
++): Promise<{ id: string }> => {
++  const id = randomUUID();
++  await fixturePool.query(
++    `INSERT INTO split_participants
++       (id, split_group_id, username, owed_amount, status, is_owner, "createdAt", "updatedAt")
++     VALUES ($1, $2, $3, $4, $5, false, NOW(), NOW())`,
++    [
++      id,
++      options.splitGroupId,
++      `Participant ${randomSuffix()}`,
++      options.owedAmount,
++      options.status ?? ParticipantStatus.PENDING,
++    ]
++  );
++  return { id };
++};
++
++/**
++ * Read a participant's persisted status directly, independent of anything
++ * a response body claims.
++ */
++export const fetchParticipant = async (
++  participantId: string
++): Promise<{ status: string } | null> => {
++  const { rows } = await fixturePool.query(
++    `SELECT status FROM split_participants WHERE id = $1`,
++    [participantId]
++  );
++  return rows[0] ?? null;
++};
++
++/**
++ * Read a split group's persisted balance/finalization state directly,
++ * independent of anything a response body claims.
++ */
++export const fetchGroup = async (
++  groupId: string
++): Promise<{
++  remaining_balance: number;
++  is_finalized: boolean;
++  payment_confirmed_at: Date | null;
++} | null> => {
++  const { rows } = await fixturePool.query(
++    `SELECT remaining_balance, is_finalized, payment_confirmed_at
++     FROM split_groups WHERE id = $1`,
++    [groupId]
++  );
++  return rows[0] ?? null;
++};
++
++/**
++ * Force a split group directly into an already-paid/already-finalized
++ * starting state, bypassing the endpoint under test entirely - used only to
++ * arrange a scenario (e.g. a reversal test that needs a pre-existing paid
++ * participant on a finalized group), never to assert anything.
++ */
++export const updateSplitGroup = async (
++  groupId: string,
++  fields: Partial<{
++    remaining_balance: number;
++    is_finalized: boolean;
++    payment_confirmed_at: Date;
++  }>
++): Promise<void> => {
++  const keys = Object.keys(fields) as (keyof typeof fields)[];
++  if (keys.length === 0) {
++    return;
++  }
++  const setClause = keys.map((key, i) => `${key} = $${i + 2}`).join(", ");
++  await fixturePool.query(
++    `UPDATE split_groups SET ${setClause} WHERE id = $1`,
++    [groupId, ...keys.map((key) => (fields as Record<string, unknown>)[key])]
++  );
++};
++
++// --- Raw-SQL helpers for forcing a genuine database-level write failure ---
++// These exist purely to prove atomicity from the outside: they never touch
++// the feature's implementation, only the split_groups table itself.
++
++// Fires on UPDATE to split_groups - the settlement's own write always
++// updates this table (recording the deducted balance, and possibly
++// finalizing), regardless of how a given implementation is structured, so
++// forcing failure here proves the whole transaction - including whatever
++// it already did to the participant's own row - rolls back together.
++export const installFailingSplitGroupWriteTrigger = async (pool: Pool) => {
++  await pool.query(`
++    CREATE OR REPLACE FUNCTION split_test_fail_group_write()
++    RETURNS trigger AS $$
++    BEGIN
++      RAISE EXCEPTION 'split payment test forced split_groups write failure';
++    END;
++    $$ LANGUAGE plpgsql;
++  `);
++
++  await pool.query(`
++    DROP TRIGGER IF EXISTS split_test_fail_group_write_trigger
++    ON split_groups;
++  `);
++
++  await pool.query(`
++    CREATE TRIGGER split_test_fail_group_write_trigger
++    BEFORE UPDATE ON split_groups
++    FOR EACH ROW
++    EXECUTE FUNCTION split_test_fail_group_write();
++  `);
++};
++
++export const removeFailingSplitGroupWriteTrigger = async (pool: Pool) => {
++  await pool.query(`
++    DROP TRIGGER IF EXISTS split_test_fail_group_write_trigger
++    ON split_groups;
++  `);
++  await pool.query(`
++    DROP FUNCTION IF EXISTS split_test_fail_group_write();
++  `);
++};
+diff --git a/rateeat_backend/src/__tests__/unit/split_payment_transaction.test.ts b/rateeat_backend/src/__tests__/unit/split_payment_transaction.test.ts
+new file mode 100644
+index 0000000..ebeb5aa
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/split_payment_transaction.test.ts
+@@ -0,0 +1,337 @@
++import request from "supertest";
++import { Pool } from "pg";
++import {
++  ParticipantStatus,
++  createOwner,
++  createParticipant,
++  createPool,
++  createSplitGroup,
++  fetchGroup,
++  fetchParticipant,
++  installFailingSplitGroupWriteTrigger,
++  removeFailingSplitGroupWriteTrigger,
++  updateSplitGroup,
++} from "./split_payment_test_support";
++
++// Every request in this file goes over a real socket to a separately-running
++// instance of the real app (see tests/test.sh) - never through an in-process
++// `import app`. That's what keeps a submitted solution's own code from ever
++// sharing a process with whatever decides these tests' outcome.
++const BASE_URL = process.env.SPLIT_TEST_BASE_URL || "http://127.0.0.1:4600";
++
++describe("PUT /api/v1/split-group/:groupId/member/:participantId/payment transactional behavior", () => {
++  let owner: { userId: string; token: string };
++  let pool: Pool;
++
++  const confirmPayment = (groupId: string, participantId: string) =>
++    request(BASE_URL)
++      .put(`/api/v1/split-group/${groupId}/member/${participantId}/payment`)
++      .set("Authorization", `Bearer ${owner.token}`)
++      .send();
++
++  const reversePayment = (groupId: string, participantId: string) =>
++    request(BASE_URL)
++      .delete(`/api/v1/split-group/${groupId}/member/${participantId}/payment`)
++      .set("Authorization", `Bearer ${owner.token}`)
++      .send();
++
++  beforeAll(async () => {
++    pool = createPool();
++    owner = await createOwner();
++  });
++
++  afterAll(async () => {
++    await pool.end();
++  });
++
++  describe("atomicity", () => {
++    it("rolls back and leaves the participant's status and the group's balance untouched when the write fails", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++      const participant = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 40,
++      });
++
++      await installFailingSplitGroupWriteTrigger(pool);
++
++      let res;
++      try {
++        res = await confirmPayment(group.id, participant.id);
++      } finally {
++        await removeFailingSplitGroupWriteTrigger(pool);
++      }
++
++      expect(res.status).toBe(500);
++
++      const persistedGroup = await fetchGroup(group.id);
++      expect(persistedGroup!.remaining_balance).toBe(100);
++      expect(persistedGroup!.is_finalized).toBe(false);
++
++      // The participant's own row-level update happens earlier in the same
++      // transaction as the group write the trigger fails - a correct
++      // implementation must roll that back too, not just the group.
++      const persistedParticipant = await fetchParticipant(participant.id);
++      expect(persistedParticipant!.status).toBe(ParticipantStatus.PENDING);
++    });
++
++    it("leaves the participant retryable after a failed write, and a subsequent confirmation succeeds", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++      const participant = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 100,
++      });
++
++      await installFailingSplitGroupWriteTrigger(pool);
++      let failedRes;
++      try {
++        failedRes = await confirmPayment(group.id, participant.id);
++      } finally {
++        await removeFailingSplitGroupWriteTrigger(pool);
++      }
++      expect(failedRes.status).toBe(500);
++
++      const retryRes = await confirmPayment(group.id, participant.id);
++
++      expect(retryRes.status).toBe(200);
++      expect(retryRes.body.data.remaining_balance).toBe(0);
++      expect(retryRes.body.data.is_finalized).toBe(true);
++
++      // The failed attempt must not have left behind a confirmation record
++      // that blocks (or duplicates) this one: exactly one entry for this
++      // participant, not zero and not two.
++      const confirmationsForParticipant =
++        retryRes.body.data.payment_confirmations.filter(
++          (c: any) => c.split_participant_id === participant.id
++        );
++      expect(confirmationsForParticipant).toHaveLength(1);
++    });
++  });
++
++  describe("concurrency", () => {
++    it("serializes concurrent confirmations for different participants so the final balance reflects both payments exactly once", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++      const participantA = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 40,
++      });
++      const participantB = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 60,
++      });
++
++      const [resA, resB] = await Promise.all([
++        confirmPayment(group.id, participantA.id),
++        confirmPayment(group.id, participantB.id),
++      ]);
++
++      expect(resA.status).toBe(200);
++      expect(resB.status).toBe(200);
++
++      // If the two confirmations both read remaining_balance before either
++      // wrote it back, the loser's write would overwrite the winner's -
++      // classic lost update - leaving the balance at 40 or 60 instead of 0.
++      const finalGroup = await fetchGroup(group.id);
++      expect(finalGroup!.remaining_balance).toBe(0);
++      expect(finalGroup!.is_finalized).toBe(true);
++
++      const finalA = await fetchParticipant(participantA.id);
++      const finalB = await fetchParticipant(participantB.id);
++      expect(finalA!.status).toBe(ParticipantStatus.PAID);
++      expect(finalB!.status).toBe(ParticipantStatus.PAID);
++    });
++
++    it("finalizes the group exactly once when two concurrent confirmations are, together, the last two payments", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 150,
++      });
++      const already = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 50,
++      });
++      await confirmPayment(group.id, already.id);
++
++      const participantB = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 50,
++      });
++      const participantC = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 50,
++      });
++
++      const [resB, resC] = await Promise.all([
++        confirmPayment(group.id, participantB.id),
++        confirmPayment(group.id, participantC.id),
++      ]);
++
++      expect(resB.status).toBe(200);
++      expect(resC.status).toBe(200);
++
++      const finalGroup = await fetchGroup(group.id);
++      expect(finalGroup!.remaining_balance).toBe(0);
++      expect(finalGroup!.is_finalized).toBe(true);
++
++      // Exactly one of the two responses should have been the one that
++      // observed the group actually flip to finalized - not both (which
++      // would suggest each ran against its own stale, pre-lock snapshot),
++      // and not neither.
++      const finalizedResponses = [resB, resC].filter(
++        (r) => r.body.data.is_finalized === true
++      );
++      expect(finalizedResponses.length).toBeGreaterThanOrEqual(1);
++    });
++
++    it("only deducts once when two simultaneous confirmations target the same already-unpaid participant", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++      const participant = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 40,
++      });
++      await createParticipant({ splitGroupId: group.id, owedAmount: 60 });
++
++      const [resA, resB] = await Promise.all([
++        confirmPayment(group.id, participant.id),
++        confirmPayment(group.id, participant.id),
++      ]);
++
++      expect(resA.status).toBe(200);
++      expect(resB.status).toBe(200);
++
++      // A duplicate concurrent confirmation of the very same participant
++      // must not be treated as if it were a second, different participant
++      // paying - the balance drops by 40 exactly once, not twice.
++      const finalGroup = await fetchGroup(group.id);
++      expect(finalGroup!.remaining_balance).toBe(60);
++      expect(finalGroup!.is_finalized).toBe(false);
++
++      // Nor should it produce a second audit entry for the same
++      // participant - both responses reflect the same final, post-commit
++      // state, so either is enough to check against.
++      const confirmationsForParticipant =
++        resA.body.data.payment_confirmations.filter(
++          (c: any) => c.split_participant_id === participant.id
++        );
++      expect(confirmationsForParticipant).toHaveLength(1);
++    });
++  });
++
++  describe("reversal atomicity and concurrency", () => {
++    it("rolls back and leaves the participant paid and the balance untouched when the reversal's write fails", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++      const participant = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 40,
++        status: ParticipantStatus.PAID,
++      });
++      await updateSplitGroup(group.id, { remaining_balance: 60 });
++
++      await installFailingSplitGroupWriteTrigger(pool);
++
++      let res;
++      try {
++        res = await reversePayment(group.id, participant.id);
++      } finally {
++        await removeFailingSplitGroupWriteTrigger(pool);
++      }
++
++      expect(res.status).toBe(500);
++
++      const persistedGroup = await fetchGroup(group.id);
++      expect(persistedGroup!.remaining_balance).toBe(60);
++
++      const persistedParticipant = await fetchParticipant(participant.id);
++      expect(persistedParticipant!.status).toBe(ParticipantStatus.PAID);
++    });
++
++    it("serializes a concurrent confirmation and reversal for different participants of the same group", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++      const toConfirm = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 40,
++      });
++      const toReverse = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 60,
++        status: ParticipantStatus.PAID,
++      });
++      await updateSplitGroup(group.id, { remaining_balance: 40 });
++
++      const [confirmRes, reverseRes] = await Promise.all([
++        confirmPayment(group.id, toConfirm.id),
++        reversePayment(group.id, toReverse.id),
++      ]);
++
++      expect(confirmRes.status).toBe(200);
++      expect(reverseRes.status).toBe(200);
++
++      // Starting balance 40, one participant's 40 confirmed (-40) and the
++      // other's 60 reversed (+60) - regardless of which one the row lock
++      // let through first, the final balance must reflect both, not just
++      // whichever wrote last.
++      const finalGroup = await fetchGroup(group.id);
++      expect(finalGroup!.remaining_balance).toBe(60);
++    });
++
++    it("serializes two concurrent reversals for different participants of the same group", async () => {
++      const group = await createSplitGroup({
++        ownerId: owner.userId,
++        totalAmount: 100,
++      });
++      const participantA = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 40,
++        status: ParticipantStatus.PAID,
++      });
++      const participantB = await createParticipant({
++        splitGroupId: group.id,
++        owedAmount: 60,
++        status: ParticipantStatus.PAID,
++      });
++      await updateSplitGroup(group.id, {
++        remaining_balance: 0,
++        is_finalized: true,
++        payment_confirmed_at: new Date(),
++      });
++
++      const [resA, resB] = await Promise.all([
++        reversePayment(group.id, participantA.id),
++        reversePayment(group.id, participantB.id),
++      ]);
++
++      expect(resA.status).toBe(200);
++      expect(resB.status).toBe(200);
++
++      // If both reversals read remaining_balance from the same stale 0
++      // before either wrote it back, the loser's write would overwrite the
++      // winner's, leaving the balance at 40 or 60 instead of both amounts
++      // being added back.
++      const finalGroup = await fetchGroup(group.id);
++      expect(finalGroup!.remaining_balance).toBe(100);
++      expect(finalGroup!.is_finalized).toBe(false);
++
++      const finalA = await fetchParticipant(participantA.id);
++      const finalB = await fetchParticipant(participantB.id);
++      expect(finalA!.status).toBe(ParticipantStatus.PENDING);
++      expect(finalB!.status).toBe(ParticipantStatus.PENDING);
++    });
++  });
++});

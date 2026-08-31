@@ -1,0 +1,11 @@
+Add a way for a split bill's organizer to record a participant's share settled outside the online payment flow, and undo that if recorded by mistake, without letting close-together settlements leave the balance wrong.
+
+Expose PUT /api/v1/split-group/:groupId/member/:participantId/payment for the user who created the split group; only they may confirm or reverse a payment. A missing group returns 404 with message "Split Group not found", a non-owner request returns 403, and a participant id that doesn't exist - or belongs to a different group - returns 404 with message "Participant not found".
+
+Confirming an already-paid participant is a no-op: respond 200 with the group unchanged. Otherwise, mark the participant paid and deduct their owed amount from the remaining balance. Once every participant has paid - the balance reaching zero, allowing for the rounding an unevenly-divided total can leave behind - mark the group finalized and record when. Respond 200 with success: true and the updated group under data, including its participants and a payment_confirmations array; each entry names its split_participant_id, the confirmed_by_user_id, and the amount_confirmed.
+
+Expose the reverse under DELETE on the same route: restore a paid participant to pending, add their amount back to the balance, un-finalize the group if that payment finalized it, and set reversed_by_user_id and reversed_at on that participant's existing confirmation entry. Reversing an unpaid participant is a no-op, and re-confirming afterward updates that same entry, clearing those two fields, rather than adding another.
+
+Both operations must be atomic: a failed write leaves the participant's status and balance as they were, and concurrent confirmations or reversals for different participants of one group must serialize so the final balance and finalized state always reflect every completed change exactly once.
+
+IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.

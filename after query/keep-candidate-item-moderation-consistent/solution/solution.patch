@@ -1,0 +1,1164 @@
+diff --git a/rateeat_backend/src/constants/candidate-item-moderation.constants.ts b/rateeat_backend/src/constants/candidate-item-moderation.constants.ts
+new file mode 100644
+index 000000000..7118ec172
+--- /dev/null
++++ b/rateeat_backend/src/constants/candidate-item-moderation.constants.ts
+@@ -0,0 +1,28 @@
++export const CANDIDATE_ITEM_APPROVAL_REWARD = 10;
++
++export const CANDIDATE_ITEM_ALREADY_APPROVED =
++  "The item is already approved";
++
++export const CANDIDATE_ITEM_ALREADY_REJECTED =
++  "The item is already rejected";
++
++export const CANDIDATE_ITEM_APPROVAL_REQUIRED =
++  "isApproved field is required";
++
++export const CANDIDATE_ITEM_ENTITY_NAME = "Candidate item";
++export const CANDIDATE_ITEM_CATEGORY_ENTITY_NAME = "Category";
++
++export const CANDIDATE_ITEM_MEDIA_ATTRIBUTES = ["id", "url"] as const;
++
++export const CANDIDATE_ITEM_IMAGE_PERSISTENCE_FIELDS = [
++  "url",
++  "low_quality_url",
++  "medium_quality_url",
++  "high_quality_url",
++  "item_id",
++] as const;
++
++export const CANDIDATE_ITEM_VIDEO_PERSISTENCE_FIELDS = [
++  "url",
++  "item_id",
++] as const;
+diff --git a/rateeat_backend/src/controllers/candidate_item.controller.ts b/rateeat_backend/src/controllers/candidate_item.controller.ts
+index 0aa9a19de..97fc4c6aa 100644
+--- a/rateeat_backend/src/controllers/candidate_item.controller.ts
++++ b/rateeat_backend/src/controllers/candidate_item.controller.ts
+@@ -19,6 +19,10 @@ import { FileRequest } from "../middlewares/upload-image";
+ import sequelize, { Sequelize, WhereOptions, Op } from "sequelize";
+ import { NotificationCategory } from "../models/Feedback/Notification";
+ import sendNotification from "../utils/notification.utils";
++import moderateCandidateItem, {
++  moderateCandidateItemsBatch,
++} from "../services/candidate-item-moderation.service";
++import { parseCandidateApprovalValue } from "../utils/candidate-item-moderation.utils";
+ 
+ import {
+   BadRequestError,
+@@ -418,132 +422,52 @@ const getCandidateItems = asyncHandler(
+ const manageCandidateItem = asyncHandler(
+   async (req: FileRequest, res: Response, next: NextFunction) => {
+     const { id } = req.params;
+-    const { ...updateFields } = req.body;
+     const adminUser = req.user as AdminUser;
+-    let isApproved = null;
+ 
+     if (!adminUser) {
+       return next(new AuthorizationError());
+     }
+ 
+-    if (req.body.isApproved) {
+-      isApproved = JSON.parse(req.body.isApproved);
+-    }
+-
+-    const candidateItem = await Item.findByPk(id, {
+-      include: [
+-        {
+-          model: ItemImage,
+-          attributes: ["id", "url"],
+-        },
+-        {
+-          model: ItemVideo,
+-          attributes: ["id", "url"],
+-        },
+-      ],
+-    });
+-
+-    if (!candidateItem) {
+-      return next(new NotFoundError("Candidate item"));
+-    }
+-
+-    if (isApproved === null) {
++    if (req.body.isApproved === undefined || req.body.isApproved === null) {
+       return next(new BadRequestError("isApproved field is required"));
+     }
+-    const currentStatus = candidateItem?.is_approved;
+-    if (isApproved === currentStatus) {
+-      return next(
+-        new BadRequestError(
+-          `The item is already ${isApproved ? "approved" : "rejected"}`
+-        )
+-      );
+-    }
+-    const category = await Category.findByPk(candidateItem.category_id);
+-    if (!category.is_approved) {
+-      category.is_approved = true;
+-      await category.save();
+-    }
+-
+-    // Update the item with the provided fields
+-    Object.assign(candidateItem, updateFields);
+ 
+-    candidateItem.is_approved = isApproved;
+-    await candidateItem.save();
++    const isApproved = parseCandidateApprovalValue(req.body.isApproved);
+ 
+-    if (req.mediaImages) {
+-      await Promise.all(
+-        candidateItem.item_images.map((image) => image.destroy())
+-      );
+-      await Promise.all(
+-        req.mediaImages.map((image) =>
+-          ItemImage.create({
+-            url: image.highQualityImg,
+-            low_quality_url: image.lowQualityImg,
+-            medium_quality_url: image.mediumQualityImg,
+-            high_quality_url: image.highQualityImg,
+-            item_id: candidateItem.id,
+-          })
+-        )
+-      );
+-    }
+-
+-    if (req.mediaVideos) {
+-      await Promise.all(
+-        candidateItem.item_videos.map((video) => video.destroy())
+-      );
+-      await Promise.all(
+-        req.mediaVideos.map((video) =>
+-          ItemVideo.create({
+-            url: video,
+-            item_id: candidateItem.id,
+-          })
+-        )
+-      );
+-    }
+-
+-    const finalItem = await Item.findOne({
+-      where: { id: candidateItem.id },
+-      include: [
+-        {
+-          model: ItemImage,
+-          attributes: ["id", "url"],
+-        },
+-        {
+-          model: ItemVideo,
+-          attributes: ["id", "url"],
+-        },
+-      ],
++    const finalItem = await moderateCandidateItem({
++      id,
++      isApproved,
++      updateFields: req.body,
++      mediaImages: req.mediaImages,
++      mediaVideos: req.mediaVideos,
+     });
+ 
+-    // get the owener of the candidate item
+-    const candidateItemUser = await CandidateItemUser.findOne({
+-      where: { item_id: candidateItem.id },
+-      attributes: ["user_id"],
++    res.status(200).json({
++      success: true,
++      data: finalItem,
+     });
++  }
++);
+ 
+-    if (candidateItemUser) {
+-      const user_id = candidateItemUser?.user_id;
+-      const MONEY_EARNED = 10;
+-      let incentive = await Incentive.findOne({
+-        where: { user_id },
+-      });
+-      if (!incentive) {
+-        incentive = await Incentive.create({
+-          user_id,
+-        });
+-      }
++/**
++ * @description Manage candidate items as one atomic batch
++ * @route PUT /candidate-items/moderate-batch
++ */
++const manageCandidateItemsBatch = asyncHandler(
++  async (req: Request, res: Response, next: NextFunction) => {
++    const adminUser = req.user as AdminUser;
+ 
+-      if (finalItem.is_approved) {
+-        incentive.current_total += MONEY_EARNED;
+-      } else if (currentStatus && !finalItem.is_approved) {
+-        // if the item was approved and now it is rejected
+-        incentive.current_total -= MONEY_EARNED;
+-      }
++    if (!adminUser) {
++      return next(new AuthorizationError());
+     }
+ 
++    const finalItems = await moderateCandidateItemsBatch({
++      items: req.body.items,
++    });
++
+     res.status(200).json({
+       success: true,
+-      data: finalItem,
++      data: finalItems,
+     });
+   }
+ );
+@@ -1019,6 +943,7 @@ export {
+   createCandidateItem,
+   getCandidateItems,
+   manageCandidateItem,
++  manageCandidateItemsBatch,
+   createCandidateItemByRestaurant,
+   getCandidateItemsByRestaurant,
+   manageCandidateItemByRestaurant,
+diff --git a/rateeat_backend/src/routes/candidate_item.route.ts b/rateeat_backend/src/routes/candidate_item.route.ts
+index 9ed248b57..8b6604516 100644
+--- a/rateeat_backend/src/routes/candidate_item.route.ts
++++ b/rateeat_backend/src/routes/candidate_item.route.ts
+@@ -4,6 +4,7 @@ import {
+   createCandidateItem,
+   getCandidateItems,
+   manageCandidateItem,
++  manageCandidateItemsBatch,
+   createCandidateItemByRestaurant,
+   getCandidateItemsByRestaurant,
+   manageCandidateItemByRestaurant,
+@@ -19,6 +20,7 @@ import {
+   getCandidateItemsParamsSchema,
+   getCandidateItemsQuerySchema,
+   manageCandidateItemBodySchema,
++  manageCandidateItemsBatchBodySchema,
+   manageCandidateItemByRestaurantBodySchema,
+   manageCandidateItemByRestaurantParamsSchema,
+   manageCandidateItemParamsSchema,
+@@ -46,6 +48,13 @@ router.get(
+   getCandidateItems
+ );
+ 
++router.put(
++  "/moderate-batch",
++  protectRouteForAdmin,
++  validateRequest(manageCandidateItemsBatchBodySchema, "body"),
++  manageCandidateItemsBatch
++);
++
+ router.put(
+   "/:id",
+   protectRouteForAdmin,
+diff --git a/rateeat_backend/src/schemas/item/candidateItemSchema.ts b/rateeat_backend/src/schemas/item/candidateItemSchema.ts
+index 4344120ae..ad8d4e313 100644
+--- a/rateeat_backend/src/schemas/item/candidateItemSchema.ts
++++ b/rateeat_backend/src/schemas/item/candidateItemSchema.ts
+@@ -49,6 +49,25 @@ export const manageCandidateItemBodySchema = z.object({
+   isApproved: z.boolean(),
+ });
+ 
++const candidateBatchMediaImageSchema = z.object({
++  highQualityImg: z.string().min(1),
++  mediumQualityImg: z.string().min(1).optional(),
++  lowQualityImg: z.string().min(1).optional(),
++});
++
++export const manageCandidateItemsBatchBodySchema = z.object({
++  items: z
++    .array(
++      z.object({
++        id: candidateItemIdSchema,
++        isApproved: z.boolean(),
++        mediaImages: z.array(candidateBatchMediaImageSchema).optional(),
++        mediaVideos: z.array(z.string().min(1)).optional(),
++      })
++    )
++    .min(1, "At least one candidate item is required"),
++});
++
+ // Schema for CREATE Candidate Item by Restaurant
+ export const createCandidateItemByRestaurantBodySchema = z.object({
+   name: z.string().min(1, "Name is required"),
+diff --git a/rateeat_backend/src/services/candidate-item-batch-notification.service.ts b/rateeat_backend/src/services/candidate-item-batch-notification.service.ts
+new file mode 100644
+index 000000000..4e3ddc7d6
+--- /dev/null
++++ b/rateeat_backend/src/services/candidate-item-batch-notification.service.ts
+@@ -0,0 +1,36 @@
++import { Transaction } from "sequelize";
++
++import { Notification } from "../models";
++import { NotificationCategory } from "../models/Feedback/Notification";
++
++type CandidateBatchNotificationInput = {
++  itemId: string;
++  ownerId: string;
++  isApproved: boolean;
++  transaction: Transaction;
++};
++
++export const createCandidateBatchModerationNotification = async ({
++  itemId,
++  ownerId,
++  isApproved,
++  transaction,
++}: CandidateBatchNotificationInput) => {
++  const message = isApproved
++    ? "Your candidate item has been approved"
++    : "Your candidate item has been rejected";
++
++  return Notification.create(
++    {
++      notifiable_type: "Item",
++      notifiable_id: itemId,
++      user_id: ownerId,
++      reactor_id: ownerId,
++      notification_category: NotificationCategory.Order,
++      message,
++    } as any,
++    {
++      transaction,
++    }
++  );
++};
+diff --git a/rateeat_backend/src/services/candidate-item-incentive.service.ts b/rateeat_backend/src/services/candidate-item-incentive.service.ts
+new file mode 100644
+index 000000000..c4e8fc596
+--- /dev/null
++++ b/rateeat_backend/src/services/candidate-item-incentive.service.ts
+@@ -0,0 +1,115 @@
++import { Transaction } from "sequelize";
++
++import { CandidateItemUser, Incentive, User } from "../models";
++import { CandidateModerationIncentiveInput } from "../types/candidate-item-moderation.types";
++import {
++  getModerationRewardDelta,
++  transactionLockOptions,
++  transactionOptions,
++} from "../utils/candidate-item-moderation.utils";
++
++export const findCandidateOwnerId = async (
++  itemId: string,
++  transaction?: Transaction
++) => {
++  const candidateOwner = await CandidateItemUser.findOne({
++    where: { item_id: itemId },
++    attributes: ["user_id"],
++    ...transactionOptions(transaction),
++  });
++
++  return candidateOwner?.user_id ?? null;
++};
++
++export const lockCandidateOwnerForIncentiveUpdate = async (
++  ownerId: string,
++  transaction?: Transaction
++) => {
++  if (!transaction) {
++    return;
++  }
++
++  const sequelizeInstance = User.sequelize;
++
++  if (!sequelizeInstance) {
++    await User.findByPk(ownerId, transactionLockOptions(transaction));
++    return;
++  }
++
++  await sequelizeInstance.query(
++    `SELECT id FROM users WHERE id = :ownerId FOR UPDATE`,
++    {
++      replacements: { ownerId },
++      transaction,
++    }
++  );
++};
++
++const findOwnerIncentiveForUpdate = async (
++  ownerId: string,
++  transaction?: Transaction
++) =>
++  Incentive.findOne({
++    where: { user_id: ownerId },
++    ...transactionLockOptions(transaction),
++  });
++
++const createOwnerIncentive = async (
++  ownerId: string,
++  transaction?: Transaction
++) =>
++  Incentive.create(
++    {
++      user_id: ownerId,
++    } as any,
++    transactionOptions(transaction)
++  );
++
++export const loadOrCreateOwnerIncentive = async (
++  ownerId: string,
++  transaction?: Transaction
++) => {
++  const existing = await findOwnerIncentiveForUpdate(ownerId, transaction);
++
++  if (existing) {
++    return existing;
++  }
++
++  return createOwnerIncentive(ownerId, transaction);
++};
++
++export const applyLockedOwnerIncentiveDelta = async (
++  ownerId: string,
++  delta: number,
++  transaction?: Transaction
++) => {
++  if (delta === 0) {
++    return;
++  }
++
++  const incentive = await loadOrCreateOwnerIncentive(ownerId, transaction);
++  incentive.current_total += delta;
++  await incentive.save(transactionOptions(transaction));
++};
++
++export const adjustCandidateOwnerIncentive = async ({
++  itemId,
++  previousApproval,
++  nextApproval,
++  transaction,
++}: CandidateModerationIncentiveInput) => {
++  const ownerId = await findCandidateOwnerId(itemId, transaction);
++
++  if (!ownerId) {
++    return;
++  }
++
++  const delta = getModerationRewardDelta(previousApproval, nextApproval);
++
++  if (delta === 0) {
++    return;
++  }
++
++  await lockCandidateOwnerForIncentiveUpdate(ownerId, transaction);
++  await applyLockedOwnerIncentiveDelta(ownerId, delta, transaction);
++};
+diff --git a/rateeat_backend/src/services/candidate-item-media.service.ts b/rateeat_backend/src/services/candidate-item-media.service.ts
+new file mode 100644
+index 000000000..a83170eb0
+--- /dev/null
++++ b/rateeat_backend/src/services/candidate-item-media.service.ts
+@@ -0,0 +1,102 @@
++import { Transaction } from "sequelize";
++
++import { Item, ItemImage, ItemVideo } from "../models";
++import { CANDIDATE_ITEM_MEDIA_ATTRIBUTES } from "../constants/candidate-item-moderation.constants";
++import {
++  CandidateMediaImageInput,
++  CandidateModerationMediaInput,
++} from "../types/candidate-item-moderation.types";
++import { transactionOptions } from "../utils/candidate-item-moderation.utils";
++
++const createCandidateImage = async (
++  itemId: string,
++  image: CandidateMediaImageInput,
++  transaction?: Transaction
++) =>
++  ItemImage.create(
++    {
++      url: image.highQualityImg,
++      low_quality_url: image.lowQualityImg,
++      medium_quality_url: image.mediumQualityImg,
++      high_quality_url: image.highQualityImg,
++      item_id: itemId,
++    } as any,
++    transactionOptions(transaction)
++  );
++
++const createCandidateVideo = async (
++  itemId: string,
++  videoUrl: string,
++  transaction?: Transaction
++) =>
++  ItemVideo.create(
++    {
++      url: videoUrl,
++      item_id: itemId,
++    } as any,
++    transactionOptions(transaction)
++  );
++
++export const replaceCandidateImages = async (
++  itemId: string,
++  images: CandidateMediaImageInput[],
++  transaction?: Transaction
++) => {
++  await ItemImage.destroy({
++    where: { item_id: itemId },
++    ...transactionOptions(transaction),
++  });
++
++  for (const image of images) {
++    await createCandidateImage(itemId, image, transaction);
++  }
++};
++
++export const replaceCandidateVideos = async (
++  itemId: string,
++  videos: string[],
++  transaction?: Transaction
++) => {
++  await ItemVideo.destroy({
++    where: { item_id: itemId },
++    ...transactionOptions(transaction),
++  });
++
++  for (const video of videos) {
++    await createCandidateVideo(itemId, video, transaction);
++  }
++};
++
++export const persistCandidateMedia = async ({
++  itemId,
++  images,
++  videos,
++  transaction,
++}: CandidateModerationMediaInput) => {
++  if (images) {
++    await replaceCandidateImages(itemId, images, transaction);
++  }
++
++  if (videos) {
++    await replaceCandidateVideos(itemId, videos, transaction);
++  }
++};
++
++export const loadCandidateWithMedia = async (
++  itemId: string,
++  transaction?: Transaction
++) =>
++  Item.findOne({
++    where: { id: itemId },
++    include: [
++      {
++        model: ItemImage,
++        attributes: [...CANDIDATE_ITEM_MEDIA_ATTRIBUTES],
++      },
++      {
++        model: ItemVideo,
++        attributes: [...CANDIDATE_ITEM_MEDIA_ATTRIBUTES],
++      },
++    ],
++    ...transactionOptions(transaction),
++  });
+diff --git a/rateeat_backend/src/services/candidate-item-moderation.service.ts b/rateeat_backend/src/services/candidate-item-moderation.service.ts
+new file mode 100644
+index 000000000..3e90ad629
+--- /dev/null
++++ b/rateeat_backend/src/services/candidate-item-moderation.service.ts
+@@ -0,0 +1,333 @@
++import { Transaction } from "sequelize";
++
++import { Item } from "../models";
++import { BadRequestError } from "../utils/error-response.utils";
++import {
++  CandidateBatchModerationInput,
++  CandidateModerationInput,
++} from "../types/candidate-item-moderation.types";
++import {
++  assertModerationChangesState,
++  getModerationRewardDelta,
++} from "../utils/candidate-item-moderation.utils";
++import {
++  adjustCandidateOwnerIncentive,
++  applyLockedOwnerIncentiveDelta,
++  findCandidateOwnerId,
++  lockCandidateOwnerForIncentiveUpdate,
++} from "./candidate-item-incentive.service";
++import {
++  loadCandidateWithMedia,
++  persistCandidateMedia,
++} from "./candidate-item-media.service";
++import {
++  approveCandidateCategory,
++  loadCandidateItemForModeration,
++  persistCandidateItemModeration,
++} from "./candidate-item-state.service";
++import {
++  createCandidateBatchModerationNotification,
++} from "./candidate-item-batch-notification.service";
++
++const moderateWithinTransaction = async (
++  input: CandidateModerationInput,
++  transaction?: Transaction
++) => {
++  const candidateItem =
++    await loadCandidateItemForModeration(
++      input.id,
++      transaction
++    );
++
++  const previousApproval =
++    candidateItem.is_approved;
++
++  assertModerationChangesState(
++    previousApproval,
++    input.isApproved
++  );
++
++  await approveCandidateCategory(
++    candidateItem.category_id,
++    transaction
++  );
++
++  await persistCandidateItemModeration({
++    candidateItem,
++    nextApproval: input.isApproved,
++    updateFields: input.updateFields,
++    transaction,
++  });
++
++  await persistCandidateMedia({
++    itemId: candidateItem.id,
++    images: input.mediaImages,
++    videos: input.mediaVideos,
++    transaction,
++  });
++
++  await adjustCandidateOwnerIncentive({
++    itemId: candidateItem.id,
++    previousApproval,
++    nextApproval: input.isApproved,
++    transaction,
++  });
++
++  return loadCandidateWithMedia(
++    candidateItem.id,
++    transaction
++  );
++};
++
++export const moderateCandidateItem = async (
++  input: CandidateModerationInput
++) => {
++  const sequelizeInstance = Item.sequelize;
++
++  if (!sequelizeInstance) {
++    return moderateWithinTransaction(input);
++  }
++
++  return sequelizeInstance.transaction(
++    (transaction) =>
++      moderateWithinTransaction(
++        input,
++        transaction
++      )
++  );
++};
++
++const assertUniqueBatchIds = (
++  input: CandidateBatchModerationInput
++) => {
++  const ids = input.items.map(
++    (item) => item.id
++  );
++
++  if (new Set(ids).size !== ids.length) {
++    throw new BadRequestError(
++      "Duplicate candidate item id"
++    );
++  }
++};
++
++const moderateBatchWithinTransaction = async (
++  input: CandidateBatchModerationInput,
++  transaction: Transaction
++) => {
++  const orderedIds = input.items
++    .map((item) => item.id)
++    .sort();
++
++  const candidatesById =
++    new Map<string, Item>();
++
++  for (const itemId of orderedIds) {
++    const candidate =
++      await loadCandidateItemForModeration(
++        itemId,
++        transaction
++      );
++
++    candidatesById.set(
++      itemId,
++      candidate
++    );
++  }
++
++  /*
++   * Check every transition before we change anything.
++   */
++  for (const requested of input.items) {
++    const candidate =
++      candidatesById.get(requested.id)!;
++
++    assertModerationChangesState(
++      candidate.is_approved,
++      requested.isApproved
++    );
++  }
++
++  /*
++   * Keep category writes deterministic as well.
++   */
++  const categoryIds = Array.from(
++    new Set(
++      orderedIds.map(
++        (id) =>
++          candidatesById.get(id)!
++            .category_id
++      )
++    )
++  ).sort();
++
++  for (const categoryId of categoryIds) {
++    await approveCandidateCategory(
++      categoryId,
++      transaction
++    );
++  }
++
++  /*
++   * Keep the owner for every owned candidate.
++   * We need this even when its reward delta is zero
++   * because an owned moderated candidate still gets
++   * one batch notification.
++   */
++  const ownerByItem =
++    new Map<string, string>();
++
++  const rewardDeltasByOwner =
++    new Map<string, number>();
++
++  for (const requested of input.items) {
++    const candidate =
++      candidatesById.get(requested.id)!;
++
++    const ownerId =
++      await findCandidateOwnerId(
++        candidate.id,
++        transaction
++      );
++
++    if (!ownerId) {
++      continue;
++    }
++
++    ownerByItem.set(
++      candidate.id,
++      ownerId
++    );
++
++    const delta =
++      getModerationRewardDelta(
++        candidate.is_approved,
++        requested.isApproved
++      );
++
++    if (delta !== 0) {
++      rewardDeltasByOwner.set(
++        ownerId,
++        (rewardDeltasByOwner.get(
++          ownerId
++        ) ?? 0) + delta
++      );
++    }
++  }
++
++  /*
++   * Lock owners in a stable order so batches touching
++   * the same owner do not lose incentive updates.
++   */
++  const ownerIds = Array.from(
++    rewardDeltasByOwner.keys()
++  ).sort();
++
++  for (const ownerId of ownerIds) {
++    await lockCandidateOwnerForIncentiveUpdate(
++      ownerId,
++      transaction
++    );
++  }
++
++  /*
++   * Persist candidate state and optional media.
++   */
++  for (const requested of input.items) {
++    const candidate =
++      candidatesById.get(requested.id)!;
++
++    await persistCandidateItemModeration({
++      candidateItem: candidate,
++      nextApproval:
++        requested.isApproved,
++      updateFields: {},
++      transaction,
++    });
++
++    await persistCandidateMedia({
++      itemId: candidate.id,
++      images:
++        requested.mediaImages,
++      videos:
++        requested.mediaVideos,
++      transaction,
++    });
++  }
++
++  /*
++   * Apply aggregated owner reward changes.
++   */
++  for (const ownerId of ownerIds) {
++    await applyLockedOwnerIncentiveDelta(
++      ownerId,
++      rewardDeltasByOwner.get(
++        ownerId
++      )!,
++      transaction
++    );
++  }
++
++  /*
++   * Notifications are ordinary transactional writes.
++   * If this write fails, the entire batch rolls back.
++   */
++  for (const requested of input.items) {
++    const ownerId =
++      ownerByItem.get(requested.id);
++
++    if (!ownerId) {
++      continue;
++    }
++
++    await createCandidateBatchModerationNotification({
++      itemId: requested.id,
++      ownerId,
++      isApproved:
++        requested.isApproved,
++      transaction,
++    });
++  }
++
++  /*
++   * Preserve request ordering.
++   */
++  const finalItems = [];
++
++  for (const requested of input.items) {
++    finalItems.push(
++      await loadCandidateWithMedia(
++        requested.id,
++        transaction
++      )
++    );
++  }
++
++  return finalItems;
++};
++
++export const moderateCandidateItemsBatch =
++  async (
++    input: CandidateBatchModerationInput
++  ) => {
++    assertUniqueBatchIds(input);
++
++    const sequelizeInstance =
++      Item.sequelize;
++
++    if (!sequelizeInstance) {
++      throw new Error(
++        "Candidate item batch moderation requires a database transaction"
++      );
++    }
++
++    return sequelizeInstance.transaction(
++      (transaction) =>
++        moderateBatchWithinTransaction(
++          input,
++          transaction
++        )
++    );
++  };
++
++export default moderateCandidateItem;
+diff --git a/rateeat_backend/src/services/candidate-item-state.service.ts b/rateeat_backend/src/services/candidate-item-state.service.ts
+new file mode 100644
+index 000000000..4d9418748
+--- /dev/null
++++ b/rateeat_backend/src/services/candidate-item-state.service.ts
+@@ -0,0 +1,70 @@
++import { Transaction } from "sequelize";
++
++import { Category, Item } from "../models";
++import {
++  CANDIDATE_ITEM_CATEGORY_ENTITY_NAME,
++  CANDIDATE_ITEM_ENTITY_NAME,
++} from "../constants/candidate-item-moderation.constants";
++import { CandidateItemUpdateFields } from "../types/candidate-item-moderation.types";
++import {
++  transactionLockOptions,
++  transactionOptions,
++  withoutModerationControlFields,
++} from "../utils/candidate-item-moderation.utils";
++import { NotFoundError } from "../utils/error-response.utils";
++
++export const loadCandidateItemForModeration = async (
++  itemId: string,
++  transaction?: Transaction
++) => {
++  const candidateItem = await Item.findByPk(
++    itemId,
++    transactionLockOptions(transaction)
++  );
++
++  if (!candidateItem) {
++    throw new NotFoundError(CANDIDATE_ITEM_ENTITY_NAME);
++  }
++
++  return candidateItem;
++};
++
++export const approveCandidateCategory = async (
++  categoryId: string,
++  transaction?: Transaction
++) => {
++  const category = await Category.findByPk(
++    categoryId,
++    transactionOptions(transaction)
++  );
++
++  if (!category) {
++    throw new NotFoundError(CANDIDATE_ITEM_CATEGORY_ENTITY_NAME);
++  }
++
++  if (!category.is_approved) {
++    category.is_approved = true;
++    await category.save(transactionOptions(transaction));
++  }
++
++  return category;
++};
++
++export const persistCandidateItemModeration = async ({
++  candidateItem,
++  nextApproval,
++  updateFields,
++  transaction,
++}: {
++  candidateItem: Item;
++  nextApproval: boolean;
++  updateFields: CandidateItemUpdateFields;
++  transaction?: Transaction;
++}) => {
++  const persistedFields = withoutModerationControlFields(updateFields);
++  Object.assign(candidateItem, persistedFields);
++  candidateItem.is_approved = nextApproval;
++  await candidateItem.save(transactionOptions(transaction));
++
++  return candidateItem;
++};
+diff --git a/rateeat_backend/src/types/candidate-item-moderation.types.ts b/rateeat_backend/src/types/candidate-item-moderation.types.ts
+new file mode 100644
+index 000000000..603223eb7
+--- /dev/null
++++ b/rateeat_backend/src/types/candidate-item-moderation.types.ts
+@@ -0,0 +1,75 @@
++import { Transaction } from "sequelize";
++
++export type CandidateApprovalState = boolean | null;
++
++export type CandidateModerationTransition =
++  | "pending-to-approved"
++  | "pending-to-rejected"
++  | "rejected-to-approved"
++  | "approved-to-rejected";
++
++export type CandidateMediaImageInput = {
++  highQualityImg?: string;
++  mediumQualityImg?: string;
++  lowQualityImg?: string;
++};
++
++export type CandidateBatchModerationItem = {
++  id: string;
++  isApproved: boolean;
++  mediaImages?: CandidateMediaImageInput[];
++  mediaVideos?: string[];
++};
++
++export type CandidateBatchModerationInput = {
++  items: CandidateBatchModerationItem[];
++};
++
++export type CandidateModerationInput = {
++  id: string;
++  isApproved: boolean;
++  updateFields: Record<string, unknown>;
++  mediaImages?: CandidateMediaImageInput[];
++  mediaVideos?: string[];
++};
++
++export type CandidateModerationTransactionOptions = {
++  transaction?: Transaction;
++};
++
++export type CandidateOwnerReference = {
++  user_id?: string | null;
++};
++
++export type CandidateIncentiveAdjustment = {
++  ownerId: string;
++  delta: number;
++};
++
++export type CandidateItemUpdateFields = Record<string, unknown>;
++
++export type CandidateModerationResult = {
++  id: string;
++  is_approved: CandidateApprovalState;
++  [key: string]: unknown;
++};
++
++export type CandidateModerationContext = {
++  transaction?: Transaction;
++  previousApproval: CandidateApprovalState;
++  nextApproval: boolean;
++};
++
++export type CandidateModerationMediaInput = {
++  itemId: string;
++  images?: CandidateMediaImageInput[];
++  videos?: string[];
++  transaction?: Transaction;
++};
++
++export type CandidateModerationIncentiveInput = {
++  itemId: string;
++  previousApproval: CandidateApprovalState;
++  nextApproval: boolean;
++  transaction?: Transaction;
++};
+diff --git a/rateeat_backend/src/utils/candidate-item-moderation.utils.ts b/rateeat_backend/src/utils/candidate-item-moderation.utils.ts
+new file mode 100644
+index 000000000..4fbd986fa
+--- /dev/null
++++ b/rateeat_backend/src/utils/candidate-item-moderation.utils.ts
+@@ -0,0 +1,110 @@
++import { Transaction } from "sequelize";
++
++import {
++  CANDIDATE_ITEM_ALREADY_APPROVED,
++  CANDIDATE_ITEM_ALREADY_REJECTED,
++  CANDIDATE_ITEM_APPROVAL_REWARD,
++} from "../constants/candidate-item-moderation.constants";
++import {
++  CandidateApprovalState,
++  CandidateItemUpdateFields,
++  CandidateModerationTransition,
++} from "../types/candidate-item-moderation.types";
++import { BadRequestError } from "./error-response.utils";
++
++export const parseCandidateApprovalValue = (value: unknown): boolean => {
++  if (typeof value === "boolean") {
++    return value;
++  }
++
++  if (typeof value === "string") {
++    const normalized = value.trim();
++
++    if (normalized === "true") {
++      return true;
++    }
++
++    if (normalized === "false") {
++      return false;
++    }
++  }
++
++  return JSON.parse(String(value));
++};
++
++export const getRepeatedModerationMessage = (approval: boolean) =>
++  approval
++    ? CANDIDATE_ITEM_ALREADY_APPROVED
++    : CANDIDATE_ITEM_ALREADY_REJECTED;
++
++export const assertModerationChangesState = (
++  previousApproval: CandidateApprovalState,
++  nextApproval: boolean
++) => {
++  if (previousApproval === nextApproval) {
++    throw new BadRequestError(getRepeatedModerationMessage(nextApproval));
++  }
++};
++
++export const getModerationTransition = (
++  previousApproval: CandidateApprovalState,
++  nextApproval: boolean
++): CandidateModerationTransition => {
++  if (previousApproval === true && nextApproval === false) {
++    return "approved-to-rejected";
++  }
++
++  if (previousApproval === false && nextApproval === true) {
++    return "rejected-to-approved";
++  }
++
++  if (previousApproval === null && nextApproval === true) {
++    return "pending-to-approved";
++  }
++
++  return "pending-to-rejected";
++};
++
++export const getModerationRewardDelta = (
++  previousApproval: CandidateApprovalState,
++  nextApproval: boolean
++) => {
++  const transition = getModerationTransition(previousApproval, nextApproval);
++
++  if (
++    transition === "pending-to-approved" ||
++    transition === "rejected-to-approved"
++  ) {
++    return CANDIDATE_ITEM_APPROVAL_REWARD;
++  }
++
++  if (transition === "approved-to-rejected") {
++    return -CANDIDATE_ITEM_APPROVAL_REWARD;
++  }
++
++  return 0;
++};
++
++export const withoutModerationControlFields = (
++  updateFields: CandidateItemUpdateFields
++) => {
++  const { isApproved: _isApproved, ...persistedFields } = updateFields;
++  return persistedFields;
++};
++
++export const transactionOptions = (transaction?: Transaction) =>
++  transaction ? { transaction } : {};
++
++export const transactionLockOptions = (transaction?: Transaction) =>
++  transaction
++    ? {
++        transaction,
++        lock: transaction.LOCK.UPDATE,
++      }
++    : {};
++
++export const shouldReplaceImages = (images: unknown): images is unknown[] =>
++  Array.isArray(images);
++
++export const shouldReplaceVideos = (videos: unknown): videos is unknown[] =>
++  Array.isArray(videos);

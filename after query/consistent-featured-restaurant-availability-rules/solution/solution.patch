@@ -1,0 +1,710 @@
+diff --git a/rateeat_backend/src/controllers/sponsored_listing.controller.ts b/rateeat_backend/src/controllers/sponsored_listing.controller.ts
+index 2d5cb31bc..ac4609422 100644
+--- a/rateeat_backend/src/controllers/sponsored_listing.controller.ts
++++ b/rateeat_backend/src/controllers/sponsored_listing.controller.ts
+@@ -12,6 +12,14 @@ import redisClient from "../utils/redis.utils";
+ import asyncAwaitHandler from "../middlewares/async-handler";
+ import "dotenv/config";
+ import { FileRequest } from "../middlewares/upload-image";
++import {
++  SPONSORED_LISTING_EXPIRED_MESSAGE,
++  SPONSORED_LISTING_NOT_FOUND_MESSAGE,
++  SPONSORED_LISTING_NOT_STARTED_MESSAGE,
++  expireSponsoredListingsByLifecycle,
++  findEligibleSponsoredListings,
++  recordSponsoredListingImpression,
++} from "../services/sponsored-listing.service";
+ 
+ // @desc Get all active sponsored listings
+ // @route GET /api/v1/sponsored-listing
+@@ -23,10 +31,7 @@ const getSponsoredListings = asyncAwaitHandler(
+       10
+     );
+ 
+-    const listings = await SponsoredListing.findAll({
+-      where: {
+-        status: "Active",
+-      },
++    const listings = await findEligibleSponsoredListings(now, {
+       include: [
+         {
+           model: Restaurant,
+@@ -311,18 +316,7 @@ const deleteSponsoredListing = asyncAwaitHandler(
+ // Automatically expire listings after their duration ends
+ const expireSponsoredListings = async () => {
+   try {
+-    const now = new Date();
+-    await SponsoredListing.update(
+-      { status: SponsoredListingStatus.Expired },
+-      {
+-        where: {
+-          end_date: {
+-            [Op.lt]: now,
+-          },
+-          status: SponsoredListingStatus.Active,
+-        },
+-      }
+-    );
++    await expireSponsoredListingsByLifecycle(new Date());
+   } catch (error) {
+     console.error("Error expiring sponsored listings:", error);
+   }
+@@ -332,22 +326,38 @@ const trackImpression = asyncAwaitHandler(
+   async (req: Request, res: Response) => {
+     const { listingId } = req.params;
+     const listing = await SponsoredListing.findByPk(listingId);
+-    if (!listing)
+-      return res.status(404).json({ success: false, message: "Not found" });
+-
+-    if (listing.impressions >= listing.max_impressions) {
+-      await listing.update({ status: SponsoredListingStatus.Expired });
+-      return res
+-        .status(200)
+-        .json({ success: true, message: "Listing expired" });
++
++    if (!listing) {
++      return res.status(404).json({
++        success: false,
++        message: SPONSORED_LISTING_NOT_FOUND_MESSAGE,
++      });
++    }
++
++    const result = await recordSponsoredListingImpression({
++      listing,
++      now: new Date(),
++    });
++
++    if (result.kind === "not-started") {
++      return res.status(409).json({
++        success: false,
++        message: SPONSORED_LISTING_NOT_STARTED_MESSAGE,
++      });
+     }
+ 
+-    const updatedListing = await listing.increment("impressions");
+-    if (updatedListing.impressions >= listing.max_impressions) {
+-      await updatedListing.update({ status: SponsoredListingStatus.Expired });
++    if (result.kind === "expired") {
++      return res.status(200).json({
++        success: true,
++        message: SPONSORED_LISTING_EXPIRED_MESSAGE,
++        data: result.listing,
++      });
+     }
+ 
+-    return res.status(200).json({ success: true, data: listing });
++    return res.status(200).json({
++      success: true,
++      data: result.listing,
++    });
+   }
+ );
+ 
+diff --git a/rateeat_backend/src/services/sponsored-listing-lifecycle-policy.service.ts b/rateeat_backend/src/services/sponsored-listing-lifecycle-policy.service.ts
+new file mode 100644
+index 000000000..fb54cc217
+--- /dev/null
++++ b/rateeat_backend/src/services/sponsored-listing-lifecycle-policy.service.ts
+@@ -0,0 +1,213 @@
++import {
++  SponsoredListingBudgetSnapshot,
++  SponsoredListingEligibilityEvaluation,
++  SponsoredListingExpirationEvaluation,
++  SponsoredListingImpressionEvaluation,
++  SponsoredListingLifecycleBoundary,
++  SponsoredListingLifecycleSnapshot,
++  SponsoredListingLifecycleState,
++} from "../types/sponsored-listing-lifecycle.types";
++
++const toTimestamp = (value: Date | string): number =>
++  value instanceof Date ? value.getTime() : new Date(value).getTime();
++
++export const buildLifecycleBoundary = (
++  listing: Pick<SponsoredListingLifecycleState, "start_date" | "end_date">,
++  now: Date
++): SponsoredListingLifecycleBoundary => ({
++  now,
++  startTimestamp: toTimestamp(listing.start_date),
++  endTimestamp: toTimestamp(listing.end_date),
++});
++
++export const buildBudgetSnapshot = (
++  listing: Pick<
++    SponsoredListingLifecycleState,
++    "impressions" | "max_impressions"
++  >
++): SponsoredListingBudgetSnapshot => {
++  const impressions = Number(listing.impressions);
++  const maxImpressions = Number(listing.max_impressions);
++  const remainingImpressions = Math.max(0, maxImpressions - impressions);
++
++  return {
++    impressions,
++    maxImpressions,
++    remainingImpressions,
++    exhausted: impressions >= maxImpressions,
++  };
++};
++
++export const hasLifecycleStarted = (
++  boundary: SponsoredListingLifecycleBoundary
++): boolean => boundary.startTimestamp <= boundary.now.getTime();
++
++export const hasLifecycleEnded = (
++  boundary: SponsoredListingLifecycleBoundary
++): boolean => boundary.endTimestamp <= boundary.now.getTime();
++
++export const buildLifecycleSnapshot = (
++  listing: SponsoredListingLifecycleState,
++  now: Date
++): SponsoredListingLifecycleSnapshot => {
++  const schedule = buildLifecycleBoundary(listing, now);
++  const budget = buildBudgetSnapshot(listing);
++  const hasStarted = hasLifecycleStarted(schedule);
++  const hasEnded = hasLifecycleEnded(schedule);
++
++  return {
++    status: listing.status,
++    schedule,
++    budget,
++    hasStarted,
++    hasEnded,
++    hasBudget: !budget.exhausted,
++  };
++};
++
++export const evaluateSponsoredListingEligibility = (
++  listing: SponsoredListingLifecycleState,
++  now: Date
++): SponsoredListingEligibilityEvaluation => {
++  const snapshot = buildLifecycleSnapshot(listing, now);
++
++  if (snapshot.status !== "Active") {
++    return {
++      eligible: false,
++      reason: "inactive",
++      hasStarted: snapshot.hasStarted,
++      hasEnded: snapshot.hasEnded,
++      hasBudget: snapshot.hasBudget,
++    };
++  }
++
++  if (!snapshot.hasStarted) {
++    return {
++      eligible: false,
++      reason: "not-started",
++      hasStarted: false,
++      hasEnded: snapshot.hasEnded,
++      hasBudget: snapshot.hasBudget,
++    };
++  }
++
++  if (snapshot.hasEnded) {
++    return {
++      eligible: false,
++      reason: "ended",
++      hasStarted: true,
++      hasEnded: true,
++      hasBudget: snapshot.hasBudget,
++    };
++  }
++
++  if (!snapshot.hasBudget) {
++    return {
++      eligible: false,
++      reason: "exhausted",
++      hasStarted: true,
++      hasEnded: false,
++      hasBudget: false,
++    };
++  }
++
++  return {
++    eligible: true,
++    reason: "eligible",
++    hasStarted: true,
++    hasEnded: false,
++    hasBudget: true,
++  };
++};
++
++export const evaluateSponsoredListingExpiration = (
++  listing: SponsoredListingLifecycleState,
++  now: Date
++): SponsoredListingExpirationEvaluation => {
++  const snapshot = buildLifecycleSnapshot(listing, now);
++
++  if (snapshot.status === "Expired") {
++    return {
++      shouldExpire: true,
++      reason: "already-expired",
++      hasEnded: snapshot.hasEnded,
++      hasBudget: snapshot.hasBudget,
++    };
++  }
++
++  if (snapshot.hasEnded) {
++    return {
++      shouldExpire: true,
++      reason: "ended",
++      hasEnded: true,
++      hasBudget: snapshot.hasBudget,
++    };
++  }
++
++  if (!snapshot.hasBudget) {
++    return {
++      shouldExpire: true,
++      reason: "exhausted",
++      hasEnded: snapshot.hasEnded,
++      hasBudget: false,
++    };
++  }
++
++  return {
++    shouldExpire: false,
++    reason: "active",
++    hasEnded: false,
++    hasBudget: true,
++  };
++};
++
++export const evaluateSponsoredListingImpression = (
++  listing: SponsoredListingLifecycleState,
++  now: Date
++): SponsoredListingImpressionEvaluation => {
++  const snapshot = buildLifecycleSnapshot(listing, now);
++
++  if (snapshot.status === "Expired") {
++    return {
++      decision: "expired",
++      expirationReason: "already-expired",
++    };
++  }
++
++  if (!snapshot.hasStarted) {
++    return {
++      decision: "not-started",
++      expirationReason: null,
++    };
++  }
++
++  const expiration = evaluateSponsoredListingExpiration(listing, now);
++
++  if (expiration.shouldExpire) {
++    return {
++      decision: "expired",
++      expirationReason: expiration.reason,
++    };
++  }
++
++  return {
++    decision: "count",
++    expirationReason: null,
++  };
++};
++
++export const isEligibleSponsoredListing = (
++  listing: SponsoredListingLifecycleState,
++  now: Date
++): boolean => evaluateSponsoredListingEligibility(listing, now).eligible;
++
++export const shouldExpireSponsoredListing = (
++  listing: SponsoredListingLifecycleState,
++  now: Date
++): boolean => evaluateSponsoredListingExpiration(listing, now).shouldExpire;
++
++export const canCountSponsoredListingImpression = (
++  listing: SponsoredListingLifecycleState,
++  now: Date
++): boolean =>
++  evaluateSponsoredListingImpression(listing, now).decision === "count";
+diff --git a/rateeat_backend/src/services/sponsored-listing.service.ts b/rateeat_backend/src/services/sponsored-listing.service.ts
+new file mode 100644
+index 000000000..c692fbc51
+--- /dev/null
++++ b/rateeat_backend/src/services/sponsored-listing.service.ts
+@@ -0,0 +1,138 @@
++import SponsoredListing, {
++  SponsoredListingStatus,
++} from "../models/SponsoredListing/SponsoredListing";
++import { SponsoredListingImpressionResult } from "../types/sponsored-listing-lifecycle.types";
++import {
++  evaluateSponsoredListingImpression,
++  shouldExpireSponsoredListing,
++} from "./sponsored-listing-lifecycle-policy.service";
++import {
++  buildEligibleListingWhere,
++  buildExpirationWhere,
++} from "../utils/sponsored-listing-lifecycle.utils";
++
++export const SPONSORED_LISTING_NOT_FOUND_MESSAGE =
++  "Sponsored listing not found";
++
++export const SPONSORED_LISTING_NOT_STARTED_MESSAGE =
++  "Sponsored listing has not started yet";
++
++export const SPONSORED_LISTING_EXPIRED_MESSAGE = "Listing expired";
++
++export const findEligibleSponsoredListings = async (
++  now: Date,
++  options: Record<string, unknown> = {}
++): Promise<SponsoredListing[]> => {
++  return SponsoredListing.findAll({
++    ...options,
++    where: buildEligibleListingWhere(now),
++  });
++};
++
++export type ImpressionResult =
++  SponsoredListingImpressionResult<SponsoredListing>;
++
++const markExpiredIfNeeded = async (
++  listing: SponsoredListing
++): Promise<SponsoredListing> => {
++  if (listing.status === SponsoredListingStatus.Expired) {
++    return listing;
++  }
++
++  const updated = await listing.update({
++    status: SponsoredListingStatus.Expired,
++  });
++
++  return updated ?? listing;
++};
++
++export const recordSponsoredListingImpression = async ({
++  listing,
++  now,
++}: {
++  listing: SponsoredListing;
++  now: Date;
++}): Promise<ImpressionResult> => {
++  const sequelize = SponsoredListing.sequelize;
++
++  if (!sequelize) {
++    throw new Error("SponsoredListing model is not connected to Sequelize");
++  }
++
++  return sequelize.transaction(async (transaction) => {
++    /*
++     * Lock the current row before checking lifecycle state. Concurrent
++     * impression requests for the same listing will therefore evaluate and
++     * update the budget one at a time instead of incrementing from stale state.
++     */
++    const currentListing = await SponsoredListing.findByPk(listing.id, {
++      transaction,
++      lock: transaction.LOCK.UPDATE,
++    });
++
++    if (!currentListing) {
++      return {
++        kind: "expired",
++        listing,
++      };
++    }
++
++    const decision = evaluateSponsoredListingImpression(
++      currentListing as any,
++      now
++    );
++
++    if (decision.decision === "not-started") {
++      return {
++        kind: "not-started",
++        listing: currentListing,
++      };
++    }
++
++    if (decision.decision === "expired") {
++      if (currentListing.status !== SponsoredListingStatus.Expired) {
++        await currentListing.update(
++          {
++            status: SponsoredListingStatus.Expired,
++          },
++          { transaction }
++        );
++      }
++
++      return {
++        kind: "expired",
++        listing: currentListing,
++      };
++    }
++
++    await currentListing.increment("impressions", { transaction });
++    await currentListing.reload({ transaction });
++
++    if (shouldExpireSponsoredListing(currentListing as any, now)) {
++      await currentListing.update(
++        {
++          status: SponsoredListingStatus.Expired,
++        },
++        { transaction }
++      );
++    }
++
++    return {
++      kind: "counted",
++      listing: currentListing,
++    };
++  });
++};
++
++export const expireSponsoredListingsByLifecycle = async (
++  now: Date
++): Promise<void> => {
++  await SponsoredListing.update(
++    {
++      status: SponsoredListingStatus.Expired,
++    },
++    {
++      where: buildExpirationWhere(now),
++    }
++  );
++};
+diff --git a/rateeat_backend/src/types/sponsored-listing-lifecycle.types.ts b/rateeat_backend/src/types/sponsored-listing-lifecycle.types.ts
+new file mode 100644
+index 000000000..e9f1e5fc5
+--- /dev/null
++++ b/rateeat_backend/src/types/sponsored-listing-lifecycle.types.ts
+@@ -0,0 +1,134 @@
++export type SponsoredListingDateValue = Date | string;
++
++export type SponsoredListingLifecycleStatus = "Active" | "Expired" | string;
++
++export interface SponsoredListingScheduleState {
++  start_date: SponsoredListingDateValue;
++  end_date: SponsoredListingDateValue;
++}
++
++export interface SponsoredListingImpressionState {
++  impressions: number;
++  max_impressions: number;
++}
++
++export interface SponsoredListingLifecycleState
++  extends SponsoredListingScheduleState,
++    SponsoredListingImpressionState {
++  status: SponsoredListingLifecycleStatus;
++}
++
++export type SponsoredListingEligibilityReason =
++  | "eligible"
++  | "inactive"
++  | "not-started"
++  | "ended"
++  | "exhausted";
++
++export interface SponsoredListingEligibilityEvaluation {
++  eligible: boolean;
++  reason: SponsoredListingEligibilityReason;
++  hasStarted: boolean;
++  hasEnded: boolean;
++  hasBudget: boolean;
++}
++
++export type SponsoredListingExpirationReason =
++  | "already-expired"
++  | "ended"
++  | "exhausted"
++  | "active";
++
++export interface SponsoredListingExpirationEvaluation {
++  shouldExpire: boolean;
++  reason: SponsoredListingExpirationReason;
++  hasEnded: boolean;
++  hasBudget: boolean;
++}
++
++export type SponsoredListingImpressionDecision =
++  | "not-started"
++  | "expired"
++  | "count";
++
++export interface SponsoredListingImpressionEvaluation {
++  decision: SponsoredListingImpressionDecision;
++  expirationReason: SponsoredListingExpirationReason | null;
++}
++
++export interface SponsoredListingLifecycleBoundary {
++  now: Date;
++  startTimestamp: number;
++  endTimestamp: number;
++}
++
++export interface SponsoredListingBudgetSnapshot {
++  impressions: number;
++  maxImpressions: number;
++  remainingImpressions: number;
++  exhausted: boolean;
++}
++
++export interface SponsoredListingLifecycleSnapshot {
++  status: SponsoredListingLifecycleStatus;
++  schedule: SponsoredListingLifecycleBoundary;
++  budget: SponsoredListingBudgetSnapshot;
++  hasStarted: boolean;
++  hasEnded: boolean;
++  hasBudget: boolean;
++}
++
++export interface SponsoredListingLifecycleQueryInput {
++  now: Date;
++}
++
++export interface SponsoredListingExpirationQueryInput {
++  now: Date;
++}
++
++export interface SponsoredListingImpressionContext<
++  TListing = SponsoredListingLifecycleState,
++> {
++  listing: TListing;
++  now: Date;
++}
++
++export type SponsoredListingImpressionResultKind =
++  | "not-started"
++  | "expired"
++  | "counted";
++
++export interface SponsoredListingNotStartedResult<TListing> {
++  kind: "not-started";
++  listing: TListing;
++}
++
++export interface SponsoredListingExpiredResult<TListing> {
++  kind: "expired";
++  listing: TListing;
++}
++
++export interface SponsoredListingCountedResult<TListing> {
++  kind: "counted";
++  listing: TListing;
++}
++
++export type SponsoredListingImpressionResult<TListing> =
++  | SponsoredListingNotStartedResult<TListing>
++  | SponsoredListingExpiredResult<TListing>
++  | SponsoredListingCountedResult<TListing>;
++
++export const isNotStartedResult = <TListing>(
++  result: SponsoredListingImpressionResult<TListing>
++): result is SponsoredListingNotStartedResult<TListing> =>
++  result.kind === "not-started";
++
++export const isExpiredResult = <TListing>(
++  result: SponsoredListingImpressionResult<TListing>
++): result is SponsoredListingExpiredResult<TListing> =>
++  result.kind === "expired";
++
++export const isCountedResult = <TListing>(
++  result: SponsoredListingImpressionResult<TListing>
++): result is SponsoredListingCountedResult<TListing> =>
++  result.kind === "counted";
+diff --git a/rateeat_backend/src/utils/sponsored-listing-lifecycle.utils.ts b/rateeat_backend/src/utils/sponsored-listing-lifecycle.utils.ts
+new file mode 100644
+index 000000000..680707243
+--- /dev/null
++++ b/rateeat_backend/src/utils/sponsored-listing-lifecycle.utils.ts
+@@ -0,0 +1,99 @@
++import { Op, col, where as sequelizeWhere } from "sequelize";
++import { SponsoredListingStatus } from "../models/SponsoredListing/SponsoredListing";
++import {
++  SponsoredListingImpressionState,
++  SponsoredListingLifecycleState,
++  SponsoredListingScheduleState,
++} from "../types/sponsored-listing-lifecycle.types";
++import {
++  buildBudgetSnapshot,
++  buildLifecycleBoundary,
++  isEligibleSponsoredListing,
++  shouldExpireSponsoredListing,
++} from "../services/sponsored-listing-lifecycle-policy.service";
++
++export type ListingSchedule = SponsoredListingScheduleState;
++export type ListingBudget = SponsoredListingImpressionState;
++export type ListingLifecycleState = SponsoredListingLifecycleState;
++
++export const hasListingStarted = (
++  listing: Pick<ListingSchedule, "start_date">,
++  now: Date
++): boolean => {
++  const boundary = buildLifecycleBoundary(
++    {
++      start_date: listing.start_date,
++      end_date: listing.start_date,
++    },
++    now
++  );
++
++  return boundary.startTimestamp <= now.getTime();
++};
++
++export const hasListingEnded = (
++  listing: Pick<ListingSchedule, "end_date">,
++  now: Date
++): boolean => {
++  const boundary = buildLifecycleBoundary(
++    {
++      start_date: listing.end_date,
++      end_date: listing.end_date,
++    },
++    now
++  );
++
++  return boundary.endTimestamp <= now.getTime();
++};
++
++export const hasImpressionBudget = (
++  listing: Pick<ListingBudget, "impressions" | "max_impressions">
++): boolean => !buildBudgetSnapshot(listing).exhausted;
++
++export const isSponsoredListingEligible = (
++  listing: ListingLifecycleState,
++  now: Date
++): boolean => isEligibleSponsoredListing(listing, now);
++
++export const shouldSponsoredListingExpire = (
++  listing: Pick<
++    ListingLifecycleState,
++    "end_date" | "impressions" | "max_impressions"
++  >,
++  now: Date
++): boolean =>
++  shouldExpireSponsoredListing(
++    {
++      status: SponsoredListingStatus.Active,
++      start_date: now,
++      end_date: listing.end_date,
++      impressions: listing.impressions,
++      max_impressions: listing.max_impressions,
++    },
++    now
++  );
++
++export const buildEligibleListingWhere = (now: Date) => ({
++  status: SponsoredListingStatus.Active,
++  start_date: {
++    [Op.lte]: now,
++  },
++  end_date: {
++    [Op.gt]: now,
++  },
++  impressions: {
++    [Op.lt]: col("max_impressions"),
++  },
++});
++
++export const buildExpirationWhere = (now: Date) => ({
++  status: SponsoredListingStatus.Active,
++  [Op.or]: [
++    {
++      end_date: {
++        [Op.lte]: now,
++      },
++    },
++    sequelizeWhere(col("impressions"), Op.gte, col("max_impressions")),
++  ],
++});

@@ -1,0 +1,2036 @@
+diff --git a/rateeat_backend/src/__tests__/db_setup.ts b/rateeat_backend/src/__tests__/db_setup.ts
+index e60a6e1f2..0f3fc4217 100644
+--- a/rateeat_backend/src/__tests__/db_setup.ts
++++ b/rateeat_backend/src/__tests__/db_setup.ts
+@@ -17,6 +17,7 @@ import {
+   ItemVideo,
+   UserLocation,
+   RestaurantLocation,
++  Neighborhood,
+   ItemReviewImage,
+   ItemReviewVideo,
+   RestaurantReview,
+@@ -116,6 +117,7 @@ class Database {
+           ItemVideo,
+           UserLocation,
+           RestaurantLocation,
++          Neighborhood,
+           ItemReviewImage,
+           ItemReviewVideo,
+           RestaurantReview,
+diff --git a/rateeat_backend/src/__tests__/unit/featured_restaurant_availability_behavior.test.ts b/rateeat_backend/src/__tests__/unit/featured_restaurant_availability_behavior.test.ts
+new file mode 100644
+index 000000000..4b3bf0967
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/featured_restaurant_availability_behavior.test.ts
+@@ -0,0 +1,272 @@
++jest.mock("../../utils/redis.utils", () => ({
++  __esModule: true,
++  default: {
++    get: jest.fn(),
++    set: jest.fn(),
++    setEx: jest.fn(),
++    del: jest.fn(),
++    keys: jest.fn(),
++    expire: jest.fn(),
++    sAdd: jest.fn(),
++    sMembers: jest.fn(),
++    connect: jest.fn(async () => undefined),
++    quit: jest.fn(async () => undefined),
++    disconnect: jest.fn(),
++    on: jest.fn(),
++    multi: jest.fn(() => ({
++      exec: jest.fn(async () => []),
++    })),
++  },
++}));
++
++import Database from "../db_setup";
++import {
++  appForFeaturedRestaurants,
++  clearFeaturedFixtures,
++  FEATURED_TEST_NOW,
++  getFeatured,
++  listingId,
++  RESTAURANT_A,
++  RESTAURANT_B,
++  RESTAURANT_C,
++  responseRestaurantIds,
++  seedListing,
++  seedRestaurant,
++  seedRestaurantImage,
++  updateRestaurantAvailability,
++} from "./helpers/featured_restaurant_test.helpers";
++
++const app = appForFeaturedRestaurants();
++
++beforeAll(async () => {
++  await Database.getInstance();
++  jest.useFakeTimers({
++    doNotFake: ["nextTick", "setImmediate"],
++  });
++  jest.setSystemTime(FEATURED_TEST_NOW);
++});
++
++afterAll(async () => {
++  await clearFeaturedFixtures();
++  jest.useRealTimers();
++  await Database.close();
++});
++
++beforeEach(async () => {
++  await clearFeaturedFixtures();
++});
++
++describe("featured restaurant availability rules", () => {
++  describe("restaurant eligibility", () => {
++    it("hides a permanently closed restaurant in the default browse mode", async () => {
++      await seedRestaurant({ id: RESTAURANT_A, permanentlyClosed: true });
++      await seedListing({ id: listingId(1), restaurantId: RESTAURANT_A });
++
++      const response = await getFeatured(app);
++
++      expect(response.status).toBe(200);
++      expect(response.body).toEqual({ success: true, data: [] });
++    });
++
++
++    it("hides a restaurant with ordering disabled in orderable mode", async () => {
++      await seedRestaurant({
++        id: RESTAURANT_A,
++        orderServiceAvailable: false,
++        orderServiceOnline: true,
++      });
++      await seedListing({ id: listingId(3), restaurantId: RESTAURANT_A });
++
++      const response = await getFeatured(app, { availability: "orderable" });
++
++      expect(response.status).toBe(200);
++      expect(response.body.data).toEqual([]);
++    });
++
++    it("hides an offline restaurant in orderable mode", async () => {
++      await seedRestaurant({
++        id: RESTAURANT_A,
++        orderServiceAvailable: true,
++        orderServiceOnline: false,
++      });
++      await seedListing({ id: listingId(4), restaurantId: RESTAURANT_A });
++
++      const response = await getFeatured(app, { availability: "orderable" });
++
++      expect(response.status).toBe(200);
++      expect(response.body.data).toEqual([]);
++    });
++
++
++    it("returns only orderable restaurants from a mixed availability set", async () => {
++      await seedRestaurant({
++        id: RESTAURANT_A,
++        orderServiceAvailable: true,
++        orderServiceOnline: true,
++      });
++      await seedRestaurant({
++        id: RESTAURANT_B,
++        orderServiceAvailable: true,
++        orderServiceOnline: false,
++      });
++      await seedRestaurant({
++        id: RESTAURANT_C,
++        orderServiceAvailable: false,
++        orderServiceOnline: true,
++      });
++      await seedListing({ id: listingId(6), restaurantId: RESTAURANT_A });
++      await seedListing({ id: listingId(7), restaurantId: RESTAURANT_B });
++      await seedListing({ id: listingId(8), restaurantId: RESTAURANT_C });
++
++      const response = await getFeatured(app, { availability: "orderable" });
++
++      expect(response.status).toBe(200);
++      expect(responseRestaurantIds(response)).toEqual([RESTAURANT_A]);
++    });
++
++  });
++
++  describe("browse compatibility", () => {
++    it("keeps a non-closed restaurant visible in browse mode when ordering is disabled", async () => {
++      await seedRestaurant({
++        id: RESTAURANT_A,
++        orderServiceAvailable: false,
++        orderServiceOnline: false,
++      });
++      await seedListing({ id: listingId(15), restaurantId: RESTAURANT_A });
++
++      const response = await getFeatured(app);
++
++      expect(response.status).toBe(200);
++      expect(responseRestaurantIds(response)).toEqual([RESTAURANT_A]);
++    });
++
++
++    it("keeps the existing image fallback and remaining-time response fields", async () => {
++      await seedRestaurant({ id: RESTAURANT_A });
++      await seedListing({
++        id: listingId(17),
++        restaurantId: RESTAURANT_A,
++        endDate: "2030-06-16T12:00:00.000Z",
++      });
++      await seedRestaurantImage({
++        restaurantId: RESTAURANT_A,
++        url: "https://images.example/fallback-logo.jpg",
++        leading: false,
++      });
++
++      const response = await getFeatured(app);
++
++      expect(response.status).toBe(200);
++      expect(response.body.data[0].restaurant_logo).toBe(
++        "https://images.example/fallback-logo.jpg"
++      );
++      expect(response.body.data[0].remainingTime).toEqual({
++        days: 1,
++        hours: 0,
++        minutes: 0,
++        seconds: 0,
++      });
++    });
++
++    it("does not expose restaurant availability flags in the successful response", async () => {
++      await seedRestaurant({
++        id: RESTAURANT_A,
++        orderServiceAvailable: true,
++        orderServiceOnline: true,
++      });
++      await seedListing({ id: listingId(18), restaurantId: RESTAURANT_A });
++
++      const response = await getFeatured(app);
++      const restaurant = response.body.data[0].restaurant;
++
++      expect(response.status).toBe(200);
++      expect(restaurant.name).toBe("Featured Cafe");
++      expect(restaurant).not.toHaveProperty("is_permanently_closed");
++      expect(restaurant).not.toHaveProperty("is_order_service_available");
++      expect(restaurant).not.toHaveProperty("is_order_service_online");
++    });
++  });
++
++  describe("fresh availability", () => {
++
++    it("removes a restaurant on the next orderable request after it goes offline", async () => {
++      await seedRestaurant({
++        id: RESTAURANT_A,
++        orderServiceAvailable: true,
++        orderServiceOnline: true,
++      });
++      await seedListing({ id: listingId(12), restaurantId: RESTAURANT_A });
++
++      const before = await getFeatured(app, { availability: "orderable" });
++      expect(before.body.data).toHaveLength(1);
++
++      await updateRestaurantAvailability(RESTAURANT_A, {
++        orderServiceOnline: false,
++      });
++
++      const after = await getFeatured(app, { availability: "orderable" });
++      expect(after.status).toBe(200);
++      expect(after.body.data).toEqual([]);
++    });
++
++
++    it("can become orderable on the next request without changing the sponsored listing", async () => {
++      await seedRestaurant({
++        id: RESTAURANT_A,
++        orderServiceAvailable: true,
++        orderServiceOnline: false,
++      });
++      await seedListing({ id: listingId(14), restaurantId: RESTAURANT_A });
++
++      const before = await getFeatured(app, { availability: "orderable" });
++      expect(before.body.data).toEqual([]);
++
++      await updateRestaurantAvailability(RESTAURANT_A, {
++        orderServiceOnline: true,
++      });
++
++      const after = await getFeatured(app, { availability: "orderable" });
++      expect(after.status).toBe(200);
++      expect(responseRestaurantIds(after)).toEqual([RESTAURANT_A]);
++    });
++  });
++
++  describe("availability query validation", () => {
++    it("rejects an unsupported availability value", async () => {
++      const response = await getFeatured(app, { availability: "closed" });
++
++      expect(response.status).toBe(400);
++      expect(response.body).toEqual({
++        success: false,
++        message: "availability must be browse or orderable",
++      });
++    });
++
++    it("rejects repeated availability values", async () => {
++      const response = await requestRepeatedAvailability();
++
++      expect(response.status).toBe(400);
++      expect(response.body).toEqual({
++        success: false,
++        message: "availability must be browse or orderable",
++      });
++    });
++
++
++    it("rejects an empty availability value", async () => {
++      const response = await getFeatured(app, { availability: "" });
++
++      expect(response.status).toBe(400);
++      expect(response.body).toEqual({
++        success: false,
++        message: "availability must be browse or orderable",
++      });
++    });
++  });
++});
++
++const requestRepeatedAvailability = () =>
++  getFeatured(app, {
++    availability: ["browse", "orderable"],
++  });
+diff --git a/rateeat_backend/src/__tests__/unit/featured_restaurant_cursor_behavior.test.ts b/rateeat_backend/src/__tests__/unit/featured_restaurant_cursor_behavior.test.ts
+new file mode 100644
+index 000000000..b829cfba0
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/featured_restaurant_cursor_behavior.test.ts
+@@ -0,0 +1,666 @@
++jest.mock("../../utils/redis.utils", () => ({
++  __esModule: true,
++  default: {
++    get: jest.fn(),
++    set: jest.fn(),
++    setEx: jest.fn(),
++    del: jest.fn(),
++    keys: jest.fn(),
++    expire: jest.fn(),
++    sAdd: jest.fn(),
++    sMembers: jest.fn(),
++    connect: jest.fn(async () => undefined),
++    quit: jest.fn(async () => undefined),
++    disconnect: jest.fn(),
++    on: jest.fn(),
++    multi: jest.fn(() => ({
++      exec: jest.fn(async () => []),
++    })),
++  },
++}));
++
++import Database from "../db_setup";
++import SponsoredListing from "../../models/SponsoredListing/SponsoredListing";
++import {
++  appForFeaturedRestaurants,
++  clearFeaturedFixtures,
++  CURSOR_TEST_RESTAURANT_IDS,
++  cursorListingId,
++  FEATURED_TEST_NOW,
++  getFeatured,
++  responseIds,
++  responseRestaurantIds,
++  seedListing,
++  seedRestaurant,
++  seedRestaurantImage,
++  updateRestaurantAvailability,
++} from "./helpers/featured_restaurant_test.helpers";
++const app = appForFeaturedRestaurants();
++beforeAll(async () => {
++  await Database.getInstance();
++  jest.useFakeTimers({ doNotFake: ["nextTick", "setImmediate"] });
++});
++afterAll(async () => {
++  await clearFeaturedFixtures();
++  jest.useRealTimers();
++  await Database.close();
++});
++beforeEach(async () => {
++  jest.setSystemTime(FEATURED_TEST_NOW);
++  await clearFeaturedFixtures();
++});
++afterEach(() => jest.setSystemTime(FEATURED_TEST_NOW));
++type Row = {
++  restaurantId: string;
++  listingId: string;
++};
++type SeedOptions = {
++  slot: number;
++  suffix: number;
++  priority: number;
++  endDate?: string;
++  orderable?: boolean;
++  closed?: boolean;
++};
++const seed = async ({
++  slot,
++  suffix,
++  priority,
++  endDate = "2030-07-15T12:00:00.000Z",
++  orderable = false,
++  closed = false,
++}: SeedOptions): Promise<Row> => {
++  const restaurantId = CURSOR_TEST_RESTAURANT_IDS[slot];
++  const listingId = cursorListingId(suffix);
++  await seedRestaurant({
++    id: restaurantId,
++    permanentlyClosed: closed,
++    orderServiceAvailable: orderable,
++    orderServiceOnline: orderable,
++  });
++  await seedListing({
++    id: listingId,
++    restaurantId,
++    priority,
++    endDate,
++  });
++  return { restaurantId, listingId };
++};
++const series = async (
++  count: number,
++  base: number,
++  orderable = false
++): Promise<Row[]> => {
++  const rows: Row[] = [];
++  for (let i = 0; i < count; i += 1) {
++    rows.push(
++      await seed({
++        slot: i,
++        suffix: base + i,
++        priority: count - i,
++        orderable,
++      })
++    );
++  }
++  return rows;
++};
++const page = (
++  limit: number,
++  cursor?: string,
++  availability?: "browse" | "orderable"
++) =>
++  getFeatured(app, {
++    limit: String(limit),
++    ...(cursor !== undefined ? { cursor } : {}),
++    ...(availability !== undefined ? { availability } : {}),
++  });
++const next = (response: any): string | undefined =>
++  typeof response.body.nextCursor === "string"
++    ? response.body.nextCursor
++    : undefined;
++const expectCursorError = async (
++  query: Record<string, unknown>,
++  message = "cursor is invalid"
++) => {
++  const response = await getFeatured(app, query);
++  expect(response.status).toBe(400);
++  expect(response.body).toEqual({
++    success: false,
++    message,
++  });
++};
++describe("featured restaurant cursor behavior", () => {
++  it("globally sorts by priority, end date, and listing id", async () => {
++    const specs: SeedOptions[] = [
++      {
++        slot: 0,
++        suffix: 506,
++        priority: 1,
++        endDate: "2030-07-15T12:00:00.000Z",
++      },
++      {
++        slot: 1,
++        suffix: 505,
++        priority: 9,
++        endDate: "2030-07-20T12:00:00.000Z",
++      },
++      {
++        slot: 2,
++        suffix: 504,
++        priority: 9,
++        endDate: "2030-07-10T12:00:00.000Z",
++      },
++      {
++        slot: 3,
++        suffix: 503,
++        priority: 9,
++        endDate: "2030-07-10T12:00:00.000Z",
++      },
++      {
++        slot: 4,
++        suffix: 502,
++        priority: 5,
++        endDate: "2030-07-01T12:00:00.000Z",
++      },
++      {
++        slot: 5,
++        suffix: 501,
++        priority: 1,
++        endDate: "2030-07-01T12:00:00.000Z",
++      },
++    ];
++    for (const spec of specs) await seed(spec);
++    const expected =
++      [503, 504, 505, 502, 501, 506].map(cursorListingId);
++    const response = await getFeatured(app);
++    expect(response.status).toBe(200);
++    expect(responseIds(response)).toEqual(expected);
++  });
++  it("traverses a persistent snapshot exactly once and ends with null", async () => {
++    const rows = await series(7, 600);
++    const one = await page(3);
++    const c1 = next(one);
++    expect(responseIds(one)).toEqual(
++      rows.slice(0, 3).map((row) => row.listingId)
++    );
++    expect(typeof c1).toBe("string");
++    if (!c1) return;
++    const two = await page(3, c1);
++    const c2 = next(two);
++    expect(responseIds(two)).toEqual(
++      rows.slice(3, 6).map((row) => row.listingId)
++    );
++    expect(typeof c2).toBe("string");
++    if (!c2) return;
++    const three = await page(3, c2);
++    expect(responseIds(three)).toEqual([rows[6].listingId]);
++    expect(three.body.nextCursor).toBeNull();
++    const all = [
++      ...responseRestaurantIds(one),
++      ...responseRestaurantIds(two),
++      ...responseRestaurantIds(three),
++    ];
++    expect(all).toEqual(rows.map((row) => row.restaurantId));
++    expect(new Set(all).size).toBe(rows.length);
++  });
++  it("deduplicates and removes closed restaurants before page slots are chosen", async () => {
++    const duplicate = await seed({
++      slot: 0,
++      suffix: 700,
++      priority: 1,
++    });
++    await seedListing({
++      id: cursorListingId(701),
++      restaurantId: duplicate.restaurantId,
++      priority: 50,
++    });
++    await seed({
++      slot: 1,
++      suffix: 702,
++      priority: 100,
++      closed: true,
++    });
++    const second = await seed({
++      slot: 2,
++      suffix: 703,
++      priority: 10,
++    });
++    const response = await page(2);
++    expect(responseRestaurantIds(response)).toEqual([
++      duplicate.restaurantId,
++      second.restaurantId,
++    ]);
++    expect(responseIds(response)).toContain(cursorListingId(701));
++  });
++  it("removes offline restaurants before orderable page slots are chosen", async () => {
++    const offline = CURSOR_TEST_RESTAURANT_IDS[0];
++    await seedRestaurant({
++      id: offline,
++      orderServiceAvailable: true,
++      orderServiceOnline: false,
++    });
++    await seedListing({
++      id: cursorListingId(800),
++      restaurantId: offline,
++      priority: 100,
++    });
++    const one = await seed({
++      slot: 1,
++      suffix: 801,
++      priority: 3,
++      orderable: true,
++    });
++    const two = await seed({
++      slot: 2,
++      suffix: 802,
++      priority: 2,
++      orderable: true,
++    });
++    const response = await page(2, undefined, "orderable");
++    expect(responseRestaurantIds(response)).toEqual([
++      one.restaurantId,
++      two.restaurantId,
++    ]);
++  });
++  it("keeps the cursor valid and backfills when availability changes between pages", async () => {
++    const rows = await series(6, 900, true);
++    const first = await page(2, undefined, "orderable");
++    const cursor = next(first);
++    expect(typeof cursor).toBe("string");
++    if (!cursor) return;
++    await updateRestaurantAvailability(rows[1].restaurantId, {
++      orderServiceOnline: false,
++    });
++    await updateRestaurantAvailability(rows[2].restaurantId, {
++      orderServiceOnline: false,
++    });
++    const second = await page(2, cursor, "orderable");
++    expect(responseRestaurantIds(second)).toEqual([
++      rows[3].restaurantId,
++      rows[4].restaurantId,
++    ]);
++    const cursor2 = next(second);
++    expect(typeof cursor2).toBe("string");
++    if (!cursor2) return;
++    const third = await page(2, cursor2, "orderable");
++    expect(responseRestaurantIds(third)).toEqual([
++      rows[5].restaurantId,
++    ]);
++    expect(third.body.nextCursor).toBeNull();
++  });
++  it("keeps snapshot membership and order despite inserts, reprioritization, date changes, and new duplicates", async () => {
++    const rows = await series(6, 1000);
++    const first = await page(2);
++    const cursor = next(first);
++    expect(typeof cursor).toBe("string");
++    if (!cursor) return;
++    const addedRestaurant = CURSOR_TEST_RESTAURANT_IDS[6];
++    await seedRestaurant({ id: addedRestaurant });
++    await seedListing({
++      id: cursorListingId(1099),
++      restaurantId: addedRestaurant,
++      priority: 999,
++    });
++    await SponsoredListing.update(
++      { priority: -100 },
++      { where: { id: rows[2].listingId } }
++    );
++    await SponsoredListing.update(
++      { end_date: new Date("2030-07-30T12:00:00.000Z") },
++      { where: { id: rows[3].listingId } }
++    );
++    await SponsoredListing.update(
++      { priority: -200 },
++      { where: { id: rows[0].listingId } }
++    );
++    const replacement = cursorListingId(1098);
++    await seedListing({
++      id: replacement,
++      restaurantId: rows[2].restaurantId,
++      priority: 1000,
++    });
++    const second = await page(2, cursor);
++    expect(responseIds(second)).toEqual([
++      rows[2].listingId,
++      rows[3].listingId,
++    ]);
++    expect(responseIds(second)).not.toContain(replacement);
++    expect(responseRestaurantIds(second)).not.toContain(addedRestaurant);
++    const cursor2 = next(second);
++    expect(typeof cursor2).toBe("string");
++    if (!cursor2) return;
++    const third = await page(2, cursor2);
++    const all = [
++      ...responseRestaurantIds(first),
++      ...responseRestaurantIds(second),
++      ...responseRestaurantIds(third),
++    ];
++    expect(all).toEqual(rows.map((row) => row.restaurantId));
++    expect(new Set(all).size).toBe(rows.length);
++    expect(third.body.nextCursor).toBeNull();
++  });
++  it("skips deleted and no-longer-Active snapshot listings and fills from later entries", async () => {
++    const rows = await series(6, 1100);
++    const first = await page(2);
++    const cursor = next(first);
++    expect(typeof cursor).toBe("string");
++    if (!cursor) return;
++    await SponsoredListing.destroy({
++      where: { id: rows[2].listingId },
++    });
++    await SponsoredListing.update(
++      { status: "Expired" as any },
++      { where: { id: rows[3].listingId } }
++    );
++    const second = await page(2, cursor);
++    expect(responseIds(second)).toEqual([
++      rows[4].listingId,
++      rows[5].listingId,
++    ]);
++    expect(second.body.nextCursor).toBeNull();
++  });
++  it("keeps the cursor at most 512 characters for a large snapshot", async () => {
++    await series(25, 1200);
++    const response = await page(20);
++    const cursor = next(response);
++    expect(response.body.data).toHaveLength(20);
++    expect(typeof cursor).toBe("string");
++    if (!cursor) return;
++    expect(cursor.length).toBeLessThanOrEqual(512);
++  });
++  it("binds a cursor to its original limit and availability", async () => {
++    await series(6, 1300, true);
++    const first = await page(2, undefined, "browse");
++    const cursor = next(first);
++    expect(typeof cursor).toBe("string");
++    if (!cursor) return;
++    await expectCursorError({
++      limit: "3",
++      availability: "browse",
++      cursor,
++    });
++    await expectCursorError({
++      limit: "2",
++      availability: "orderable",
++      cursor,
++    });
++  });
++  it("expires a pagination snapshot fifteen minutes after page one", async () => {
++    await series(4, 1400);
++    const first = await page(2);
++    const cursor = next(first);
++    expect(typeof cursor).toBe("string");
++    if (!cursor) return;
++    jest.setSystemTime(
++      new Date(
++        FEATURED_TEST_NOW.getTime() +
++          15 * 60 * 1000 +
++          1
++      )
++    );
++    await expectCursorError({
++      limit: "2",
++      cursor,
++    });
++  });
++  it("rejects blank, malformed, repeated, oversized, and changed cursors exactly", async () => {
++    await expectCursorError({
++      limit: "2",
++      cursor: "",
++    });
++    await expectCursorError({
++      limit: "2",
++      cursor: "not-a-cursor",
++    });
++    await expectCursorError({
++      limit: "2",
++      cursor: ["one", "two"],
++    });
++    await expectCursorError({
++      limit: "2",
++      cursor: "x".repeat(513),
++    });
++    await series(3, 1500);
++    const first = await page(1);
++    const cursor = next(first);
++    expect(typeof cursor).toBe("string");
++    if (!cursor) return;
++    const changed =
++      `${cursor.slice(0, -1)}${
++        cursor.endsWith("a") ? "b" : "a"
++      }`;
++    await expectCursorError({
++      limit: "1",
++      cursor: changed,
++    });
++  });
++  it("rejects a valid cursor without limit using the exact body", async () => {
++    await series(3, 1600);
++    const first = await page(1);
++    const cursor = next(first);
++    expect(typeof cursor).toBe("string");
++    if (!cursor) return;
++    await expectCursorError(
++      { cursor },
++      "cursor requires limit"
++    );
++  });
++  it("keeps no-limit response shape, listing fields, image fallback, remaining time, and private availability fields", async () => {
++    const row = await seed({
++      slot: 0,
++      suffix: 1700,
++      priority: 6,
++      endDate: "2030-06-16T12:00:00.000Z",
++      orderable: true,
++    });
++    await seedRestaurantImage({
++      restaurantId: row.restaurantId,
++      url: "https://images.example/fallback.jpg",
++      leading: false,
++    });
++    const response = await getFeatured(app);
++    expect(Object.keys(response.body).sort()).toEqual([
++      "data",
++      "success",
++    ]);
++    const listing = response.body.data[0];
++    expect(listing).toEqual(
++      expect.objectContaining({
++        id: row.listingId,
++        restaurant_id: row.restaurantId,
++        priority: 6,
++        image_url:
++          `https://images.example/${row.listingId}.jpg`,
++        restaurant_logo:
++          "https://images.example/fallback.jpg",
++      })
++    );
++    expect(listing.remainingTime).toEqual({
++      days: 1,
++      hours: 0,
++      minutes: 0,
++      seconds: 0,
++    });
++    expect(listing.restaurant).not.toHaveProperty(
++      "is_permanently_closed"
++    );
++    expect(listing.restaurant).not.toHaveProperty(
++      "is_order_service_available"
++    );
++    expect(listing.restaurant).not.toHaveProperty(
++      "is_order_service_online"
++    );
++  });
++
++  it("consumes a successful cursor exactly once", async () => {
++    const rows = await series(5, 1700);
++
++    const first = await page(2);
++    const cursor = next(first);
++
++    const second = await page(2, cursor);
++
++    expect(second.status).toBe(200);
++    expect(responseIds(second)).toEqual([
++      rows[2].listingId,
++      rows[3].listingId,
++    ]);
++
++    const replay = await page(2, cursor);
++
++    expect(replay.status).toBe(400);
++    expect(replay.body).toEqual({
++      success: false,
++      message: "cursor is invalid",
++    });
++  });
++
++  it("allows exactly one concurrent request to consume a cursor", async () => {
++    const rows = await series(6, 1800);
++
++    const first = await page(2);
++    const cursor = next(first);
++
++    const [left, right] = await Promise.all([
++      page(2, cursor),
++      page(2, cursor),
++    ]);
++
++    expect(
++      [left.status, right.status].sort((a, b) => a - b)
++    ).toEqual([200, 400]);
++
++    const winner =
++      left.status === 200 ? left : right;
++
++    const loser =
++      left.status === 400 ? left : right;
++
++    expect(responseIds(winner)).toEqual([
++      rows[2].listingId,
++      rows[3].listingId,
++    ]);
++
++    expect(loser.body).toEqual({
++      success: false,
++      message: "cursor is invalid",
++    });
++
++    const winnerCursor = next(winner);
++
++    const third = await page(
++      2,
++      winnerCursor
++    );
++
++    expect(third.status).toBe(200);
++    expect(responseIds(third)).toEqual([
++      rows[4].listingId,
++      rows[5].listingId,
++    ]);
++    expect(third.body.nextCursor).toBeNull();
++  });
++
++  it("rejects a stale cursor without invalidating the current cursor", async () => {
++    const rows = await series(6, 1900);
++
++    const first = await page(2);
++    const firstCursor = next(first);
++
++    const second = await page(
++      2,
++      firstCursor
++    );
++
++    expect(second.status).toBe(200);
++    expect(responseIds(second)).toEqual([
++      rows[2].listingId,
++      rows[3].listingId,
++    ]);
++
++    const secondCursor = next(second);
++
++    const stale = await page(
++      2,
++      firstCursor
++    );
++
++    expect(stale.status).toBe(400);
++    expect(stale.body).toEqual({
++      success: false,
++      message: "cursor is invalid",
++    });
++
++    const third = await page(
++      2,
++      secondCursor
++    );
++
++    expect(third.status).toBe(200);
++    expect(responseIds(third)).toEqual([
++      rows[4].listingId,
++      rows[5].listingId,
++    ]);
++    expect(third.body.nextCursor).toBeNull();
++  });
++
++  it("consumes skipped snapshot entries even when no listing is returned", async () => {
++    const rows = await series(
++      4,
++      2000,
++      true
++    );
++
++    const first = await page(
++      2,
++      undefined,
++      "orderable"
++    );
++
++    const cursor = next(first);
++
++    await updateRestaurantAvailability(
++      rows[2].restaurantId,
++      {
++        orderServiceOnline: false,
++      }
++    );
++
++    await updateRestaurantAvailability(
++      rows[3].restaurantId,
++      {
++        orderServiceOnline: false,
++      }
++    );
++
++    const skipped = await page(
++      2,
++      cursor,
++      "orderable"
++    );
++
++    expect(skipped.status).toBe(200);
++    expect(responseRestaurantIds(skipped)).toEqual([]);
++    expect(skipped.body.nextCursor).toBeNull();
++
++    await updateRestaurantAvailability(
++      rows[2].restaurantId,
++      {
++        orderServiceOnline: true,
++      }
++    );
++
++    const replay = await page(
++      2,
++      cursor,
++      "orderable"
++    );
++
++    expect(replay.status).toBe(400);
++    expect(replay.body).toEqual({
++      success: false,
++      message: "cursor is invalid",
++    });
++  });
++
++});
+diff --git a/rateeat_backend/src/__tests__/unit/featured_restaurant_request_id_behavior.test.ts b/rateeat_backend/src/__tests__/unit/featured_restaurant_request_id_behavior.test.ts
+new file mode 100644
+index 000000000..8a61cca4b
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/featured_restaurant_request_id_behavior.test.ts
+@@ -0,0 +1,521 @@
++import request from "supertest";
++
++jest.mock("../../utils/redis.utils", () => ({
++  __esModule: true,
++  default: {
++    get: jest.fn(),
++    set: jest.fn(),
++    setEx: jest.fn(),
++    del: jest.fn(),
++    keys: jest.fn(),
++    expire: jest.fn(),
++    sAdd: jest.fn(),
++    sMembers: jest.fn(),
++    connect: jest.fn(async () => undefined),
++    quit: jest.fn(async () => undefined),
++    disconnect: jest.fn(),
++    on: jest.fn(),
++    multi: jest.fn(() => ({
++      exec: jest.fn(async () => []),
++    })),
++  },
++}));
++
++import Database from "../db_setup";
++import SponsoredListing from "../../models/SponsoredListing/SponsoredListing";
++import {
++  appForFeaturedRestaurants,
++  clearFeaturedFixtures,
++  CURSOR_TEST_RESTAURANT_IDS,
++  cursorListingId,
++  FEATURED_TEST_NOW,
++  getFeatured,
++  responseIds,
++  seedListing,
++  seedRestaurant,
++  seedRestaurantImage,
++  updateRestaurantAvailability,
++} from "./helpers/featured_restaurant_test.helpers";
++
++const app = appForFeaturedRestaurants();
++
++const requestId = (suffix: number): string =>
++  `57000000-0000-4000-8000-${String(suffix).padStart(12, "0")}`;
++
++const seedSeries = async (
++  count: number,
++  listingBase: number,
++  orderable = false
++) => {
++  const rows: Array<{
++    restaurantId: string;
++    listingId: string;
++  }> = [];
++
++  for (let i = 0; i < count; i += 1) {
++    const restaurantId =
++      CURSOR_TEST_RESTAURANT_IDS[i];
++
++    const listingId =
++      cursorListingId(listingBase + i);
++
++    await seedRestaurant({
++      id: restaurantId,
++      orderServiceAvailable: orderable,
++      orderServiceOnline: orderable,
++    });
++
++    await seedListing({
++      id: listingId,
++      restaurantId,
++      priority: count - i,
++    });
++
++    rows.push({
++      restaurantId,
++      listingId,
++    });
++  }
++
++  return rows;
++};
++
++const limited = (
++  limit: number,
++  id: string,
++  cursor?: string,
++  availability?: "browse" | "orderable"
++) =>
++  getFeatured(app, {
++    limit: String(limit),
++    requestId: id,
++    ...(cursor ? { cursor } : {}),
++    ...(availability
++      ? { availability }
++      : {}),
++  });
++
++beforeAll(async () => {
++  await Database.getInstance();
++
++  jest.useFakeTimers({
++    doNotFake: [
++      "nextTick",
++      "setImmediate",
++    ],
++  });
++
++  jest.setSystemTime(FEATURED_TEST_NOW);
++});
++
++afterAll(async () => {
++  await clearFeaturedFixtures();
++  jest.useRealTimers();
++  await Database.close();
++});
++
++beforeEach(async () => {
++  await clearFeaturedFixtures();
++});
++
++describe("featured restaurant durable page requests", () => {
++  it("requires requestId whenever limit is supplied", async () => {
++    const response = await request(app)
++      .get("/api/v1/sponsored-listings")
++      .query({
++        limit: "2",
++      });
++
++    expect(response.status).toBe(400);
++    expect(response.body).toEqual({
++      success: false,
++      message: "limit requires requestId",
++    });
++  });
++
++  it("rejects invalid and repeated requestId values exactly", async () => {
++    const invalid = await request(app)
++      .get("/api/v1/sponsored-listings")
++      .query({
++        limit: "2",
++        requestId: "not-a-uuid",
++      });
++
++    expect(invalid.status).toBe(400);
++    expect(invalid.body).toEqual({
++      success: false,
++      message: "requestId is invalid",
++    });
++
++    const repeated = await request(app)
++      .get("/api/v1/sponsored-listings")
++      .query({
++        limit: "2",
++        requestId: [
++          requestId(1),
++          requestId(2),
++        ],
++      });
++
++    expect(repeated.status).toBe(400);
++    expect(repeated.body).toEqual({
++      success: false,
++      message: "requestId is invalid",
++    });
++  });
++
++  it("rejects requestId when limit is absent", async () => {
++    const response = await request(app)
++      .get("/api/v1/sponsored-listings")
++      .query({
++        requestId: requestId(3),
++      });
++
++    expect(response.status).toBe(400);
++    expect(response.body).toEqual({
++      success: false,
++      message: "requestId requires limit",
++    });
++  });
++
++  it("replays the exact first-page body after membership changes", async () => {
++    await seedSeries(4, 3000);
++
++    const id = requestId(10);
++
++    const first = await limited(
++      2,
++      id
++    );
++
++    expect(first.status).toBe(200);
++
++    const extraRestaurant =
++      CURSOR_TEST_RESTAURANT_IDS[6];
++
++    await seedRestaurant({
++      id: extraRestaurant,
++    });
++
++    await seedListing({
++      id: cursorListingId(3999),
++      restaurantId:
++        extraRestaurant,
++      priority: 1000,
++    });
++
++    const replay = await limited(
++      2,
++      id
++    );
++
++    expect(replay.status).toBe(200);
++    expect(replay.body).toEqual(
++      first.body
++    );
++  });
++
++  it("replays the exact committed continuation after data changes", async () => {
++    const rows = await seedSeries(
++      6,
++      4000,
++      true
++    );
++
++    const first = await limited(
++      2,
++      requestId(20),
++      undefined,
++      "orderable"
++    );
++
++    const cursor =
++      first.body.nextCursor as string;
++
++    const id = requestId(21);
++
++    const second = await limited(
++      2,
++      id,
++      cursor,
++      "orderable"
++    );
++
++    expect(second.status).toBe(200);
++
++    await updateRestaurantAvailability(
++      rows[2].restaurantId,
++      {
++        orderServiceOnline: false,
++      }
++    );
++
++    await seedRestaurantImage({
++      restaurantId:
++        rows[3].restaurantId,
++      url:
++        "https://images.example/changed-after-commit.jpg",
++      leading: true,
++    });
++
++    await SponsoredListing.destroy({
++      where: {
++        id: rows[2].listingId,
++      },
++    });
++
++    const replay = await limited(
++      2,
++      id,
++      cursor,
++      "orderable"
++    );
++
++    expect(replay.status).toBe(200);
++    expect(replay.body).toEqual(
++      second.body
++    );
++  });
++
++  it("does not allow a successful requestId to be rebound", async () => {
++    await seedSeries(7, 5000);
++
++    const first =
++      await limited(
++        2,
++        requestId(30)
++      );
++
++    const firstCursor =
++      first.body.nextCursor as string;
++
++    const id = requestId(31);
++
++    const second =
++      await limited(
++        2,
++        id,
++        firstCursor
++      );
++
++    expect(second.status).toBe(200);
++
++    const rebound =
++      await limited(
++        3,
++        id,
++        firstCursor
++      );
++
++    expect(rebound.status).toBe(400);
++    expect(rebound.body).toEqual({
++      success: false,
++      message: "requestId is invalid",
++    });
++  });
++
++  it("makes concurrent retries converge on the same durable page", async () => {
++    const rows =
++      await seedSeries(
++        6,
++        6000
++      );
++
++    const first =
++      await limited(
++        2,
++        requestId(40)
++      );
++
++    expect(first.status).toBe(200);
++
++    const cursor =
++      first.body.nextCursor as string;
++
++    const id =
++      requestId(41);
++
++    const [left, right] =
++      await Promise.all([
++        limited(
++          2,
++          id,
++          cursor
++        ),
++        limited(
++          2,
++          id,
++          cursor
++        ),
++      ]);
++
++    expect(left.status).toBe(200);
++    expect(right.status).toBe(200);
++
++    expect(left.body).toEqual(
++      right.body
++    );
++
++    expect(left.body.data).toHaveLength(
++      2
++    );
++
++    expect(
++      typeof left.body.nextCursor
++    ).toBe("string");
++
++    await SponsoredListing.destroy({
++      where: {
++        id: rows[2].listingId,
++      },
++    });
++
++    await updateRestaurantAvailability(
++      rows[3].restaurantId,
++      {
++        orderServiceOnline: false,
++      }
++    );
++
++    const replay =
++      await limited(
++        2,
++        id,
++        cursor
++      );
++
++    expect(replay.status).toBe(200);
++
++    expect(replay.body).toEqual(
++      left.body
++    );
++  });
++
++  it("allows only one competing requestId to consume a cursor", async () => {
++    await seedSeries(6, 7000);
++
++    const first =
++      await limited(
++        2,
++        requestId(50)
++      );
++
++    const cursor =
++      first.body.nextCursor as string;
++
++    const [left, right] =
++      await Promise.all([
++        limited(
++          2,
++          requestId(51),
++          cursor
++        ),
++        limited(
++          2,
++          requestId(52),
++          cursor
++        ),
++      ]);
++
++    expect(
++      [left.status, right.status]
++        .sort((a, b) => a - b)
++    ).toEqual([200, 400]);
++
++    const loser =
++      left.status === 400
++        ? left
++        : right;
++
++    expect(loser.body).toEqual({
++      success: false,
++      message: "cursor is invalid",
++    });
++  });
++
++  it("makes concurrent first-page retries return the same snapshot and cursor", async () => {
++    await seedSeries(6, 8000);
++
++    const id = requestId(60);
++
++    const [left, right] =
++      await Promise.all([
++        limited(2, id),
++        limited(2, id),
++      ]);
++
++    expect(left.status).toBe(200);
++    expect(right.status).toBe(200);
++    expect(left.body).toEqual(
++      right.body
++    );
++
++    expect(
++      typeof left.body.nextCursor
++    ).toBe("string");
++  });
++
++  it("replays an exact terminal page with null nextCursor after data changes", async () => {
++    await seedSeries(
++      3,
++      9000
++    );
++
++    const first =
++      await limited(
++        2,
++        requestId(70)
++      );
++
++    expect(first.status).toBe(200);
++    expect(
++      typeof first.body.nextCursor
++    ).toBe("string");
++
++    const cursor =
++      first.body.nextCursor as string;
++
++    const id =
++      requestId(71);
++
++    const terminal =
++      await limited(
++        2,
++        id,
++        cursor
++      );
++
++    expect(terminal.status).toBe(200);
++    expect(terminal.body.data).toHaveLength(1);
++    expect(terminal.body.nextCursor).toBeNull();
++
++    const returned =
++      terminal.body.data[0];
++
++    await SponsoredListing.destroy({
++      where: {
++        id: returned.id,
++      },
++    });
++
++    await updateRestaurantAvailability(
++      returned.restaurant_id,
++      {
++        orderServiceOnline: false,
++      }
++    );
++
++    const replay =
++      await limited(
++        2,
++        id,
++        cursor
++      );
++
++    expect(replay.status).toBe(200);
++    expect(replay.body).toEqual(
++      terminal.body
++    );
++  });
++
++});
+diff --git a/rateeat_backend/src/__tests__/unit/featured_restaurant_selection_behavior.test.ts b/rateeat_backend/src/__tests__/unit/featured_restaurant_selection_behavior.test.ts
+new file mode 100644
+index 000000000..252caab14
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/featured_restaurant_selection_behavior.test.ts
+@@ -0,0 +1,308 @@
++jest.mock("../../utils/redis.utils", () => ({
++  __esModule: true,
++  default: {
++    get: jest.fn(),
++    set: jest.fn(),
++    setEx: jest.fn(),
++    del: jest.fn(),
++    keys: jest.fn(),
++    expire: jest.fn(),
++    sAdd: jest.fn(),
++    sMembers: jest.fn(),
++    connect: jest.fn(async () => undefined),
++    quit: jest.fn(async () => undefined),
++    disconnect: jest.fn(),
++    on: jest.fn(),
++    multi: jest.fn(() => ({
++      exec: jest.fn(async () => []),
++    })),
++  },
++}));
++
++import Database from "../db_setup";
++import SponsoredListing from "../../models/SponsoredListing/SponsoredListing";
++import {
++  appForFeaturedRestaurants,
++  clearFeaturedFixtures,
++  FEATURED_TEST_NOW,
++  getFeatured,
++  listingId,
++  RESTAURANT_A,
++  RESTAURANT_B,
++  RESTAURANT_C,
++  RESTAURANT_D,
++  LIMIT_TEST_RESTAURANT_IDS,
++  responseIds,
++  responseRestaurantIds,
++  seedListing,
++  seedRestaurant,
++} from "./helpers/featured_restaurant_test.helpers";
++
++const app = appForFeaturedRestaurants();
++
++beforeAll(async () => {
++  await Database.getInstance();
++  jest.useFakeTimers({
++    doNotFake: ["nextTick", "setImmediate"],
++  });
++  jest.setSystemTime(FEATURED_TEST_NOW);
++});
++
++afterAll(async () => {
++  await clearFeaturedFixtures();
++  jest.useRealTimers();
++  await Database.close();
++});
++
++beforeEach(async () => {
++  await clearFeaturedFixtures();
++});
++
++const seedBasicRestaurant = (id: string) => seedRestaurant({ id });
++
++const seedOrderableRestaurant = (id: string) =>
++  seedRestaurant({
++    id,
++    orderServiceAvailable: true,
++    orderServiceOnline: true,
++  });
++
++describe("featured restaurant selection rules", () => {
++  describe("one listing per restaurant", () => {
++    it("collapses two Active listings for the same restaurant into one result", async () => {
++      await seedBasicRestaurant(RESTAURANT_A);
++      await seedListing({ id: listingId(101), restaurantId: RESTAURANT_A, priority: 1 });
++      await seedListing({ id: listingId(102), restaurantId: RESTAURANT_A, priority: 2 });
++
++      const response = await getFeatured(app);
++
++      expect(response.status).toBe(200);
++      expect(response.body.data).toHaveLength(1);
++    });
++
++    it("keeps the highest-priority listing when one restaurant has duplicates", async () => {
++      await seedBasicRestaurant(RESTAURANT_A);
++      await seedListing({ id: listingId(103), restaurantId: RESTAURANT_A, priority: 2 });
++      await seedListing({ id: listingId(104), restaurantId: RESTAURANT_A, priority: 8 });
++
++      const response = await getFeatured(app);
++
++      expect(response.status).toBe(200);
++      expect(responseIds(response)).toEqual([listingId(104)]);
++    });
++
++    it("uses the sooner end date when duplicate priorities tie", async () => {
++      await seedBasicRestaurant(RESTAURANT_A);
++      await seedListing({
++        id: listingId(105),
++        restaurantId: RESTAURANT_A,
++        priority: 5,
++        endDate: "2030-08-01T00:00:00.000Z",
++      });
++      await seedListing({
++        id: listingId(106),
++        restaurantId: RESTAURANT_A,
++        priority: 5,
++        endDate: "2030-07-01T00:00:00.000Z",
++      });
++
++      const response = await getFeatured(app);
++
++      expect(response.status).toBe(200);
++      expect(responseIds(response)).toEqual([listingId(106)]);
++    });
++
++    it("uses the lexicographically smaller listing id after priority and end-date ties", async () => {
++      await seedBasicRestaurant(RESTAURANT_A);
++      await seedListing({ id: listingId(109), restaurantId: RESTAURANT_A, priority: 4 });
++      await seedListing({ id: listingId(108), restaurantId: RESTAURANT_A, priority: 4 });
++
++      const response = await getFeatured(app);
++
++      expect(response.status).toBe(200);
++      expect(responseIds(response)).toEqual([listingId(108)]);
++    });
++
++    it("chooses the same canonical listing when duplicate rows are created in reverse order", async () => {
++      await seedBasicRestaurant(RESTAURANT_A);
++      await seedListing({ id: listingId(110), restaurantId: RESTAURANT_A, priority: 1 });
++      await seedListing({ id: listingId(111), restaurantId: RESTAURANT_A, priority: 9 });
++
++      const first = await getFeatured(app);
++      expect(responseIds(first)).toEqual([listingId(111)]);
++
++      await SponsoredListing.destroy({ where: { restaurant_id: RESTAURANT_A } });
++
++      await seedListing({ id: listingId(111), restaurantId: RESTAURANT_A, priority: 9 });
++      await seedListing({ id: listingId(110), restaurantId: RESTAURANT_A, priority: 1 });
++
++      const second = await getFeatured(app);
++      expect(second.status).toBe(200);
++      expect(responseIds(second)).toEqual([listingId(111)]);
++    });
++  });
++
++  describe("limit after eligibility and duplicate removal", () => {
++    it("applies limit after duplicate listings have been collapsed", async () => {
++      await seedBasicRestaurant(RESTAURANT_A);
++      await seedBasicRestaurant(RESTAURANT_B);
++      await seedListing({ id: listingId(120), restaurantId: RESTAURANT_A, priority: 1 });
++      await seedListing({ id: listingId(121), restaurantId: RESTAURANT_A, priority: 6 });
++      await seedListing({ id: listingId(122), restaurantId: RESTAURANT_B, priority: 2 });
++
++      const response = await getFeatured(app, { limit: "2" });
++
++      expect(response.status).toBe(200);
++      expect(response.body.data).toHaveLength(2);
++      expect(new Set(responseRestaurantIds(response)).size).toBe(2);
++    });
++
++    it("does not let a permanently closed restaurant consume a limit slot", async () => {
++      await seedRestaurant({ id: RESTAURANT_A, permanentlyClosed: true });
++      await seedBasicRestaurant(RESTAURANT_B);
++      await seedBasicRestaurant(RESTAURANT_C);
++      await seedListing({ id: listingId(123), restaurantId: RESTAURANT_A, priority: 10 });
++      await seedListing({ id: listingId(124), restaurantId: RESTAURANT_B, priority: 2 });
++      await seedListing({ id: listingId(125), restaurantId: RESTAURANT_C, priority: 1 });
++
++      const response = await getFeatured(app, { limit: "2" });
++
++      expect(response.status).toBe(200);
++      expect(response.body.data).toHaveLength(2);
++      expect(responseRestaurantIds(response)).not.toContain(RESTAURANT_A);
++    });
++
++    it("does not let an offline restaurant consume an orderable limit slot", async () => {
++      await seedRestaurant({
++        id: RESTAURANT_A,
++        orderServiceAvailable: true,
++        orderServiceOnline: false,
++      });
++      await seedOrderableRestaurant(RESTAURANT_B);
++      await seedOrderableRestaurant(RESTAURANT_C);
++      await seedListing({ id: listingId(126), restaurantId: RESTAURANT_A, priority: 10 });
++      await seedListing({ id: listingId(127), restaurantId: RESTAURANT_B, priority: 2 });
++      await seedListing({ id: listingId(128), restaurantId: RESTAURANT_C, priority: 1 });
++
++      const response = await getFeatured(app, {
++        availability: "orderable",
++        limit: "2",
++      });
++
++      expect(response.status).toBe(200);
++      expect(response.body.data).toHaveLength(2);
++      expect(responseRestaurantIds(response)).not.toContain(RESTAURANT_A);
++    });
++
++
++    it("returns one restaurant when limit is one even when several are eligible", async () => {
++      await seedBasicRestaurant(RESTAURANT_A);
++      await seedBasicRestaurant(RESTAURANT_B);
++      await seedBasicRestaurant(RESTAURANT_C);
++      await seedListing({ id: listingId(132), restaurantId: RESTAURANT_A, priority: 1 });
++      await seedListing({ id: listingId(133), restaurantId: RESTAURANT_B, priority: 2 });
++      await seedListing({ id: listingId(134), restaurantId: RESTAURANT_C, priority: 3 });
++
++      const response = await getFeatured(app, { limit: "1" });
++
++      expect(response.status).toBe(200);
++      expect(response.body.data).toHaveLength(1);
++    });
++
++    it("counts unique restaurants rather than raw listing rows toward the limit", async () => {
++      await seedBasicRestaurant(RESTAURANT_A);
++      await seedBasicRestaurant(RESTAURANT_B);
++      await seedBasicRestaurant(RESTAURANT_C);
++      await seedListing({ id: listingId(135), restaurantId: RESTAURANT_A, priority: 1 });
++      await seedListing({ id: listingId(136), restaurantId: RESTAURANT_A, priority: 9 });
++      await seedListing({ id: listingId(137), restaurantId: RESTAURANT_B, priority: 3 });
++      await seedListing({ id: listingId(138), restaurantId: RESTAURANT_C, priority: 2 });
++
++      const response = await getFeatured(app, { limit: "2" });
++
++      expect(response.status).toBe(200);
++      expect(response.body.data).toHaveLength(2);
++      expect(new Set(responseRestaurantIds(response)).size).toBe(2);
++    });
++
++
++  });
++
++  describe("limit query validation", () => {
++    it("accepts every whole-number limit from 3 through 20", async () => {
++      for (const limit of Array.from({ length: 18 }, (_, index) => index + 3)) {
++        await clearFeaturedFixtures();
++        const restaurantCount = limit + 1;
++        for (let index = 0; index < restaurantCount; index += 1) {
++            const restaurantId = LIMIT_TEST_RESTAURANT_IDS[index];
++            await seedBasicRestaurant(restaurantId);
++            await seedListing({
++                id: listingId(200 + index),
++                restaurantId,
++                priority: restaurantCount - index,
++            });
++        }
++        const response = await getFeatured(app, {
++            limit: String(limit),
++        });
++        expect(response.status).toBe(200);
++        expect(response.body.data).toHaveLength(limit);
++        expect(new Set(responseRestaurantIds(response)).size).toBe(limit);
++      }
++    });
++
++    it("rejects limit zero", async () => {
++      const response = await getFeatured(app, { limit: "0" });
++      expect(response.status).toBe(400);
++      expect(response.body).toEqual({
++        success: false,
++        message: "limit must be a whole number from 1 to 20",
++      });
++    });
++
++    it("rejects a negative limit", async () => {
++      const response = await getFeatured(app, { limit: "-1" });
++      expect(response.status).toBe(400);
++      expect(response.body).toEqual({
++        success: false,
++        message: "limit must be a whole number from 1 to 20",
++      });
++    });
++
++    it("rejects a fractional limit", async () => {
++      const response = await getFeatured(app, { limit: "1.5" });
++      expect(response.status).toBe(400);
++      expect(response.body).toEqual({
++        success: false,
++        message: "limit must be a whole number from 1 to 20",
++      });
++    });
++
++    it("rejects a non-numeric limit", async () => {
++      const response = await getFeatured(app, { limit: "many" });
++      expect(response.status).toBe(400);
++      expect(response.body).toEqual({
++        success: false,
++        message: "limit must be a whole number from 1 to 20",
++      });
++    });
++
++    it("rejects a limit above twenty", async () => {
++      const response = await getFeatured(app, { limit: "21" });
++      expect(response.status).toBe(400);
++      expect(response.body).toEqual({
++        success: false,
++        message: "limit must be a whole number from 1 to 20",
++      });
++    });
++
++    it("rejects repeated limit values", async () => {
++      const response = await getFeatured(app, { limit: ["1", "2"] });
++      expect(response.status).toBe(400);
++      expect(response.body).toEqual({
++        success: false,
++        message: "limit must be a whole number from 1 to 20",
++      });
++    });
++  });
++});
+diff --git a/rateeat_backend/src/__tests__/unit/helpers/featured_restaurant_test.helpers.ts b/rateeat_backend/src/__tests__/unit/helpers/featured_restaurant_test.helpers.ts
+new file mode 100644
+index 000000000..bc7521229
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/helpers/featured_restaurant_test.helpers.ts
+@@ -0,0 +1,219 @@
++import { randomUUID } from "crypto";
++import express, { NextFunction, Request, Response } from "express";
++import request from "supertest";
++import { Op } from "sequelize";
++
++import Database from "../../db_setup";
++import { Restaurant, RestaurantImage } from "../../../models";
++import SponsoredListing from "../../../models/SponsoredListing/SponsoredListing";
++import { getSponsoredListings } from "../../../controllers/sponsored_listing.controller";
++
++export const FEATURED_TEST_NOW = new Date("2030-06-15T12:00:00.000Z");
++
++export const RESTAURANT_A = "41000000-0000-4000-8000-000000000001";
++export const RESTAURANT_B = "41000000-0000-4000-8000-000000000002";
++export const RESTAURANT_C = "41000000-0000-4000-8000-000000000003";
++export const RESTAURANT_D = "41000000-0000-4000-8000-000000000004";
++export const RESTAURANT_E = "41000000-0000-4000-8000-000000000005";
++
++export const LIMIT_TEST_RESTAURANT_IDS = Array.from(
++  { length: 21 },
++  (_, index) =>
++    `43000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`
++);
++
++export const CURSOR_TEST_RESTAURANT_IDS = Array.from(
++  { length: 30 },
++  (_, index) =>
++    `44000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`
++);
++
++export const FEATURED_RESTAURANT_IDS = [
++  RESTAURANT_A,
++  RESTAURANT_B,
++  RESTAURANT_C,
++  RESTAURANT_D,
++  RESTAURANT_E,
++  ...LIMIT_TEST_RESTAURANT_IDS,
++  ...CURSOR_TEST_RESTAURANT_IDS,
++];
++
++export const listingId = (suffix: number): string =>
++  `42000000-0000-4000-8000-${String(suffix).padStart(12, "0")}`;
++
++export const cursorListingId = (suffix: number): string =>
++  `45000000-0000-4000-8000-${String(suffix).padStart(12, "0")}`;
++
++export const nextFeaturedRequestId = (): string =>
++  randomUUID();
++
++export const appForFeaturedRestaurants = () => {
++  const app = express();
++  app.use(express.json());
++  app.get("/api/v1/sponsored-listings", getSponsoredListings as any);
++  app.use(
++    (
++      error: any,
++      _req: Request,
++      res: Response,
++      _next: NextFunction
++    ) => {
++      res.status(error?.statusCode ?? error?.status ?? 500).json({
++        success: false,
++        message: error?.message ?? "Internal Server Error",
++      });
++    }
++  );
++  return app;
++};
++
++export const getFeatured = (
++  app: ReturnType<typeof appForFeaturedRestaurants>,
++  query?: Record<string, unknown>
++) => {
++  const call = request(app).get("/api/v1/sponsored-listings");
++
++  if (!query) {
++    return call;
++  }
++
++  const normalized = {
++    ...query,
++  };
++
++  if (
++    normalized.limit !== undefined &&
++    normalized.requestId === undefined
++  ) {
++    normalized.requestId =
++      nextFeaturedRequestId();
++  }
++
++  return call.query(normalized as any);
++};
++
++export const clearFeaturedFixtures = async () => {
++  await RestaurantImage.destroy({
++    where: {
++      restaurant_id: {
++        [Op.in]: FEATURED_RESTAURANT_IDS,
++      },
++    },
++  });
++
++  await SponsoredListing.destroy({
++    where: {
++      restaurant_id: {
++        [Op.in]: FEATURED_RESTAURANT_IDS,
++      },
++    },
++  });
++
++  await Restaurant.destroy({
++    where: {
++      id: {
++        [Op.in]: FEATURED_RESTAURANT_IDS,
++      },
++    },
++  });
++};
++
++export const seedRestaurant = async ({
++  id,
++  name = "Featured Cafe",
++  permanentlyClosed = false,
++  orderServiceAvailable = false,
++  orderServiceOnline = false,
++}: {
++  id: string;
++  name?: string;
++  permanentlyClosed?: boolean;
++  orderServiceAvailable?: boolean;
++  orderServiceOnline?: boolean;
++}) => {
++  const sequelize = await Database.getInstance();
++
++  await sequelize.getQueryInterface().bulkInsert("restaurants", [
++    {
++      id,
++      name,
++      currency: "ETB",
++      is_permanently_closed: permanentlyClosed,
++      is_order_service_available: orderServiceAvailable,
++      is_order_service_online: orderServiceOnline,
++      createdAt: FEATURED_TEST_NOW,
++      updatedAt: FEATURED_TEST_NOW,
++    },
++  ]);
++};
++
++export const updateRestaurantAvailability = async (
++  id: string,
++  values: {
++    permanentlyClosed?: boolean;
++    orderServiceAvailable?: boolean;
++    orderServiceOnline?: boolean;
++  }
++) => {
++  const update: Record<string, boolean> = {};
++
++  if (values.permanentlyClosed !== undefined) {
++    update.is_permanently_closed = values.permanentlyClosed;
++  }
++  if (values.orderServiceAvailable !== undefined) {
++    update.is_order_service_available = values.orderServiceAvailable;
++  }
++  if (values.orderServiceOnline !== undefined) {
++    update.is_order_service_online = values.orderServiceOnline;
++  }
++
++  await Restaurant.update(update, {
++    where: { id },
++  });
++};
++
++export const seedListing = async ({
++  id,
++  restaurantId,
++  priority = 1,
++  endDate = "2030-07-15T12:00:00.000Z",
++}: {
++  id: string;
++  restaurantId: string;
++  priority?: number;
++  endDate?: Date | string;
++}) =>
++  SponsoredListing.create({
++    id,
++    restaurant_id: restaurantId,
++    start_date: new Date("2030-06-01T00:00:00.000Z"),
++    end_date: new Date(endDate),
++    impressions: 1,
++    max_impressions: 100,
++    status: "Active",
++    priority,
++    rotation_interval: 5,
++    image_url: `https://images.example/${id}.jpg`,
++    discount_info: null,
++  } as any);
++
++export const seedRestaurantImage = async ({
++  restaurantId,
++  url,
++  leading,
++}: {
++  restaurantId: string;
++  url: string;
++  leading: boolean;
++}) =>
++  RestaurantImage.create({
++    restaurant_id: restaurantId,
++    url,
++    is_leading: leading,
++  } as any);
++
++export const responseIds = (response: request.Response): string[] =>
++  response.body.data.map((entry: any) => entry.id);
++
++export const responseRestaurantIds = (response: request.Response): string[] =>
++  response.body.data.map((entry: any) => entry.restaurant_id);

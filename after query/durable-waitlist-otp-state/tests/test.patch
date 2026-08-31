@@ -1,0 +1,1258 @@
+diff --git a/rateeat_backend/src/__tests__/db_setup.ts b/rateeat_backend/src/__tests__/db_setup.ts
+index e60a6e1f2..f125b35c2 100644
+--- a/rateeat_backend/src/__tests__/db_setup.ts
++++ b/rateeat_backend/src/__tests__/db_setup.ts
+@@ -86,6 +86,9 @@ import {
+   UserComplaint,
+   Survey,
+   RestaurantAccountDetail,
++  Neighborhood,
++  Waitlist,
++  PendingVerification,
+ } from "../models";
+ 
+ dotenv.config({
+@@ -185,6 +188,9 @@ class Database {
+           UserComplaint,
+           Survey,
+           RestaurantAccountDetail,
++          Neighborhood,
++          Waitlist,
++          PendingVerification,
+         ],
+         logging: false,
+       });
+diff --git a/rateeat_backend/src/__tests__/unit/waitlist_otp_send_behavior.test.ts b/rateeat_backend/src/__tests__/unit/waitlist_otp_send_behavior.test.ts
+new file mode 100644
+index 000000000..d647e2aa0
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/waitlist_otp_send_behavior.test.ts
+@@ -0,0 +1,455 @@
++jest.mock("../../utils/whatsapp.utils", () => ({
++  sendWhatsAppOTP: jest.fn(),
++}));
++
++jest.mock("../../utils/telegram.utils", () => ({
++  sendTelegramMessage: jest.fn(),
++}));
++
++import { sendWhatsAppOTP } from "../../utils/whatsapp.utils";
++import { sendTelegramMessage } from "../../utils/telegram.utils";
++import {
++  cleanWaitlistOtpTables,
++  concurrent,
++  createOtp,
++  createWaitlist,
++  db,
++  expectUnverifiedWaitlist,
++  gate,
++  otpState,
++  pause,
++  registerAgain,
++  sendOtp,
++  setOtpCounters,
++  uniquePhone,
++} from "./waitlist_otp_test_support";
++
++const whatsapp = sendWhatsAppOTP as jest.MockedFunction<
++  typeof sendWhatsAppOTP
++>;
++const telegram = sendTelegramMessage as jest.MockedFunction<
++  typeof sendTelegramMessage
++>;
++
++describe("durable waitlist OTP send behavior", () => {
++  beforeAll(async () => {
++    await db();
++  });
++
++  beforeEach(async () => {
++    await cleanWaitlistOtpTables();
++    whatsapp.mockReset();
++    telegram.mockReset();
++    whatsapp.mockResolvedValue(undefined);
++    telegram.mockResolvedValue(undefined as any);
++  });
++
++  it("keeps the existing missing-phone response", async () => {
++    const response = await sendOtp();
++    expect(response.status).toBe(400);
++    expect(response.body.message).toBe("Phone is required");
++  });
++
++  it("keeps the existing unknown-phone response", async () => {
++    const phone = uniquePhone();
++    const response = await sendOtp(phone);
++    expect(response.status).toBe(404);
++    expect(response.body.message).toBe("Phone not found on waitlist");
++  });
++
++  it("keeps the successful development response and sends the generated code", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone);
++
++    const response = await sendOtp(phone);
++
++    expect(response.status).toBe(200);
++    expect(response.body.message).toBe("OTP sent");
++    expect(response.body.otp).toMatch(/^\d{6}$/);
++    expect(Object.keys(response.body).sort()).toEqual(["message", "otp"]);
++    expect(whatsapp).toHaveBeenCalledTimes(1);
++    expect(whatsapp).toHaveBeenCalledWith(phone, response.body.otp);
++  });
++
++  it("stores the first send count, method, timestamp, and expiry in PostgreSQL", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone);
++
++    const response = await sendOtp(phone);
++    expect(response.status).toBe(200);
++
++    const state = await otpState(phone);
++    expect(state).not.toBeNull();
++    expect(state?.phoneOtpCode).toBe(response.body.otp);
++    expect(state?.resendCount).toBe(1);
++    expect(state?.attempts).toBe(0);
++    expect(state?.method).toBe("whatsapp");
++    expect(state?.lastSentAt).not.toBeNull();
++    expect(state?.expiresAt).not.toBeNull();
++    expect(state!.expiresAt!.getTime()).toBeGreaterThan(Date.now());
++  });
++
++  it("increments the persisted resend count and resets attempts for a fresh code", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone);
++    await createOtp(phone, "111111", { attempts: 2, resendCount: 1 });
++
++    const response = await sendOtp(phone);
++    expect(response.status).toBe(200);
++
++    const state = await otpState(phone);
++    expect(state?.phoneOtpCode).toBe(response.body.otp);
++    expect(state?.phoneOtpCode).not.toBe("111111");
++    expect(state?.resendCount).toBe(2);
++    expect(state?.attempts).toBe(0);
++  });
++
++  it("enforces the resend limit from the stored row without any process history", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone);
++    await createOtp(phone, "222222", { attempts: 0, resendCount: 3 });
++
++    const response = await sendOtp(phone);
++
++    expect(response.status).toBe(429);
++    expect(response.body.message).toBe("Max resend attempts reached");
++    expect(whatsapp).not.toHaveBeenCalled();
++    expect((await otpState(phone))?.phoneOtpCode).toBe("222222");
++    expect((await otpState(phone))?.resendCount).toBe(3);
++  });
++
++  it("reports persisted resend and verification counts for an active registration", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone);
++    await createOtp(phone, "333333", { attempts: 2, resendCount: 3 });
++
++    const response = await registerAgain(phone);
++
++    expect(response.status).toBe(409);
++    expect(response.body).toMatchObject({
++      message:
++        "You have an active pending WhatsApp registration. OTP already sent.",
++      resendAttempts: 3,
++      verificationAttempts: 2,
++    });
++  });
++
++  it("rolls back a first OTP and keeps the waitlist entry when delivery fails", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone);
++    whatsapp.mockRejectedValueOnce(new Error("provider unavailable"));
++
++    const response = await sendOtp(phone);
++
++    expect(response.status).toBe(500);
++    expect(response.body.message).toBe("Error sending verification");
++    expect(await otpState(phone)).toBeNull();
++    await expectUnverifiedWaitlist(phone);
++  });
++
++  it("restores the previous usable OTP and counters when replacement delivery fails", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone);
++    await createOtp(phone, "444444", {
++      attempts: 2,
++      resendCount: 1,
++      method: "whatsapp",
++    });
++    const before = await otpState(phone);
++
++    whatsapp.mockRejectedValueOnce(new Error("provider unavailable"));
++    const response = await sendOtp(phone);
++
++    expect(response.status).toBe(500);
++    expect(response.body.message).toBe("Error sending verification");
++
++    const after = await otpState(phone);
++    expect(after?.phoneOtpCode).toBe("444444");
++    expect(after?.attempts).toBe(2);
++    expect(after?.resendCount).toBe(1);
++    expect(after?.method).toBe(before?.method);
++    expect(after?.expiresAt?.getTime()).toBe(before?.expiresAt?.getTime());
++    await expectUnverifiedWaitlist(phone);
++  });
++
++  it("uses the stored method when the request does not override it", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone, "telegram");
++
++    const response = await sendOtp(phone, { telegramChatId: "gold-chat-1" });
++
++    expect(response.status).toBe(200);
++    expect(telegram).toHaveBeenCalledTimes(1);
++    expect(telegram).toHaveBeenCalledWith("gold-chat-1", response.body.otp);
++    expect(whatsapp).not.toHaveBeenCalled();
++    expect((await otpState(phone))?.method).toBe("telegram");
++  });
++
++  it("keeps a failed Telegram delivery inside the same rollback boundary", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone, "telegram");
++    telegram.mockRejectedValueOnce(new Error("telegram unavailable"));
++
++    const response = await sendOtp(phone, { telegramChatId: "gold-chat-2" });
++
++    expect(response.status).toBe(500);
++    expect(response.body.message).toBe("Error sending verification");
++    expect(await otpState(phone)).toBeNull();
++    await expectUnverifiedWaitlist(phone);
++  });
++
++  it("serializes three simultaneous sends for one phone without losing resend increments", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone);
++    whatsapp.mockImplementation(async () => {
++      await pause(75);
++    });
++
++    const responses = await concurrent([
++      () => sendOtp(phone),
++      () => sendOtp(phone),
++      () => sendOtp(phone),
++    ]);
++
++    expect(responses.map((response) => response.status)).toEqual([200, 200, 200]);
++    expect(whatsapp).toHaveBeenCalledTimes(3);
++    expect((await otpState(phone))?.resendCount).toBe(3);
++    expect((await otpState(phone))?.attempts).toBe(0);
++  });
++
++  it("allows only one overlapping send when the durable resend count starts at two", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone);
++    await createOtp(phone, "555555", { resendCount: 2, attempts: 1 });
++    whatsapp.mockImplementation(async () => {
++      await pause(75);
++    });
++
++    const responses = await concurrent([
++      () => sendOtp(phone),
++      () => sendOtp(phone),
++    ]);
++
++    expect(responses.map((response) => response.status).sort()).toEqual([200, 429]);
++    expect(whatsapp).toHaveBeenCalledTimes(1);
++    expect((await otpState(phone))?.resendCount).toBe(3);
++    expect((await otpState(phone))?.attempts).toBe(0);
++  });
++
++  it("keeps counters independent for different phones", async () => {
++    const first = uniquePhone();
++    const second = uniquePhone();
++    await createWaitlist(first);
++    await createWaitlist(second);
++    whatsapp.mockImplementation(async () => {
++      await pause(40);
++    });
++
++    const responses = await concurrent([
++      () => sendOtp(first),
++      () => sendOtp(second),
++    ]);
++
++    expect(responses.every((response) => response.status === 200)).toBe(true);
++    expect((await otpState(first))?.resendCount).toBe(1);
++    expect((await otpState(second))?.resendCount).toBe(1);
++  });
++
++  it("rejects negative verification attempts at the database boundary", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone);
++    await createOtp(phone, "666666");
++
++    await expect(setOtpCounters(phone, -1, 0)).rejects.toThrow();
++  });
++
++  it("rejects verification attempts above the supported maximum at the database boundary", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone);
++    await createOtp(phone, "676767");
++
++    await expect(setOtpCounters(phone, 4, 0)).rejects.toThrow();
++  });
++
++  it("rejects a negative resend count at the database boundary", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone);
++    await createOtp(phone, "686868");
++
++    await expect(setOtpCounters(phone, 0, -1)).rejects.toThrow();
++  });
++
++  it("rejects a resend count above the supported maximum at the database boundary", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone);
++    await createOtp(phone, "777777");
++
++    await expect(setOtpCounters(phone, 0, 4)).rejects.toThrow();
++  });
++
++  it("starts a fresh resend cycle after the stored OTP expires", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone);
++    await createOtp(phone, "818181", {
++      attempts: 3,
++      resendCount: 3,
++      expiresAt: new Date(Date.now() - 60_000),
++    });
++
++    const response = await sendOtp(phone);
++
++    expect(response.status).toBe(200);
++
++    const state = await otpState(phone);
++    expect(state?.phoneOtpCode).toBe(response.body.otp);
++    expect(state?.phoneOtpCode).not.toBe("818181");
++    expect(state?.resendCount).toBe(1);
++    expect(state?.attempts).toBe(0);
++    expect(state?.expiresAt?.getTime()).toBeGreaterThan(Date.now());
++  });
++
++  it("restores an expired OTP row when delivery of its replacement fails", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone);
++    await createOtp(phone, "828282", {
++      attempts: 3,
++      resendCount: 3,
++      method: "whatsapp",
++      expiresAt: new Date(Date.now() - 60_000),
++    });
++
++    const before = await otpState(phone);
++
++    whatsapp.mockRejectedValueOnce(
++      new Error("provider unavailable")
++    );
++
++    const response = await sendOtp(phone);
++
++    expect(response.status).toBe(500);
++    expect(response.body.message).toBe(
++      "Error sending verification"
++    );
++
++    const after = await otpState(phone);
++
++    expect(after?.phoneOtpCode).toBe("828282");
++    expect(after?.attempts).toBe(3);
++    expect(after?.resendCount).toBe(3);
++    expect(after?.method).toBe(before?.method);
++    expect(after?.expiresAt?.getTime()).toBe(
++      before?.expiresAt?.getTime()
++    );
++
++    await expectUnverifiedWaitlist(phone);
++  });
++
++  it("reports the committed counters when registration overlaps a resend", async () => {
++    const phone = uniquePhone();
++
++    await createWaitlist(phone);
++
++    await createOtp(phone, "838383", {
++      attempts: 2,
++      resendCount: 1,
++    });
++
++    const deliveryEntered = gate();
++    const releaseDelivery = gate();
++
++    whatsapp.mockImplementationOnce(async () => {
++      deliveryEntered.release();
++      await releaseDelivery.promise;
++    });
++
++    const sendPromise = sendOtp(phone).then(
++      (response) => response
++    );
++
++    await deliveryEntered.promise;
++
++    const registrationPromise = registerAgain(phone).then(
++      (response) => response
++    );
++
++    await pause(30);
++
++    releaseDelivery.release();
++
++    const [sendResponse, registrationResponse] =
++      await Promise.all([
++        sendPromise,
++        registrationPromise,
++      ]);
++
++    expect(sendResponse.status).toBe(200);
++    expect(registrationResponse.status).toBe(409);
++
++    expect(
++      registrationResponse.body.resendAttempts
++    ).toBe(2);
++
++    expect(
++      registrationResponse.body.verificationAttempts
++    ).toBe(0);
++
++    const state = await otpState(phone);
++
++    expect(state?.resendCount).toBe(2);
++    expect(state?.attempts).toBe(0);
++  });
++
++  it("does not let a slow delivery for one phone block another phone", async () => {
++    const slowPhone = uniquePhone();
++    const otherPhone = uniquePhone();
++
++    await createWaitlist(slowPhone);
++    await createWaitlist(otherPhone);
++
++    const deliveryEntered = gate();
++    const releaseDelivery = gate();
++
++    whatsapp.mockImplementationOnce(async () => {
++      deliveryEntered.release();
++      await releaseDelivery.promise;
++    });
++
++    whatsapp.mockResolvedValueOnce(undefined);
++
++    const slowPromise = sendOtp(slowPhone).then(
++      (response) => response
++    );
++
++    await deliveryEntered.promise;
++
++    const otherPromise = sendOtp(otherPhone).then(
++      (response) => response
++    );
++
++    const otherFinishedBeforeRelease =
++      await Promise.race([
++        otherPromise.then(() => true),
++        pause(600).then(() => false),
++      ]);
++
++    releaseDelivery.release();
++
++    const [slowResponse, otherResponse] =
++      await Promise.all([
++        slowPromise,
++        otherPromise,
++      ]);
++
++    expect(otherFinishedBeforeRelease).toBe(true);
++    expect(slowResponse.status).toBe(200);
++    expect(otherResponse.status).toBe(200);
++
++    expect(
++      (await otpState(slowPhone))?.resendCount
++    ).toBe(1);
++
++    expect(
++      (await otpState(otherPhone))?.resendCount
++    ).toBe(1);
++  });
++});
+diff --git a/rateeat_backend/src/__tests__/unit/waitlist_otp_test_support.ts b/rateeat_backend/src/__tests__/unit/waitlist_otp_test_support.ts
+new file mode 100644
+index 000000000..fd2fb2d49
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/waitlist_otp_test_support.ts
+@@ -0,0 +1,317 @@
++import express from "express";
++import request from "supertest";
++import { QueryTypes, Sequelize } from "sequelize";
++
++import Database from "../db_setup";
++import { errorHandler } from "../../middlewares/error-handler";
++import {
++  registerWaitlist,
++  sendWaitlistOtp,
++  verifyWaitlistOtp,
++} from "../../controllers/waitlist.controller";
++import { PhoneOtp, Waitlist, PendingVerification } from "../../models";
++
++export const app = express();
++app.use(express.json());
++app.post("/api/v1/waitlist/register", registerWaitlist);
++app.post("/api/v1/waitlist/send-otp", sendWaitlistOtp);
++app.post("/api/v1/waitlist/verify-otp", verifyWaitlistOtp);
++app.use(errorHandler);
++
++let phoneSequence = 100000000;
++
++export const uniquePhone = (): string => {
++  phoneSequence += 1;
++  return `+250${String(phoneSequence).padStart(9, "0").slice(-9)}`;
++};
++
++export const db = async (): Promise<Sequelize> => Database.getInstance();
++
++export const cleanWaitlistOtpTables = async (): Promise<void> => {
++  await PendingVerification.destroy({ where: {} });
++  await PhoneOtp.destroy({ where: {} });
++  await Waitlist.destroy({ where: {} });
++};
++
++export const createWaitlist = async (
++  phone: string,
++  method: "whatsapp" | "telegram" = "whatsapp"
++): Promise<Waitlist> =>
++  Waitlist.create({
++    user_type: "Eater",
++    phone,
++    name: "Gold Waitlist User",
++    email: `${phone.replace(/\D/g, "")}@example.com`,
++    location: "Kigali",
++    preferences: "quiet tables",
++    privacy_consent: true,
++    method,
++    verified: false,
++  } as any);
++
++export const sendOtp = (
++  phone?: string,
++  overrides: Record<string, unknown> = {}
++) =>
++  request(app)
++    .post("/api/v1/waitlist/send-otp")
++    .send({
++      ...(phone ? { phone } : {}),
++      ...overrides,
++    });
++
++export const verifyOtp = (phone?: string, otp?: string) =>
++  request(app)
++    .post("/api/v1/waitlist/verify-otp")
++    .send({
++      ...(phone ? { phone } : {}),
++      ...(otp ? { otp } : {}),
++    });
++
++export const registerAgain = (phone: string) =>
++  request(app)
++    .post("/api/v1/waitlist/register")
++    .send({
++      userType: "Eater",
++      phone,
++      name: "Gold Waitlist User",
++      method: "whatsapp",
++    });
++
++export interface PersistedOtpState {
++  phoneOtpCode: string;
++  attempts: number;
++  resendCount: number;
++  method: string | null;
++  expiresAt: Date | null;
++  lastSentAt: Date | null;
++}
++
++export const otpState = async (
++  phone: string
++): Promise<PersistedOtpState | null> => {
++  const sequelize = await db();
++  const rows = await sequelize.query<any>(
++    `SELECT
++       "phoneOtpCode",
++       attempts,
++       resend_count AS "resendCount",
++       method,
++       expires_at AS "expiresAt",
++       last_sent_at AS "lastSentAt"
++     FROM phone_otps
++     WHERE "phoneNumber" = :phone`,
++    {
++      replacements: { phone },
++      type: QueryTypes.SELECT,
++    }
++  );
++
++  if (!rows.length) return null;
++
++  const row = rows[0];
++  return {
++    phoneOtpCode: String(row.phoneOtpCode),
++    attempts: Number(row.attempts),
++    resendCount: Number(row.resendCount),
++    method: row.method ?? null,
++    expiresAt: row.expiresAt ? new Date(row.expiresAt) : null,
++    lastSentAt: row.lastSentAt ? new Date(row.lastSentAt) : null,
++  };
++};
++
++export const createOtp = async (
++  phone: string,
++  code = "123456",
++  options: {
++    attempts?: number;
++    resendCount?: number;
++    method?: string;
++    expiresAt?: Date;
++  } = {}
++): Promise<void> => {
++  const expiresAt =
++    options.expiresAt || new Date(Date.now() + 10 * 60 * 1000);
++
++  await PhoneOtp.create({
++    phoneNumber: phone,
++    phoneOtpCode: code,
++    expires_at: expiresAt,
++  } as any);
++
++  const sequelize = await db();
++  await sequelize.query(
++    `UPDATE phone_otps
++     SET attempts = :attempts,
++         resend_count = :resendCount,
++         method = :method,
++         last_sent_at = NOW()
++     WHERE "phoneNumber" = :phone`,
++    {
++      replacements: {
++        phone,
++        attempts: options.attempts ?? 0,
++        resendCount: options.resendCount ?? 0,
++        method: options.method || "whatsapp",
++      },
++    }
++  );
++};
++
++export const setOtpCounters = async (
++  phone: string,
++  attempts: number,
++  resendCount: number
++): Promise<void> => {
++  const sequelize = await db();
++  await sequelize.query(
++    `UPDATE phone_otps
++     SET attempts = :attempts,
++         resend_count = :resendCount
++     WHERE "phoneNumber" = :phone`,
++    { replacements: { phone, attempts, resendCount } }
++  );
++};
++
++const safeIdent = (value: string): string => {
++  if (!/^[a-zA-Z0-9_]+$/.test(value)) {
++    throw new Error(`Unsafe identifier: ${value}`);
++  }
++  return `"${value}"`;
++};
++
++let failureSequence = 0;
++
++export const rejectDatabaseWrite = async (
++  table: "phone_otps" | "waitlists",
++  operation: "INSERT" | "UPDATE" | "DELETE"
++): Promise<() => Promise<void>> => {
++  const sequelize = await db();
++  failureSequence += 1;
++  const suffix = `${Date.now()}_${failureSequence}`;
++  const fn = `gold_waitlist_fail_fn_${suffix}`;
++  const trigger = `gold_waitlist_fail_trg_${suffix}`;
++
++  await sequelize.query(`
++    CREATE FUNCTION ${safeIdent(fn)}()
++    RETURNS trigger AS $$
++    BEGIN
++      RAISE EXCEPTION 'forced waitlist otp write failure';
++    END;
++    $$ LANGUAGE plpgsql;
++  `);
++
++  await sequelize.query(`
++    CREATE TRIGGER ${safeIdent(trigger)}
++    BEFORE ${operation} ON ${safeIdent(table)}
++    FOR EACH ROW
++    EXECUTE FUNCTION ${safeIdent(fn)}();
++  `);
++
++  return async () => {
++    await sequelize.query(
++      `DROP TRIGGER IF EXISTS ${safeIdent(trigger)} ON ${safeIdent(table)}`
++    );
++    await sequelize.query(`DROP FUNCTION IF EXISTS ${safeIdent(fn)}()`);
++  };
++};
++
++let delaySequence = 0;
++
++export const delayDatabaseWrite = async (
++  table: "phone_otps" | "waitlists",
++  operation: "INSERT" | "UPDATE" | "DELETE",
++  milliseconds: number
++): Promise<() => Promise<void>> => {
++  if (
++    !Number.isInteger(milliseconds) ||
++    milliseconds < 1 ||
++    milliseconds > 5_000
++  ) {
++    throw new Error("Invalid database delay");
++  }
++
++  const sequelize = await db();
++  delaySequence += 1;
++
++  const suffix = `${Date.now()}_${delaySequence}`;
++  const fn = `gold_waitlist_delay_fn_${suffix}`;
++  const trigger = `gold_waitlist_delay_trg_${suffix}`;
++  const seconds = milliseconds / 1000;
++
++  await sequelize.query(`
++    CREATE FUNCTION ${safeIdent(fn)}()
++    RETURNS trigger AS $$
++    BEGIN
++      PERFORM pg_sleep(${seconds});
++
++      IF TG_OP = 'DELETE' THEN
++        RETURN OLD;
++      END IF;
++
++      RETURN NEW;
++    END;
++    $$ LANGUAGE plpgsql;
++  `);
++
++  await sequelize.query(`
++    CREATE TRIGGER ${safeIdent(trigger)}
++    BEFORE ${operation} ON ${safeIdent(table)}
++    FOR EACH ROW
++    EXECUTE FUNCTION ${safeIdent(fn)}();
++  `);
++
++  return async () => {
++    await sequelize.query(
++      `DROP TRIGGER IF EXISTS ${safeIdent(trigger)}
++       ON ${safeIdent(table)}`
++    );
++
++    await sequelize.query(
++      `DROP FUNCTION IF EXISTS ${safeIdent(fn)}()`
++    );
++  };
++};
++
++export const waitlistState = async (phone: string) => {
++  const row = await Waitlist.findOne({ where: { phone } });
++  if (!row) return null;
++  return {
++    verified: Boolean(row.verified),
++    verifiedAt: row.verified_at ? new Date(row.verified_at) : null,
++  };
++};
++
++export const expectUnverifiedWaitlist = async (phone: string) => {
++  const state = await waitlistState(phone);
++  expect(state).not.toBeNull();
++  expect(state?.verified).toBe(false);
++  expect(state?.verifiedAt).toBeNull();
++};
++
++export const expectVerifiedWaitlist = async (phone: string) => {
++  const state = await waitlistState(phone);
++  expect(state).not.toBeNull();
++  expect(state?.verified).toBe(true);
++  expect(state?.verifiedAt).not.toBeNull();
++};
++
++export const concurrent = async <T>(
++  actions: Array<() => Promise<T>>
++): Promise<T[]> => Promise.all(actions.map((action) => action()));
++
++export const gate = () => {
++  let release!: () => void;
++
++  const promise = new Promise<void>((resolve) => {
++    release = resolve;
++  });
++
++  return {
++    promise,
++    release,
++  };
++};
++
++export const pause = (ms: number): Promise<void> =>
++  new Promise((resolve) => setTimeout(resolve, ms));
+diff --git a/rateeat_backend/src/__tests__/unit/waitlist_otp_verify_behavior.test.ts b/rateeat_backend/src/__tests__/unit/waitlist_otp_verify_behavior.test.ts
+new file mode 100644
+index 000000000..3a87fe115
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/waitlist_otp_verify_behavior.test.ts
+@@ -0,0 +1,444 @@
++jest.mock("../../utils/whatsapp.utils", () => ({
++  sendWhatsAppOTP: jest.fn(),
++}));
++
++jest.mock("../../utils/telegram.utils", () => ({
++  sendTelegramMessage: jest.fn(),
++}));
++
++import { sendWhatsAppOTP } from "../../utils/whatsapp.utils";
++import {
++  cleanWaitlistOtpTables,
++  concurrent,
++  createOtp,
++  createWaitlist,
++  db,
++  delayDatabaseWrite,
++  gate,
++  expectUnverifiedWaitlist,
++  expectVerifiedWaitlist,
++  otpState,
++  pause,
++  rejectDatabaseWrite,
++  registerAgain,
++  sendOtp,
++  uniquePhone,
++  verifyOtp,
++} from "./waitlist_otp_test_support";
++
++const whatsapp = sendWhatsAppOTP as jest.MockedFunction<
++  typeof sendWhatsAppOTP
++>;
++
++describe("durable waitlist OTP verification behavior", () => {
++  beforeAll(async () => {
++    await db();
++  });
++
++  beforeEach(async () => {
++    await cleanWaitlistOtpTables();
++    whatsapp.mockReset();
++    whatsapp.mockResolvedValue(undefined);
++  });
++
++  it("keeps the existing missing-input response", async () => {
++    const response = await verifyOtp();
++    expect(response.status).toBe(400);
++    expect(response.body.message).toBe("Phone and otp are required");
++  });
++
++  it("keeps the existing unknown-phone response", async () => {
++    const response = await verifyOtp(uniquePhone(), "123456");
++    expect(response.status).toBe(404);
++    expect(response.body.message).toBe("Phone not found on waitlist");
++  });
++
++  it("keeps the existing missing-OTP response for a registered phone", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone);
++    const response = await verifyOtp(phone, "123456");
++    expect(response.status).toBe(401);
++    expect(response.body.message).toBe("OTP is not correct");
++  });
++
++  it("keeps the existing expired-OTP response", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone);
++    await createOtp(phone, "123456", {
++      expiresAt: new Date(Date.now() - 60_000),
++    });
++
++    const response = await verifyOtp(phone, "123456");
++    expect(response.status).toBe(401);
++    expect(response.body.message).toBe("OTP expired");
++    await expectUnverifiedWaitlist(phone);
++  });
++
++  it("persists a wrong-code attempt before returning the 401", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone);
++    await createOtp(phone, "123456");
++
++    const response = await verifyOtp(phone, "654321");
++    expect(response.status).toBe(401);
++    expect(response.body.message).toBe("OTP is not correct");
++    expect((await otpState(phone))?.attempts).toBe(1);
++    await expectUnverifiedWaitlist(phone);
++  });
++
++  it("accumulates three incorrect verification attempts in PostgreSQL", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone);
++    await createOtp(phone, "123456");
++
++    const first = await verifyOtp(phone, "000001");
++    const second = await verifyOtp(phone, "000002");
++    const third = await verifyOtp(phone, "000003");
++
++    expect([first.status, second.status, third.status]).toEqual([401, 401, 401]);
++    expect((await otpState(phone))?.attempts).toBe(3);
++  });
++
++  it("enforces the verification limit from a previously persisted attempt count", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone);
++    await createOtp(phone, "123456", { attempts: 3, resendCount: 1 });
++
++    const response = await verifyOtp(phone, "123456");
++    expect(response.status).toBe(429);
++    expect(response.body.message).toBe("Max verification attempts reached");
++    expect((await otpState(phone))?.attempts).toBe(3);
++    await expectUnverifiedWaitlist(phone);
++  });
++
++  it("resets persisted verification attempts when a new OTP is successfully sent", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone);
++    await createOtp(phone, "123456", { attempts: 2, resendCount: 1 });
++
++    const response = await sendOtp(phone);
++    expect(response.status).toBe(200);
++    expect((await otpState(phone))?.attempts).toBe(0);
++    expect((await otpState(phone))?.resendCount).toBe(2);
++    expect((await otpState(phone))?.phoneOtpCode).toBe(response.body.otp);
++  });
++
++  it("keeps the successful verification response and removes the used OTP", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone);
++    await createOtp(phone, "123456");
++
++    const response = await verifyOtp(phone, "123456");
++    expect(response.status).toBe(200);
++    expect(response.body).toEqual({ message: "Phone verified" });
++    await expectVerifiedWaitlist(phone);
++    expect(await otpState(phone)).toBeNull();
++  });
++
++  it("rolls back waitlist verification when deleting the consumed OTP fails", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone);
++    await createOtp(phone, "123456", { attempts: 2, resendCount: 2 });
++    const cleanup = await rejectDatabaseWrite("phone_otps", "DELETE");
++
++    try {
++      const response = await verifyOtp(phone, "123456");
++      expect(response.status).toBeGreaterThanOrEqual(500);
++    } finally {
++      await cleanup();
++    }
++
++    await expectUnverifiedWaitlist(phone);
++    expect((await otpState(phone))?.phoneOtpCode).toBe("123456");
++    expect((await otpState(phone))?.attempts).toBe(2);
++    expect((await otpState(phone))?.resendCount).toBe(2);
++  });
++
++  it("leaves the OTP usable when persisting the verified waitlist state fails", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone);
++    await createOtp(phone, "123456", { attempts: 1, resendCount: 2 });
++    const cleanup = await rejectDatabaseWrite("waitlists", "UPDATE");
++
++    try {
++      const response = await verifyOtp(phone, "123456");
++      expect(response.status).toBeGreaterThanOrEqual(500);
++    } finally {
++      await cleanup();
++    }
++
++    await expectUnverifiedWaitlist(phone);
++    expect((await otpState(phone))?.phoneOtpCode).toBe("123456");
++    expect((await otpState(phone))?.attempts).toBe(1);
++    expect((await otpState(phone))?.resendCount).toBe(2);
++  });
++
++  it("serializes simultaneous wrong codes so neither persisted attempt is lost", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone);
++    await createOtp(phone, "123456");
++
++    const responses = await concurrent([
++      () => verifyOtp(phone, "000001"),
++      () => verifyOtp(phone, "000002"),
++    ]);
++
++    expect(responses.map((response) => response.status)).toEqual([401, 401]);
++    expect((await otpState(phone))?.attempts).toBe(2);
++    await expectUnverifiedWaitlist(phone);
++  });
++
++  it("allows only one success when two correct verifications overlap", async () => {
++    const phone = uniquePhone();
++
++    await createWaitlist(phone);
++    await createOtp(phone, "123456");
++
++    // Keep the first OTP consumption open long enough for the
++    // unlocked base implementation to read the same OTP twice.
++    // The transactional solution locks the phone before the
++    // second request can observe that stale OTP state.
++    const cleanup = await delayDatabaseWrite(
++      "phone_otps",
++      "DELETE",
++      700
++    );
++
++    try {
++      const firstPromise = verifyOtp(
++        phone,
++        "123456"
++      ).then((response) => response);
++
++      // The first verification is now given time to reach its
++      // delayed DELETE while the OTP is still visible to an
++      // ordinary unlocked SELECT in the base implementation.
++      await pause(120);
++
++      const secondPromise = verifyOtp(
++        phone,
++        "123456"
++      ).then((response) => response);
++
++      const responses = await Promise.all([
++        firstPromise,
++        secondPromise,
++      ]);
++
++      expect(
++        responses
++          .map((response) => response.status)
++          .sort()
++      ).toEqual([200, 401]);
++
++      await expectVerifiedWaitlist(phone);
++      expect(await otpState(phone)).toBeNull();
++    } finally {
++      await cleanup();
++    }
++  });
++
++  it("does not increment verification attempts for an expired code", async () => {
++    const phone = uniquePhone();
++    await createWaitlist(phone);
++    await createOtp(phone, "123456", {
++      attempts: 2,
++      resendCount: 1,
++      expiresAt: new Date(Date.now() - 1_000),
++    });
++
++    const response = await verifyOtp(phone, "000000");
++    expect(response.status).toBe(401);
++    expect(response.body.message).toBe("OTP expired");
++    expect((await otpState(phone))?.attempts).toBe(2);
++  });
++
++  it("rejects the old code when verification overlaps a successful replacement", async () => {
++    const phone = uniquePhone();
++
++    await createWaitlist(phone);
++
++    await createOtp(phone, "848484", {
++      attempts: 0,
++      resendCount: 1,
++    });
++
++    const deliveryEntered = gate();
++    const releaseDelivery = gate();
++
++    whatsapp.mockImplementationOnce(async () => {
++      deliveryEntered.release();
++      await releaseDelivery.promise;
++    });
++
++    const sendPromise = sendOtp(phone).then(
++      (response) => response
++    );
++
++    await deliveryEntered.promise;
++
++    const verifyPromise = verifyOtp(
++      phone,
++      "848484"
++    ).then((response) => response);
++
++    await pause(30);
++
++    releaseDelivery.release();
++
++    const [sendResponse, verifyResponse] =
++      await Promise.all([
++        sendPromise,
++        verifyPromise,
++      ]);
++
++    expect(sendResponse.status).toBe(200);
++
++    expect(verifyResponse.status).toBe(401);
++    expect(verifyResponse.body.message).toBe(
++      "OTP is not correct"
++    );
++
++    const state = await otpState(phone);
++
++    expect(state?.phoneOtpCode).toBe(
++      sendResponse.body.otp
++    );
++
++    expect(state?.phoneOtpCode).not.toBe(
++      "848484"
++    );
++
++    expect(state?.resendCount).toBe(2);
++    expect(state?.attempts).toBe(1);
++
++    await expectUnverifiedWaitlist(phone);
++  });
++
++  it("keeps the old code valid when an overlapping replacement delivery rolls back", async () => {
++    const phone = uniquePhone();
++
++    await createWaitlist(phone);
++
++    await createOtp(phone, "858585", {
++      attempts: 1,
++      resendCount: 1,
++    });
++
++    const deliveryEntered = gate();
++    const releaseDelivery = gate();
++
++    whatsapp.mockImplementationOnce(async () => {
++      deliveryEntered.release();
++      await releaseDelivery.promise;
++      throw new Error("provider unavailable");
++    });
++
++    const sendPromise = sendOtp(phone).then(
++      (response) => response
++    );
++
++    await deliveryEntered.promise;
++
++    const verifyPromise = verifyOtp(
++      phone,
++      "858585"
++    ).then((response) => response);
++
++    await pause(30);
++
++    releaseDelivery.release();
++
++    const [sendResponse, verifyResponse] =
++      await Promise.all([
++        sendPromise,
++        verifyPromise,
++      ]);
++
++    expect(sendResponse.status).toBe(500);
++
++    expect(sendResponse.body.message).toBe(
++      "Error sending verification"
++    );
++
++    expect(verifyResponse.status).toBe(200);
++
++    expect(verifyResponse.body).toEqual({
++      message: "Phone verified",
++    });
++
++    await expectVerifiedWaitlist(phone);
++
++    expect(await otpState(phone)).toBeNull();
++  });
++
++  it("keeps registration on one committed state when it overlaps successful verification", async () => {
++    const phone = uniquePhone();
++
++    await createWaitlist(phone);
++
++    await createOtp(phone, "919191", {
++      attempts: 2,
++      resendCount: 2,
++    });
++
++    // Keep successful verification open after it has reached OTP
++    // consumption, giving registration a deterministic overlap window.
++    const cleanup = await delayDatabaseWrite(
++      "phone_otps",
++      "DELETE",
++      700
++    );
++
++    try {
++      const verifyPromise = verifyOtp(
++        phone,
++        "919191"
++      ).then((response) => response);
++
++      // Give verification time to lock the phone, mark the
++      // waitlist verified, and enter the delayed OTP DELETE.
++      await pause(120);
++
++      const registrationPromise = registerAgain(
++        phone
++      ).then((response) => response);
++
++      const [
++        verifyResponse,
++        registrationResponse,
++      ] = await Promise.all([
++        verifyPromise,
++        registrationPromise,
++      ]);
++
++      expect(verifyResponse.status).toBe(200);
++      expect(verifyResponse.body).toEqual({
++        message: "Phone verified",
++      });
++
++      await expectVerifiedWaitlist(phone);
++      expect(await otpState(phone)).toBeNull();
++
++      // Registration must not combine the pre-verification
++      // OTP/expiry with post-verification counters.
++      expect(registrationResponse.body.message).not.toBe(
++        "You have an active pending WhatsApp registration. OTP already sent."
++      );
++
++      expect(
++        registrationResponse.body
++      ).not.toHaveProperty("resendAttempts");
++
++      expect(
++        registrationResponse.body
++      ).not.toHaveProperty("verificationAttempts");
++
++      expect(
++        registrationResponse.body
++      ).not.toHaveProperty("expiresAt");
++    } finally {
++      await cleanup();
++    }
++  });
++});

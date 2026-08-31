@@ -1,0 +1,1524 @@
+diff --git a/rateeat_backend/src/__tests__/db_setup.ts b/rateeat_backend/src/__tests__/db_setup.ts
+index e60a6e1f2..e9a7a46ae 100644
+--- a/rateeat_backend/src/__tests__/db_setup.ts
++++ b/rateeat_backend/src/__tests__/db_setup.ts
+@@ -4,6 +4,7 @@ import dotenv from "dotenv";
+ import path from "path";
+ import configs from "../config/config";
+ 
++import Neighborhood from "../models/Restaurant/Neighborhood";
+ import {
+   User,
+   AdminUser,
+@@ -105,6 +106,7 @@ class Database {
+         ...configFile,
+         models: [
+           User,
++          Neighborhood,
+           AdminUser,
+           Restaurant,
+           RestaurantPhoneNumber,
+diff --git a/rateeat_backend/src/__tests__/unit/review_vote_item_consistency_behavior.test.ts b/rateeat_backend/src/__tests__/unit/review_vote_item_consistency_behavior.test.ts
+new file mode 100644
+index 000000000..4b11eb1c2
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/review_vote_item_consistency_behavior.test.ts
+@@ -0,0 +1,555 @@
++import { randomUUID } from "crypto";
++import { Interaction } from "../../models";
++import {
++  concurrentVotes,
++  concurrentVotesForUsers,
++  createFixture,
++  expectDurableVoteConsistency,
++  interactionCount,
++  mention,
++  mentionCount,
++  postVote,
++  rejectWrite,
++  reviewId,
++  seedMention,
++  seedVote,
++  setTotals,
++  state,
++  expectVoteResponseContract,
++} from "./review_vote_test_support";
++
++describe("consistent review vote transitions item reviews", () => {
++  it("repairs stale totals when a new upvote is created", async () => {
++    const f = await createFixture();
++    const id = reviewId(f, "item");
++    await setTotals("item", id, 7, 4);
++    await postVote("item", "up", id, f.voter.id);
++    expect(await state("item", id)).toMatchObject({ up: 1, down: 0 });
++    await expectDurableVoteConsistency("item", id, f.voter.id, "up");
++    expect(await mentionCount("item", id, f.owner.id, f.voter.id)).toBe(1);
++  });
++
++  it("repairs stale totals when an upvote is toggled off", async () => {
++    const f = await createFixture(); const id = reviewId(f, "item");
++    await seedVote("item", id, f.voter.id, "up"); await setTotals("item", id, 9, 3);
++    await postVote("item", "up", id, f.voter.id);
++    expect(await state("item", id)).toEqual({ up: 0, down: 0, votes: [] });
++    await expectDurableVoteConsistency("item", id, f.voter.id, null);
++  });
++
++  it("repairs both totals when a downvote becomes an upvote", async () => {
++    const f = await createFixture(); const id = reviewId(f, "item");
++    await seedVote("item", id, f.voter.id, "down"); await setTotals("item", id, 5, 8);
++    await postVote("item", "up", id, f.voter.id);
++    expect(await state("item", id)).toMatchObject({ up: 1, down: 0 });
++    await expectDurableVoteConsistency("item", id, f.voter.id, "up");
++    expect(await mentionCount("item", id, f.owner.id, f.voter.id)).toBe(1);
++  });
++
++  it("updates the stored vote value when down becomes up", async () => {
++    const f = await createFixture(); const id = reviewId(f, "item");
++    await seedVote("item", id, f.voter.id, "down"); await setTotals("item", id, 0, 1);
++    await postVote("item", "up", id, f.voter.id);
++    expect((await state("item", id)).votes).toEqual([{ flag: true, value: 1 }]);
++    await expectDurableVoteConsistency("item", id, f.voter.id, "up");
++  });
++
++  it("refreshes an existing mention when the vote direction changes", async () => {
++    const f = await createFixture();
++    const id = reviewId(f, "item");
++
++    await seedVote("item", id, f.voter.id, "down");
++    await setTotals("item", id, 0, 1);
++    await seedMention(
++      "item",
++      id,
++      f.owner.id,
++      f.voter.id,
++      "down"
++    );
++
++    const before = await mention(
++      "item",
++      id,
++      f.owner.id,
++      f.voter.id
++    );
++
++    expect(before).not.toBeNull();
++
++    await before!.update({
++      read_status: true,
++    });
++
++    await postVote(
++      "item",
++      "up",
++      id,
++      f.voter.id
++    );
++
++    const refreshed = await mention(
++      "item",
++      id,
++      f.owner.id,
++      f.voter.id
++    );
++
++    expect(refreshed?.message).toContain("upvote");
++    expect(refreshed?.read_status).toBe(false);
++
++    expect(
++      await mentionCount(
++        "item",
++        id,
++        f.owner.id,
++        f.voter.id
++      )
++    ).toBe(1);
++
++    await expectDurableVoteConsistency(
++      "item",
++      id,
++      f.voter.id,
++      "up"
++    );
++  });
++
++  it("rolls back counters when vote creation fails", async () => {
++    const f = await createFixture(); const id = reviewId(f, "item");
++    const cleanup = await rejectWrite(f.db, "item_votes", "INSERT");
++    try { expect((await postVote("item", "up", id, f.voter.id)).status).toBeGreaterThanOrEqual(400); }
++    finally { await cleanup(); }
++    expect(await state("item", id)).toEqual({ up: 0, down: 0, votes: [] });
++  });
++
++  it("rolls back a direction change when vote update fails", async () => {
++    const f = await createFixture(); const id = reviewId(f, "item");
++    await seedVote("item", id, f.voter.id, "down"); await setTotals("item", id, 0, 1);
++    const cleanup = await rejectWrite(f.db, "item_votes", "UPDATE");
++    try {
++      const response = await postVote("item", "up", id, f.voter.id);
++      expect(response.status).toBeGreaterThanOrEqual(400);
++    } finally { await cleanup(); }
++    expect(await state("item", id)).toEqual({ up: 0, down: 1, votes: [{ flag: false, value: -1 }] });
++    await expectDurableVoteConsistency("item", id, f.voter.id, "down");
++  });
++
++  it("rolls back a toggle when vote deletion fails", async () => {
++    const f = await createFixture(); const id = reviewId(f, "item");
++    await seedVote("item", id, f.voter.id, "up"); await setTotals("item", id, 1, 0);
++    const cleanup = await rejectWrite(f.db, "item_votes", "DELETE");
++    try {
++      const response = await postVote("item", "up", id, f.voter.id);
++      expect(response.status).toBeGreaterThanOrEqual(400);
++    } finally { await cleanup(); }
++    expect(await state("item", id)).toEqual({ up: 1, down: 0, votes: [{ flag: true, value: 1 }] });
++    await expectDurableVoteConsistency("item", id, f.voter.id, "up");
++  });
++
++  it("rolls back vote and totals when notification creation fails", async () => {
++    const f = await createFixture(); const id = reviewId(f, "item");
++    const cleanup = await rejectWrite(f.db, "notifications", "INSERT");
++    try {
++      const response = await postVote("item", "down", id, f.voter.id);
++      expect(response.status).toBeGreaterThanOrEqual(400);
++    } finally { await cleanup(); }
++    expect(await state("item", id)).toEqual({ up: 0, down: 0, votes: [] });
++  });
++
++  it("rolls back the upvote when interaction persistence fails last", async () => {
++    const f = await createFixture(); const id = reviewId(f, "item");
++    const cleanup = await rejectWrite(f.db, "interactions", "INSERT");
++    try {
++      const response = await postVote("item", "up", id, f.voter.id);
++      expect(response.status).toBeGreaterThanOrEqual(400);
++    } finally { await cleanup(); }
++    expect(await state("item", id)).toEqual({ up: 0, down: 0, votes: [] });
++    expect(await Interaction.count({ where: { userId: f.voter.id } })).toBe(0);
++    expect(await interactionCount(f.voter.id)).toBe(0);
++    await expectDurableVoteConsistency("item", id, f.voter.id, null);
++  });
++
++  it("leaves an item-review vote unchanged when counter persistence fails", async () => {
++    const f = await createFixture();
++    const id = reviewId(f, "item");
++
++    const cleanup = await rejectWrite(
++      f.db,
++      "item_reviews",
++      "UPDATE"
++    );
++
++    try {
++      const response = await postVote(
++        "item",
++        "up",
++        id,
++        f.voter.id
++      );
++
++      expect(
++        response.status
++      ).toBeGreaterThanOrEqual(400);
++    } finally {
++      await cleanup();
++    }
++
++    expect(
++      await state("item", id)
++    ).toEqual({
++      up: 0,
++      down: 0,
++      votes: [],
++    });
++
++    expect(
++      await mentionCount(
++        "item",
++        id,
++        f.owner.id,
++        f.voter.id
++      )
++    ).toBe(0);
++
++    await expectDurableVoteConsistency(
++      "item",
++      id,
++      f.voter.id,
++      null
++    );
++  });
++
++  it("rolls back an item-review switch when mention refresh fails", async () => {
++    const f = await createFixture();
++    const id = reviewId(f, "item");
++
++    await seedVote(
++      "item",
++      id,
++      f.voter.id,
++      "down"
++    );
++
++    await setTotals(
++      "item",
++      id,
++      0,
++      1
++    );
++
++    await seedMention(
++      "item",
++      id,
++      f.owner.id,
++      f.voter.id,
++      "down"
++    );
++
++    const existing = await mention(
++      "item",
++      id,
++      f.owner.id,
++      f.voter.id
++    );
++
++    expect(existing).not.toBeNull();
++
++    await existing!.update({
++      read_status: true,
++    });
++
++    const cleanup = await rejectWrite(
++      f.db,
++      "notifications",
++      "UPDATE"
++    );
++
++    try {
++      const response = await postVote(
++        "item",
++        "up",
++        id,
++        f.voter.id
++      );
++
++      expect(
++        response.status
++      ).toBeGreaterThanOrEqual(400);
++    } finally {
++      await cleanup();
++    }
++
++    expect(
++      await state("item", id)
++    ).toEqual({
++      up: 0,
++      down: 1,
++      votes: [
++        {
++          flag: false,
++          value: -1,
++        },
++      ],
++    });
++
++    const after = await mention(
++      "item",
++      id,
++      f.owner.id,
++      f.voter.id
++    );
++
++    expect(after?.message).toContain("downvote");
++    expect(after?.read_status).toBe(true);
++
++    expect(
++      await mentionCount(
++        "item",
++        id,
++        f.owner.id,
++        f.voter.id
++      )
++    ).toBe(1);
++
++    await expectDurableVoteConsistency(
++      "item",
++      id,
++      f.voter.id,
++      "down"
++    );
++  });
++
++  it("serializes two simultaneous identical upvotes", async () => {
++    const f = await createFixture(); const id = reviewId(f, "item");
++    const responses = await concurrentVotes(f, "item", ["up", "up"]);
++    expect(responses.map((r) => r.body.message).sort()).toEqual(["Vote created", "Vote deleted"].sort());
++    expect(await state("item", id)).toEqual({ up: 0, down: 0, votes: [] });
++    expect(responses.every((r) => r.status === 201)).toBe(true);
++    await expectDurableVoteConsistency("item", id, f.voter.id, null);
++  });
++
++  it("serializes simultaneous opposite votes into one current vote", async () => {
++    const f = await createFixture(); const id = reviewId(f, "item");
++    await concurrentVotes(f, "item", ["up", "down"]);
++    const result = await state("item", id);
++    expect(result.votes).toHaveLength(1);
++    expect(result.up + result.down).toBe(1);
++    expect(result.votes[0].flag ? result.up : result.down).toBe(1);
++    await expectDurableVoteConsistency(
++      "item",
++      id,
++      f.voter.id,
++      result.votes[0].flag ? "up" : "down"
++    );
++  });
++
++  it("preserves simultaneous item-review votes from different users", async () => {
++    const f = await createFixture();
++    const id = reviewId(f, "item");
++
++    const responses = await concurrentVotesForUsers(
++      f,
++      "item",
++      [
++        {
++          direction: "up",
++          userId: f.voter.id,
++        },
++        {
++          direction: "up",
++          userId: f.owner.id,
++        },
++      ]
++    );
++
++    expect(
++      responses.every((response) => response.status === 201)
++    ).toBe(true);
++
++    expect(
++      responses.map((response) => response.body.message)
++    ).toEqual([
++      "Vote created",
++      "Vote created",
++    ]);
++
++    const result = await state("item", id);
++
++    expect(result.votes).toHaveLength(2);
++    expect(result.up).toBe(2);
++    expect(result.down).toBe(0);
++  });
++
++  it("preserves the complete item-review success response payload", async () => {
++    const f = await createFixture();
++    const id = reviewId(f, "item");
++
++    const createdUp = await postVote(
++      "item",
++      "up",
++      id,
++      f.voter.id
++    );
++
++    await expectVoteResponseContract(
++      "item",
++      id,
++      createdUp,
++      "Vote created",
++      1
++    );
++
++    const deletedUp = await postVote(
++      "item",
++      "up",
++      id,
++      f.voter.id
++    );
++
++    await expectVoteResponseContract(
++      "item",
++      id,
++      deletedUp,
++      "Vote deleted",
++      0
++    );
++
++    const createdDown = await postVote(
++      "item",
++      "down",
++      id,
++      f.voter.id
++    );
++
++    await expectVoteResponseContract(
++      "item",
++      id,
++      createdDown,
++      "Vote created",
++      -1
++    );
++
++    const switchedUp = await postVote(
++      "item",
++      "up",
++      id,
++      f.voter.id
++    );
++
++    await expectVoteResponseContract(
++      "item",
++      id,
++      switchedUp,
++      "Vote updated",
++      1
++    );
++  });
++
++  it("preserves item-review missing review and user errors", async () => {
++    const f = await createFixture();
++    const id = reviewId(f, "item");
++
++    const missingReview = await postVote(
++      "item",
++      "up",
++      "ffffffff-ffff-4fff-8fff-ffffffffffff",
++      f.voter.id
++    );
++
++    expect(missingReview.status).toBe(400);
++    expect(missingReview.body.message).toBe(
++      "Bad request"
++    );
++
++    const missingUser = await postVote(
++      "item",
++      "up",
++      id,
++      "ffffffff-ffff-4fff-8fff-ffffffffffff"
++    );
++
++    expect(missingUser.status).toBe(400);
++    expect(missingUser.body.message).toBe(
++      "Bad request"
++    );
++  });
++
++  it("keeps the first item upvote response contract", async () => {
++    const f = await createFixture(); const id = reviewId(f, "item");
++    const response = await postVote("item", "up", id, f.voter.id);
++    expect(response.status).toBe(201);
++    expect(response.body.message).toBe("Vote created");
++    expect(response.body.data.voted).toBe(1);
++  });
++
++  it("keeps the first item downvote response contract", async () => {
++    const f = await createFixture(); const id = reviewId(f, "item");
++    const response = await postVote("item", "down", id, f.voter.id);
++    expect(response.status).toBe(201);
++    expect(response.body.message).toBe("Vote created");
++    expect(response.body.data.voted).toBe(-1);
++  });
++
++  it("keeps the existing item upvote toggle behavior", async () => {
++    const f = await createFixture(); const id = reviewId(f, "item");
++    await postVote("item", "up", id, f.voter.id);
++    const response = await postVote("item", "up", id, f.voter.id);
++    expect(response.status).toBe(201);
++    expect(response.body).toMatchObject({ message: "Vote deleted", data: { voted: 0 } });
++  });
++
++  it("keeps the existing item downvote toggle behavior", async () => {
++    const f = await createFixture(); const id = reviewId(f, "item");
++    await postVote("item", "down", id, f.voter.id);
++    const response = await postVote("item", "down", id, f.voter.id);
++    expect(response.status).toBe(201);
++    expect(response.body).toMatchObject({ message: "Vote deleted", data: { voted: 0 } });
++  });
++
++  it("keeps the item-review missing-review error", async () => {
++    const f = await createFixture();
++    const response = await postVote("item", "up", randomUUID(), f.voter.id);
++    expect(response.status).toBe(400);
++    expect(await state("item", f.itemReview.id)).toEqual({ up: 0, down: 0, votes: [] });
++  });
++
++  it("keeps the item-review missing-user error", async () => {
++    const f = await createFixture(); const id = reviewId(f, "item");
++    const response = await postVote("item", "up", id, randomUUID());
++    expect(response.status).toBe(400);
++    expect(await state("item", id)).toEqual({ up: 0, down: 0, votes: [] });
++  });
++
++  it("still skips item-review mentions for a self vote", async () => {
++    const f = await createFixture(); const id = reviewId(f, "item");
++    const response = await postVote("item", "down", id, f.owner.id);
++    expect(response.status).toBe(201);
++    expect(await mention("item", id, f.owner.id, f.owner.id)).toBeNull();
++  });
++
++
++  it("keeps the item-review up-to-down switch response", async () => {
++    const f = await createFixture(); const id = reviewId(f, "item");
++    await postVote("item", "up", id, f.voter.id);
++    const response = await postVote("item", "down", id, f.voter.id);
++    expect(response.status).toBe(201);
++    expect(response.body).toMatchObject({ message: "Vote updated", data: { voted: -1 } });
++  });
++
++  it("keeps the item-review down-to-up switch response", async () => {
++    const f = await createFixture(); const id = reviewId(f, "item");
++    await postVote("item", "down", id, f.voter.id);
++    const response = await postVote("item", "up", id, f.voter.id);
++    expect(response.status).toBe(201);
++    expect(response.body).toMatchObject({ message: "Vote updated", data: { voted: 1 } });
++  });
++
++  it("still creates one mention for a first item-review downvote", async () => {
++    const f = await createFixture(); const id = reviewId(f, "item");
++    const response = await postVote("item", "down", id, f.voter.id);
++    expect(response.status).toBe(201);
++    expect(await mention("item", id, f.owner.id, f.voter.id)).not.toBeNull();
++  });
++
++});
+diff --git a/rateeat_backend/src/__tests__/unit/review_vote_restaurant_consistency_behavior.test.ts b/rateeat_backend/src/__tests__/unit/review_vote_restaurant_consistency_behavior.test.ts
+new file mode 100644
+index 000000000..50bdf0b75
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/review_vote_restaurant_consistency_behavior.test.ts
+@@ -0,0 +1,552 @@
++import { randomUUID } from "crypto";
++import {
++  concurrentVotes,
++  concurrentVotesForUsers,
++  createFixture,
++  expectDurableVoteConsistency,
++  mention,
++  mentionCount,
++  postVote,
++  rejectWrite,
++  reviewId,
++  seedMention,
++  seedVote,
++  setTotals,
++  state,
++  expectVoteResponseContract,
++} from "./review_vote_test_support";
++
++describe("consistent review vote transitions restaurant reviews", () => {
++  it("repairs stale totals when a new downvote is created", async () => {
++    const f = await createFixture(); const id = reviewId(f, "restaurant");
++    await setTotals("restaurant", id, 6, 5); await postVote("restaurant", "down", id, f.voter.id);
++    expect(await state("restaurant", id)).toMatchObject({ up: 0, down: 1 });
++    await expectDurableVoteConsistency("restaurant", id, f.voter.id, "down");
++    expect(await mentionCount("restaurant", id, f.owner.id, f.voter.id)).toBe(1);
++  });
++
++  it("repairs stale totals when a downvote is toggled off", async () => {
++    const f = await createFixture(); const id = reviewId(f, "restaurant");
++    await seedVote("restaurant", id, f.voter.id, "down"); await setTotals("restaurant", id, 3, 9);
++    await postVote("restaurant", "down", id, f.voter.id);
++    expect(await state("restaurant", id)).toEqual({ up: 0, down: 0, votes: [] });
++    await expectDurableVoteConsistency("restaurant", id, f.voter.id, null);
++  });
++
++  it("repairs both totals when an upvote becomes a downvote", async () => {
++    const f = await createFixture(); const id = reviewId(f, "restaurant");
++    await seedVote("restaurant", id, f.voter.id, "up"); await setTotals("restaurant", id, 8, 4);
++    await postVote("restaurant", "down", id, f.voter.id);
++    expect(await state("restaurant", id)).toMatchObject({ up: 0, down: 1 });
++    await expectDurableVoteConsistency("restaurant", id, f.voter.id, "down");
++    expect(await mentionCount("restaurant", id, f.owner.id, f.voter.id)).toBe(1);
++  });
++
++  it("updates the stored vote value when up becomes down", async () => {
++    const f = await createFixture(); const id = reviewId(f, "restaurant");
++    await seedVote("restaurant", id, f.voter.id, "up"); await setTotals("restaurant", id, 1, 0);
++    await postVote("restaurant", "down", id, f.voter.id);
++    expect((await state("restaurant", id)).votes).toEqual([{ flag: false, value: -1 }]);
++    await expectDurableVoteConsistency("restaurant", id, f.voter.id, "down");
++  });
++
++  it("refreshes an existing mention when the vote direction changes", async () => {
++    const f = await createFixture();
++    const id = reviewId(f, "restaurant");
++
++    await seedVote(
++      "restaurant",
++      id,
++      f.voter.id,
++      "up"
++    );
++
++    await setTotals(
++      "restaurant",
++      id,
++      1,
++      0
++    );
++
++    await seedMention(
++      "restaurant",
++      id,
++      f.owner.id,
++      f.voter.id,
++      "up"
++    );
++
++    const before = await mention(
++      "restaurant",
++      id,
++      f.owner.id,
++      f.voter.id
++    );
++
++    expect(before).not.toBeNull();
++
++    await before!.update({
++      read_status: true,
++    });
++
++    await postVote(
++      "restaurant",
++      "down",
++      id,
++      f.voter.id
++    );
++
++    const refreshed = await mention(
++      "restaurant",
++      id,
++      f.owner.id,
++      f.voter.id
++    );
++
++    expect(refreshed?.message).toContain("downvote");
++    expect(refreshed?.read_status).toBe(false);
++
++    expect(
++      await mentionCount(
++        "restaurant",
++        id,
++        f.owner.id,
++        f.voter.id
++      )
++    ).toBe(1);
++
++    await expectDurableVoteConsistency(
++      "restaurant",
++      id,
++      f.voter.id,
++      "down"
++    );
++  });
++
++  it("rolls back counters when vote creation fails", async () => {
++    const f = await createFixture(); const id = reviewId(f, "restaurant");
++    const cleanup = await rejectWrite(f.db, "restaurant_votes", "INSERT");
++    try {
++      const response = await postVote("restaurant", "down", id, f.voter.id);
++      expect(response.status).toBeGreaterThanOrEqual(400);
++    } finally { await cleanup(); }
++    expect(await state("restaurant", id)).toEqual({ up: 0, down: 0, votes: [] });
++  });
++
++  it("rolls back a direction change when vote update fails", async () => {
++    const f = await createFixture(); const id = reviewId(f, "restaurant");
++    await seedVote("restaurant", id, f.voter.id, "up"); await setTotals("restaurant", id, 1, 0);
++    const cleanup = await rejectWrite(f.db, "restaurant_votes", "UPDATE");
++    try {
++      const response = await postVote("restaurant", "down", id, f.voter.id);
++      expect(response.status).toBeGreaterThanOrEqual(400);
++    } finally { await cleanup(); }
++    expect(await state("restaurant", id)).toEqual({ up: 1, down: 0, votes: [{ flag: true, value: 1 }] });
++    await expectDurableVoteConsistency("restaurant", id, f.voter.id, "up");
++  });
++
++  it("rolls back a toggle when vote deletion fails", async () => {
++    const f = await createFixture(); const id = reviewId(f, "restaurant");
++    await seedVote("restaurant", id, f.voter.id, "down"); await setTotals("restaurant", id, 0, 1);
++    const cleanup = await rejectWrite(f.db, "restaurant_votes", "DELETE");
++    try {
++      const response = await postVote("restaurant", "down", id, f.voter.id);
++      expect(response.status).toBeGreaterThanOrEqual(400);
++    } finally { await cleanup(); }
++    expect(await state("restaurant", id)).toEqual({ up: 0, down: 1, votes: [{ flag: false, value: -1 }] });
++    await expectDurableVoteConsistency("restaurant", id, f.voter.id, "down");
++  });
++
++  it("rolls back vote and totals when notification creation fails", async () => {
++    const f = await createFixture(); const id = reviewId(f, "restaurant");
++    const cleanup = await rejectWrite(f.db, "notifications", "INSERT");
++    try {
++      const response = await postVote("restaurant", "down", id, f.voter.id);
++      expect(response.status).toBeGreaterThanOrEqual(400);
++    } finally { await cleanup(); }
++    expect(await state("restaurant", id)).toEqual({ up: 0, down: 0, votes: [] });
++  });
++
++  it("leaves a restaurant-review vote unchanged when counter persistence fails", async () => {
++    const f = await createFixture();
++    const id = reviewId(f, "restaurant");
++
++    const cleanup = await rejectWrite(
++      f.db,
++      "restaurant_reviews",
++      "UPDATE"
++    );
++
++    try {
++      const response = await postVote(
++        "restaurant",
++        "down",
++        id,
++        f.voter.id
++      );
++
++      expect(
++        response.status
++      ).toBeGreaterThanOrEqual(400);
++    } finally {
++      await cleanup();
++    }
++
++    expect(
++      await state("restaurant", id)
++    ).toEqual({
++      up: 0,
++      down: 0,
++      votes: [],
++    });
++
++    expect(
++      await mentionCount(
++        "restaurant",
++        id,
++        f.owner.id,
++        f.voter.id
++      )
++    ).toBe(0);
++
++    await expectDurableVoteConsistency(
++      "restaurant",
++      id,
++      f.voter.id,
++      null
++    );
++  });
++
++  it("rolls back a restaurant-review switch when mention refresh fails", async () => {
++    const f = await createFixture();
++    const id = reviewId(f, "restaurant");
++
++    await seedVote(
++      "restaurant",
++      id,
++      f.voter.id,
++      "up"
++    );
++
++    await setTotals(
++      "restaurant",
++      id,
++      1,
++      0
++    );
++
++    await seedMention(
++      "restaurant",
++      id,
++      f.owner.id,
++      f.voter.id,
++      "up"
++    );
++
++    const existing = await mention(
++      "restaurant",
++      id,
++      f.owner.id,
++      f.voter.id
++    );
++
++    expect(existing).not.toBeNull();
++
++    await existing!.update({
++      read_status: true,
++    });
++
++    const cleanup = await rejectWrite(
++      f.db,
++      "notifications",
++      "UPDATE"
++    );
++
++    try {
++      const response = await postVote(
++        "restaurant",
++        "down",
++        id,
++        f.voter.id
++      );
++
++      expect(
++        response.status
++      ).toBeGreaterThanOrEqual(400);
++    } finally {
++      await cleanup();
++    }
++
++    expect(
++      await state("restaurant", id)
++    ).toEqual({
++      up: 1,
++      down: 0,
++      votes: [
++        {
++          flag: true,
++          value: 1,
++        },
++      ],
++    });
++
++    const after = await mention(
++      "restaurant",
++      id,
++      f.owner.id,
++      f.voter.id
++    );
++
++    expect(after?.message).toContain("upvote");
++    expect(after?.read_status).toBe(true);
++
++    expect(
++      await mentionCount(
++        "restaurant",
++        id,
++        f.owner.id,
++        f.voter.id
++      )
++    ).toBe(1);
++
++    await expectDurableVoteConsistency(
++      "restaurant",
++      id,
++      f.voter.id,
++      "up"
++    );
++  });
++
++  it("serializes two simultaneous identical downvotes", async () => {
++    const f = await createFixture(); const id = reviewId(f, "restaurant");
++    const responses = await concurrentVotes(f, "restaurant", ["down", "down"]);
++    expect(responses.map((r) => r.body.message).sort()).toEqual(["Vote created", "Vote deleted"].sort());
++    expect(await state("restaurant", id)).toEqual({ up: 0, down: 0, votes: [] });
++    expect(responses.every((r) => r.status === 201)).toBe(true);
++    await expectDurableVoteConsistency("restaurant", id, f.voter.id, null);
++  });
++
++  it("serializes simultaneous opposite votes into one current vote", async () => {
++    const f = await createFixture(); const id = reviewId(f, "restaurant");
++    await concurrentVotes(f, "restaurant", ["up", "down"]);
++    const result = await state("restaurant", id);
++    expect(result.votes).toHaveLength(1);
++    expect(result.up + result.down).toBe(1);
++    expect(result.votes[0].flag ? result.up : result.down).toBe(1);
++    await expectDurableVoteConsistency(
++      "restaurant",
++      id,
++      f.voter.id,
++      result.votes[0].flag ? "up" : "down"
++    );
++  });
++
++  it("preserves simultaneous restaurant-review votes from different users", async () => {
++    const f = await createFixture();
++    const id = reviewId(f, "restaurant");
++
++    const responses = await concurrentVotesForUsers(
++      f,
++      "restaurant",
++      [
++        {
++          direction: "down",
++          userId: f.voter.id,
++        },
++        {
++          direction: "down",
++          userId: f.owner.id,
++        },
++      ]
++    );
++
++    expect(
++      responses.every((response) => response.status === 201)
++    ).toBe(true);
++
++    expect(
++      responses.map((response) => response.body.message)
++    ).toEqual([
++      "Vote created",
++      "Vote created",
++    ]);
++
++    const result = await state("restaurant", id);
++
++    expect(result.votes).toHaveLength(2);
++    expect(result.up).toBe(0);
++    expect(result.down).toBe(2);
++  });
++
++  it("preserves the complete restaurant-review success response payload", async () => {
++    const f = await createFixture();
++    const id = reviewId(f, "restaurant");
++
++    const createdDown = await postVote(
++      "restaurant",
++      "down",
++      id,
++      f.voter.id
++    );
++
++    await expectVoteResponseContract(
++      "restaurant",
++      id,
++      createdDown,
++      "Vote created",
++      -1
++    );
++
++    const deletedDown = await postVote(
++      "restaurant",
++      "down",
++      id,
++      f.voter.id
++    );
++
++    await expectVoteResponseContract(
++      "restaurant",
++      id,
++      deletedDown,
++      "Vote deleted",
++      0
++    );
++
++    const createdUp = await postVote(
++      "restaurant",
++      "up",
++      id,
++      f.voter.id
++    );
++
++    await expectVoteResponseContract(
++      "restaurant",
++      id,
++      createdUp,
++      "Vote created",
++      1
++    );
++
++    const switchedDown = await postVote(
++      "restaurant",
++      "down",
++      id,
++      f.voter.id
++    );
++
++    await expectVoteResponseContract(
++      "restaurant",
++      id,
++      switchedDown,
++      "Vote updated",
++      -1
++    );
++  });
++
++  it("preserves restaurant-review missing review and user errors", async () => {
++    const f = await createFixture();
++    const id = reviewId(f, "restaurant");
++
++    const missingReview = await postVote(
++      "restaurant",
++      "down",
++      "ffffffff-ffff-4fff-8fff-ffffffffffff",
++      f.voter.id
++    );
++
++    expect(missingReview.status).toBe(400);
++    expect(missingReview.body.message).toBe(
++      "Bad request"
++    );
++
++    const missingUser = await postVote(
++      "restaurant",
++      "down",
++      id,
++      "ffffffff-ffff-4fff-8fff-ffffffffffff"
++    );
++
++    expect(missingUser.status).toBe(400);
++    expect(missingUser.body.message).toBe(
++      "Bad request"
++    );
++  });
++
++  it("keeps the first restaurant upvote response contract", async () => {
++    const f = await createFixture(); const id = reviewId(f, "restaurant");
++    const response = await postVote("restaurant", "up", id, f.voter.id);
++    expect(response.status).toBe(201);
++    expect(response.body.message).toBe("Vote created");
++    expect(response.body.data.voted).toBe(1);
++  });
++
++  it("keeps the first restaurant downvote response contract", async () => {
++    const f = await createFixture(); const id = reviewId(f, "restaurant");
++    const response = await postVote("restaurant", "down", id, f.voter.id);
++    expect(response.status).toBe(201);
++    expect(response.body.message).toBe("Vote created");
++    expect(response.body.data.voted).toBe(-1);
++  });
++
++  it("keeps the existing restaurant upvote toggle behavior", async () => {
++    const f = await createFixture(); const id = reviewId(f, "restaurant");
++    await postVote("restaurant", "up", id, f.voter.id);
++    const response = await postVote("restaurant", "up", id, f.voter.id);
++    expect(response.status).toBe(201);
++    expect(response.body).toMatchObject({ message: "Vote deleted", data: { voted: 0 } });
++  });
++
++  it("keeps the existing restaurant downvote toggle behavior", async () => {
++    const f = await createFixture(); const id = reviewId(f, "restaurant");
++    await postVote("restaurant", "down", id, f.voter.id);
++    const response = await postVote("restaurant", "down", id, f.voter.id);
++    expect(response.status).toBe(201);
++    expect(response.body).toMatchObject({ message: "Vote deleted", data: { voted: 0 } });
++  });
++
++  it("keeps the restaurant-review missing-review error", async () => {
++    const f = await createFixture();
++    const response = await postVote("restaurant", "up", randomUUID(), f.voter.id);
++    expect(response.status).toBe(400);
++    expect(await state("restaurant", f.restaurantReview.id)).toEqual({ up: 0, down: 0, votes: [] });
++  });
++
++  it("keeps the restaurant-review missing-user error", async () => {
++    const f = await createFixture(); const id = reviewId(f, "restaurant");
++    const response = await postVote("restaurant", "up", id, randomUUID());
++    expect(response.status).toBe(400);
++    expect(await state("restaurant", id)).toEqual({ up: 0, down: 0, votes: [] });
++  });
++
++  it("still skips restaurant-review mentions for a self vote", async () => {
++    const f = await createFixture(); const id = reviewId(f, "restaurant");
++    const response = await postVote("restaurant", "down", id, f.owner.id);
++    expect(response.status).toBe(201);
++    expect(await mention("restaurant", id, f.owner.id, f.owner.id)).toBeNull();
++  });
++
++
++  it("keeps the restaurant-review up-to-down switch response", async () => {
++    const f = await createFixture(); const id = reviewId(f, "restaurant");
++    await postVote("restaurant", "up", id, f.voter.id);
++    const response = await postVote("restaurant", "down", id, f.voter.id);
++    expect(response.status).toBe(201);
++    expect(response.body).toMatchObject({ message: "Vote updated", data: { voted: -1 } });
++  });
++
++  it("keeps the restaurant-review down-to-up switch response", async () => {
++    const f = await createFixture(); const id = reviewId(f, "restaurant");
++    await postVote("restaurant", "down", id, f.voter.id);
++    const response = await postVote("restaurant", "up", id, f.voter.id);
++    expect(response.status).toBe(201);
++    expect(response.body).toMatchObject({ message: "Vote updated", data: { voted: 1 } });
++  });
++
++  it("still creates one mention for a first restaurant-review downvote", async () => {
++    const f = await createFixture(); const id = reviewId(f, "restaurant");
++    const response = await postVote("restaurant", "down", id, f.voter.id);
++    expect(response.status).toBe(201);
++    expect(await mention("restaurant", id, f.owner.id, f.voter.id)).not.toBeNull();
++  });
++
++});
+diff --git a/rateeat_backend/src/__tests__/unit/review_vote_test_support.ts b/rateeat_backend/src/__tests__/unit/review_vote_test_support.ts
+new file mode 100644
+index 000000000..2dc8821a7
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/review_vote_test_support.ts
+@@ -0,0 +1,379 @@
++import { randomUUID } from "crypto";
++import request from "supertest";
++import { QueryTypes, Sequelize, Transaction } from "sequelize";
++import app from "../../app";
++import Database from "../db_setup";
++import {
++  Category,
++  Item,
++  ItemReview,
++  ItemVote,
++  Interaction,
++  Menu,
++  Notification,
++  Restaurant,
++  RestaurantReview,
++  RestaurantVote,
++  Role,
++  User,
++} from "../../models";
++
++export type Kind = "item" | "restaurant";
++export type Direction = "up" | "down";
++
++export interface Fixture {
++  db: Sequelize;
++  owner: User;
++  voter: User;
++  itemReview: ItemReview;
++  restaurantReview: RestaurantReview;
++}
++
++const suffix = () => randomUUID().replace(/-/g, "").slice(0, 18);
++
++export const createFixture = async (): Promise<Fixture> => {
++  const db = (await Database.getInstance()) as unknown as Sequelize;
++  const [role] = await Role.findOrCreate({
++    where: { name: "review-vote-consistency-user" },
++    defaults: { name: "review-vote-consistency-user" },
++  });
++  const makeUser = (name: string) =>
++    User.create({
++      role_id: role.id,
++      username: `${name}_${suffix()}`,
++      email: `${name}_${suffix()}@example.test`,
++      phone_number: `+2519${suffix().slice(0, 8)}`,
++      first_name: name,
++      last_name: "VoteTest",
++      fcm_token: `fcm-${suffix()}`,
++      verified: 4,
++    } as any);
++  const owner = await makeUser("owner");
++  const voter = await makeUser("voter");
++  const restaurant = await Restaurant.create({
++    name: `Vote Restaurant ${suffix()}`,
++    currency: "ETB",
++  } as any);
++  const menu = await Menu.create({
++    restaurant_id: restaurant.id,
++    menu_updated_at: new Date(),
++  } as any);
++  const category = await Category.create({
++    name: `Vote Category ${suffix()}`,
++    menu_id: menu.id,
++    url: "",
++  } as any);
++  const item = await Item.create({
++    name: `Vote Item ${suffix()}`,
++    price: 10,
++    category_id: category.id,
++    fasting: false,
++  } as any);
++  const itemReview = await ItemReview.create({
++    item_id: item.id,
++    user_id: owner.id,
++    rating: 5,
++    comment: "item vote consistency",
++    visibility: true,
++    up_vote: 0,
++    down_vote: 0,
++  } as any);
++  const restaurantReview = await RestaurantReview.create({
++    restaurant_id: restaurant.id,
++    user_id: owner.id,
++    rating: 5,
++    comment: "restaurant vote consistency",
++    visibility: true,
++    up_vote: 0,
++    down_vote: 0,
++  } as any);
++  return { db, owner, voter, itemReview, restaurantReview };
++};
++
++export const reviewId = (f: Fixture, kind: Kind) =>
++  kind === "item" ? f.itemReview.id : f.restaurantReview.id;
++
++export const postVote = (
++  kind: Kind,
++  direction: Direction,
++  id: string,
++  userId: string
++) =>
++  request(app)
++    .post(
++      `/api/v1/votes/${direction === "up" ? "upvote" : "downvote"}-${kind}-review`
++    )
++    .send({ reviewId: id, userId });
++
++export const setTotals = async (kind: Kind, id: string, up: number, down: number) => {
++  if (kind === "item") {
++    await ItemReview.update(
++      { up_vote: up, down_vote: down },
++      { where: { id } }
++    );
++  } else {
++    await RestaurantReview.update(
++      { up_vote: up, down_vote: down },
++      { where: { id } }
++    );
++  }
++};
++
++export const seedVote = async (
++  kind: Kind,
++  id: string,
++  userId: string,
++  direction: Direction
++) => {
++  const model = kind === "item" ? ItemVote : RestaurantVote;
++  const key = kind === "item" ? "item_review_id" : "restaurant_review_id";
++  return (model as any).create({
++    [key]: id,
++    voter_id: userId,
++    flag: direction === "up",
++    value: direction === "up" ? 1 : -1,
++  });
++};
++
++export const state = async (kind: Kind, id: string) => {
++  const voteModel =
++    kind === "item" ? ItemVote : RestaurantVote;
++
++  const key =
++    kind === "item" ? "item_review_id" : "restaurant_review_id";
++
++  const review =
++    kind === "item"
++      ? await ItemReview.findByPk(id)
++      : await RestaurantReview.findByPk(id);
++  const votes = await (voteModel as any).findAll({ where: { [key]: id } });
++  if (!review) throw new Error("review missing");
++  return {
++    up: review.up_vote,
++    down: review.down_vote,
++    votes: votes.map((v: any) => ({ flag: v.flag, value: v.value })),
++  };
++};
++
++export const seedMention = async (
++  kind: Kind,
++  id: string,
++  ownerId: string,
++  voterId: string,
++  direction: Direction
++) =>
++  Notification.create({
++    notifiable_type: kind === "item" ? "ItemReview" : "RestaurantReview",
++    notifiable_id: id,
++    user_id: ownerId,
++    reactor_id: voterId,
++    message: `Your ${kind} review received a ${direction}vote from user.`,
++    notification_category: "Mentions",
++  } as any);
++
++export const mention = (kind: Kind, id: string, ownerId: string, voterId: string) =>
++  Notification.findOne({
++    where: {
++      notifiable_type: kind === "item" ? "ItemReview" : "RestaurantReview",
++      notifiable_id: id,
++      user_id: ownerId,
++      reactor_id: voterId,
++      notification_category: "Mentions",
++    },
++  });
++
++const qi = (s: string) => `"${s.replace(/"/g, '""')}"`;
++
++export const rejectWrite = async (
++  db: Sequelize,
++  table: string,
++  operation: "INSERT" | "UPDATE" | "DELETE"
++): Promise<() => Promise<void>> => {
++  const tag = suffix();
++  const fn = `vote_fail_fn_${tag}`;
++  const trg = `vote_fail_trg_${tag}`;
++  await db.query(
++    `CREATE FUNCTION ${qi(fn)}() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'forced vote test failure'; END; $$ LANGUAGE plpgsql`
++  );
++  await db.query(
++    `CREATE TRIGGER ${qi(trg)} BEFORE ${operation} ON ${qi(table)} FOR EACH ROW EXECUTE FUNCTION ${qi(fn)}()`
++  );
++  return async () => {
++    await db.query(`DROP TRIGGER IF EXISTS ${qi(trg)} ON ${qi(table)}`);
++    await db.query(`DROP FUNCTION IF EXISTS ${qi(fn)}()`);
++  };
++};
++
++const installVoteInsertDelay = async (
++  db: Sequelize,
++  table: "item_votes" | "restaurant_votes"
++): Promise<() => Promise<void>> => {
++  const tag = suffix();
++  const fn = `vote_delay_fn_${tag}`;
++  const trg = `vote_delay_trg_${tag}`;
++
++  await db.query(
++    `CREATE FUNCTION ${qi(fn)}() RETURNS trigger AS $$
++     BEGIN
++       PERFORM pg_sleep(0.75);
++       RETURN NEW;
++     END;
++     $$ LANGUAGE plpgsql`
++  );
++
++  await db.query(
++    `CREATE TRIGGER ${qi(trg)}
++     BEFORE INSERT ON ${qi(table)}
++     FOR EACH ROW EXECUTE FUNCTION ${qi(fn)}()`
++  );
++
++  return async () => {
++    await db.query(
++      `DROP TRIGGER IF EXISTS ${qi(trg)} ON ${qi(table)}`
++    );
++    await db.query(
++      `DROP FUNCTION IF EXISTS ${qi(fn)}()`
++    );
++  };
++};
++
++export const concurrentVotes = async (
++  f: Fixture,
++  kind: Kind,
++  directions: Direction[]
++) => {
++  const id = reviewId(f, kind);
++  const table =
++    kind === "item" ? "item_votes" : "restaurant_votes";
++
++  const cleanup = await installVoteInsertDelay(f.db, table);
++
++  try {
++    return await Promise.all(
++      directions.map((direction) =>
++        postVote(kind, direction, id, f.voter.id)
++      )
++    );
++  } finally {
++    await cleanup();
++  }
++};
++
++export const concurrentVotesForUsers = async (
++  f: Fixture,
++  kind: Kind,
++  requests: Array<{
++    direction: Direction;
++    userId: string;
++  }>
++) => {
++  const id = reviewId(f, kind);
++  const table =
++    kind === "item" ? "item_votes" : "restaurant_votes";
++
++  const cleanup = await installVoteInsertDelay(f.db, table);
++
++  try {
++    return await Promise.all(
++      requests.map(({ direction, userId }) =>
++        postVote(kind, direction, id, userId)
++      )
++    );
++  } finally {
++    await cleanup();
++  }
++};
++
++export const voteRowsForUser = async (
++  kind: Kind,
++  id: string,
++  userId: string
++) => {
++  const model = kind === "item" ? ItemVote : RestaurantVote;
++  const key = kind === "item" ? "item_review_id" : "restaurant_review_id";
++  const rows = await (model as any).findAll({
++    where: { [key]: id, voter_id: userId },
++    order: [["createdAt", "ASC"]],
++  });
++  return rows.map((row: any) => ({
++    flag: row.flag,
++    value: row.value,
++  }));
++};
++
++export const expectVoteResponseContract = async (
++  kind: Kind,
++  id: string,
++  response: any,
++  message: "Vote created" | "Vote deleted" | "Vote updated",
++  voted: -1 | 0 | 1
++) => {
++  const review =
++    kind === "item"
++      ? await ItemReview.findByPk(id)
++      : await RestaurantReview.findByPk(id);
++
++  expect(review).not.toBeNull();
++
++  const expectedData = JSON.parse(
++    JSON.stringify({
++      ...(review as any).dataValues,
++      voted,
++    })
++  );
++
++  expect(response.status).toBe(201);
++
++  expect(response.body).toEqual({
++    message,
++    data: expectedData,
++  });
++};
++
++export const expectDurableVoteConsistency = async (
++  kind: Kind,
++  id: string,
++  userId: string,
++  expected: Direction | null
++) => {
++  const current = await state(kind, id);
++  const allVotes = current.votes;
++  const upRows = allVotes.filter((vote) => vote.flag === true);
++  const downRows = allVotes.filter((vote) => vote.flag === false);
++
++  expect(current.up).toBe(upRows.length);
++  expect(current.down).toBe(downRows.length);
++
++  const userVotes = await voteRowsForUser(kind, id, userId);
++  if (expected === null) {
++    expect(userVotes).toEqual([]);
++    return current;
++  }
++
++  expect(userVotes).toEqual([
++    {
++      flag: expected === "up",
++      value: expected === "up" ? 1 : -1,
++    },
++  ]);
++  return current;
++};
++
++export const mentionCount = async (
++  kind: Kind,
++  id: string,
++  ownerId: string,
++  voterId: string
++) =>
++  Notification.count({
++    where: {
++      notifiable_type: kind === "item" ? "ItemReview" : "RestaurantReview",
++      notifiable_id: id,
++      user_id: ownerId,
++      reactor_id: voterId,
++      notification_category: "Mentions",
++    },
++  });
++
++export const interactionCount = (userId: string) =>
++  Interaction.count({ where: { userId } });

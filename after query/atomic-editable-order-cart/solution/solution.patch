@@ -1,0 +1,846 @@
+diff --git a/rateeat_backend/migrations/20260828120000-create-order-cart-idempotency-keys-table.js b/rateeat_backend/migrations/20260828120000-create-order-cart-idempotency-keys-table.js
+new file mode 100644
+index 0000000..304b56d
+--- /dev/null
++++ b/rateeat_backend/migrations/20260828120000-create-order-cart-idempotency-keys-table.js
+@@ -0,0 +1,61 @@
++'use strict';
++
++/** @type {import('sequelize-cli').Migration} */
++module.exports = {
++  async up(queryInterface, Sequelize) {
++    await queryInterface.createTable("order_cart_idempotency_keys", {
++      id: {
++        type: Sequelize.UUID,
++        defaultValue: Sequelize.UUIDV4,
++        allowNull: false,
++        primaryKey: true,
++      },
++      order_id: {
++        type: Sequelize.UUID,
++        allowNull: false,
++        references: {
++          model: "orders",
++          key: "id",
++        },
++        onDelete: "CASCADE",
++        onUpdate: "CASCADE",
++      },
++      idempotency_key: {
++        type: Sequelize.STRING(255),
++        allowNull: false,
++      },
++      // The exact `data` payload the original successful PUT
++      // /api/v1/orders/:orderId/cart response returned, replayed
++      // byte-for-byte on every later request that reuses this key.
++      response_body: {
++        type: Sequelize.JSONB,
++        allowNull: false,
++      },
++      createdAt: {
++        type: Sequelize.DATE,
++        allowNull: false,
++        defaultValue: Sequelize.NOW,
++      },
++      updatedAt: {
++        type: Sequelize.DATE,
++        allowNull: false,
++        defaultValue: Sequelize.NOW,
++      },
++    });
++
++    // One key means one remembered response per order - never across
++    // orders, and never more than once per order.
++    await queryInterface.addIndex(
++      "order_cart_idempotency_keys",
++      ["order_id", "idempotency_key"],
++      {
++        unique: true,
++        name: "order_cart_idempotency_keys_order_id_idempotency_key_uindex",
++      }
++    );
++  },
++
++  async down(queryInterface) {
++    await queryInterface.dropTable("order_cart_idempotency_keys");
++  },
++};
+diff --git a/rateeat_backend/src/config/db.ts b/rateeat_backend/src/config/db.ts
+index 0f7384b..776429b 100644
+--- a/rateeat_backend/src/config/db.ts
++++ b/rateeat_backend/src/config/db.ts
+@@ -66,6 +66,7 @@ import {
+   AvailabilityAlert,
+   Order,
+   OrderItem,
++  OrderCartIdempotencyKey,
+   Payment,
+   Following,
+   FollowerRecommendation,
+@@ -181,6 +182,7 @@ const sequelize: Sequelize = new Sequelize({
+     AvailabilityAlert,
+     Order,
+     OrderItem,
++    OrderCartIdempotencyKey,
+     Payment,
+     Following,
+     FollowerRecommendation,
+diff --git a/rateeat_backend/src/controllers/order.controller.ts b/rateeat_backend/src/controllers/order.controller.ts
+index c7afccc..a115d77 100644
+--- a/rateeat_backend/src/controllers/order.controller.ts
++++ b/rateeat_backend/src/controllers/order.controller.ts
+@@ -29,6 +29,7 @@ import { OrderStatus } from "../models/Order/Order";
+ import { io } from "../utils/socket.utils";
+ import { Op, Sequelize } from "sequelize";
+ import { calculateNumberOfItemsAndPrice } from "../utils/order.utils";
++import { replaceOrderCart } from "../services/order-cart.service";
+ import { NotificationCategory } from "../models/Feedback/Notification";
+ import sendNotification from "../utils/notification.utils";
+ 
+@@ -1429,6 +1430,49 @@ const toggleOrderEdit = asyncAwaitHandler(
+   }
+ );
+ 
++// @desc    Replace the cart of an order that is still being edited
++// @route   PUT /api/v1/orders/:orderId/cart
++const updateOrderCart = asyncAwaitHandler(
++  async (req: Request, res: Response, next: NextFunction) => {
++    const { orderId } = req.params;
++    const user: any = req.user;
++
++    if (!user) {
++      return next(new AuthorizationError());
++    }
++
++    // Optional: a caller that wants a repeated/racing request deduped to a
++    // single replacement supplies this. Blank or absent is treated the same
++    // as "no key" - the request always processes fresh, exactly as before
++    // this header existed.
++    const rawIdempotencyKey = req.header("Idempotency-Key");
++    const idempotencyKey =
++      typeof rawIdempotencyKey === "string" && rawIdempotencyKey.trim()
++        ? rawIdempotencyKey.trim()
++        : undefined;
++
++    // The raw, unvalidated `items` field is handed straight to the service
++    // rather than parsed here: a request replaying an already-successful
++    // Idempotency-Key must be answered from that stored response without
++    // this attempt's own body ever being inspected, structurally or
++    // otherwise - parseCartItems only runs inside the service, and only
++    // once the service has confirmed this isn't a replay. All order/item
++    // validation, locking, and the atomic write happen inside the service;
++    // a rejected request throws before anything is persisted.
++    const order = await replaceOrderCart({
++      orderId,
++      userId: user.id,
++      rawItems: req.body?.items,
++      idempotencyKey,
++    });
++
++    return res.status(200).json({
++      success: true,
++      data: order,
++    });
++  }
++);
++
+ export {
+   createOrder,
+   getOrder,
+@@ -1448,4 +1492,5 @@ export {
+   getOrdersCount,
+   cancelOrder,
+   getOrderDetails,
++  updateOrderCart,
+ };
+diff --git a/rateeat_backend/src/models/Order/OrderCartIdempotencyKey.ts b/rateeat_backend/src/models/Order/OrderCartIdempotencyKey.ts
+new file mode 100644
+index 0000000..a0f968b
+--- /dev/null
++++ b/rateeat_backend/src/models/Order/OrderCartIdempotencyKey.ts
+@@ -0,0 +1,62 @@
++/* eslint-disable no-use-before-define */
++import {
++  Table,
++  Column,
++  Model,
++  DataType,
++  ForeignKey,
++  PrimaryKey,
++  BelongsTo,
++} from "sequelize-typescript";
++
++import { Order } from "..";
++
++/**
++ * Records the response a successful PUT /api/v1/orders/:orderId/cart
++ * request produced when the request carried an Idempotency-Key header,
++ * keyed by (order_id, idempotency_key). A later request reusing the same
++ * key against the same order looks its response up here instead of
++ * re-validating items or writing to the cart again - see
++ * `replaceOrderCart` in order-cart.service.ts.
++ *
++ * Only a successful replacement is ever recorded here: a rejected request
++ * (400/403/404/409) throws before this row would be written, so the same
++ * key is still free to be retried after fixing whatever was rejected.
++ */
++@Table({
++  tableName: "order_cart_idempotency_keys",
++  timestamps: true,
++})
++class OrderCartIdempotencyKey extends Model<OrderCartIdempotencyKey> {
++  @PrimaryKey
++  @Column({
++    type: DataType.UUID,
++    defaultValue: DataType.UUIDV4,
++    allowNull: false,
++  })
++  id!: string;
++
++  @ForeignKey(() => Order)
++  @Column({
++    type: DataType.UUID,
++    allowNull: false,
++  })
++  order_id!: string;
++
++  @Column({
++    type: DataType.STRING(255),
++    allowNull: false,
++  })
++  idempotency_key!: string;
++
++  @Column({
++    type: DataType.JSONB,
++    allowNull: false,
++  })
++  response_body!: Record<string, unknown>;
++
++  @BelongsTo(() => Order)
++  order!: Order;
++}
++
++export default OrderCartIdempotencyKey;
+diff --git a/rateeat_backend/src/models/index.ts b/rateeat_backend/src/models/index.ts
+index 83f7a36..1e61a41 100644
+--- a/rateeat_backend/src/models/index.ts
++++ b/rateeat_backend/src/models/index.ts
+@@ -60,6 +60,7 @@ import CandidateAdminUser from "./Incentive/CandidateAdminUser";
+ import AvailabilityAlert from "./Restaurant/AvailabilityAlert";
+ import Order from "./Order/Order";
+ import OrderItem from "./Order/OrderItem";
++import OrderCartIdempotencyKey from "./Order/OrderCartIdempotencyKey";
+ import Payment from "./Order/Payment";
+ import Following from "./Social/Following";
+ import FollowerRecommendation from "./Social/FollowerRecommendation";
+@@ -160,6 +161,7 @@ export {
+   AvailabilityAlert,
+   Order,
+   OrderItem,
++  OrderCartIdempotencyKey,
+   Payment,
+   Following,
+   FollowerRecommendation,
+diff --git a/rateeat_backend/src/routes/order.route.ts b/rateeat_backend/src/routes/order.route.ts
+index 7002bbf..89aa987 100644
+--- a/rateeat_backend/src/routes/order.route.ts
++++ b/rateeat_backend/src/routes/order.route.ts
+@@ -17,6 +17,7 @@ import {
+   getOrdersCount,
+   cancelOrder,
+   toggleOrderEdit,
++  updateOrderCart,
+ } from "../controllers/order.controller";
+ import { protectRoute, protectRouteForAdmin } from "../middlewares/auth";
+ 
+@@ -40,6 +41,7 @@ router.put(
+ router.route("/:orderId/confirm").put(protectRouteForAdmin, confirmOrder);
+ router.route("/:orderId/reject").put(protectRouteForAdmin, rejectOrder);
+ router.route("/:orderId/cancel-order").put(protectRoute, cancelOrder);
++router.route("/:orderId/cart").put(protectRoute, updateOrderCart);
+ router.route("/:orderId/place").put(protectRouteForAdmin, placeOrder);
+ router.route("/:orderId/complete").put(protectRouteForAdmin, completeOrder);
+ router.route("/restaurant/:restaurantId").get(getRestaurantOrders);
+diff --git a/rateeat_backend/src/services/order-cart.service.ts b/rateeat_backend/src/services/order-cart.service.ts
+new file mode 100644
+index 0000000..6cf73ed
+--- /dev/null
++++ b/rateeat_backend/src/services/order-cart.service.ts
+@@ -0,0 +1,251 @@
++import { Transaction } from "sequelize";
++import sequelize from "../config/db";
++import { Category, Item, Order } from "../models";
++import Menu from "../models/Menu/Menu";
++import OrderItem from "../models/Order/OrderItem";
++import OrderCartIdempotencyKey from "../models/Order/OrderCartIdempotencyKey";
++import { OrderStatus } from "../models/Order/Order";
++import {
++  ForbiddenError,
++  NotFoundError,
++  OrderCartNotEditableError,
++} from "../utils/error-response.utils";
++import {
++  buildCartItemRejectionError,
++  calculateCartTotals,
++  evaluateCartItemEligibility,
++  parseCartItems,
++} from "../utils/order-cart-validation.utils";
++import {
++  CartItemLike,
++  CartOrderItemRow,
++  CartReplacementResult,
++  ReplaceOrderCartInput,
++} from "../types/order-cart.types";
++
++/** Order statuses from which the cart may still be replaced. */
++const EDITABLE_ORDER_STATUSES: OrderStatus[] = [
++  OrderStatus.OrderCreated,
++  OrderStatus.OrderEdited,
++];
++
++/**
++ * @description whether an order's current status still allows its cart to
++ * be replaced (i.e. it has not yet been confirmed, placed, rejected, or
++ * cancelled).
++ *
++ * @param orderStatus - the order's current `order_status`.
++ * @returns true when the cart may still be replaced.
++ */
++export const isOrderCartEditable = (orderStatus: OrderStatus): boolean =>
++  EDITABLE_ORDER_STATUSES.includes(orderStatus);
++
++/**
++ * Fetch every requested item, together with the Category -> Menu chain
++ * needed to know which restaurant it belongs to, keyed by item id for O(1)
++ * lookups while building the new cart rows.
++ *
++ * @param itemIds - the itemId of every requested cart entry.
++ * @param transaction - the open transaction the lookup participates in, so
++ *   it observes the same snapshot as the locked order row.
++ * @returns the found items keyed by their id; an id with no matching row is
++ *   simply absent from the map.
++ */
++const fetchRequestedItemsById = async (
++  itemIds: string[],
++  transaction: Transaction
++): Promise<Map<string, CartItemLike>> => {
++  const foundItems = await Item.findAll({
++    where: { id: itemIds },
++    include: [
++      {
++        model: Category,
++        include: [Menu],
++      },
++    ],
++    transaction,
++  });
++
++  return new Map(
++    foundItems.map((item) => [item.id, item as unknown as CartItemLike])
++  );
++};
++
++/**
++ * @description Atomically replace the items on an order that is still
++ * editable, recompute its totals, and leave its status unchanged.
++ *
++ * The whole operation runs inside one transaction:
++ *  1. The order row is locked with `SELECT ... FOR UPDATE`, so a second,
++ *     concurrent call for the same order blocks here until this one commits
++ *     or rolls back - the final state can never interleave two requests.
++ *  2. Ownership is checked against the locked row.
++ *  3. If the caller supplied an Idempotency-Key that already has a stored
++ *     response for this order, that response is returned as-is - nothing
++ *     else below runs, and in particular `rawItems` is never even parsed:
++ *     a replay must be answered purely from what the first successful
++ *     attempt produced, regardless of what this attempt's own body says, so
++ *     validating it first (only to then discard the result) would still be
++ *     re-validating in every sense that matters. Because step 1 already
++ *     serializes every request against this order (concurrent or not), a
++ *     second request reusing the same key can only reach this check after
++ *     the first request's own transaction - the one that wrote the stored
++ *     response - has committed, so it is guaranteed to see it. This is what
++ *     makes a replay, including a genuinely concurrent one, execute the
++ *     replacement at most once.
++ *  4. Otherwise, `rawItems` is parsed and structurally validated, status is
++ *     checked, every requested item is validated (exists, orderable,
++ *     belongs to the order's restaurant) before anything is written, and
++ *     only once every item has passed does the previous cart get replaced
++ *     and the order's totals recomputed from current prices.
++ *  5. On success, if an Idempotency-Key was supplied, the exact response
++ *     about to be returned is stored against it, in the same transaction as
++ *     the write itself - so a request whose write later rolls back never
++ *     leaves a stored response behind either, and the key remains free to
++ *     retry.
++ *
++ * Any failure at any step rolls the whole transaction back, so the previous
++ * cart and totals are left exactly as they were, and - since step 5 never
++ * ran - no Idempotency-Key is consumed by a rejected request.
++ *
++ * @param input.orderId - the order whose cart is being replaced.
++ * @param input.userId - the id of the authenticated user making the
++ *   request; must match the order's owner.
++ * @param input.rawItems - the untrusted `items` field straight off the
++ *   request body; only parsed (see parseCartItems) once this is confirmed
++ *   not to be a replay.
++ * @param input.idempotencyKey - optional Idempotency-Key to dedupe repeated
++ *   requests by; omit (or send only whitespace) to always process the
++ *   request fresh.
++ * @returns the `data` payload the endpoint responds with: either the
++ *   freshly updated order (with its new totals and `order_items` attached)
++ *   or, for a replayed key, the exact response the original request
++ *   produced.
++ * @throws {NotFoundError} when the order or an item does not exist.
++ * @throws {ForbiddenError} when `userId` does not own the order.
++ * @throws {OrderCartNotEditableError} when the order's status no longer
++ *   allows edits.
++ * @throws {OrderCartItemNotAvailableError | OrderCartItemRestaurantMismatchError}
++ *   when a requested item fails an eligibility check.
++ */
++export const replaceOrderCart = async ({
++  orderId,
++  userId,
++  rawItems,
++  idempotencyKey,
++}: ReplaceOrderCartInput): Promise<CartReplacementResult> => {
++  const transaction: Transaction = await sequelize.transaction();
++
++  try {
++    const order = await Order.findByPk(orderId, {
++      transaction,
++      lock: transaction.LOCK.UPDATE,
++    });
++
++    if (!order) {
++      throw new NotFoundError("Order");
++    }
++
++    if (order.user_id !== userId) {
++      throw new ForbiddenError();
++    }
++
++    if (idempotencyKey) {
++      const existingReplay = await OrderCartIdempotencyKey.findOne({
++        where: { order_id: order.id, idempotency_key: idempotencyKey },
++        transaction,
++      });
++
++      if (existingReplay) {
++        await transaction.commit();
++        return existingReplay.response_body;
++      }
++    }
++
++    // Only reached once this is confirmed not to be a replay: the whole
++    // request - starting with its items - is validated before touching the
++    // order, so a bad request never partially changes anything.
++    const items = parseCartItems(rawItems);
++
++    if (!isOrderCartEditable(order.order_status)) {
++      throw new OrderCartNotEditableError();
++    }
++
++    const itemIds = items.map((item) => item.itemId);
++    const itemsById = await fetchRequestedItemsById(itemIds, transaction);
++
++    // Validate every requested item before writing anything: a single
++    // rejected item must leave the existing cart and totals untouched.
++    const orderItemRows: CartOrderItemRow[] = items.map((requested) => {
++      const item = itemsById.get(requested.itemId);
++      const eligibility = evaluateCartItemEligibility(
++        item,
++        order.restaurant_id
++      );
++
++      if (!eligibility.eligible) {
++        throw buildCartItemRejectionError(item, eligibility.reason);
++      }
++
++      return {
++        item_id: item!.id,
++        quantity: requested.quantity,
++        order_id: order.id,
++        restaurant_id: order.restaurant_id,
++      };
++    });
++
++    const { totalNumberOfItems, totalPrice } = calculateCartTotals(
++      items,
++      itemsById
++    );
++
++    await OrderItem.destroy({
++      where: { order_id: order.id },
++      transaction,
++    });
++
++    await OrderItem.bulkCreate(orderItemRows, { transaction });
++
++    order.total_number_of_items = totalNumberOfItems;
++    order.total_price = totalPrice;
++    await order.save({ transaction });
++
++    // Re-fetch with the freshly-written items eager-loaded: a plain object
++    // property assigned onto the Sequelize instance (e.g.
++    // `order.order_items = orderItemRows`) is not picked up by the
++    // instance's own JSON serialization, since it isn't how Sequelize
++    // populates an association - the response would silently come back
++    // without its items. Loading it back through the association is what
++    // makes it actually appear in `res.json(order)`. Read inside the same
++    // still-open transaction: reads see their own transaction's uncommitted
++    // writes, so this doesn't need to wait for the commit below, and doing
++    // it before the commit is what lets the exact same payload be stored as
++    // this key's replayable response in the same atomic write.
++    const updatedOrder = await Order.findByPk(order.id, {
++      include: [{ model: OrderItem }],
++      transaction,
++    });
++
++    const responseBody =
++      updatedOrder!.toJSON() as unknown as CartReplacementResult;
++
++    if (idempotencyKey) {
++      await OrderCartIdempotencyKey.create(
++        {
++          order_id: order.id,
++          idempotency_key: idempotencyKey,
++          response_body: responseBody,
++        },
++        { transaction }
++      );
++    }
++
++    await transaction.commit();
++
++    return responseBody;
++  } catch (error) {
++    await transaction.rollback();
++    throw error;
++  }
++};
+diff --git a/rateeat_backend/src/types/order-cart.types.ts b/rateeat_backend/src/types/order-cart.types.ts
+new file mode 100644
+index 0000000..cc341d0
+--- /dev/null
++++ b/rateeat_backend/src/types/order-cart.types.ts
+@@ -0,0 +1,105 @@
++/**
++ * Shared shapes for the editable-order-cart feature (PUT
++ * /api/v1/orders/:orderId/cart). Kept separate from the service and
++ * validation-utils modules so both can depend on the same contract without
++ * importing each other's implementation details.
++ */
++
++/**
++ * One entry of the client-submitted cart payload, after structural
++ * validation (parseCartItems) has confirmed itemId is a non-empty string and
++ * quantity is a positive integer.
++ */
++export interface CartItemInput {
++  itemId: string;
++  quantity: number;
++}
++
++/**
++ * The row shape persisted to the order_items table for a single cart entry.
++ * Mirrors the columns OrderItem.bulkCreate expects.
++ */
++export interface CartOrderItemRow {
++  item_id: string;
++  quantity: number;
++  order_id: string;
++  restaurant_id: string;
++}
++
++/**
++ * The minimal shape of a fetched Item (plus its Category -> Menu chain) that
++ * the eligibility check needs. Deliberately narrower than the full Sequelize
++ * Item model so the pure validation utils never need to import it.
++ */
++export interface CartItemLike {
++  id: string;
++  price: number;
++  is_available_for_order: boolean;
++  categories?: {
++    menu?: {
++      restaurant_id?: string;
++    } | null;
++  } | null;
++}
++
++/**
++ * Why a single requested item was or was not accepted into the cart.
++ *
++ *  - "eligible":         the item exists, is orderable, and belongs to the
++ *                        order's restaurant.
++ *  - "missing":          no item with that id could be found at all.
++ *  - "unavailable":      the item exists but is_available_for_order is false.
++ *  - "wrong-restaurant": the item exists and is orderable, but its menu
++ *                        belongs to a different restaurant than the order.
++ */
++export type CartItemEligibilityReason =
++  | "eligible"
++  | "missing"
++  | "unavailable"
++  | "wrong-restaurant";
++
++export interface CartItemEligibility {
++  eligible: boolean;
++  reason: CartItemEligibilityReason;
++}
++
++/** Input to the transactional cart-replacement service call. */
++export interface ReplaceOrderCartInput {
++  orderId: string;
++  userId: string;
++  /**
++   * The untrusted `items` field straight off the request body, not yet run
++   * through parseCartItems. Left unparsed here (rather than in the
++   * controller) so a request replaying an already-successful
++   * Idempotency-Key can be answered from the stored response without this
++   * attempt's own body ever being inspected - see `replaceOrderCart`.
++   */
++  rawItems: unknown;
++  /**
++   * The caller-supplied Idempotency-Key header, already trimmed to a
++   * non-empty string, or `undefined` when the request didn't include one (or
++   * included only whitespace). When present, a repeat of the same key
++   * against the same order replays the first successful response instead of
++   * reprocessing - see `replaceOrderCart`.
++   */
++  idempotencyKey?: string;
++}
++
++/**
++ * The JSON-serializable shape `replaceOrderCart` resolves with: either a
++ * freshly-written order (via `.toJSON()`) or a stored `response_body`
++ * replayed for a repeated Idempotency-Key. Deliberately not
++ * `InstanceType<typeof Order>` - a replayed response is a plain object, not
++ * a live Sequelize instance, and the controller only ever needs to hand
++ * whichever one it gets straight to `res.json`.
++ */
++export type CartReplacementResult = Record<string, unknown>;
++
++/**
++ * Totals recomputed from the current price of every accepted item, ready to
++ * be written back onto the order row.
++ */
++export interface CartTotals {
++  totalNumberOfItems: number;
++  totalPrice: number;
++}
+diff --git a/rateeat_backend/src/utils/error-response.utils.ts b/rateeat_backend/src/utils/error-response.utils.ts
+index ecb7415..c5334e5 100644
+--- a/rateeat_backend/src/utils/error-response.utils.ts
++++ b/rateeat_backend/src/utils/error-response.utils.ts
+@@ -149,3 +149,44 @@ export class UnprocessableEntityError extends HttpError {
+     super("Unprocessable entity", 422, true, details);
+   }
+ }
++
++// Editable-order-cart errors. Typed rather than generic HttpError instances
++// so callers (and tests) can distinguish these failure modes with
++// `instanceof` instead of matching on a message string, while still
++// carrying the exact status code and message the cart API promises.
++
++/**
++ * The order exists and the requester owns it, but its current status no
++ * longer allows the cart to be replaced (it has already been confirmed,
++ * placed, rejected, or cancelled).
++ */
++export class OrderCartNotEditableError extends HttpError {
++  constructor() {
++    super("Order is not editable", 409);
++  }
++}
++
++/**
++ * A requested item exists but is currently marked unavailable for ordering.
++ */
++export class OrderCartItemNotAvailableError extends HttpError {
++  public readonly itemId: string;
++
++  constructor(itemId: string) {
++    super(`Item ${itemId} is not available for ordering`, 400);
++    this.itemId = itemId;
++  }
++}
++
++/**
++ * A requested item exists and is orderable, but belongs to a different
++ * restaurant than the one the order was placed at.
++ */
++export class OrderCartItemRestaurantMismatchError extends HttpError {
++  public readonly itemId: string;
++
++  constructor(itemId: string) {
++    super(`Item ${itemId} does not belong to this order's restaurant`, 400);
++    this.itemId = itemId;
++  }
++}
+diff --git a/rateeat_backend/src/utils/order-cart-validation.utils.ts b/rateeat_backend/src/utils/order-cart-validation.utils.ts
+new file mode 100644
+index 0000000..6f3c243
+--- /dev/null
++++ b/rateeat_backend/src/utils/order-cart-validation.utils.ts
+@@ -0,0 +1,160 @@
++import {
++  HttpError,
++  NotFoundError,
++  OrderCartItemNotAvailableError,
++  OrderCartItemRestaurantMismatchError,
++} from "./error-response.utils";
++import {
++  CartItemEligibility,
++  CartItemEligibilityReason,
++  CartItemInput,
++  CartItemLike,
++  CartTotals,
++} from "../types/order-cart.types";
++
++/**
++ * Structurally validate the raw `items` field of a cart-replacement request.
++ *
++ * This runs before the order (or any item) is looked up in the database, so
++ * a malformed request can never partially change anything: the caller must
++ * hold a fully-parsed, well-formed item list before it does a single query.
++ *
++ * Requirements enforced here:
++ *  - `rawItems` must be a non-empty array.
++ *  - every entry must carry a non-empty string `itemId`.
++ *  - every entry's `quantity` must be a positive integer.
++ *  - no `itemId` may appear more than once in the same request.
++ *
++ * @param rawItems - the untrusted `items` field straight off `req.body`.
++ * @returns the parsed, de-duplicated list of `{ itemId, quantity }` entries.
++ * @throws {HttpError} a 400 describing the first validation failure found.
++ */
++export const parseCartItems = (rawItems: unknown): CartItemInput[] => {
++  if (!Array.isArray(rawItems) || rawItems.length === 0) {
++    throw new HttpError("items must be a non-empty array", 400);
++  }
++
++  const seenItemIds = new Set<string>();
++
++  return rawItems.map((entry) => {
++    const itemId = (entry as Partial<CartItemInput>)?.itemId;
++    const quantity = (entry as Partial<CartItemInput>)?.quantity;
++
++    if (typeof itemId !== "string" || itemId.trim().length === 0) {
++      throw new HttpError("Each cart item must include a valid itemId", 400);
++    }
++
++    if (!Number.isInteger(quantity) || (quantity as number) <= 0) {
++      throw new HttpError(
++        "Each cart item quantity must be a positive integer",
++        400
++      );
++    }
++
++    if (seenItemIds.has(itemId)) {
++      throw new HttpError(
++        "Cart items cannot contain the same itemId more than once",
++        400
++      );
++    }
++    seenItemIds.add(itemId);
++
++    return { itemId, quantity: quantity as number };
++  });
++};
++
++/**
++ * Decide whether a single fetched item may be added to the cart.
++ *
++ * Pure and side-effect free: it takes the item already fetched from the
++ * database (or `undefined` when no row was found) plus the restaurant the
++ * order was placed at, and returns a reason rather than throwing. Keeping
++ * this decision separate from the database orchestration in
++ * order-cart.service.ts makes every eligibility rule testable without a
++ * mocked model or transaction.
++ *
++ * @param item - the item fetched for this itemId, or `undefined` if no row
++ *   was found.
++ * @param orderRestaurantId - the restaurant_id of the order the cart belongs
++ *   to; the item must belong to the same restaurant to be eligible.
++ * @returns whether the item is eligible, and if not, which rule it failed.
++ */
++export const evaluateCartItemEligibility = (
++  item: CartItemLike | undefined,
++  orderRestaurantId: string
++): CartItemEligibility => {
++  if (!item) {
++    return { eligible: false, reason: "missing" };
++  }
++
++  if (!item.is_available_for_order) {
++    return { eligible: false, reason: "unavailable" };
++  }
++
++  const itemRestaurantId = item.categories?.menu?.restaurant_id;
++
++  if (itemRestaurantId !== orderRestaurantId) {
++    return { eligible: false, reason: "wrong-restaurant" };
++  }
++
++  return { eligible: true, reason: "eligible" };
++};
++
++/**
++ * Translate a rejected CartItemEligibilityReason into the HTTP error the
++ * cart endpoint responds with. A missing item is a 404 ("Item not found");
++ * an item that exists but can't be ordered here is a 400 describing why.
++ *
++ * @param item - the item the reason was computed for (used to name it in
++ *   the 400 messages); may be `undefined` when reason is "missing".
++ * @param reason - the rejection reason returned by
++ *   evaluateCartItemEligibility. Must not be "eligible".
++ * @returns an HttpError instance ready to be thrown or passed to `next`.
++ */
++export const buildCartItemRejectionError = (
++  item: CartItemLike | undefined,
++  reason: CartItemEligibilityReason
++): HttpError => {
++  switch (reason) {
++    case "missing":
++      return new NotFoundError("Item");
++    case "unavailable":
++      return new OrderCartItemNotAvailableError(item?.id ?? "");
++    case "wrong-restaurant":
++      return new OrderCartItemRestaurantMismatchError(item?.id ?? "");
++    case "eligible":
++    default:
++      // Defensive: callers only invoke this after evaluateCartItemEligibility
++      // reported eligible: false, so "eligible" should never reach here.
++      return new HttpError("Item is not eligible for this order", 400);
++  }
++};
++
++/**
++ * Recompute the order's aggregate totals from the accepted cart items and
++ * their current prices. Runs once every requested item has already passed
++ * evaluateCartItemEligibility, so this never needs to reject anything
++ * itself.
++ *
++ * @param items - the parsed cart items the order is being replaced with.
++ * @param itemsById - the fetched items, keyed by id, used to look up each
++ *   requested item's current price.
++ * @returns the new `total_number_of_items` and `total_price` for the order.
++ */
++export const calculateCartTotals = (
++  items: CartItemInput[],
++  itemsById: Map<string, CartItemLike>
++): CartTotals => {
++  return items.reduce(
++    (totals, requested) => {
++      const item = itemsById.get(requested.itemId);
++      const price = item?.price ?? 0;
++
++      return {
++        totalNumberOfItems: totals.totalNumberOfItems + requested.quantity,
++        totalPrice: totals.totalPrice + price * requested.quantity,
++      };
++    },
++    { totalNumberOfItems: 0, totalPrice: 0 }
++  );
++};

@@ -1,0 +1,1617 @@
+diff --git a/rateeat_backend/src/__tests__/unit/order_atomicity_real_db.test.ts b/rateeat_backend/src/__tests__/unit/order_atomicity_real_db.test.ts
+new file mode 100644
+index 000000000..67a84f04b
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/order_atomicity_real_db.test.ts
+@@ -0,0 +1,473 @@
++import request from "supertest";
++
++jest.mock("../../utils/telegram.utils", () => ({
++  initializeTelegramClient: jest.fn(),
++  sendTelegramMessage: jest.fn(),
++  sendTelegramContactRequest: jest.fn(),
++  handleTelegramUpdate: jest.fn(),
++  getTelegramSessionString: jest.fn(() => ""),
++  setTelegramSessionString: jest.fn(),
++  checkTelegramHealth: jest.fn(async () => true),
++  disconnectTelegramClient: jest.fn(async () => undefined),
++}));
++
++jest.mock("../../utils/redis.utils", () => ({
++  __esModule: true,
++  default: {
++    get: jest.fn(),
++    set: jest.fn(),
++    setEx: jest.fn(),
++    del: jest.fn(),
++    keys: jest.fn(),
++    expire: jest.fn(),
++    sAdd: jest.fn(),
++    sMembers: jest.fn(),
++    multi: jest.fn(() => ({
++      exec: jest.fn(),
++    })),
++  },
++}));
++
++jest.mock("../../utils/slack-alerting", () => ({
++  sendSlackNotification: jest.fn(async () => undefined),
++}));
++
++const mockSocketEmit = jest.fn();
++
++const mockSocketTo = jest.fn(() => ({
++  emit: mockSocketEmit,
++}));
++
++const mockSocketsLeave = jest.fn();
++
++const mockSocketIn = jest.fn(() => ({
++  socketsLeave: mockSocketsLeave,
++}));
++
++jest.mock("../../utils/socket.utils", () => ({
++  io: {
++    to: mockSocketTo,
++    in: mockSocketIn,
++  },
++}));
++
++const mockSendNotification = jest.fn(async () => undefined);
++
++jest.mock("../../utils/notification.utils", () => ({
++  __esModule: true,
++  default: mockSendNotification,
++}));
++
++import app from "../../app";
++import sequelize from "../../config/db";
++
++import {
++  USER_ID,
++  USER_2_ID,
++  RESTAURANT_ID,
++  RESTAURANT_2_ID,
++  ITEM_1,
++  ITEM_2,
++  MANAGER_ID,
++  token,
++  token2,
++  createDatabasePool,
++  clearOrders,
++  installFailingOrderItemTrigger,
++  removeFailingOrderItemTrigger,
++  runOrderInFreshProcess,
++  seedOrderTestFixtures,
++} from "./order_real_db_test_support";
++
++const pool = createDatabasePool();
++const observerPool = createDatabasePool();
++
++beforeEach(() => {
++  mockSocketTo.mockImplementation(() => ({
++    emit: mockSocketEmit,
++  }));
++
++  mockSocketIn.mockImplementation(() => ({
++    socketsLeave: mockSocketsLeave,
++  }));
++
++  mockSendNotification.mockImplementation(async () => undefined);
++});
++
++beforeAll(async () => {
++  await clearOrders(pool);
++  await seedOrderTestFixtures(pool);
++});
++
++afterAll(async () => {
++  await clearOrders(pool);
++  await pool.end();
++  await observerPool.end();
++  await sequelize.close();
++});
++
++describe("real PostgreSQL order atomicity and side effects", () => {
++  it("rolls back the order and leaves a failed idempotency key retryable", async () => {
++    const key = `gold-rollback-${Date.now()}`;
++    const orderMessage = `Gold rollback ${Date.now()}`;
++
++    const body = {
++      orderType: "DineIn",
++      estimatedWaitingTime: 30,
++      orderMessage,
++      restaurantId: RESTAURANT_ID,
++      items: [
++        { itemId: ITEM_1, quantity: 1 },
++        { itemId: ITEM_2, quantity: 2 },
++      ],
++    };
++
++    try {
++      await installFailingOrderItemTrigger(pool);
++
++      const failed = await request(app)
++        .post("/api/v1/orders")
++        .set("Authorization", `Bearer ${token}`)
++        .set("Idempotency-Key", key)
++        .send(body);
++
++      expect(failed.status).toBe(500);
++
++      const afterFailure = await pool.query(
++        `
++        SELECT id
++        FROM orders
++        WHERE user_id = $1
++          AND order_message = $2
++      `,
++        [USER_ID, orderMessage]
++      );
++
++      expect(afterFailure.rowCount).toBe(0);
++    } finally {
++      await removeFailingOrderItemTrigger(pool);
++    }
++
++    const retry = await request(app)
++      .post("/api/v1/orders")
++      .set("Authorization", `Bearer ${token}`)
++      .set("Idempotency-Key", key)
++      .send(body);
++
++    expect(retry.status).toBe(201);
++    expect(retry.headers["idempotency-replayed"]).toBe("false");
++    expect(retry.body.success).toBe(true);
++
++    const durableOrders = await pool.query(
++      `
++      SELECT id
++      FROM orders
++      WHERE user_id = $1
++        AND order_message = $2
++    `,
++      [USER_ID, orderMessage]
++    );
++
++    expect(durableOrders.rowCount).toBe(1);
++    expect(durableOrders.rows[0].id).toBe(retry.body.data.id);
++
++    const durableItems = await pool.query(
++      `
++      SELECT item_id, quantity
++      FROM order_items
++      WHERE order_id = $1
++      ORDER BY item_id
++    `,
++      [retry.body.data.id]
++    );
++
++    expect(durableItems.rowCount).toBe(2);
++    expect(
++      durableItems.rows.map((row) => ({
++        itemId: row.item_id,
++        quantity: Number(row.quantity),
++      }))
++    ).toEqual([
++      { itemId: ITEM_1, quantity: 1 },
++      { itemId: ITEM_2, quantity: 2 },
++    ]);
++  });
++  it("rolls back an unkeyed order when order-item persistence fails", async () => {
++    const orderMessage = `Gold unkeyed rollback ${Date.now()}`;
++
++    const body = {
++      orderType: "DineIn",
++      estimatedWaitingTime: 30,
++      orderMessage,
++      restaurantId: RESTAURANT_ID,
++      items: [
++        { itemId: ITEM_1, quantity: 1 },
++        { itemId: ITEM_2, quantity: 2 },
++      ],
++    };
++
++    try {
++      await installFailingOrderItemTrigger(pool);
++
++      const failed = await request(app)
++        .post("/api/v1/orders")
++        .set("Authorization", `Bearer ${token}`)
++        .send(body);
++
++      expect(failed.status).toBe(500);
++
++      const durableOrders = await pool.query(
++        `
++        SELECT id
++        FROM orders
++        WHERE user_id = $1
++          AND order_message = $2
++      `,
++        [USER_ID, orderMessage]
++      );
++
++      expect(durableOrders.rowCount).toBe(0);
++    } finally {
++      await removeFailingOrderItemTrigger(pool);
++    }
++  });
++  it("does not repeat order-created side effects when a keyed request is replayed", async () => {
++    const key = `gold-side-effects-${Date.now()}`;
++    const orderMessage = `Gold side effects ${Date.now()}`;
++
++    const body = {
++      orderType: "DineIn",
++      estimatedWaitingTime: 20,
++      orderMessage,
++      restaurantId: RESTAURANT_ID,
++      items: [{ itemId: ITEM_1, quantity: 1 }],
++    };
++
++    const first = await request(app)
++      .post("/api/v1/orders")
++      .set("Authorization", `Bearer ${token}`)
++      .set("Idempotency-Key", key)
++      .send(body);
++
++    expect(first.status).toBe(201);
++    expect(first.headers["idempotency-replayed"]).toBe("false");
++
++    const orderId = first.body.data.id;
++
++    expect(mockSocketEmit).toHaveBeenCalledTimes(2);
++
++    expect(mockSocketEmit).toHaveBeenCalledWith("newOrder", expect.any(Object));
++
++    expect(mockSocketEmit).toHaveBeenCalledWith(
++      "orderCreated",
++      expect.any(Object)
++    );
++
++    expect(mockSendNotification).toHaveBeenCalledTimes(1);
++
++    const notificationsAfterFirst = await pool.query(
++      `
++      SELECT id, notifiable_id, user_id, reactor_id, notification_category
++      FROM notifications
++      WHERE notifiable_type = 'Order'
++        AND notifiable_id = $1
++        AND user_id = $2
++    `,
++      [orderId, MANAGER_ID]
++    );
++
++    expect(notificationsAfterFirst.rowCount).toBe(1);
++    expect(notificationsAfterFirst.rows[0].reactor_id).toBe(USER_ID);
++    expect(notificationsAfterFirst.rows[0].notification_category).toBe("Order");
++
++    const replay = await request(app)
++      .post("/api/v1/orders")
++      .set("Authorization", `Bearer ${token}`)
++      .set("Idempotency-Key", key)
++      .send(body);
++
++    expect(replay.status).toBe(201);
++    expect(replay.headers["idempotency-replayed"]).toBe("true");
++    expect(replay.body.data.id).toBe(orderId);
++
++    // Replay must not emit either socket event again.
++    expect(mockSocketEmit).toHaveBeenCalledTimes(2);
++
++    // Replay must not send another push notification.
++    expect(mockSendNotification).toHaveBeenCalledTimes(1);
++
++    // Replay must not persist another manager notification.
++    const notificationsAfterReplay = await pool.query(
++      `
++      SELECT id
++      FROM notifications
++      WHERE notifiable_type = 'Order'
++        AND notifiable_id = $1
++        AND user_id = $2
++    `,
++      [orderId, MANAGER_ID]
++    );
++
++    expect(notificationsAfterReplay.rowCount).toBe(1);
++  });
++  it("does not emit order-created side effects when the order transaction rolls back", async () => {
++    const key = `gold-side-effect-rollback-${Date.now()}`;
++    const orderMessage = `Gold side-effect rollback ${Date.now()}`;
++
++    const body = {
++      orderType: "DineIn",
++      estimatedWaitingTime: 20,
++      orderMessage,
++      restaurantId: RESTAURANT_ID,
++      items: [{ itemId: ITEM_1, quantity: 1 }],
++    };
++
++    try {
++      await installFailingOrderItemTrigger(pool);
++
++      const failed = await request(app)
++        .post("/api/v1/orders")
++        .set("Authorization", `Bearer ${token}`)
++        .set("Idempotency-Key", key)
++        .send(body);
++
++      expect(failed.status).toBe(500);
++
++      expect(mockSocketEmit).not.toHaveBeenCalled();
++      expect(mockSendNotification).not.toHaveBeenCalled();
++
++      const orders = await pool.query(
++        `
++        SELECT id
++        FROM orders
++        WHERE user_id = $1
++          AND order_message = $2
++      `,
++        [USER_ID, orderMessage]
++      );
++
++      expect(orders.rowCount).toBe(0);
++
++      const notifications = await pool.query(
++        `
++        SELECT id
++        FROM notifications
++        WHERE reactor_id = $1
++          AND message = $2
++      `,
++        [USER_ID, "New order from Gold Tester"]
++      );
++
++      /*
++       * There may be notifications from earlier successful tests with the same
++       * generic message, so verify none can be associated with this failed order
++       * by looking for an order created by this request.
++       */
++      expect(orders.rowCount).toBe(0);
++    } finally {
++      await removeFailingOrderItemTrigger(pool);
++    }
++
++    // The failed key must still be usable, and side effects should happen
++    // exactly once when the retry finally commits.
++    const retry = await request(app)
++      .post("/api/v1/orders")
++      .set("Authorization", `Bearer ${token}`)
++      .set("Idempotency-Key", key)
++      .send(body);
++
++    expect(retry.status).toBe(201);
++    expect(retry.headers["idempotency-replayed"]).toBe("false");
++
++    expect(mockSocketEmit).toHaveBeenCalledTimes(2);
++    expect(mockSendNotification).toHaveBeenCalledTimes(1);
++
++    const notificationsAfterRetry = await pool.query(
++      `
++      SELECT id
++      FROM notifications
++      WHERE notifiable_type = 'Order'
++        AND notifiable_id = $1
++        AND user_id = $2
++    `,
++      [retry.body.data.id, MANAGER_ID]
++    );
++
++    expect(notificationsAfterRetry.rowCount).toBe(1);
++  });
++  it("runs manager notification side effects only after the order commit is externally visible", async () => {
++    const orderMessage = `Gold after commit ${Date.now()}`;
++
++    let observedOrderId: string | undefined;
++
++    let resolveObservation!: () => void;
++    let rejectObservation!: (error: unknown) => void;
++
++    const observationFinished = new Promise<void>((resolve, reject) => {
++      resolveObservation = resolve;
++      rejectObservation = reject;
++    });
++
++    mockSendNotification.mockImplementation(async () => {
++      try {
++        const visibleOrder = await observerPool.query(
++          `
++        SELECT id
++        FROM orders
++        WHERE user_id = $1
++          AND order_message = $2
++        `,
++          [USER_ID, orderMessage]
++        );
++
++        expect(visibleOrder.rowCount).toBe(1);
++
++        observedOrderId = visibleOrder.rows[0].id;
++
++        const visibleItems = await observerPool.query(
++          `
++        SELECT item_id, quantity
++        FROM order_items
++        WHERE order_id = $1
++        `,
++          [observedOrderId]
++        );
++
++        expect(visibleItems.rowCount).toBe(1);
++        expect(visibleItems.rows[0].item_id).toBe(ITEM_1);
++        expect(Number(visibleItems.rows[0].quantity)).toBe(1);
++
++        resolveObservation();
++      } catch (error) {
++        rejectObservation(error);
++      }
++    });
++
++    const response = await request(app)
++      .post("/api/v1/orders")
++      .set("Authorization", `Bearer ${token}`)
++      .send({
++        orderType: "DineIn",
++        estimatedWaitingTime: 20,
++        orderMessage,
++        restaurantId: RESTAURANT_ID,
++        items: [{ itemId: ITEM_1, quantity: 1 }],
++      });
++
++    expect(response.status).toBe(201);
++
++    await Promise.race([
++      observationFinished,
++      new Promise<never>((_, reject) =>
++        setTimeout(
++          () =>
++            reject(new Error("manager notification side effect did not run")),
++          5000
++        )
++      ),
++    ]);
++
++    expect(mockSendNotification).toHaveBeenCalledTimes(1);
++    expect(observedOrderId).toBe(response.body.data.id);
++  });
++});
+diff --git a/rateeat_backend/src/__tests__/unit/order_idempotency_real_db.test.ts b/rateeat_backend/src/__tests__/unit/order_idempotency_real_db.test.ts
+new file mode 100644
+index 000000000..d40195f14
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/order_idempotency_real_db.test.ts
+@@ -0,0 +1,681 @@
++import request from "supertest";
++
++jest.mock("../../utils/telegram.utils", () => ({
++  initializeTelegramClient: jest.fn(),
++  sendTelegramMessage: jest.fn(),
++  sendTelegramContactRequest: jest.fn(),
++  handleTelegramUpdate: jest.fn(),
++  getTelegramSessionString: jest.fn(() => ""),
++  setTelegramSessionString: jest.fn(),
++  checkTelegramHealth: jest.fn(async () => true),
++  disconnectTelegramClient: jest.fn(async () => undefined),
++}));
++
++jest.mock("../../utils/redis.utils", () => ({
++  __esModule: true,
++  default: {
++    get: jest.fn(),
++    set: jest.fn(),
++    setEx: jest.fn(),
++    del: jest.fn(),
++    keys: jest.fn(),
++    expire: jest.fn(),
++    sAdd: jest.fn(),
++    sMembers: jest.fn(),
++    multi: jest.fn(() => ({
++      exec: jest.fn(),
++    })),
++  },
++}));
++
++jest.mock("../../utils/slack-alerting", () => ({
++  sendSlackNotification: jest.fn(async () => undefined),
++}));
++
++const mockSocketEmit = jest.fn();
++
++const mockSocketTo = jest.fn(() => ({
++  emit: mockSocketEmit,
++}));
++
++const mockSocketsLeave = jest.fn();
++
++const mockSocketIn = jest.fn(() => ({
++  socketsLeave: mockSocketsLeave,
++}));
++
++jest.mock("../../utils/socket.utils", () => ({
++  io: {
++    to: mockSocketTo,
++    in: mockSocketIn,
++  },
++}));
++
++const mockSendNotification = jest.fn(async () => undefined);
++
++jest.mock("../../utils/notification.utils", () => ({
++  __esModule: true,
++  default: mockSendNotification,
++}));
++
++import app from "../../app";
++import sequelize from "../../config/db";
++
++import {
++  USER_ID,
++  USER_2_ID,
++  RESTAURANT_ID,
++  RESTAURANT_2_ID,
++  ITEM_1,
++  ITEM_2,
++  MANAGER_ID,
++  token,
++  token2,
++  createDatabasePool,
++  clearOrders,
++  installFailingOrderItemTrigger,
++  removeFailingOrderItemTrigger,
++  runOrderInFreshProcess,
++  seedOrderTestFixtures,
++} from "./order_real_db_test_support";
++
++const pool = createDatabasePool();
++const observerPool = createDatabasePool();
++
++beforeEach(() => {
++  mockSocketTo.mockImplementation(() => ({
++    emit: mockSocketEmit,
++  }));
++
++  mockSocketIn.mockImplementation(() => ({
++    socketsLeave: mockSocketsLeave,
++  }));
++
++  mockSendNotification.mockImplementation(async () => undefined);
++});
++
++beforeAll(async () => {
++  await clearOrders(pool);
++  await seedOrderTestFixtures(pool);
++});
++
++afterAll(async () => {
++  await clearOrders(pool);
++  await pool.end();
++  await observerPool.end();
++  await sequelize.close();
++});
++
++describe("real PostgreSQL order API smoke test", () => {
++  it("creates an order through HTTP and exposes it through order history", async () => {
++    const created = await request(app)
++      .post("/api/v1/orders")
++      .set("Authorization", `Bearer ${token}`)
++      .send({
++        orderType: "DineIn",
++        estimatedWaitingTime: 20,
++        orderMessage: "Gold integration smoke test",
++        restaurantId: RESTAURANT_ID,
++        items: [
++          { itemId: ITEM_1, quantity: 2 },
++          { itemId: ITEM_2, quantity: 1 },
++        ],
++      });
++
++    expect(created.status).toBe(201);
++    expect(created.body.success).toBe(true);
++    expect(created.body.data?.id).toBeTruthy();
++
++    const orderId = created.body.data.id;
++
++    const history = await request(app)
++      .get("/api/v1/orders/history?limit=20")
++      .set("Authorization", `Bearer ${token}`);
++
++    expect(history.status).toBe(200);
++    expect(history.body.success).toBe(true);
++
++    expect(history.body.data.some((order: any) => order.id === orderId)).toBe(
++      true
++    );
++  });
++  it("replays a keyed order after the application process is restarted", () => {
++    const key = `gold-process-replay-${Date.now()}`;
++
++    const body = {
++      orderType: "DineIn",
++      estimatedWaitingTime: 20,
++      orderMessage: `Gold process durability ${Date.now()}`,
++      restaurantId: RESTAURANT_ID,
++      items: [
++        { itemId: ITEM_1, quantity: 2 },
++        { itemId: ITEM_2, quantity: 1 },
++      ],
++    };
++
++    const firstProcess = runOrderInFreshProcess(key, body);
++    const secondProcess = runOrderInFreshProcess(key, body);
++
++    expect(firstProcess.status).toBe(201);
++    expect(firstProcess.headers.replayed).toBe("false");
++    expect(firstProcess.body.success).toBe(true);
++
++    expect(secondProcess.status).toBe(201);
++    expect(secondProcess.headers.replayed).toBe("true");
++    expect(secondProcess.body).toEqual(firstProcess.body);
++
++    expect(secondProcess.body.data.id).toBe(firstProcess.body.data.id);
++  });
++  it("creates only one durable order when equivalent keyed requests arrive concurrently", async () => {
++    const key = `gold-concurrent-${Date.now()}`;
++
++    const body = {
++      orderType: "DineIn",
++      estimatedWaitingTime: 25,
++      orderMessage: `Gold concurrent ${Date.now()}`,
++      restaurantId: RESTAURANT_ID,
++      items: [
++        { itemId: ITEM_1, quantity: 2 },
++        { itemId: ITEM_2, quantity: 3 },
++      ],
++    };
++
++    const makeRequest = () =>
++      request(app)
++        .post("/api/v1/orders")
++        .set("Authorization", `Bearer ${token}`)
++        .set("Idempotency-Key", key)
++        .send(body);
++
++    const [first, second] = await Promise.all([makeRequest(), makeRequest()]);
++    if (first.status !== 201 || second.status !== 201) {
++      throw new Error(
++        JSON.stringify(
++          {
++            first: {
++              status: first.status,
++              body: first.body,
++            },
++            second: {
++              status: second.status,
++              body: second.body,
++            },
++          },
++          null,
++          2
++        )
++      );
++    }
++
++    expect(first.status).toBe(201);
++    expect(second.status).toBe(201);
++
++    expect(first.body.success).toBe(true);
++    expect(second.body.success).toBe(true);
++
++    expect(first.body.data.id).toBe(second.body.data.id);
++
++    const replayHeaders = [
++      first.headers["idempotency-replayed"],
++      second.headers["idempotency-replayed"],
++    ].sort();
++
++    expect(replayHeaders).toEqual(["false", "true"]);
++
++    const orders = await pool.query(
++      `
++      SELECT id
++      FROM orders
++      WHERE user_id = $1
++        AND order_message = $2
++    `,
++      [USER_ID, body.orderMessage]
++    );
++
++    expect(orders.rowCount).toBe(1);
++    expect(orders.rows[0].id).toBe(first.body.data.id);
++
++    const items = await pool.query(
++      `
++      SELECT item_id, quantity
++      FROM order_items
++      WHERE order_id = $1
++      ORDER BY item_id
++    `,
++      [first.body.data.id]
++    );
++
++    expect(items.rowCount).toBe(2);
++
++    expect(
++      items.rows.map((row) => ({
++        itemId: row.item_id,
++        quantity: Number(row.quantity),
++      }))
++    ).toEqual([
++      { itemId: ITEM_1, quantity: 2 },
++      { itemId: ITEM_2, quantity: 3 },
++    ]);
++  });
++  it("rejects reuse of an idempotency key for a different order", async () => {
++    const key = `gold-conflict-${Date.now()}`;
++    const originalMessage = `Gold original ${Date.now()}`;
++    const conflictingMessage = `Gold conflicting ${Date.now()}`;
++
++    const originalBody = {
++      orderType: "DineIn",
++      estimatedWaitingTime: 20,
++      orderMessage: originalMessage,
++      restaurantId: RESTAURANT_ID,
++      items: [
++        { itemId: ITEM_1, quantity: 1 },
++        { itemId: ITEM_2, quantity: 1 },
++      ],
++    };
++
++    const first = await request(app)
++      .post("/api/v1/orders")
++      .set("Authorization", `Bearer ${token}`)
++      .set("Idempotency-Key", key)
++      .send(originalBody);
++
++    expect(first.status).toBe(201);
++    expect(first.headers["idempotency-replayed"]).toBe("false");
++
++    const conflicting = await request(app)
++      .post("/api/v1/orders")
++      .set("Authorization", `Bearer ${token}`)
++      .set("Idempotency-Key", key)
++      .send({
++        ...originalBody,
++        orderMessage: conflictingMessage,
++      });
++
++    expect(conflicting.status).toBe(409);
++    expect(conflicting.body.success).toBe(false);
++
++    const originalOrders = await pool.query(
++      `
++      SELECT id
++      FROM orders
++      WHERE user_id = $1
++        AND order_message = $2
++    `,
++      [USER_ID, originalMessage]
++    );
++
++    expect(originalOrders.rowCount).toBe(1);
++    expect(originalOrders.rows[0].id).toBe(first.body.data.id);
++
++    const conflictingOrders = await pool.query(
++      `
++      SELECT id
++      FROM orders
++      WHERE user_id = $1
++        AND order_message = $2
++    `,
++      [USER_ID, conflictingMessage]
++    );
++
++    expect(conflictingOrders.rowCount).toBe(0);
++  });
++  it("replays the same order when equivalent payloads use different property and item order", async () => {
++    const key = `gold-equivalent-${Date.now()}`;
++    const orderMessage = `Gold equivalent ${Date.now()}`;
++
++    const first = await request(app)
++      .post("/api/v1/orders")
++      .set("Authorization", `Bearer ${token}`)
++      .set("Idempotency-Key", key)
++      .send({
++        orderType: "DineIn",
++        estimatedWaitingTime: 20,
++        orderMessage,
++        restaurantId: RESTAURANT_ID,
++        items: [
++          { itemId: ITEM_1, quantity: 2 },
++          { itemId: ITEM_2, quantity: 1 },
++        ],
++      });
++
++    expect(first.status).toBe(201);
++    expect(first.headers["idempotency-replayed"]).toBe("false");
++
++    const replay = await request(app)
++      .post("/api/v1/orders")
++      .set("Authorization", `Bearer ${token}`)
++      .set("Idempotency-Key", key)
++      .send({
++        items: [
++          { quantity: 1, itemId: ITEM_2 },
++          { quantity: 2, itemId: ITEM_1 },
++        ],
++        restaurantId: RESTAURANT_ID,
++        orderMessage,
++        estimatedWaitingTime: 20,
++        orderType: "DineIn",
++      });
++
++    expect(replay.status).toBe(201);
++    expect(replay.headers["idempotency-replayed"]).toBe("true");
++    expect(replay.body).toEqual(first.body);
++    expect(replay.body.data.id).toBe(first.body.data.id);
++
++    const durableOrders = await pool.query(
++      `
++      SELECT id
++      FROM orders
++      WHERE user_id = $1
++        AND order_message = $2
++    `,
++      [USER_ID, orderMessage]
++    );
++
++    expect(durableOrders.rowCount).toBe(1);
++    expect(durableOrders.rows[0].id).toBe(first.body.data.id);
++  });
++  it("trims whitespace around the idempotency key before matching it", async () => {
++    const key = `gold-trimmed-${Date.now()}`;
++    const orderMessage = `Gold trimmed key ${Date.now()}`;
++
++    const body = {
++      orderType: "DineIn",
++      estimatedWaitingTime: 20,
++      orderMessage,
++      restaurantId: RESTAURANT_ID,
++      items: [{ itemId: ITEM_1, quantity: 1 }],
++    };
++
++    const first = await request(app)
++      .post("/api/v1/orders")
++      .set("Authorization", `Bearer ${token}`)
++      .set("Idempotency-Key", `   ${key}   `)
++      .send(body);
++
++    expect(first.status).toBe(201);
++    expect(first.headers["idempotency-replayed"]).toBe("false");
++
++    const replay = await request(app)
++      .post("/api/v1/orders")
++      .set("Authorization", `Bearer ${token}`)
++      .set("Idempotency-Key", key)
++      .send(body);
++
++    expect(replay.status).toBe(201);
++    expect(replay.headers["idempotency-replayed"]).toBe("true");
++    expect(replay.body).toEqual(first.body);
++
++    const durableOrders = await pool.query(
++      `
++      SELECT id
++      FROM orders
++      WHERE user_id = $1
++        AND order_message = $2
++    `,
++      [USER_ID, orderMessage]
++    );
++
++    expect(durableOrders.rowCount).toBe(1);
++  });
++  it.each([
++    ["empty after trimming", "   "],
++    ["longer than 128 characters", "x".repeat(129)],
++    ["non-ASCII characters", "gold-key-é"],
++    ["ASCII control character", "gold\tkey"],
++  ])("rejects an idempotency key that is %s", async (_label, key) => {
++    const orderMessage = `Gold invalid key ${Date.now()} ${_label}`;
++
++    const response = await request(app)
++      .post("/api/v1/orders")
++      .set("Authorization", `Bearer ${token}`)
++      .set("Idempotency-Key", key)
++      .send({
++        orderType: "DineIn",
++        estimatedWaitingTime: 20,
++        orderMessage,
++        restaurantId: RESTAURANT_ID,
++        items: [{ itemId: ITEM_1, quantity: 1 }],
++      });
++
++    expect(response.status).toBe(400);
++    expect(response.body.success).toBe(false);
++
++    const durableOrders = await pool.query(
++      `
++      SELECT id
++      FROM orders
++      WHERE user_id = $1
++        AND order_message = $2
++    `,
++      [USER_ID, orderMessage]
++    );
++
++    expect(durableOrders.rowCount).toBe(0);
++  });
++  it("scopes the same idempotency key independently to each authenticated user", async () => {
++    const key = `gold-user-scope-${Date.now()}`;
++
++    const bodyForUser1 = {
++      orderType: "DineIn",
++      estimatedWaitingTime: 20,
++      orderMessage: `Gold user one ${Date.now()}`,
++      restaurantId: RESTAURANT_ID,
++      items: [{ itemId: ITEM_1, quantity: 1 }],
++    };
++
++    const bodyForUser2 = {
++      orderType: "DineIn",
++      estimatedWaitingTime: 25,
++      orderMessage: `Gold user two ${Date.now()}`,
++      restaurantId: RESTAURANT_ID,
++      items: [{ itemId: ITEM_2, quantity: 2 }],
++    };
++
++    const firstUser = await request(app)
++      .post("/api/v1/orders")
++      .set("Authorization", `Bearer ${token}`)
++      .set("Idempotency-Key", key)
++      .send(bodyForUser1);
++
++    const secondUser = await request(app)
++      .post("/api/v1/orders")
++      .set("Authorization", `Bearer ${token2}`)
++      .set("Idempotency-Key", key)
++      .send(bodyForUser2);
++
++    expect(firstUser.status).toBe(201);
++    expect(firstUser.headers["idempotency-replayed"]).toBe("false");
++
++    expect(secondUser.status).toBe(201);
++    expect(secondUser.headers["idempotency-replayed"]).toBe("false");
++
++    expect(secondUser.body.data.id).not.toBe(firstUser.body.data.id);
++
++    const persisted = await pool.query(
++      `
++      SELECT id, user_id
++      FROM orders
++      WHERE id = ANY($1::uuid[])
++      ORDER BY user_id
++    `,
++      [[firstUser.body.data.id, secondUser.body.data.id]]
++    );
++
++    expect(persisted.rowCount).toBe(2);
++
++    expect(persisted.rows.map((row) => row.user_id)).toEqual([
++      USER_ID,
++      USER_2_ID,
++    ]);
++  });
++  it.each([
++    ["1 character", "a"],
++    ["128 characters", "x".repeat(128)],
++  ])("accepts an idempotency key with %s", async (_label, key) => {
++    const orderMessage = `Gold valid key boundary ${Date.now()} ${_label}`;
++
++    const response = await request(app)
++      .post("/api/v1/orders")
++      .set("Authorization", `Bearer ${token}`)
++      .set("Idempotency-Key", key)
++      .send({
++        orderType: "DineIn",
++        estimatedWaitingTime: 20,
++        orderMessage,
++        restaurantId: RESTAURANT_ID,
++        items: [{ itemId: ITEM_1, quantity: 1 }],
++      });
++
++    expect(response.status).toBe(201);
++    expect(response.headers["idempotency-replayed"]).toBe("false");
++    expect(response.body.success).toBe(true);
++
++    const persisted = await pool.query(
++      `
++      SELECT id
++      FROM orders
++      WHERE user_id = $1
++        AND order_message = $2
++    `,
++      [USER_ID, orderMessage]
++    );
++
++    expect(persisted.rowCount).toBe(1);
++    expect(persisted.rows[0].id).toBe(response.body.data.id);
++  });
++  it.each([
++    [
++      "estimated waiting time",
++      (body: any) => ({
++        ...body,
++        estimatedWaitingTime: 45,
++      }),
++    ],
++    [
++      "order type",
++      (body: any) => ({
++        ...body,
++        orderType: "Takeaway",
++      }),
++    ],
++    [
++      "item quantity",
++      (body: any) => ({
++        ...body,
++        items: [{ itemId: ITEM_1, quantity: 3 }],
++      }),
++    ],
++    [
++      "item id",
++      (body: any) => ({
++        ...body,
++        items: [{ itemId: ITEM_2, quantity: 1 }],
++      }),
++    ],
++  ])(
++    "returns 409 when the same key is reused with a different %s",
++    async (label, mutatePayload) => {
++      const key = `gold-conflict-${label}-${Date.now()}`;
++      const orderMessage = `Gold conflict ${label} ${Date.now()}`;
++
++      const originalBody = {
++        orderType: "DineIn",
++        estimatedWaitingTime: 20,
++        orderMessage,
++        restaurantId: RESTAURANT_ID,
++        items: [{ itemId: ITEM_1, quantity: 1 }],
++      };
++
++      const first = await request(app)
++        .post("/api/v1/orders")
++        .set("Authorization", `Bearer ${token}`)
++        .set("Idempotency-Key", key)
++        .send(originalBody);
++
++      expect(first.status).toBe(201);
++      expect(first.headers["idempotency-replayed"]).toBe("false");
++
++      const conflict = await request(app)
++        .post("/api/v1/orders")
++        .set("Authorization", `Bearer ${token}`)
++        .set("Idempotency-Key", key)
++        .send(mutatePayload(originalBody));
++
++      expect(conflict.status).toBe(409);
++      expect(conflict.body.success).toBe(false);
++
++      const persisted = await pool.query(
++        `
++        SELECT id
++        FROM orders
++        WHERE user_id = $1
++          AND order_message = $2
++      `,
++        [USER_ID, orderMessage]
++      );
++
++      expect(persisted.rowCount).toBe(1);
++      expect(persisted.rows[0].id).toBe(first.body.data.id);
++
++      const items = await pool.query(
++        `
++        SELECT item_id, quantity
++        FROM order_items
++        WHERE order_id = $1
++      `,
++        [first.body.data.id]
++      );
++
++      expect(items.rowCount).toBe(1);
++      expect(items.rows[0].item_id).toBe(ITEM_1);
++      expect(Number(items.rows[0].quantity)).toBe(1);
++    }
++  );
++  it("returns 409 when the same key is reused for a different restaurant", async () => {
++    const key = `gold-restaurant-conflict-${Date.now()}`;
++    const orderMessage = `Gold restaurant conflict ${Date.now()}`;
++
++    const originalBody = {
++      orderType: "DineIn",
++      estimatedWaitingTime: 20,
++      orderMessage,
++      restaurantId: RESTAURANT_ID,
++      items: [{ itemId: ITEM_1, quantity: 1 }],
++    };
++
++    const first = await request(app)
++      .post("/api/v1/orders")
++      .set("Authorization", `Bearer ${token}`)
++      .set("Idempotency-Key", key)
++      .send(originalBody);
++
++    expect(first.status).toBe(201);
++    expect(first.headers["idempotency-replayed"]).toBe("false");
++
++    const conflict = await request(app)
++      .post("/api/v1/orders")
++      .set("Authorization", `Bearer ${token}`)
++      .set("Idempotency-Key", key)
++      .send({
++        ...originalBody,
++        restaurantId: RESTAURANT_2_ID,
++      });
++
++    expect(conflict.status).toBe(409);
++    expect(conflict.body.success).toBe(false);
++
++    const originalOrders = await pool.query(
++      `
++      SELECT id, restaurant_id
++      FROM orders
++      WHERE user_id = $1
++        AND order_message = $2
++    `,
++      [USER_ID, orderMessage]
++    );
++
++    expect(originalOrders.rowCount).toBe(1);
++    expect(originalOrders.rows[0].id).toBe(first.body.data.id);
++    expect(originalOrders.rows[0].restaurant_id).toBe(RESTAURANT_ID);
++  });
++});
+diff --git a/rateeat_backend/src/__tests__/unit/order_process_worker.ts b/rateeat_backend/src/__tests__/unit/order_process_worker.ts
+new file mode 100644
+index 000000000..9fa0064e8
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/order_process_worker.ts
+@@ -0,0 +1,52 @@
++import express from "express";
++import request from "supertest";
++import sequelize from "../../config/db";
++import orderRouter from "../../routes/order.route";
++
++async function main() {
++  const app = express();
++  app.use(express.json());
++  app.use("/api/v1/orders", orderRouter);
++
++  app.use((err: any, _req: any, res: any, _next: any) => {
++    res.status(err.statusCode || 500).json({
++      success: false,
++      message: err.message,
++    });
++  });
++
++  const token = process.env.GOLD_ORDER_TOKEN;
++  const key = process.env.GOLD_IDEMPOTENCY_KEY;
++  const body = JSON.parse(process.env.GOLD_ORDER_BODY || "{}");
++
++  if (!token || !key) {
++    throw new Error("GOLD_ORDER_TOKEN and GOLD_IDEMPOTENCY_KEY are required");
++  }
++
++  const response = await request(app)
++    .post("/api/v1/orders")
++    .set("Authorization", `Bearer ${token}`)
++    .set("Idempotency-Key", key)
++    .send(body);
++
++  process.stdout.write(
++    `__GOLD_RESULT__${JSON.stringify({
++      status: response.status,
++      headers: {
++        replayed: response.headers["idempotency-replayed"],
++      },
++      body: response.body,
++    })}`
++  );
++  await sequelize.close();
++}
++
++main()
++  .then(() => process.exit(0))
++  .catch(async (error) => {
++    console.error(error);
++    try {
++      await sequelize.close();
++    } catch {}
++    process.exit(1);
++  });
+diff --git a/rateeat_backend/src/__tests__/unit/order_real_db_test_support.ts b/rateeat_backend/src/__tests__/unit/order_real_db_test_support.ts
+new file mode 100644
+index 000000000..f5e0c6faa
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/order_real_db_test_support.ts
+@@ -0,0 +1,396 @@
++import jwt from "jsonwebtoken";
++import { Pool } from "pg";
++import { spawnSync } from "child_process";
++import path from "path";
++
++export const USER_ID = "00000000-0000-0000-0000-000000000011";
++export const USER_2_ID = "00000000-0000-0000-0000-000000000012";
++
++export const RESTAURANT_ID = "00000000-0000-0000-0000-000000000021";
++export const RESTAURANT_2_ID = "00000000-0000-0000-0000-000000000022";
++
++export const ITEM_1 = "00000000-0000-0000-0000-000000000051";
++export const ITEM_2 = "00000000-0000-0000-0000-000000000052";
++
++export const MANAGER_ID = "00000000-0000-0000-0000-000000000061";
++
++export const token = jwt.sign(
++  { id: USER_ID },
++  process.env.JWT_SECRET || "gold-test-secret"
++);
++
++export const token2 = jwt.sign(
++  { id: USER_2_ID },
++  process.env.JWT_SECRET || "gold-test-secret"
++);
++
++export const createDatabasePool = () =>
++  new Pool({
++    host: process.env.DEVELOPMENT_PG_HOST,
++    port: Number(process.env.DEVELOPMENT_PG_PORT || 5432),
++    user: process.env.DEVELOPMENT_PG_USER,
++    password: process.env.DEVELOPMENT_PG_PASSWORD,
++    database: process.env.DEVELOPMENT_PG_DATABASE,
++  });
++
++export async function clearOrders(pool: Pool) {
++  const userIds = [USER_ID, USER_2_ID];
++
++  await pool.query(
++    `
++      DELETE FROM order_items
++      WHERE order_id IN (
++        SELECT id
++        FROM orders
++        WHERE user_id = ANY($1::uuid[])
++      )
++    `,
++    [userIds]
++  );
++
++  await pool.query(
++    `
++      DELETE FROM orders
++      WHERE user_id = ANY($1::uuid[])
++    `,
++    [userIds]
++  );
++}
++
++export async function installFailingOrderItemTrigger(pool: Pool) {
++  await pool.query(`
++    CREATE OR REPLACE FUNCTION gold_fail_order_item_insert()
++    RETURNS trigger AS $$
++    BEGIN
++      RAISE EXCEPTION 'gold forced order_items failure';
++    END;
++    $$ LANGUAGE plpgsql;
++  `);
++
++  await pool.query(`
++    DROP TRIGGER IF EXISTS gold_fail_order_item_insert_trigger
++    ON order_items;
++  `);
++
++  await pool.query(`
++    CREATE TRIGGER gold_fail_order_item_insert_trigger
++    BEFORE INSERT ON order_items
++    FOR EACH ROW
++    EXECUTE FUNCTION gold_fail_order_item_insert();
++  `);
++}
++
++export async function removeFailingOrderItemTrigger(pool: Pool) {
++  await pool.query(`
++    DROP TRIGGER IF EXISTS gold_fail_order_item_insert_trigger
++    ON order_items;
++  `);
++
++  await pool.query(`
++    DROP FUNCTION IF EXISTS gold_fail_order_item_insert();
++  `);
++}
++
++export const runOrderInFreshProcess = (
++  key: string,
++  body: Record<string, unknown>
++) => {
++  const workerPath = path.join(__dirname, "order_process_worker.ts");
++
++  const child = spawnSync(
++    process.execPath,
++    ["-r", "ts-node/register/transpile-only", workerPath],
++    {
++      cwd: process.cwd(),
++      encoding: "utf8",
++      timeout: 30000,
++      env: {
++        ...process.env,
++        NODE_ENV: "development",
++        JWT_SECRET: process.env.JWT_SECRET || "gold-test-secret",
++        GOLD_ORDER_TOKEN: token,
++        GOLD_IDEMPOTENCY_KEY: key,
++        GOLD_ORDER_BODY: JSON.stringify(body),
++      },
++    }
++  );
++
++  if (child.status !== 0) {
++    throw new Error(
++      [
++        `fresh order process exited with ${child.status}`,
++        `stdout: ${child.stdout}`,
++        `stderr: ${child.stderr}`,
++      ].join("\n")
++    );
++  }
++
++  const marker = "__GOLD_RESULT__";
++  const markerIndex = child.stdout.lastIndexOf(marker);
++
++  if (markerIndex === -1) {
++    throw new Error(`worker result marker missing:\n${child.stdout}`);
++  }
++
++  return JSON.parse(child.stdout.slice(markerIndex + marker.length));
++};
++
++export async function seedOrderTestFixtures(pool: Pool) {
++  await pool.query(`
++    INSERT INTO roles (
++      id,
++      name,
++      "createdAt",
++      "updatedAt"
++    )
++    VALUES (
++      '00000000-0000-0000-0000-000000000001',
++      'user',
++      NOW(),
++      NOW()
++    )
++    ON CONFLICT (id) DO UPDATE
++    SET
++      name = EXCLUDED.name,
++      "updatedAt" = NOW();
++  `);
++
++  await pool.query(`
++    INSERT INTO users (
++      id,
++      first_name,
++      last_name,
++      email,
++      role_id,
++      phone_number,
++      password,
++      username,
++      verified,
++      acquisition_channel,
++      is_active,
++      "createdAt",
++      "updatedAt"
++    )
++    VALUES
++      (
++        '00000000-0000-0000-0000-000000000011',
++        'Gold',
++        'Tester',
++        'gold-order-test@example.com',
++        '00000000-0000-0000-0000-000000000001',
++        '+251900001111',
++        '',
++        'gold_order_test',
++        4,
++        'direct-signup',
++        true,
++        NOW(),
++        NOW()
++      ),
++      (
++        '00000000-0000-0000-0000-000000000012',
++        'Gold',
++        'Tester Two',
++        'gold-order-test-2@example.com',
++        '00000000-0000-0000-0000-000000000001',
++        '+251900001112',
++        '',
++        'gold_order_test_2',
++        4,
++        'direct-signup',
++        true,
++        NOW(),
++        NOW()
++      )
++    ON CONFLICT (id) DO UPDATE
++    SET
++      first_name = EXCLUDED.first_name,
++      last_name = EXCLUDED.last_name,
++      email = EXCLUDED.email,
++      role_id = EXCLUDED.role_id,
++      phone_number = EXCLUDED.phone_number,
++      username = EXCLUDED.username,
++      is_active = true,
++      "updatedAt" = NOW();
++  `);
++
++  await pool.query(`
++    INSERT INTO admin_users (
++      id,
++      first_name,
++      last_name,
++      email,
++      password,
++      role_id,
++      fcm_token,
++      phone_number,
++      is_active,
++      "createdAt",
++      "updatedAt"
++    )
++    VALUES (
++      '00000000-0000-0000-0000-000000000061',
++      'Gold',
++      'Manager',
++      'gold-manager@example.com',
++      'not-used-by-tests',
++      '00000000-0000-0000-0000-000000000001',
++      'gold-test-fcm-token',
++      '+251900001161',
++      true,
++      NOW(),
++      NOW()
++    )
++    ON CONFLICT (id) DO UPDATE
++    SET
++      first_name = EXCLUDED.first_name,
++      last_name = EXCLUDED.last_name,
++      fcm_token = EXCLUDED.fcm_token,
++      is_active = true,
++      "updatedAt" = NOW();
++  `);
++
++  await pool.query(`
++    INSERT INTO restaurants (
++      id,
++      name,
++      is_open,
++      is_order_service_available,
++      is_order_service_online,
++      branch_manager_id,
++      "createdAt",
++      "updatedAt"
++    )
++    VALUES
++      (
++        '00000000-0000-0000-0000-000000000021',
++        'Gold Test Restaurant',
++        true,
++        true,
++        true,
++        '00000000-0000-0000-0000-000000000061',
++        NOW(),
++        NOW()
++      ),
++      (
++        '00000000-0000-0000-0000-000000000022',
++        'Gold Test Restaurant Two',
++        true,
++        true,
++        true,
++        NULL,
++        NOW(),
++        NOW()
++      )
++    ON CONFLICT (id) DO UPDATE
++    SET
++      name = EXCLUDED.name,
++      is_open = true,
++      is_order_service_available = true,
++      is_order_service_online = true,
++      branch_manager_id = EXCLUDED.branch_manager_id,
++      "updatedAt" = NOW();
++  `);
++
++  await pool.query(`
++    INSERT INTO menus (
++      id,
++      restaurant_id,
++      "createdAt",
++      "updatedAt",
++      menu_updated_at
++    )
++    VALUES (
++      '00000000-0000-0000-0000-000000000031',
++      '00000000-0000-0000-0000-000000000021',
++      NOW(),
++      NOW(),
++      NOW()
++    )
++    ON CONFLICT (id) DO UPDATE
++    SET
++      restaurant_id = EXCLUDED.restaurant_id,
++      "updatedAt" = NOW(),
++      menu_updated_at = NOW();
++  `);
++
++  await pool.query(`
++    INSERT INTO categories (
++      id,
++      name,
++      menu_id,
++      url,
++      is_approved,
++      "createdAt",
++      "updatedAt"
++    )
++    VALUES (
++      '00000000-0000-0000-0000-000000000041',
++      'Gold Test Category',
++      '00000000-0000-0000-0000-000000000031',
++      '',
++      true,
++      NOW(),
++      NOW()
++    )
++    ON CONFLICT (id) DO UPDATE
++    SET
++      name = EXCLUDED.name,
++      menu_id = EXCLUDED.menu_id,
++      is_approved = true,
++      "updatedAt" = NOW();
++  `);
++
++  await pool.query(`
++    INSERT INTO items (
++      id,
++      name,
++      description,
++      price,
++      category_id,
++      fasting,
++      is_approved,
++      is_available_for_order,
++      price_updated_at,
++      "createdAt",
++      "updatedAt"
++    )
++    VALUES
++      (
++        '00000000-0000-0000-0000-000000000051',
++        'Gold Burger',
++        'Integration test item',
++        10,
++        '00000000-0000-0000-0000-000000000041',
++        false,
++        true,
++        true,
++        NOW(),
++        NOW(),
++        NOW()
++      ),
++      (
++        '00000000-0000-0000-0000-000000000052',
++        'Gold Fries',
++        'Integration test item',
++        5,
++        '00000000-0000-0000-0000-000000000041',
++        false,
++        true,
++        true,
++        NOW(),
++        NOW(),
++        NOW()
++      )
++    ON CONFLICT (id) DO UPDATE
++    SET
++      name = EXCLUDED.name,

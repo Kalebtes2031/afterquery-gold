@@ -1,0 +1,993 @@
+diff --git a/rateeat_backend/migrations/20260814120000-create-order-idempotency-keys.js b/rateeat_backend/migrations/20260814120000-create-order-idempotency-keys.js
+new file mode 100644
+index 000000000..4ef1be65e
+--- /dev/null
++++ b/rateeat_backend/migrations/20260814120000-create-order-idempotency-keys.js
+@@ -0,0 +1,72 @@
++"use strict";
++
++/** @type {import('sequelize-cli').Migration} */
++module.exports = {
++  async up(queryInterface, Sequelize) {
++    await queryInterface.createTable("order_idempotency_keys", {
++      id: {
++        type: Sequelize.UUID,
++        allowNull: false,
++        primaryKey: true,
++        defaultValue: Sequelize.UUIDV4,
++      },
++      user_id: {
++        type: Sequelize.UUID,
++        allowNull: false,
++        references: {
++          model: "users",
++          key: "id",
++        },
++        onDelete: "CASCADE",
++        onUpdate: "CASCADE",
++      },
++      idempotency_key: {
++        type: Sequelize.STRING(128),
++        allowNull: false,
++      },
++      request_hash: {
++        type: Sequelize.STRING(64),
++        allowNull: false,
++      },
++      order_id: {
++        type: Sequelize.UUID,
++        allowNull: true,
++        references: {
++          model: "orders",
++          key: "id",
++        },
++        onDelete: "CASCADE",
++        onUpdate: "CASCADE",
++      },
++      status: {
++        type: Sequelize.STRING(20),
++        allowNull: false,
++        defaultValue: "processing",
++      },
++      createdAt: {
++        type: Sequelize.DATE,
++        allowNull: false,
++        defaultValue: Sequelize.fn("NOW"),
++      },
++      updatedAt: {
++        type: Sequelize.DATE,
++        allowNull: false,
++        defaultValue: Sequelize.fn("NOW"),
++      },
++    });
++
++    await queryInterface.addConstraint("order_idempotency_keys", {
++      fields: ["user_id", "idempotency_key"],
++      type: "unique",
++      name: "order_idempotency_keys_user_key_unique",
++    });
++
++    await queryInterface.addIndex("order_idempotency_keys", ["order_id"], {
++      name: "order_idempotency_keys_order_id_idx",
++    });
++  },
++
++  async down(queryInterface) {
++    await queryInterface.dropTable("order_idempotency_keys");
++  },
++};
+diff --git a/rateeat_backend/src/config/db.ts b/rateeat_backend/src/config/db.ts
+index 0f7384b9e..dcf1520fb 100644
+--- a/rateeat_backend/src/config/db.ts
++++ b/rateeat_backend/src/config/db.ts
+@@ -66,6 +66,7 @@ import {
+   AvailabilityAlert,
+   Order,
+   OrderItem,
++  OrderIdempotencyKey,
+   Payment,
+   Following,
+   FollowerRecommendation,
+@@ -181,6 +182,7 @@ const sequelize: Sequelize = new Sequelize({
+     AvailabilityAlert,
+     Order,
+     OrderItem,
++    OrderIdempotencyKey,
+     Payment,
+     Following,
+     FollowerRecommendation,
+diff --git a/rateeat_backend/src/controllers/order.controller.ts b/rateeat_backend/src/controllers/order.controller.ts
+index c7afccc15..e5335a969 100644
+--- a/rateeat_backend/src/controllers/order.controller.ts
++++ b/rateeat_backend/src/controllers/order.controller.ts
+@@ -31,6 +31,15 @@ import { Op, Sequelize } from "sequelize";
+ import { calculateNumberOfItemsAndPrice } from "../utils/order.utils";
+ import { NotificationCategory } from "../models/Feedback/Notification";
+ import sendNotification from "../utils/notification.utils";
++import {
++  createOrderWithIdempotency,
++  parseIdempotencyKey,
++} from "../services/order-idempotency.service";
++import {
++  dispatchOrderCreatedSideEffects,
++  getDetailedOrderItems,
++  persistOrderAggregate,
++} from "../services/order-creation.service";
+ 
+ export const checkOrderAuthorization = async (
+   user: AdminUser,
+@@ -110,124 +119,87 @@ const createOrder = asyncAwaitHandler(
+       estimatedWaitingTime,
+       orderMessage,
+       restaurantId,
+-      items, // array of objects with itemId and quantity
++      items,
+     } = req.body;
++
+     let user: any = req.user;
+     if (!user) {
+       return next(new NotFoundError("User not found"));
+     }
++
+     user = await User.findOne({ where: { id: user.id } });
+     if (!user) {
+       return next(new NotFoundError("User not found"));
+     }
++
++    const idempotencyKey = parseIdempotencyKey(
++      req.get("Idempotency-Key")
++    );
++
++    const payload = {
++      orderType,
++      estimatedWaitingTime,
++      orderMessage,
++      restaurantId,
++      items,
++    };
++
++    // Pricing is read-only and happens before opening the write transaction.
++    // If item validation or pricing fails, no database mutation has begun.
+     const { totalItems, totalPrice } =
+       await calculateNumberOfItemsAndPrice(items);
+ 
+-    let order = await Order.create({
+-      order_type: orderType,
+-      total_number_of_items: totalItems,
+-      total_price: totalPrice,
+-      estimated_waiting_time: estimatedWaitingTime,
+-      order_message: orderMessage,
+-      user_id: user.id,
+-      restaurant_id: restaurantId, // restaurant where the order is placed
++    const creationResult = await createOrderWithIdempotency({
++      userId: user.id,
++      idempotencyKey,
++      payload,
++      createOrder: async (transaction) => {
++        return persistOrderAggregate(
++          {
++            userId: user.id,
++            payload,
++            totalItems,
++            totalPrice,
++          },
++          transaction
++        );
++      },
+     });
+ 
+-    if (!order) {
++    const createdOrder = await getOrderDetails(creationResult.orderId);
++    if (!createdOrder) {
+       return next(new BadRequestError("Order not created"));
+     }
+ 
+-    const orderItems = items.map(
+-      (item: { itemId: string; quantity: number }) => ({
+-        item_id: item.itemId,
+-        quantity: item.quantity,
+-        order_id: order.id,
+-        restaurant_id: restaurantId, // restaurant where the item belongs
+-      })
+-    );
++    if (creationResult.replayed) {
++      res.setHeader("Idempotency-Replayed", "true");
++      return res.status(201).json({
++        success: true,
++        data: createdOrder,
++      });
++    }
+ 
+-    // create order items in bulk means all items in one transaction
+-    await OrderItem.bulkCreate(orderItems);
++    if (idempotencyKey) {
++      res.setHeader("Idempotency-Replayed", "false");
++    }
+ 
+-    // Fetch item details
+-    const itemDetails = await Item.findAll({
+-      where: {
+-        id: items.map((item: { itemId: string }) => item.itemId),
+-      },
+-      attributes: ["id", "name", "price"],
+-    });
++    const detailedOrderItems = await getDetailedOrderItems(
++      creationResult.orderId,
++      payload
++    );
+ 
+-    // Combine item details with quantities
+-    const detailedOrderItems = orderItems.map((orderItem) => {
+-      const itemDetail = itemDetails.find(
+-        (item) => item.id === orderItem.item_id
+-      );
+-      return {
+-        ...orderItem,
+-        item: {
+-          name: itemDetail?.name,
+-          price: itemDetail?.price,
+-        },
+-      };
++    // Socket and notification work is intentionally performed only after the
++    // transaction has committed. Retried idempotent requests return above, so
++    // they never emit the same external side effects a second time.
++    await dispatchOrderCreatedSideEffects({
++      order: createdOrder,
++      orderItems: detailedOrderItems,
++      user,
+     });
+ 
+-    const userDetail = {
+-      firstName: user.firstName,
+-      lastName: user.lastName,
+-      email: user.email,
+-      phoneNumber: user.phoneNumber,
+-    };
+-
+-    const createdOrder = await getOrderDetails(order.id);
+-    order = createdOrder;
+-    if (io) {
+-      /**
+-       * Emit an event to the restaurant room
+-       */
+-      io.to(`restaurant-${order?.restaurant_id}`).emit("newOrder", {
+-        order,
+-        orderItems: detailedOrderItems,
+-        user: userDetail,
+-      });
+-      io.to(`user-${user.id}`).emit("orderCreated", {
+-        userId: user.id,
+-        order,
+-        orderItems: detailedOrderItems,
+-      });
+-    } else {
+-      console.log("Socket not initialized");
+-    }
+-    const restaurant = await Restaurant.findByPk(restaurantId);
+-    const branch_manager = restaurant?.branch_manager_id;
+-    const order_manager = restaurant?.order_manager_id;
+-    if (branch_manager || order_manager) {
+-      const notificationRecipients = [branch_manager, order_manager];
+-      notificationRecipients.forEach(async (recipient) => {
+-        if (recipient) {
+-          const message = `New order from ${user.first_name} ${user.last_name}`;
+-          await Notification.create({
+-            notifiable_type: "Order",
+-            notifiable_id: order.id,
+-            user_id: recipient,
+-            reactor_id: user.id,
+-            notification_category: NotificationCategory.Order,
+-            message,
+-          });
+-          const adminUser = await AdminUser.findOne({
+-            where: { id: recipient },
+-          });
+-          await sendNotification(
+-            adminUser?.fcm_token,
+-            "New Order",
+-            message,
+-            "businessApp"
+-          );
+-        }
+-      });
+-    }
+     return res.status(201).json({
+       success: true,
+-      data: order,
++      data: createdOrder,
+     });
+   }
+ );
+diff --git a/rateeat_backend/src/models/Order/OrderIdempotencyKey.ts b/rateeat_backend/src/models/Order/OrderIdempotencyKey.ts
+new file mode 100644
+index 000000000..da7982dce
+--- /dev/null
++++ b/rateeat_backend/src/models/Order/OrderIdempotencyKey.ts
+@@ -0,0 +1,93 @@
++/* eslint-disable no-use-before-define */
++import {
++  BelongsTo,
++  Column,
++  CreatedAt,
++  DataType,
++  ForeignKey,
++  Model,
++  PrimaryKey,
++  Table,
++  UpdatedAt,
++} from "sequelize-typescript";
++import User from "../User/User";
++import Order from "./Order";
++
++export enum OrderIdempotencyStatus {
++  Processing = "processing",
++  Completed = "completed",
++}
++
++@Table({
++  tableName: "order_idempotency_keys",
++  timestamps: true,
++  indexes: [
++    {
++      name: "order_idempotency_keys_user_key_unique",
++      unique: true,
++      fields: ["user_id", "idempotency_key"],
++    },
++  ],
++})
++class OrderIdempotencyKey extends Model<OrderIdempotencyKey> {
++  @PrimaryKey
++  @Column({
++    type: DataType.UUID,
++    defaultValue: DataType.UUIDV4,
++    allowNull: false,
++  })
++  id!: string;
++
++  @ForeignKey(() => User)
++  @Column({
++    type: DataType.UUID,
++    allowNull: false,
++  })
++  user_id!: string;
++
++  @Column({
++    type: DataType.STRING(128),
++    allowNull: false,
++  })
++  idempotency_key!: string;
++
++  @Column({
++    type: DataType.STRING(64),
++    allowNull: false,
++  })
++  request_hash!: string;
++
++  @ForeignKey(() => Order)
++  @Column({
++    type: DataType.UUID,
++    allowNull: true,
++  })
++  order_id!: string | null;
++
++  @Column({
++    type: DataType.STRING(20),
++    allowNull: false,
++    defaultValue: OrderIdempotencyStatus.Processing,
++  })
++  status!: OrderIdempotencyStatus;
++
++  @CreatedAt
++  createdAt!: Date;
++
++  @UpdatedAt
++  updatedAt!: Date;
++
++  @BelongsTo(() => User, {
++    onDelete: "CASCADE",
++    onUpdate: "CASCADE",
++  })
++  user!: User;
++
++  @BelongsTo(() => Order, {
++    onDelete: "CASCADE",
++    onUpdate: "CASCADE",
++  })
++  order!: Order;
++}
++
++export default OrderIdempotencyKey;
+diff --git a/rateeat_backend/src/models/index.ts b/rateeat_backend/src/models/index.ts
+index 83f7a36de..36ca92ccc 100644
+--- a/rateeat_backend/src/models/index.ts
++++ b/rateeat_backend/src/models/index.ts
+@@ -60,6 +60,7 @@ import CandidateAdminUser from "./Incentive/CandidateAdminUser";
+ import AvailabilityAlert from "./Restaurant/AvailabilityAlert";
+ import Order from "./Order/Order";
+ import OrderItem from "./Order/OrderItem";
++import OrderIdempotencyKey from "./Order/OrderIdempotencyKey";
+ import Payment from "./Order/Payment";
+ import Following from "./Social/Following";
+ import FollowerRecommendation from "./Social/FollowerRecommendation";
+@@ -160,6 +161,7 @@ export {
+   AvailabilityAlert,
+   Order,
+   OrderItem,
++  OrderIdempotencyKey,
+   Payment,
+   Following,
+   FollowerRecommendation,
+diff --git a/rateeat_backend/src/services/order-creation.service.ts b/rateeat_backend/src/services/order-creation.service.ts
+new file mode 100644
+index 000000000..b603c1324
+--- /dev/null
++++ b/rateeat_backend/src/services/order-creation.service.ts
+@@ -0,0 +1,232 @@
++import { Transaction } from "sequelize";
++import {
++  AdminUser,
++  Item,
++  Notification,
++  Order,
++  Restaurant,
++  User,
++} from "../models";
++import OrderItem from "../models/Order/OrderItem";
++import { NotificationCategory } from "../models/Feedback/Notification";
++import { io } from "../utils/socket.utils";
++import sendNotification from "../utils/notification.utils";
++import { OrderCreationPayload } from "./order-idempotency.service";
++
++export type PersistOrderInput = {
++  userId: string;
++  payload: OrderCreationPayload;
++  totalItems: number;
++  totalPrice: number;
++};
++
++export type OrderItemWithDetails = {
++  item_id: string;
++  quantity: number;
++  order_id: string;
++  restaurant_id: string;
++  item: {
++    name?: string;
++    price?: number;
++  };
++};
++
++type UserSummary = {
++  firstName?: string;
++  lastName?: string;
++  email?: string;
++  phoneNumber?: string;
++};
++
++/**
++ * Persists the order aggregate inside a caller-owned transaction.
++ *
++ * The transaction is required rather than optional. This makes it difficult
++ * for future callers to accidentally reintroduce the partial-write behavior
++ * where an Order exists but one or more OrderItem rows do not.
++ */
++export const persistOrderAggregate = async (
++  input: PersistOrderInput,
++  transaction: Transaction
++): Promise<string> => {
++  const { userId, payload, totalItems, totalPrice } = input;
++
++  const order = await Order.create(
++    {
++      order_type: payload.orderType,
++      total_number_of_items: totalItems,
++      total_price: totalPrice,
++      estimated_waiting_time: payload.estimatedWaitingTime,
++      order_message: payload.orderMessage,
++      user_id: userId,
++      restaurant_id: payload.restaurantId,
++    },
++    { transaction }
++  );
++
++  const orderItems = payload.items.map((item) => ({
++    item_id: item.itemId,
++    quantity: item.quantity,
++    order_id: order.id,
++    restaurant_id: payload.restaurantId,
++  }));
++
++  await OrderItem.bulkCreate(orderItems, { transaction });
++
++  return order.id;
++};
++
++export const getDetailedOrderItems = async (
++  orderId: string,
++  payload: OrderCreationPayload
++): Promise<OrderItemWithDetails[]> => {
++  const itemIds = payload.items.map((item) => item.itemId);
++  const itemDetails = await Item.findAll({
++    where: {
++      id: itemIds,
++    },
++    attributes: ["id", "name", "price"],
++  });
++
++  return payload.items.map((orderItem) => {
++    const itemDetail = itemDetails.find((item) => item.id === orderItem.itemId);
++
++    return {
++      item_id: orderItem.itemId,
++      quantity: orderItem.quantity,
++      order_id: orderId,
++      restaurant_id: payload.restaurantId,
++      item: {
++        name: itemDetail?.name,
++        price: itemDetail?.price,
++      },
++    };
++  });
++};
++
++const buildUserSummary = (user: User): UserSummary => ({
++  firstName: user.first_name,
++  lastName: user.last_name,
++  email: user.email,
++  phoneNumber: user.phone_number,
++});
++
++export const emitOrderCreatedEvents = ({
++  order,
++  orderItems,
++  user,
++}: {
++  order: Order;
++  orderItems: OrderItemWithDetails[];
++  user: User;
++}) => {
++  if (!io) {
++    return;
++  }
++
++  const userSummary = buildUserSummary(user);
++
++  io.to(`restaurant-${order.restaurant_id}`).emit("newOrder", {
++    order,
++    orderItems,
++    user: userSummary,
++  });
++
++  io.to(`user-${user.id}`).emit("orderCreated", {
++    userId: user.id,
++    order,
++    orderItems,
++  });
++};
++
++const notifyManager = async ({
++  recipientId,
++  order,
++  user,
++}: {
++  recipientId: string;
++  order: Order;
++  user: User;
++}) => {
++  const message = `New order from ${user.first_name} ${user.last_name}`;
++
++  await Notification.create({
++    notifiable_type: "Order",
++    notifiable_id: order.id,
++    user_id: recipientId,
++    reactor_id: user.id,
++    notification_category: NotificationCategory.Order,
++    message,
++  });
++
++  const adminUser = await AdminUser.findOne({
++    where: { id: recipientId },
++  });
++
++  await sendNotification(
++    adminUser?.fcm_token,
++    "New Order",
++    message,
++    "businessApp"
++  );
++};
++
++export const notifyRestaurantManagersOfNewOrder = async ({
++  order,
++  user,
++}: {
++  order: Order;
++  user: User;
++}) => {
++  const restaurant = await Restaurant.findByPk(order.restaurant_id);
++
++  if (!restaurant) {
++    return;
++  }
++
++  const recipients = new Set<string>();
++
++  if (restaurant.branch_manager_id) {
++    recipients.add(restaurant.branch_manager_id);
++  }
++
++  if (restaurant.order_manager_id) {
++    recipients.add(restaurant.order_manager_id);
++  }
++
++  // A restaurant can have the same person in both manager roles. Using a Set
++  // ensures that a single order does not create duplicate notifications.
++  await Promise.all(
++    Array.from(recipients).map((recipientId) =>
++      notifyManager({
++        recipientId,
++        order,
++        user,
++      })
++    )
++  );
++};
++
++/**
++ * Runs external side effects after the order transaction has committed.
++ *
++ * This function is deliberately separate from persistOrderAggregate. Socket,
++ * push-notification, or notification-table failures must never cause the
++ * database transaction that creates the order to be partially committed.
++ */
++export const dispatchOrderCreatedSideEffects = async ({
++  order,
++  orderItems,
++  user,
++}: {
++  order: Order;
++  orderItems: OrderItemWithDetails[];
++  user: User;
++}) => {
++  emitOrderCreatedEvents({ order, orderItems, user });
++
++  await notifyRestaurantManagersOfNewOrder({
++    order,
++    user,
++  });
++};
+diff --git a/rateeat_backend/src/services/order-idempotency.service.ts b/rateeat_backend/src/services/order-idempotency.service.ts
+new file mode 100644
+index 000000000..9d521f710
+--- /dev/null
++++ b/rateeat_backend/src/services/order-idempotency.service.ts
+@@ -0,0 +1,332 @@
++import crypto from "crypto";
++import { Transaction, UniqueConstraintError } from "sequelize";
++import sequelize from "../config/db";
++import { HttpError } from "../utils/error-response.utils";
++import OrderIdempotencyKey, {
++  OrderIdempotencyStatus,
++} from "../models/Order/OrderIdempotencyKey";
++import { OrderType } from "../models/Order/Order";
++
++const MAX_IDEMPOTENCY_KEY_LENGTH = 128;
++const IDEMPOTENCY_KEY_HEADER = "idempotency-key";
++
++export type OrderItemInput = {
++  itemId: string;
++  quantity: number;
++};
++
++export type OrderCreationPayload = {
++  orderType?: OrderType;
++  estimatedWaitingTime?: number;
++  orderMessage?: string;
++  restaurantId: string;
++  items: OrderItemInput[];
++};
++
++type SerializableValue =
++  | string
++  | number
++  | boolean
++  | null
++  | SerializableValue[]
++  | { [key: string]: SerializableValue };
++
++export type OrderCreationResult = {
++  orderId: string;
++  replayed: boolean;
++};
++
++type CreateOrderCallback = (transaction: Transaction) => Promise<string>;
++
++export class InvalidIdempotencyKeyError extends HttpError {
++  constructor(message: string) {
++    super(message, 400, true);
++  }
++}
++
++export class IdempotencyConflictError extends HttpError {
++  constructor() {
++    super(
++      "This idempotency key was already used with a different order request",
++      409,
++      true
++    );
++  }
++}
++
++export class IdempotencyStateError extends HttpError {
++  constructor() {
++    super(
++      "The previous request for this idempotency key has not completed",
++      409,
++      true
++    );
++  }
++}
++
++/**
++ * Reads and validates the optional Idempotency-Key request header.
++ *
++ * Header names are case-insensitive in Express, so callers should pass the
++ * value returned by req.get("Idempotency-Key") rather than reading raw headers.
++ */
++export const parseIdempotencyKey = (
++  rawValue: string | string[] | undefined
++): string | undefined => {
++  if (rawValue === undefined) {
++    return undefined;
++  }
++
++  if (Array.isArray(rawValue)) {
++    throw new InvalidIdempotencyKeyError(
++      "Idempotency-Key must contain a single value"
++    );
++  }
++
++  const key = rawValue.trim();
++
++  if (!key) {
++    throw new InvalidIdempotencyKeyError("Idempotency-Key cannot be empty");
++  }
++
++  if (key.length > MAX_IDEMPOTENCY_KEY_LENGTH) {
++    throw new InvalidIdempotencyKeyError(
++      `Idempotency-Key cannot exceed ${MAX_IDEMPOTENCY_KEY_LENGTH} characters`
++    );
++  }
++
++  // Control characters are intentionally rejected. They are not useful as
++  // client-generated keys and can make logs and proxies behave unpredictably.
++  if (/[^\x20-\x7E]/.test(key)) {
++    throw new InvalidIdempotencyKeyError(
++      "Idempotency-Key must contain printable ASCII characters only"
++    );
++  }
++
++  return key;
++};
++
++const normalizeItems = (items: OrderItemInput[]): OrderItemInput[] => {
++  return items
++    .map((item) => ({
++      itemId: item.itemId,
++      quantity: item.quantity,
++    }))
++    .sort((left, right) => {
++      const idComparison = left.itemId.localeCompare(right.itemId);
++
++      if (idComparison !== 0) {
++        return idComparison;
++      }
++
++      return left.quantity - right.quantity;
++    });
++};
++
++/**
++ * Build the business representation used for idempotency comparisons.
++ *
++ * Object property ordering in JSON must not change the meaning of a request.
++ * Item ordering is also normalized because an order containing item A then B
++ * is the same business request as the same quantities sent as B then A.
++ */
++export const normalizeOrderPayload = (
++  payload: OrderCreationPayload
++): SerializableValue => {
++  return {
++    estimatedWaitingTime: payload.estimatedWaitingTime ?? null,
++    items: normalizeItems(payload.items),
++    orderMessage: payload.orderMessage ?? null,
++    orderType: payload.orderType ?? null,
++    restaurantId: payload.restaurantId,
++  };
++};
++
++const stableSerialize = (value: SerializableValue): string => {
++  if (value === null || typeof value !== "object") {
++    return JSON.stringify(value);
++  }
++
++  if (Array.isArray(value)) {
++    return `[${value.map((entry) => stableSerialize(entry)).join(",")}]`;
++  }
++
++  const entries = Object.entries(value).sort(([leftKey], [rightKey]) =>
++    leftKey.localeCompare(rightKey)
++  );
++
++  return `{${entries
++    .map(([key, entry]) => `${JSON.stringify(key)}:${stableSerialize(entry)}`)
++    .join(",")}}`;
++};
++
++export const hashOrderPayload = (payload: OrderCreationPayload): string => {
++  const canonicalPayload = stableSerialize(normalizeOrderPayload(payload));
++
++  return crypto.createHash("sha256").update(canonicalPayload).digest("hex");
++};
++
++const ensureMatchingRequest = (
++  record: OrderIdempotencyKey,
++  requestHash: string
++) => {
++  if (record.request_hash !== requestHash) {
++    throw new IdempotencyConflictError();
++  }
++};
++
++const replayCompletedRecord = (
++  record: OrderIdempotencyKey,
++  requestHash: string
++): OrderCreationResult => {
++  ensureMatchingRequest(record, requestHash);
++
++  if (record.status !== OrderIdempotencyStatus.Completed || !record.order_id) {
++    throw new IdempotencyStateError();
++  }
++
++  return {
++    orderId: record.order_id,
++    replayed: true,
++  };
++};
++
++const findExistingRecord = async (
++  userId: string,
++  idempotencyKey: string,
++  transaction?: Transaction
++): Promise<OrderIdempotencyKey | null> => {
++  return OrderIdempotencyKey.findOne({
++    where: {
++      user_id: userId,
++      idempotency_key: idempotencyKey,
++    },
++    transaction,
++    ...(transaction ? { lock: transaction.LOCK.UPDATE } : {}),
++  });
++};
++
++const recoverFromConcurrentInsert = async (
++  userId: string,
++  idempotencyKey: string,
++  requestHash: string
++): Promise<OrderCreationResult> => {
++  const existing = await findExistingRecord(userId, idempotencyKey);
++
++  if (!existing) {
++    // A uniqueness error without a visible winning row is unexpected. Do not
++    // turn it into a successful replay because there is no order to return.
++    throw new IdempotencyStateError();
++  }
++
++  return replayCompletedRecord(existing, requestHash);
++};
++
++/**
++ * Runs order creation atomically and adds optional request idempotency.
++ *
++ * When no key is supplied the callback still runs in a transaction so the
++ * Order and OrderItem records can be committed or rolled back as one unit.
++ * When a key is supplied, the idempotency row is created in that same
++ * transaction. A failed transaction therefore does not consume the key.
++ */
++export const createOrderWithIdempotency = async ({
++  userId,
++  idempotencyKey,
++  payload,
++  createOrder,
++}: {
++  userId: string;
++  idempotencyKey?: string;
++  payload: OrderCreationPayload;
++  createOrder: CreateOrderCallback;
++}): Promise<OrderCreationResult> => {
++  if (!idempotencyKey) {
++    const orderId = await sequelize.transaction(async (transaction) => {
++      return createOrder(transaction);
++    });
++
++    return {
++      orderId,
++      replayed: false,
++    };
++  }
++
++  const requestHash = hashOrderPayload(payload);
++
++  try {
++    return await sequelize.transaction(async (transaction) => {
++      const existing = await findExistingRecord(
++        userId,
++        idempotencyKey,
++        transaction
++      );
++
++      if (existing) {
++        return replayCompletedRecord(existing, requestHash);
++      }
++
++      /*
++       * findOrCreate handles the race where two requests both observe that
++       * the key does not exist and then attempt to insert it concurrently.
++       *
++       * With the outer transaction supplied, Sequelize uses a savepoint for
++       * the insert attempt. That allows a uniqueness conflict to be handled
++       * without leaving the outer PostgreSQL transaction in an aborted state.
++       */
++      const [record, created] = await OrderIdempotencyKey.findOrCreate({
++        where: {
++          user_id: userId,
++          idempotency_key: idempotencyKey,
++        },
++        defaults: {
++          user_id: userId,
++          idempotency_key: idempotencyKey,
++          request_hash: requestHash,
++          order_id: null,
++          status: OrderIdempotencyStatus.Processing,
++        },
++        transaction,
++      });
++
++      /*
++       * If another concurrent transaction won the insert race, findOrCreate
++       * returns its persisted record. By the time the uniqueness conflict is
++       * resolved, PostgreSQL has visibility into the winning transaction.
++       */
++      if (!created) {
++        return replayCompletedRecord(record, requestHash);
++      }
++
++      /*
++       * The new idempotency row, order, and order items all remain inside the
++       * same transaction. If createOrder fails, none of them are committed and
++       * the key remains usable for a later retry.
++       */
++      const orderId = await createOrder(transaction);
++
++      record.order_id = orderId;
++      record.status = OrderIdempotencyStatus.Completed;
++
++      await record.save({ transaction });
++
++      return {
++        orderId,
++        replayed: false,
++      };
++    });
++  } catch (error) {
++    /*
++     * Keep a defensive recovery path for uniqueness errors that escape
++     * findOrCreate. Recovery happens outside the failed transaction, so any
++     * winning committed idempotency record can be read safely.
++     */
++    if (error instanceof UniqueConstraintError) {
++      return recoverFromConcurrentInsert(userId, idempotencyKey, requestHash);
++    }
++
++    throw error;
++  }
++};

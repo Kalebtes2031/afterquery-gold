@@ -1,0 +1,1316 @@
+diff --git a/rateeat_backend/src/__tests__/unit/order_cart_endpoint.test.ts b/rateeat_backend/src/__tests__/unit/order_cart_endpoint.test.ts
+new file mode 100644
+index 0000000..ca0a25a
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/order_cart_endpoint.test.ts
+@@ -0,0 +1,859 @@
++import request from "supertest";
++import app from "../../app";
++import { Item, Order } from "../../models";
++import { OrderStatus } from "../../models/Order/Order";
++import {
++  createItemInCategory,
++  createOwner,
++  createRestaurantWithItem,
++  createSuperAdmin,
++  TestRestaurant,
++} from "./order_cart_test_support";
++
++// External integrations the cart endpoint has no business needing during a
++// black-box HTTP test: none of these change the endpoint's own behavior, so
++// they're mocked purely to keep the test environment self-contained.
++jest.mock("../../utils/redis.utils", () => ({
++  __esModule: true,
++  default: {
++    get: jest.fn(),
++    set: jest.fn(),
++    setEx: jest.fn(),
++    del: jest.fn(),
++    keys: jest.fn().mockResolvedValue([]),
++    expire: jest.fn(),
++    sAdd: jest.fn(),
++    sMembers: jest.fn(),
++    multi: jest.fn(() => ({ exec: jest.fn() })),
++    connect: jest.fn(),
++    quit: jest.fn(),
++  },
++}));
++
++jest.mock("../../utils/socket.utils", () => ({
++  io: undefined,
++}));
++
++jest.mock("../../utils/notification.utils", () => ({
++  __esModule: true,
++  default: jest.fn(async () => undefined),
++}));
++
++jest.mock("../../utils/telegram.utils", () => ({
++  initializeTelegramClient: jest.fn(),
++  sendTelegramMessage: jest.fn(),
++  sendTelegramContactRequest: jest.fn(),
++  handleTelegramUpdate: jest.fn(),
++  getTelegramSessionString: jest.fn(() => ""),
++  setTelegramSessionString: jest.fn(),
++  checkTelegramHealth: jest.fn(async () => true),
++  disconnectTelegramClient: jest.fn(async () => undefined),
++}));
++
++// Neither pattern pins down the implementation's exact wording - each
++// accepts several reasonable ways of saying the same thing - but an
++// arbitrary or placeholder message ("a", "Bad request") satisfies neither,
++// so these genuinely check that the 400 describes *which* problem occurred
++// rather than merely being present and non-empty.
++const UNAVAILABLE_ITEM_MESSAGE_PATTERN =
++  /\bavailab|\borderable\b|out.?of.?stock|sold.?out|no longer.*(order|available)|can(?:not|'t).*(?:currently )?(?:be )?ordered/i;
++const WRONG_RESTAURANT_MESSAGE_PATTERN =
++  /\brestaurant\b|\bmenu\b|does(?:n't| not) belong|different (restaurant|location)/i;
++
++describe("PUT /api/v1/orders/:orderId/cart", () => {
++  let owner: { userId: string; token: string };
++  let otherUser: { userId: string; token: string };
++  let admin: { adminId: string; token: string };
++  let restaurant: TestRestaurant;
++  let secondRestaurant: TestRestaurant;
++  let secondItemId: string;
++  let unavailableItemId: string;
++  let restaurantItemPrice: number;
++  let secondItemPrice: number;
++
++  const createOrder = async (
++    token: string,
++    restaurantId: string,
++    itemId: string,
++    quantity = 1
++  ): Promise<string> => {
++    const res = await request(app)
++      .post("/api/v1/orders")
++      .set("Authorization", `Bearer ${token}`)
++      .send({
++        items: [{ itemId, quantity }],
++        orderType: "DineIn",
++        estimatedWaitingTime: 20,
++        orderMessage: "cart test order",
++        restaurantId,
++      });
++
++    if (res.status !== 201) {
++      throw new Error(
++        `failed to create the order fixture: ${JSON.stringify(res.body)}`
++      );
++    }
++
++    return res.body.data.id as string;
++  };
++
++  const getOrder = (orderId: string) =>
++    request(app)
++      .get(`/api/v1/orders/${orderId}`)
++      .set("Authorization", `Bearer ${admin.token}`);
++
++  /**
++   * Asserts that a rejected request left the order's cart and totals
++   * exactly as they were - every rejected case (malformed payload, wrong
++   * owner, wrong status, or a bad item) must satisfy this. Every order this
++   * is called against was seeded with exactly one order-item row, so this
++   * checks the persisted row itself (id and quantity), not just the
++   * aggregates a buggy implementation could recompute without ever writing
++   * the right quantities.
++   */
++  const expectCartUnchanged = async (
++    orderId: string,
++    expectedTotalItems: number,
++    expectedTotalPrice: number,
++    expectedItemId: string = restaurant.itemId
++  ) => {
++    const fetched = await getOrder(orderId);
++    expect(fetched.body.data.total_number_of_items).toBe(expectedTotalItems);
++    expect(fetched.body.data.total_price).toBe(expectedTotalPrice);
++    expect(fetched.body.data.order_items).toHaveLength(1);
++    expect(fetched.body.data.order_items[0]).toMatchObject({
++      item_id: expectedItemId,
++      quantity: expectedTotalItems,
++    });
++  };
++
++  beforeAll(async () => {
++    // Deliberately no separate Database.getInstance() call here: importing
++    // `app` above already constructs and registers the real app's own
++    // Sequelize instance (see config/db.ts), which every model import used
++    // below (Item, Order, ...) is already bound to - a second, independent
++    // instance sharing those same model classes isn't needed, and would
++    // fight the first over their shared association wiring.
++    owner = await createOwner();
++    otherUser = await createOwner();
++    admin = await createSuperAdmin();
++
++    restaurant = await createRestaurantWithItem(admin.token);
++    secondRestaurant = await createRestaurantWithItem(admin.token);
++
++    const secondItem = await createItemInCategory(restaurant.categoryId);
++    secondItemId = secondItem.id;
++
++    const unavailableItem = await createItemInCategory(restaurant.categoryId, {
++      is_available_for_order: false,
++    });
++    unavailableItemId = unavailableItem.id;
++
++    const restaurantItem = await Item.findByPk(restaurant.itemId);
++    restaurantItemPrice = restaurantItem!.price;
++    secondItemPrice = secondItem.price;
++  });
++
++  describe("payload validation", () => {
++    it("returns 400 when items is missing", async () => {
++      const orderId = await createOrder(
++        owner.token,
++        restaurant.restaurantId,
++        restaurant.itemId
++      );
++
++      const res = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .send({});
++
++      expect(res.status).toBe(400);
++      expect(res.body.success).toBe(false);
++      await expectCartUnchanged(orderId, 1, restaurantItemPrice);
++    });
++
++    it("returns 400 when items is an empty array", async () => {
++      const orderId = await createOrder(
++        owner.token,
++        restaurant.restaurantId,
++        restaurant.itemId
++      );
++
++      const res = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .send({ items: [] });
++
++      expect(res.status).toBe(400);
++      expect(res.body.success).toBe(false);
++      await expectCartUnchanged(orderId, 1, restaurantItemPrice);
++    });
++
++    it("returns 400 when items is not an array", async () => {
++      const orderId = await createOrder(
++        owner.token,
++        restaurant.restaurantId,
++        restaurant.itemId
++      );
++
++      const res = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .send({ items: { itemId: restaurant.itemId, quantity: 1 } });
++
++      expect(res.status).toBe(400);
++      expect(res.body.success).toBe(false);
++      await expectCartUnchanged(orderId, 1, restaurantItemPrice);
++    });
++
++    it("returns 400 when a quantity is zero", async () => {
++      const orderId = await createOrder(
++        owner.token,
++        restaurant.restaurantId,
++        restaurant.itemId
++      );
++
++      const res = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .send({ items: [{ itemId: restaurant.itemId, quantity: 0 }] });
++
++      expect(res.status).toBe(400);
++      expect(res.body.success).toBe(false);
++      await expectCartUnchanged(orderId, 1, restaurantItemPrice);
++    });
++
++    it("returns 400 when a quantity is not an integer", async () => {
++      const orderId = await createOrder(
++        owner.token,
++        restaurant.restaurantId,
++        restaurant.itemId
++      );
++
++      const res = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .send({ items: [{ itemId: restaurant.itemId, quantity: 1.5 }] });
++
++      expect(res.status).toBe(400);
++      expect(res.body.success).toBe(false);
++      await expectCartUnchanged(orderId, 1, restaurantItemPrice);
++    });
++
++    it("returns 400 when the same itemId is submitted twice", async () => {
++      const orderId = await createOrder(
++        owner.token,
++        restaurant.restaurantId,
++        restaurant.itemId
++      );
++
++      const res = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .send({
++          items: [
++            { itemId: restaurant.itemId, quantity: 1 },
++            { itemId: restaurant.itemId, quantity: 2 },
++          ],
++        });
++
++      expect(res.status).toBe(400);
++      expect(res.body.success).toBe(false);
++      await expectCartUnchanged(orderId, 1, restaurantItemPrice);
++    });
++
++    it("returns 401 when no auth token is provided", async () => {
++      const orderId = await createOrder(
++        owner.token,
++        restaurant.restaurantId,
++        restaurant.itemId
++      );
++
++      const res = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .send({ items: [{ itemId: restaurant.itemId, quantity: 1 }] });
++
++      expect(res.status).toBe(401);
++      await expectCartUnchanged(orderId, 1, restaurantItemPrice);
++    });
++
++    it("returns 400 when a quantity is negative", async () => {
++      const orderId = await createOrder(
++        owner.token,
++        restaurant.restaurantId,
++        restaurant.itemId
++      );
++
++      const res = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .send({ items: [{ itemId: restaurant.itemId, quantity: -3 }] });
++
++      expect(res.status).toBe(400);
++      expect(res.body.success).toBe(false);
++      await expectCartUnchanged(orderId, 1, restaurantItemPrice);
++    });
++
++    it("returns 400 when an item entry is missing itemId", async () => {
++      const orderId = await createOrder(
++        owner.token,
++        restaurant.restaurantId,
++        restaurant.itemId
++      );
++
++      const res = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .send({ items: [{ quantity: 1 }] });
++
++      expect(res.status).toBe(400);
++      expect(res.body.success).toBe(false);
++      await expectCartUnchanged(orderId, 1, restaurantItemPrice);
++    });
++  });
++
++  describe("order eligibility", () => {
++    it("returns 404 with 'Order not found' for an order id that doesn't exist", async () => {
++      const res = await request(app)
++        .put("/api/v1/orders/00000000-0000-4000-8000-000000000000/cart")
++        .set("Authorization", `Bearer ${owner.token}`)
++        .send({ items: [{ itemId: restaurant.itemId, quantity: 1 }] });
++
++      expect(res.status).toBe(404);
++      expect(res.body).toMatchObject({
++        success: false,
++        message: "Order not found",
++      });
++    });
++
++    it("returns 403 when the requester does not own the order", async () => {
++      const orderId = await createOrder(
++        owner.token,
++        restaurant.restaurantId,
++        restaurant.itemId
++      );
++
++      const res = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${otherUser.token}`)
++        .send({ items: [{ itemId: restaurant.itemId, quantity: 2 }] });
++
++      expect(res.status).toBe(403);
++      await expectCartUnchanged(orderId, 1, restaurantItemPrice);
++    });
++
++    it("returns 409 with 'Order is not editable' once the order has been confirmed", async () => {
++      const orderId = await createOrder(
++        owner.token,
++        restaurant.restaurantId,
++        restaurant.itemId
++      );
++
++      const confirmRes = await request(app)
++        .put(`/api/v1/orders/${orderId}/confirm`)
++        .set("Authorization", `Bearer ${admin.token}`)
++        .send({});
++      expect(confirmRes.status).toBe(200);
++
++      const res = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .send({ items: [{ itemId: restaurant.itemId, quantity: 2 }] });
++
++      expect(res.status).toBe(409);
++      expect(res.body).toMatchObject({
++        success: false,
++        message: "Order is not editable",
++      });
++      await expectCartUnchanged(orderId, 1, restaurantItemPrice);
++    });
++
++    // The contract is "any status other than Order Created / Order Edited",
++    // not just "confirmed" - exercise every other status the model defines,
++    // not just one or two samples, so an implementation that only special-
++    // cases the couple of statuses reachable through a short HTTP sequence
++    // (like the "confirmed" test above) can't slip through for the rest.
++    const NON_EDITABLE_STATUSES = Object.values(OrderStatus).filter(
++      (status) =>
++        status !== OrderStatus.OrderCreated &&
++        status !== OrderStatus.OrderEdited
++    );
++
++    it.each(NON_EDITABLE_STATUSES)(
++      "returns 409 with 'Order is not editable' when the order's status is %s",
++      async (status) => {
++        const orderId = await createOrder(
++          owner.token,
++          restaurant.restaurantId,
++          restaurant.itemId
++        );
++
++        // Move the order straight to the status under test. Several of
++        // these statuses (Bill Requested, Payment Confirmed, ...) have no
++        // single reachable HTTP step from a freshly created order, so this
++        // sets up the precondition directly rather than testing the whole
++        // order lifecycle again here - what's under test is the cart
++        // endpoint's own reaction to the order's current status.
++        await Order.update(
++          { order_status: status },
++          { where: { id: orderId } }
++        );
++
++        const res = await request(app)
++          .put(`/api/v1/orders/${orderId}/cart`)
++          .set("Authorization", `Bearer ${owner.token}`)
++          .send({ items: [{ itemId: restaurant.itemId, quantity: 2 }] });
++
++        expect(res.status).toBe(409);
++        expect(res.body).toMatchObject({
++          success: false,
++          message: "Order is not editable",
++        });
++        await expectCartUnchanged(orderId, 1, restaurantItemPrice);
++      }
++    );
++  });
++
++  describe("item eligibility", () => {
++    it("returns 404 with 'Item not found' for an item id that doesn't exist", async () => {
++      const orderId = await createOrder(
++        owner.token,
++        restaurant.restaurantId,
++        restaurant.itemId
++      );
++
++      const res = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .send({
++          items: [
++            { itemId: "00000000-0000-4000-8000-000000000001", quantity: 1 },
++          ],
++        });
++
++      expect(res.status).toBe(404);
++      expect(res.body).toMatchObject({
++        success: false,
++        message: "Item not found",
++      });
++      await expectCartUnchanged(orderId, 1, restaurantItemPrice);
++    });
++
++    it("returns 400 describing that the item is not available for ordering, and leaves the cart untouched", async () => {
++      const orderId = await createOrder(
++        owner.token,
++        restaurant.restaurantId,
++        restaurant.itemId,
++        3
++      );
++
++      const res = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .send({ items: [{ itemId: unavailableItemId, quantity: 1 }] });
++
++      expect(res.status).toBe(400);
++      expect(res.body.success).toBe(false);
++      // The exact wording isn't part of the contract, but an arbitrary or
++      // placeholder message ("a", "Bad request") must not pass either - the
++      // message has to actually say the item can't currently be ordered, in
++      // one of several reasonable phrasings, not just be present.
++      expect(res.body.message).toEqual(
++        expect.stringMatching(UNAVAILABLE_ITEM_MESSAGE_PATTERN)
++      );
++
++      await expectCartUnchanged(orderId, 3, 3 * restaurantItemPrice);
++    });
++
++    it("returns 400 describing that the item belongs to a different restaurant, and leaves the cart untouched", async () => {
++      const orderId = await createOrder(
++        owner.token,
++        restaurant.restaurantId,
++        restaurant.itemId,
++        2
++      );
++
++      const res = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .send({ items: [{ itemId: secondRestaurant.itemId, quantity: 1 }] });
++
++      expect(res.status).toBe(400);
++      expect(res.body.success).toBe(false);
++      // Same reasoning as the unavailable-item case above: the message must
++      // actually say the item doesn't belong to this restaurant/menu, not
++      // just be some non-empty string.
++      expect(res.body.message).toEqual(
++        expect.stringMatching(WRONG_RESTAURANT_MESSAGE_PATTERN)
++      );
++
++      await expectCartUnchanged(orderId, 2, 2 * restaurantItemPrice);
++    });
++
++    it("describes the not-available and wrong-restaurant problems with distinguishable messages", async () => {
++      // Neither test above pins down exact wording (any correct
++      // implementation's phrasing is fine), but the instructions promise
++      // the response describes *which* problem occurred - so the two
++      // messages, produced under otherwise-identical conditions, must
++      // actually differ from each other rather than sharing one generic
++      // "item rejected" string.
++      const unavailableOrderId = await createOrder(
++        owner.token,
++        restaurant.restaurantId,
++        restaurant.itemId
++      );
++      const unavailableRes = await request(app)
++        .put(`/api/v1/orders/${unavailableOrderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .send({ items: [{ itemId: unavailableItemId, quantity: 1 }] });
++
++      const wrongRestaurantOrderId = await createOrder(
++        owner.token,
++        restaurant.restaurantId,
++        restaurant.itemId
++      );
++      const wrongRestaurantRes = await request(app)
++        .put(`/api/v1/orders/${wrongRestaurantOrderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .send({ items: [{ itemId: secondRestaurant.itemId, quantity: 1 }] });
++
++      expect(unavailableRes.status).toBe(400);
++      expect(wrongRestaurantRes.status).toBe(400);
++      expect(unavailableRes.body.message).not.toBe(
++        wrongRestaurantRes.body.message
++      );
++    });
++
++    it("rejects a list mixing a valid item with an invalid one, and leaves the existing item and its quantity untouched", async () => {
++      // The valid item is listed first, so an implementation that validates
++      // and writes items one at a time (rather than validating the whole
++      // request before touching the order) would already have persisted it
++      // by the time it reaches the invalid one.
++      const orderId = await createOrder(
++        owner.token,
++        restaurant.restaurantId,
++        restaurant.itemId,
++        4
++      );
++
++      const res = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .send({
++          items: [
++            { itemId: secondItemId, quantity: 5 },
++            { itemId: unavailableItemId, quantity: 1 },
++          ],
++        });
++
++      expect(res.status).toBe(400);
++      expect(res.body.success).toBe(false);
++
++      // Neither the valid item from the rejected list nor any change to the
++      // original quantity should have been persisted.
++      await expectCartUnchanged(orderId, 4, 4 * restaurantItemPrice);
++    });
++  });
++
++  describe("successful replacement", () => {
++    it("replaces the cart, recomputes totals from current prices, and keeps the status unchanged", async () => {
++      const orderId = await createOrder(
++        owner.token,
++        restaurant.restaurantId,
++        restaurant.itemId,
++        1
++      );
++
++      const res = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .send({
++          items: [
++            { itemId: restaurant.itemId, quantity: 2 },
++            { itemId: secondItemId, quantity: 3 },
++          ],
++        });
++
++      const expectedTotalPrice = 2 * restaurantItemPrice + 3 * secondItemPrice;
++
++      expect(res.status).toBe(200);
++      expect(res.body.success).toBe(true);
++      expect(res.body.data.id).toBe(orderId);
++      expect(res.body.data.order_status).toBe("Order Created");
++      expect(res.body.data.total_number_of_items).toBe(5);
++      expect(res.body.data.total_price).toBe(expectedTotalPrice);
++
++      // The 200 response itself must carry the updated order's items, not
++      // just its aggregate totals - a caller shouldn't have to make a
++      // second GET to see what's actually in the cart it just replaced.
++      const responseQuantityByItemId = Object.fromEntries(
++        res.body.data.order_items.map((orderItem: any) => [
++          orderItem.item_id,
++          orderItem.quantity,
++        ])
++      );
++      expect(responseQuantityByItemId).toEqual({
++        [restaurant.itemId]: 2,
++        [secondItemId]: 3,
++      });
++
++      // Cross-checked against a separate GET too, so the response isn't
++      // just an in-memory echo of the request - it must match what was
++      // actually persisted.
++      const fetched = await getOrder(orderId);
++
++      expect(fetched.status).toBe(200);
++      expect(fetched.body.data.total_number_of_items).toBe(5);
++      expect(fetched.body.data.total_price).toBe(expectedTotalPrice);
++
++      const persistedQuantityByItemId = Object.fromEntries(
++        fetched.body.data.order_items.map((orderItem: any) => [
++          orderItem.item_id,
++          orderItem.quantity,
++        ])
++      );
++      expect(persistedQuantityByItemId).toEqual({
++        [restaurant.itemId]: 2,
++        [secondItemId]: 3,
++      });
++    });
++
++    it("allows replacing the cart while the order is in Order Edited status", async () => {
++      const orderId = await createOrder(
++        owner.token,
++        restaurant.restaurantId,
++        restaurant.itemId,
++        1
++      );
++
++      const editRes = await request(app)
++        .get(`/api/v1/orders/${orderId}/edit`)
++        .set("Authorization", `Bearer ${owner.token}`);
++      expect(editRes.status).toBe(200);
++
++      const res = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .send({ items: [{ itemId: restaurant.itemId, quantity: 4 }] });
++
++      expect(res.status).toBe(200);
++      expect(res.body.success).toBe(true);
++      expect(res.body.data.order_status).toBe("Order Edited");
++      expect(res.body.data.total_number_of_items).toBe(4);
++      expect(res.body.data.total_price).toBe(4 * restaurantItemPrice);
++      expect(res.body.data.order_items).toMatchObject([
++        { item_id: restaurant.itemId, quantity: 4 },
++      ]);
++    });
++
++    it("counts an increased quantity of the same single item correctly", async () => {
++      const orderId = await createOrder(
++        owner.token,
++        restaurant.restaurantId,
++        restaurant.itemId,
++        1
++      );
++
++      const res = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .send({ items: [{ itemId: restaurant.itemId, quantity: 6 }] });
++
++      expect(res.status).toBe(200);
++      expect(res.body.data.total_number_of_items).toBe(6);
++      expect(res.body.data.total_price).toBe(6 * restaurantItemPrice);
++      expect(res.body.data.order_items).toMatchObject([
++        { item_id: restaurant.itemId, quantity: 6 },
++      ]);
++    });
++
++    it("recomputes totals from the item's current price, not its price when the order was created", async () => {
++      const priceChangingItem = await createItemInCategory(
++        restaurant.categoryId,
++        { price: 20 }
++      );
++
++      const orderId = await createOrder(
++        owner.token,
++        restaurant.restaurantId,
++        priceChangingItem.id,
++        2
++      );
++
++      // The item's price changes after the order (and its original cart)
++      // already exist - exactly the situation "current item prices" in the
++      // instructions is about. An implementation that reused a price
++      // captured at order-creation time, instead of re-reading the item's
++      // price at replacement time, would still compute totals from the old
++      // price of 20 here.
++      await Item.update({ price: 35 }, { where: { id: priceChangingItem.id } });
++
++      const res = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .send({ items: [{ itemId: priceChangingItem.id, quantity: 2 }] });
++
++      expect(res.status).toBe(200);
++      expect(res.body.data.total_price).toBe(2 * 35);
++    });
++  });
++
++  describe("idempotency", () => {
++    const uniqueKey = () => `cart-idem-${Math.random().toString(36).slice(2)}`;
++
++    it("replays the first successful response for a repeated Idempotency-Key, ignoring the retry's own body", async () => {
++      const orderId = await createOrder(
++        owner.token,
++        restaurant.restaurantId,
++        restaurant.itemId,
++        1
++      );
++      const key = uniqueKey();
++
++      const first = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .set("Idempotency-Key", key)
++        .send({ items: [{ itemId: restaurant.itemId, quantity: 2 }] });
++
++      expect(first.status).toBe(200);
++      expect(first.body.data.total_number_of_items).toBe(2);
++
++      // Same key, a completely different body - if this were reprocessed
++      // instead of replayed, it would produce a different total.
++      const replay = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .set("Idempotency-Key", key)
++        .send({ items: [{ itemId: secondItemId, quantity: 9 }] });
++
++      expect(replay.status).toBe(200);
++      expect(replay.body).toEqual(first.body);
++
++      // The replay must not have touched the cart a second time - it should
++      // still reflect the first, genuinely-processed request.
++      await expectCartUnchanged(orderId, 2, 2 * restaurantItemPrice);
++    });
++
++    it("replays the first successful response even when the retry's own body is structurally invalid", async () => {
++      // The replay guarantee is unconditional - "without re-validating its
++      // items", not "as long as the retry happens to still be well-formed".
++      // An implementation that validates the retry's body before checking
++      // whether the key has already been used - even if it only rejects a
++      // genuinely malformed body rather than reprocessing a valid one -
++      // would still return 400 here instead of the first attempt's 200.
++      const orderId = await createOrder(
++        owner.token,
++        restaurant.restaurantId,
++        restaurant.itemId,
++        1
++      );
++      const key = uniqueKey();
++
++      const first = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .set("Idempotency-Key", key)
++        .send({ items: [{ itemId: restaurant.itemId, quantity: 2 }] });
++
++      expect(first.status).toBe(200);
++
++      const replay = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .set("Idempotency-Key", key)
++        .send({ items: [] });
++
++      expect(replay.status).toBe(200);
++      expect(replay.body).toEqual(first.body);
++
++      await expectCartUnchanged(orderId, 2, 2 * restaurantItemPrice);
++    });
++
++    it("does not replay across a different Idempotency-Key, even for the same order", async () => {
++      const orderId = await createOrder(
++        owner.token,
++        restaurant.restaurantId,
++        restaurant.itemId,
++        1
++      );
++
++      const first = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .set("Idempotency-Key", uniqueKey())
++        .send({ items: [{ itemId: restaurant.itemId, quantity: 2 }] });
++      expect(first.status).toBe(200);
++
++      const second = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .set("Idempotency-Key", uniqueKey())
++        .send({ items: [{ itemId: secondItemId, quantity: 6 }] });
++
++      expect(second.status).toBe(200);
++      expect(second.body.data.total_number_of_items).toBe(6);
++      expect(second.body.data.order_items).toMatchObject([
++        { item_id: secondItemId, quantity: 6 },
++      ]);
++    });
++
++    it("does not consume the key when the request under it was rejected", async () => {
++      const orderId = await createOrder(
++        owner.token,
++        restaurant.restaurantId,
++        restaurant.itemId,
++        1
++      );
++      const key = uniqueKey();
++
++      const rejected = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .set("Idempotency-Key", key)
++        .send({
++          items: [
++            { itemId: "00000000-0000-4000-8000-000000000002", quantity: 1 },
++          ],
++        });
++      expect(rejected.status).toBe(404);
++
++      // Reusing the same key after a rejection must process normally - a
++      // failed attempt must never get "cached" as if it had succeeded.
++      const retry = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .set("Idempotency-Key", key)
++        .send({ items: [{ itemId: restaurant.itemId, quantity: 5 }] });
++
++      expect(retry.status).toBe(200);
++      expect(retry.body.data.total_number_of_items).toBe(5);
++    });
++
++    it("never replays when no Idempotency-Key is supplied, no matter how similar consecutive requests are", async () => {
++      const orderId = await createOrder(
++        owner.token,
++        restaurant.restaurantId,
++        restaurant.itemId,
++        1
++      );
++
++      const first = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .send({ items: [{ itemId: restaurant.itemId, quantity: 2 }] });
++      expect(first.status).toBe(200);
++
++      const second = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .send({ items: [{ itemId: secondItemId, quantity: 8 }] });
++
++      expect(second.status).toBe(200);
++      expect(second.body.data.total_number_of_items).toBe(8);
++      expect(second.body.data.order_items).toMatchObject([
++        { item_id: secondItemId, quantity: 8 },
++      ]);
++    });
++  });
++});
+diff --git a/rateeat_backend/src/__tests__/unit/order_cart_test_support.ts b/rateeat_backend/src/__tests__/unit/order_cart_test_support.ts
+new file mode 100644
+index 0000000..a5fab01
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/order_cart_test_support.ts
+@@ -0,0 +1,153 @@
++import jwt from "jsonwebtoken";
++import { Pool } from "pg";
++import { AdminUser, Item, Role, User } from "../../models";
++import { setupRestaurantDetail } from "../helpers/auth_helper";
++
++/**
++ * Shared fixtures for the black-box PUT /api/v1/orders/:orderId/cart tests.
++ * Everything here talks to the real database (through the real Sequelize
++ * models, the real HTTP API via setupRestaurantDetail, or, for the
++ * atomicity helpers, a raw pg connection) - nothing here is a test double
++ * for the feature under test.
++ */
++
++const randomSuffix = () => Math.random().toString(36).slice(2, 10);
++
++export const signToken = (id: string): string =>
++  jwt.sign({ id }, process.env.JWT_SECRET || "");
++
++/**
++ * Create a real client User and a bearer token for it. `protectRoute`
++ * resolves this token straight to the User row via User.findByPk.
++ */
++export const createOwner = async (): Promise<{
++  userId: string;
++  token: string;
++}> => {
++  const [role] = await Role.findOrCreate({ where: { name: "user" } });
++  const suffix = randomSuffix();
++
++  const user = await User.create({
++    role_id: role.id,
++    username: `cart_owner_${suffix}`,
++    email: `cart_owner_${suffix}@example.com`,
++    first_name: "Cart",
++    last_name: "Owner",
++  } as any);
++
++  return { userId: user.id, token: signToken(user.id) };
++};
++
++/**
++ * Create a real AdminUser with a "super_admin" role and a bearer token for
++ * it. `protectRouteForAdmin` resolves this token to the AdminUser row, and
++ * a super_admin role satisfies checkOrderAuthorization for every
++ * restaurant, so this same admin can create restaurants and confirm orders.
++ */
++export const createSuperAdmin = async (): Promise<{
++  adminId: string;
++  token: string;
++}> => {
++  const [role] = await Role.findOrCreate({ where: { name: "super_admin" } });
++  const suffix = randomSuffix();
++
++  const admin = await AdminUser.create({
++    role_id: role.id,
++    email: `cart_admin_${suffix}@example.com`,
++    password: "not-used-by-tests",
++    phone_number: `+2519${Math.floor(Math.random() * 100000000)
++      .toString()
++      .padStart(8, "0")}`,
++    first_name: "Cart",
++    last_name: "Admin",
++  } as any);
++
++  return { adminId: admin.id, token: signToken(admin.id) };
++};
++
++export interface TestRestaurant {
++  restaurantId: string;
++  menuId: string;
++  categoryId: string;
++  itemId: string;
++}
++
++/**
++ * Create a restaurant chain, restaurant, menu, category, and one item. The
++ * chain and restaurant are created through the real HTTP API (via the
++ * shared setupRestaurantDetail helper other order tests already rely on),
++ * exactly as a real admin would.
++ */
++export const createRestaurantWithItem = async (
++  adminToken: string
++): Promise<TestRestaurant> => {
++  const { restaurantId, menuId, categoryId, itemId } =
++    await setupRestaurantDetail(adminToken);
++
++  return { restaurantId, menuId, categoryId, itemId };
++};
++
++export const createItemInCategory = (
++  categoryId: string,
++  overrides: Record<string, unknown> = {}
++) =>
++  Item.create({
++    name: `Cart Test Item ${randomSuffix()}`,
++    price: 15,
++    fasting: false,
++    category_id: categoryId,
++    is_available_for_order: true,
++    ...overrides,
++  } as any);
++
++// --- Raw-SQL helpers for forcing a genuine database-level write failure ---
++// These exist purely to prove atomicity from the outside: they never touch
++// the feature's implementation, only the order_items table itself.
++
++export const createPool = () =>
++  new Pool({
++    host: process.env.DEVELOPMENT_PG_HOST,
++    port: Number(process.env.DEVELOPMENT_PG_PORT || 5432),
++    user: process.env.DEVELOPMENT_PG_USER,
++    password: process.env.DEVELOPMENT_PG_PASSWORD,
++    database: process.env.DEVELOPMENT_PG_DATABASE,
++  });
++
++// Fires on INSERT, UPDATE, *and* DELETE - deliberately not just INSERT.
++// This forces a genuine write failure no matter how the cart replacement is
++// implemented at the SQL level: delete-then-insert, an in-place UPDATE of
++// the existing row, or an upsert all touch order_items through one of these
++// three operations, so all three are covered rather than only one
++// particular delete+insert strategy.
++export const installFailingOrderItemWriteTrigger = async (pool: Pool) => {
++  await pool.query(`
++    CREATE OR REPLACE FUNCTION cart_test_fail_order_item_write()
++    RETURNS trigger AS $$
++    BEGIN
++      RAISE EXCEPTION 'cart test forced order_items write failure';
++    END;
++    $$ LANGUAGE plpgsql;
++  `);
++
++  await pool.query(`
++    DROP TRIGGER IF EXISTS cart_test_fail_order_item_write_trigger
++    ON order_items;
++  `);
++
++  await pool.query(`
++    CREATE TRIGGER cart_test_fail_order_item_write_trigger
++    BEFORE INSERT OR UPDATE OR DELETE ON order_items
++    FOR EACH ROW
++    EXECUTE FUNCTION cart_test_fail_order_item_write();
++  `);
++};
++
++export const removeFailingOrderItemWriteTrigger = async (pool: Pool) => {
++  await pool.query(`
++    DROP TRIGGER IF EXISTS cart_test_fail_order_item_write_trigger
++    ON order_items;
++  `);
++  await pool.query(`
++    DROP FUNCTION IF EXISTS cart_test_fail_order_item_write();
++  `);
++};
+diff --git a/rateeat_backend/src/__tests__/unit/order_cart_transaction.test.ts b/rateeat_backend/src/__tests__/unit/order_cart_transaction.test.ts
+new file mode 100644
+index 0000000..65cc22b
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/order_cart_transaction.test.ts
+@@ -0,0 +1,286 @@
++import request from "supertest";
++import { Pool } from "pg";
++import app from "../../app";
++import { Item } from "../../models";
++import {
++  createItemInCategory,
++  createOwner,
++  createPool,
++  createRestaurantWithItem,
++  createSuperAdmin,
++  installFailingOrderItemWriteTrigger,
++  removeFailingOrderItemWriteTrigger,
++  TestRestaurant,
++} from "./order_cart_test_support";
++
++// Same external-integration mocks as order_cart_endpoint.test.ts - none of
++// them are part of what this file verifies.
++jest.mock("../../utils/redis.utils", () => ({
++  __esModule: true,
++  default: {
++    get: jest.fn(),
++    set: jest.fn(),
++    setEx: jest.fn(),
++    del: jest.fn(),
++    keys: jest.fn().mockResolvedValue([]),
++    expire: jest.fn(),
++    sAdd: jest.fn(),
++    sMembers: jest.fn(),
++    multi: jest.fn(() => ({ exec: jest.fn() })),
++    connect: jest.fn(),
++    quit: jest.fn(),
++  },
++}));
++
++jest.mock("../../utils/socket.utils", () => ({
++  io: undefined,
++}));
++
++jest.mock("../../utils/notification.utils", () => ({
++  __esModule: true,
++  default: jest.fn(async () => undefined),
++}));
++
++jest.mock("../../utils/telegram.utils", () => ({
++  initializeTelegramClient: jest.fn(),
++  sendTelegramMessage: jest.fn(),
++  sendTelegramContactRequest: jest.fn(),
++  handleTelegramUpdate: jest.fn(),
++  getTelegramSessionString: jest.fn(() => ""),
++  setTelegramSessionString: jest.fn(),
++  checkTelegramHealth: jest.fn(async () => true),
++  disconnectTelegramClient: jest.fn(async () => undefined),
++}));
++
++describe("PUT /api/v1/orders/:orderId/cart transactional behavior", () => {
++  let owner: { userId: string; token: string };
++  let admin: { adminId: string; token: string };
++  let restaurant: TestRestaurant;
++  let secondItemId: string;
++  let restaurantItemPrice: number;
++  let secondItemPrice: number;
++  let pool: Pool;
++
++  const createOrder = async (itemId: string, quantity = 1): Promise<string> => {
++    const res = await request(app)
++      .post("/api/v1/orders")
++      .set("Authorization", `Bearer ${owner.token}`)
++      .send({
++        items: [{ itemId, quantity }],
++        orderType: "DineIn",
++        estimatedWaitingTime: 20,
++        orderMessage: "cart transaction test order",
++        restaurantId: restaurant.restaurantId,
++      });
++
++    if (res.status !== 201) {
++      throw new Error(
++        `failed to create the order fixture: ${JSON.stringify(res.body)}`
++      );
++    }
++
++    return res.body.data.id as string;
++  };
++
++  const getOrder = (orderId: string) =>
++    request(app)
++      .get(`/api/v1/orders/${orderId}`)
++      .set("Authorization", `Bearer ${admin.token}`);
++
++  beforeAll(async () => {
++    // Deliberately no separate Database.getInstance() call here - see the
++    // matching note in order_cart_endpoint.test.ts: importing `app` above
++    // already constructs and registers the real app's own Sequelize
++    // instance, which every model used below is already bound to.
++    pool = createPool();
++
++    owner = await createOwner();
++    admin = await createSuperAdmin();
++    restaurant = await createRestaurantWithItem(admin.token);
++
++    const secondItem = await createItemInCategory(restaurant.categoryId);
++    secondItemId = secondItem.id;
++
++    const restaurantItem = await Item.findByPk(restaurant.itemId);
++    restaurantItemPrice = restaurantItem!.price;
++    secondItemPrice = secondItem.price;
++  });
++
++  afterAll(async () => {
++    await pool.end();
++  });
++
++  describe("atomicity", () => {
++    it("rolls back and leaves the previous cart and totals untouched when the write fails", async () => {
++      const orderId = await createOrder(restaurant.itemId, 2);
++      const before = await getOrder(orderId);
++
++      await installFailingOrderItemWriteTrigger(pool);
++
++      let res;
++      try {
++        res = await request(app)
++          .put(`/api/v1/orders/${orderId}/cart`)
++          .set("Authorization", `Bearer ${owner.token}`)
++          .send({ items: [{ itemId: secondItemId, quantity: 5 }] });
++      } finally {
++        await removeFailingOrderItemWriteTrigger(pool);
++      }
++
++      expect(res.status).toBe(500);
++
++      const after = await getOrder(orderId);
++
++      expect(after.body.data.total_price).toBe(before.body.data.total_price);
++      expect(after.body.data.total_number_of_items).toBe(
++        before.body.data.total_number_of_items
++      );
++
++      const afterItemIds = after.body.data.order_items.map(
++        (orderItem: any) => orderItem.item_id
++      );
++      expect(afterItemIds).toEqual([restaurant.itemId]);
++    });
++
++    it("leaves the order retryable after a failed write, and a subsequent request succeeds", async () => {
++      const orderId = await createOrder(restaurant.itemId, 1);
++
++      await installFailingOrderItemWriteTrigger(pool);
++      let failedRes;
++      try {
++        failedRes = await request(app)
++          .put(`/api/v1/orders/${orderId}/cart`)
++          .set("Authorization", `Bearer ${owner.token}`)
++          .send({ items: [{ itemId: secondItemId, quantity: 3 }] });
++      } finally {
++        await removeFailingOrderItemWriteTrigger(pool);
++      }
++      expect(failedRes.status).toBe(500);
++
++      const retryRes = await request(app)
++        .put(`/api/v1/orders/${orderId}/cart`)
++        .set("Authorization", `Bearer ${owner.token}`)
++        .send({ items: [{ itemId: secondItemId, quantity: 3 }] });
++
++      expect(retryRes.status).toBe(200);
++      expect(retryRes.body.data.total_number_of_items).toBe(3);
++    });
++  });
++
++  describe("concurrency", () => {
++    it("serializes concurrent replacements so the final state matches exactly one request", async () => {
++      const orderId = await createOrder(restaurant.itemId, 1);
++
++      const payloadA = { items: [{ itemId: restaurant.itemId, quantity: 7 }] };
++      const payloadB = { items: [{ itemId: secondItemId, quantity: 9 }] };
++
++      const [resA, resB] = await Promise.all([
++        request(app)
++          .put(`/api/v1/orders/${orderId}/cart`)
++          .set("Authorization", `Bearer ${owner.token}`)
++          .send(payloadA),
++        request(app)
++          .put(`/api/v1/orders/${orderId}/cart`)
++          .set("Authorization", `Bearer ${owner.token}`)
++          .send(payloadB),
++      ]);
++
++      // The row lock serializes the two writes rather than rejecting
++      // either one, so both individually-valid requests succeed.
++      expect(resA.status).toBe(200);
++      expect(resB.status).toBe(200);
++
++      const final = await getOrder(orderId);
++      const finalOrderItems = final.body.data.order_items;
++      const finalItemIds = finalOrderItems.map(
++        (orderItem: any) => orderItem.item_id
++      );
++
++      // Checked against every field the winning payload determines - item
++      // id, the persisted row's own quantity, the aggregate item count, and
++      // total_price - not just the item id and item count. A mixed/blended
++      // final state (e.g. the right single item id but a stale or
++      // interleaved price/quantity left over from the losing request) must
++      // fail every one of these, not slip through on a partial match.
++      const matchesA =
++        finalItemIds.length === 1 &&
++        finalItemIds[0] === restaurant.itemId &&
++        finalOrderItems[0].quantity === 7 &&
++        final.body.data.total_number_of_items === 7 &&
++        final.body.data.total_price === 7 * restaurantItemPrice;
++
++      const matchesB =
++        finalItemIds.length === 1 &&
++        finalItemIds[0] === secondItemId &&
++        finalOrderItems[0].quantity === 9 &&
++        final.body.data.total_number_of_items === 9 &&
++        final.body.data.total_price === 9 * secondItemPrice;
++
++      // The final state must be exactly one of the two requests, never a
++      // mix (e.g. both items present, or a blended item count/price).
++      expect(matchesA || matchesB).toBe(true);
++    });
++  });
++
++  describe("idempotency", () => {
++    it("serializes two concurrent requests sharing one Idempotency-Key so only one is ever actually processed", async () => {
++      const orderId = await createOrder(restaurant.itemId, 1);
++      const key = `cart-idem-race-${Math.random().toString(36).slice(2)}`;
++
++      // Same key, deliberately different bodies: true dedup means whichever
++      // request's write actually lands, the *other* response must be an
++      // exact replay of it - not its own (different) body having also been
++      // applied.
++      const payloadA = { items: [{ itemId: restaurant.itemId, quantity: 4 }] };
++      const payloadB = { items: [{ itemId: secondItemId, quantity: 10 }] };
++
++      const [resA, resB] = await Promise.all([
++        request(app)
++          .put(`/api/v1/orders/${orderId}/cart`)
++          .set("Authorization", `Bearer ${owner.token}`)
++          .set("Idempotency-Key", key)
++          .send(payloadA),
++        request(app)
++          .put(`/api/v1/orders/${orderId}/cart`)
++          .set("Authorization", `Bearer ${owner.token}`)
++          .set("Idempotency-Key", key)
++          .send(payloadB),
++      ]);
++
++      expect(resA.status).toBe(200);
++      expect(resB.status).toBe(200);
++      // The order lock (see the plain concurrency test above) makes one of
++      // these process fully and commit first; whichever request's
++      // transaction reaches the idempotency check second, having been
++      // blocked until the first committed, must see the stored response and
++      // replay it verbatim rather than writing its own body.
++      expect(resB.body).toEqual(resA.body);
++
++      // Cross-checked against a separate GET, same as the plain concurrency
++      // test above - matched on item id/quantity/totals rather than a full
++      // deep-equal, since the GET endpoint's order_items shape (it nests the
++      // full item) legitimately differs from the PUT response's.
++      const final = await getOrder(orderId);
++      const finalOrderItems = final.body.data.order_items;
++      const finalItemIds = finalOrderItems.map(
++        (orderItem: any) => orderItem.item_id
++      );
++
++      expect(finalItemIds).toEqual(
++        resA.body.data.order_items.map((orderItem: any) => orderItem.item_id)
++      );
++      expect(finalOrderItems[0].quantity).toBe(
++        resA.body.data.order_items[0].quantity
++      );
++      expect(final.body.data.total_number_of_items).toBe(
++        resA.body.data.total_number_of_items
++      );
++      expect(final.body.data.total_price).toBe(resA.body.data.total_price);
++
++      // The winning payload was applied exactly once - never blended with,
++      // or followed by, the other one.
++      expect(finalItemIds).toHaveLength(1);
++      expect([restaurant.itemId, secondItemId]).toContain(finalItemIds[0]);
++    });
++  });
++});

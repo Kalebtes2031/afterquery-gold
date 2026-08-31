@@ -1,0 +1,8 @@
+Voting should behave the same whether someone casts a vote, takes it back, or flips it.
+The endpoints for item reviews and restaurant reviews keep their current API and messages. A first vote returns Vote created. Send the same vote again and it toggles off, so Vote deleted. Flip an upvote to a downvote and you land on one row, not two, with Vote updated. What's stored has to match the direction the user picked.
+Counters are where this usually falls apart. After any of those operations, the totals need to agree with what's in the votes table. Some are already wrong, so don't trust the current numbers.
+Wrap each operation in a transaction. If the vote write lands but the counter update, the mention/notification record, or the activity record fails, roll it all back. A half-applied vote is worse than a failed request.
+Mentions follow the vote. If someone flips direction and a mention already exists, reuse that row, rewrite the message to match, and set it back to unread. Voting on your own review shouldn't generate a mention.
+Two things to get right under load. Duplicate requests from one user shouldn't create two rows or double-count. Simultaneous votes from different users all need to be kept and counted.
+Both review types, same rules. Auth, routes, error responses and the success payload stay as they are.
+IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.

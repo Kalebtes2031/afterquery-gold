@@ -1,0 +1,665 @@
+diff --git a/rateeat_backend/migrations/20260829120000-create-split-payment-confirmations-table.js b/rateeat_backend/migrations/20260829120000-create-split-payment-confirmations-table.js
+new file mode 100644
+index 0000000..e03aa5f
+--- /dev/null
++++ b/rateeat_backend/migrations/20260829120000-create-split-payment-confirmations-table.js
+@@ -0,0 +1,97 @@
++'use strict';
++
++/** @type {import('sequelize-cli').Migration} */
++module.exports = {
++  async up(queryInterface, Sequelize) {
++    await queryInterface.createTable("split_payment_confirmations", {
++      id: {
++        type: Sequelize.UUID,
++        defaultValue: Sequelize.UUIDV4,
++        allowNull: false,
++        primaryKey: true,
++      },
++      split_group_id: {
++        type: Sequelize.UUID,
++        allowNull: false,
++        references: {
++          model: "split_groups",
++          key: "id",
++        },
++        onDelete: "CASCADE",
++        onUpdate: "CASCADE",
++      },
++      split_participant_id: {
++        type: Sequelize.UUID,
++        allowNull: false,
++        references: {
++          model: "split_participants",
++          key: "id",
++        },
++        onDelete: "CASCADE",
++        onUpdate: "CASCADE",
++      },
++      confirmed_by_user_id: {
++        type: Sequelize.UUID,
++        allowNull: false,
++        references: {
++          model: "users",
++          key: "id",
++        },
++        onDelete: "CASCADE",
++        onUpdate: "CASCADE",
++      },
++      amount_confirmed: {
++        type: Sequelize.DOUBLE,
++        allowNull: false,
++      },
++      // Set when a mistaken confirmation is later reversed (see
++      // reverseParticipantPayment). Left null for a confirmation that
++      // still stands, so this one row's own lifecycle - confirmed, then
++      // possibly reversed - is the audit trail, rather than a fresh row
++      // being added for every re-confirmation after an undo.
++      reversed_at: {
++        type: Sequelize.DATE,
++        allowNull: true,
++      },
++      reversed_by_user_id: {
++        type: Sequelize.UUID,
++        allowNull: true,
++        references: {
++          model: "users",
++          key: "id",
++        },
++        onDelete: "CASCADE",
++        onUpdate: "CASCADE",
++      },
++      createdAt: {
++        type: Sequelize.DATE,
++        allowNull: false,
++        defaultValue: Sequelize.NOW,
++      },
++      updatedAt: {
++        type: Sequelize.DATE,
++        allowNull: false,
++        defaultValue: Sequelize.NOW,
++      },
++    });
++
++    // At most one confirmation record per participant, ever - re-confirming
++    // after a reversal updates this same row (clearing reversed_at) rather
++    // than inserting a second one, so this index is what stops a genuine
++    // duplicate confirm from producing two rows if it somehow reaches this
++    // insert at all (the service's own guard against reprocessing an
++    // already-paid participant is the primary defense).
++    await queryInterface.addIndex(
++      "split_payment_confirmations",
++      ["split_participant_id"],
++      {
++        unique: true,
++        name: "split_payment_confirmations_split_participant_id_uindex",
++      }
++    );
++  },
++
++  async down(queryInterface) {
++    await queryInterface.dropTable("split_payment_confirmations");
++  },
++};
+diff --git a/rateeat_backend/src/config/db.ts b/rateeat_backend/src/config/db.ts
+index 0f7384b..f0589ac 100644
+--- a/rateeat_backend/src/config/db.ts
++++ b/rateeat_backend/src/config/db.ts
+@@ -82,6 +82,7 @@ import {
+   Bill,
+   SplitGroup,
+   SplitParticipant,
++  SplitPaymentConfirmation,
+   MenuItemVote,
+   UserComplaint,
+   Survey,
+@@ -197,6 +198,7 @@ const sequelize: Sequelize = new Sequelize({
+     Bill,
+     SplitGroup,
+     SplitParticipant,
++    SplitPaymentConfirmation,
+     MenuItemVote,
+     UserComplaint,
+     Survey,
+diff --git a/rateeat_backend/src/controllers/split_bill.controller.ts b/rateeat_backend/src/controllers/split_bill.controller.ts
+index 4a69ffe..041f443 100644
+--- a/rateeat_backend/src/controllers/split_bill.controller.ts
++++ b/rateeat_backend/src/controllers/split_bill.controller.ts
+@@ -12,6 +12,10 @@ import { ParticipantStatus } from "../models/SharedBill/SplitParticipant";
+ import { generatePaymentLink, sendPaymentLink } from "../utils/payment.utils";
+ import { PaymentStatus } from "../models/Order/Payment";
+ import { Op, Sequelize } from "sequelize";
++import {
++  confirmParticipantPayment as settleParticipantPayment,
++  reverseParticipantPayment as undoParticipantPayment,
++} from "../services/split-payment.service";
+ 
+ /**
+  * @description create a split group
+@@ -506,6 +510,66 @@ const searchSplitGroups = asyncAwaitHandler(
+   }
+ );
+ 
++/**
++ * @description record a participant's share as paid outside the online
++ * payment flow (cash at the table, a bank transfer confirmed by phone,
++ * ...); only the split group's owner may confirm a participant's payment
++ * @route   PUT /api/v1/split-group/:groupId/member/:participantId/payment
++ */
++const confirmParticipantPayment = asyncAwaitHandler(
++  async (req: Request, res: Response, next: NextFunction) => {
++    const { groupId, participantId } = req.params;
++    const user: any = req.user;
++
++    if (!user) {
++      return next(new AuthorizationError());
++    }
++
++    // All ownership/existence validation, locking, and the atomic update
++    // happen inside the service; a rejected request throws before anything
++    // is persisted.
++    const splitGroup = await settleParticipantPayment({
++      groupId,
++      participantId,
++      userId: user.id,
++    });
++
++    return res.status(200).json({
++      success: true,
++      data: splitGroup,
++    });
++  }
++);
++
++/**
++ * @description reverse a mistaken payment confirmation, restoring the
++ * participant to pending and adding their share back to the group's
++ * remaining balance; only the split group's owner may reverse a
++ * participant's payment
++ * @route   DELETE /api/v1/split-group/:groupId/member/:participantId/payment
++ */
++const reverseParticipantPayment = asyncAwaitHandler(
++  async (req: Request, res: Response, next: NextFunction) => {
++    const { groupId, participantId } = req.params;
++    const user: any = req.user;
++
++    if (!user) {
++      return next(new AuthorizationError());
++    }
++
++    const splitGroup = await undoParticipantPayment({
++      groupId,
++      participantId,
++      userId: user.id,
++    });
++
++    return res.status(200).json({
++      success: true,
++      data: splitGroup,
++    });
++  }
++);
++
+ export {
+   createGroup,
+   updateGroup,
+@@ -517,4 +581,6 @@ export {
+   reInviteMember,
+   saveSplitGroup,
+   searchSplitGroups,
++  confirmParticipantPayment,
++  reverseParticipantPayment,
+ };
+diff --git a/rateeat_backend/src/models/SharedBill/SplitGroup.ts b/rateeat_backend/src/models/SharedBill/SplitGroup.ts
+index 25dc8d4..dadaebc 100644
+--- a/rateeat_backend/src/models/SharedBill/SplitGroup.ts
++++ b/rateeat_backend/src/models/SharedBill/SplitGroup.ts
+@@ -8,7 +8,14 @@ import {
+   PrimaryKey,
+   HasMany,
+ } from "sequelize-typescript";
+-import { Order, Bill, User, SplitParticipant, Restaurant } from "..";
++import {
++  Order,
++  Bill,
++  User,
++  SplitParticipant,
++  SplitPaymentConfirmation,
++  Restaurant,
++} from "..";
+ 
+ @Table({
+   tableName: "split_groups",
+@@ -117,6 +124,9 @@ class SplitGroup extends Model<SplitGroup> {
+ 
+   @HasMany(() => SplitParticipant)
+   participants!: SplitParticipant[];
++
++  @HasMany(() => SplitPaymentConfirmation)
++  payment_confirmations!: SplitPaymentConfirmation[];
+ }
+ 
+ export default SplitGroup;
+diff --git a/rateeat_backend/src/models/SharedBill/SplitPaymentConfirmation.ts b/rateeat_backend/src/models/SharedBill/SplitPaymentConfirmation.ts
+new file mode 100644
+index 0000000..4f9d409
+--- /dev/null
++++ b/rateeat_backend/src/models/SharedBill/SplitPaymentConfirmation.ts
+@@ -0,0 +1,97 @@
++/* eslint-disable no-use-before-define */
++import {
++  Table,
++  Column,
++  Model,
++  DataType,
++  ForeignKey,
++  PrimaryKey,
++  BelongsTo,
++} from "sequelize-typescript";
++
++import { SplitGroup, SplitParticipant, User } from "..";
++
++/**
++ * An audit record of one participant's payment settlement, written by PUT
++ * /api/v1/split-group/:groupId/member/:participantId/payment and updated
++ * by its DELETE counterpart - who confirmed it, for how much, when, and,
++ * if the confirmation was later reversed as a mistake, by whom and when
++ * that happened. There is at most one row per participant (see the unique
++ * index on `split_participant_id`): a reversal followed by a fresh
++ * confirmation updates this same row rather than adding another, so its
++ * own lifecycle - confirmed, possibly reversed, possibly confirmed again -
++ * is the audit trail, rather than the row itself.
++ *
++ * Every write to this table happens inside the same transaction as the
++ * participant/group update it accompanies - see `confirmParticipantPayment`
++ * and `reverseParticipantPayment` in split-payment.service.ts - so it can
++ * never fall out of step with the settlement it's recording.
++ */
++@Table({
++  tableName: "split_payment_confirmations",
++  timestamps: true,
++})
++class SplitPaymentConfirmation extends Model<SplitPaymentConfirmation> {
++  @PrimaryKey
++  @Column({
++    type: DataType.UUID,
++    defaultValue: DataType.UUIDV4,
++    allowNull: false,
++  })
++  id!: string;
++
++  @ForeignKey(() => SplitGroup)
++  @Column({
++    type: DataType.UUID,
++    allowNull: false,
++  })
++  split_group_id!: string;
++
++  @ForeignKey(() => SplitParticipant)
++  @Column({
++    type: DataType.UUID,
++    allowNull: false,
++  })
++  split_participant_id!: string;
++
++  @ForeignKey(() => User)
++  @Column({
++    type: DataType.UUID,
++    allowNull: false,
++  })
++  confirmed_by_user_id!: string;
++
++  @Column({
++    type: DataType.DOUBLE,
++    allowNull: false,
++  })
++  amount_confirmed!: number;
++
++  @Column({
++    type: DataType.DATE,
++    allowNull: true,
++  })
++  reversed_at!: Date | null;
++
++  @ForeignKey(() => User)
++  @Column({
++    type: DataType.UUID,
++    allowNull: true,
++  })
++  reversed_by_user_id!: string | null;
++
++  // Relationships
++  @BelongsTo(() => SplitGroup)
++  split_group!: SplitGroup;
++
++  @BelongsTo(() => SplitParticipant)
++  split_participant!: SplitParticipant;
++
++  @BelongsTo(() => User, { foreignKey: "confirmed_by_user_id" })
++  confirmed_by!: User;
++
++  @BelongsTo(() => User, { foreignKey: "reversed_by_user_id" })
++  reversed_by!: User | null;
++}
++
++export default SplitPaymentConfirmation;
+diff --git a/rateeat_backend/src/models/index.ts b/rateeat_backend/src/models/index.ts
+index 83f7a36..4d1f316 100644
+--- a/rateeat_backend/src/models/index.ts
++++ b/rateeat_backend/src/models/index.ts
+@@ -76,6 +76,7 @@ import RefreshToken from "./RefreshToken/RefreshToken";
+ import Bill from "./Order/Bill";
+ import SplitGroup from "./SharedBill/SplitGroup";
+ import SplitParticipant from "./SharedBill/SplitParticipant";
++import SplitPaymentConfirmation from "./SharedBill/SplitPaymentConfirmation";
+ import MenuItemVote from "./Vote/MenuItemVote";
+ import UserComplaint from "./User/UserComplaint";
+ import Survey from "./Survey/survey";
+@@ -176,6 +177,7 @@ export {
+   Bill,
+   SplitGroup,
+   SplitParticipant,
++  SplitPaymentConfirmation,
+   MenuItemVote,
+   UserComplaint,
+   Survey,
+diff --git a/rateeat_backend/src/routes/split_bill.route.ts b/rateeat_backend/src/routes/split_bill.route.ts
+index 3b6a9bf..05ceb10 100644
+--- a/rateeat_backend/src/routes/split_bill.route.ts
++++ b/rateeat_backend/src/routes/split_bill.route.ts
+@@ -11,6 +11,8 @@ import {
+   removeMember,
+   saveSplitGroup,
+   searchSplitGroups,
++  confirmParticipantPayment,
++  reverseParticipantPayment,
+ } from "../controllers/split_bill.controller";
+ import { validateRequest } from "../middlewares/validateRequest";
+ import {
+@@ -81,6 +83,11 @@ router
+   .route("/:groupId/member/:participantId/re-invite")
+   .get(validateRequest(reInviteMemberParamsSchema, "params"), reInviteMember);
+ 
++router
++  .route("/:groupId/member/:participantId/payment")
++  .put(protectRoute, confirmParticipantPayment)
++  .delete(protectRoute, reverseParticipantPayment);
++
+ router
+   .route("/:groupId/confirm")
+   .post(
+diff --git a/rateeat_backend/src/services/split-payment.service.ts b/rateeat_backend/src/services/split-payment.service.ts
+new file mode 100644
+index 0000000..b08cb35
+--- /dev/null
++++ b/rateeat_backend/src/services/split-payment.service.ts
+@@ -0,0 +1,249 @@
++import { Transaction } from "sequelize";
++import sequelize from "../config/db";
++import { SplitGroup, SplitParticipant } from "../models";
++import { ParticipantStatus } from "../models/SharedBill/SplitParticipant";
++import SplitPaymentConfirmation from "../models/SharedBill/SplitPaymentConfirmation";
++import { ForbiddenError, NotFoundError } from "../utils/error-response.utils";
++import { SplitPaymentParticipantActionInput } from "../types/split-payment.types";
++
++/**
++ * `remaining_balance` is a DOUBLE column, adjusted one participant's
++ * `owed_amount` at a time. A total that doesn't divide evenly among
++ * participants (100 split three ways, say) means those adjustments don't
++ * necessarily sum back to exactly 0 - floating-point arithmetic can leave a
++ * residue like 1e-13 instead. Anything within this tolerance of zero counts
++ * as fully settled, so a total's own rounding never prevents the group from
++ * finalizing once every participant has genuinely paid.
++ */
++const BALANCE_EPSILON = 1e-6;
++
++/**
++ * Lock the split group row, confirm the requesting user owns it, and look
++ * up the participant scoped to that group. Shared by both
++ * `confirmParticipantPayment` and `reverseParticipantPayment`, since both
++ * start from exactly this same precondition check.
++ *
++ * @param transaction - the open transaction both callers run their whole
++ *   operation inside.
++ * @throws {NotFoundError} when the split group, or a participant belonging
++ *   to it, does not exist.
++ * @throws {ForbiddenError} when `userId` does not own the split group.
++ */
++const lockOwnedGroupAndParticipant = async (
++  { groupId, participantId, userId }: SplitPaymentParticipantActionInput,
++  transaction: Transaction
++): Promise<{
++  splitGroup: InstanceType<typeof SplitGroup>;
++  participant: InstanceType<typeof SplitParticipant>;
++}> => {
++  const splitGroup = await SplitGroup.findByPk(groupId, {
++    transaction,
++    lock: transaction.LOCK.UPDATE,
++  });
++
++  if (!splitGroup) {
++    throw new NotFoundError("Split Group");
++  }
++
++  if (splitGroup.user_id !== userId) {
++    throw new ForbiddenError();
++  }
++
++  const participant = await SplitParticipant.findOne({
++    where: { id: participantId, split_group_id: splitGroup.id },
++    transaction,
++  });
++
++  if (!participant) {
++    throw new NotFoundError("Participant");
++  }
++
++  return { splitGroup, participant };
++};
++
++/**
++ * Re-fetch a split group with its participants and payment confirmations
++ * eager-loaded, for the response both service calls below return. A plain
++ * object assignment isn't how Sequelize populates an association, so the
++ * response has to be loaded back through it to actually carry every
++ * participant and confirmation.
++ */
++const loadGroupForResponse = (
++  groupId: string
++): Promise<InstanceType<typeof SplitGroup> | null> =>
++  SplitGroup.findByPk(groupId, {
++    include: [{ model: SplitParticipant }, { model: SplitPaymentConfirmation }],
++  });
++
++/**
++ * @description Atomically record one participant's share of a split bill as
++ * paid, outside the online payment flow, and finalize the group the moment
++ * every participant has.
++ *
++ * The whole operation runs inside one transaction:
++ *  1. The split group row is locked with `SELECT ... FOR UPDATE`, so a
++ *     second, concurrent confirmation (or reversal) for a different
++ *     participant of the *same* group blocks here until this one commits or
++ *     rolls back - the group's `remaining_balance` can never be adjusted
++ *     from two stale reads at once.
++ *  2. Ownership is checked against the locked row.
++ *  3. The participant is looked up scoped to this group, so an id that
++ *     exists but belongs to a different split group is treated the same as
++ *     one that doesn't exist at all.
++ *  4. If the participant is already marked paid, nothing further happens -
++ *     this call is a no-op, and the group's current state is returned as
++ *     it stood. This is what makes a repeated confirmation (a retried
++ *     request, two people submitting the same in-person payment twice)
++ *     safe to call more than once without double-deducting, or recording a
++ *     second audit entry for the same participant.
++ *  5. Otherwise, the participant is marked paid, their `owed_amount` is
++ *     deducted from the group's `remaining_balance`, and - once that
++ *     balance has reached (approximately) zero - the group is marked
++ *     finalized with the moment that happened.
++ *  6. The participant's `SplitPaymentConfirmation` row is created (or, if a
++ *     previous confirmation of this same participant was since reversed,
++ *     reused and un-reversed) recording who confirmed this payment and for
++ *     how much, in the same transaction as the settlement itself.
++ *
++ * Any failure at any step rolls the whole transaction back, so the
++ * participant's status, the group's balance, and the audit trail are all
++ * left exactly as they were.
++ *
++ * @param input.groupId - the split group whose participant is being
++ *   confirmed.
++ * @param input.participantId - the participant being marked paid; must
++ *   belong to `groupId`.
++ * @param input.userId - the id of the authenticated user making the
++ *   request; must match the split group's owner.
++ * @returns the updated split group, with its participants and payment
++ *   confirmations attached.
++ * @throws {NotFoundError} when the split group, or a participant belonging
++ *   to it, does not exist.
++ * @throws {ForbiddenError} when `userId` does not own the split group.
++ */
++export const confirmParticipantPayment = async (
++  input: SplitPaymentParticipantActionInput
++): Promise<InstanceType<typeof SplitGroup>> => {
++  const transaction: Transaction = await sequelize.transaction();
++
++  try {
++    const { splitGroup, participant } = await lockOwnedGroupAndParticipant(
++      input,
++      transaction
++    );
++
++    if (participant.status !== ParticipantStatus.PAID) {
++      participant.status = ParticipantStatus.PAID;
++      await participant.save({ transaction });
++
++      splitGroup.remaining_balance -= participant.owed_amount;
++
++      if (Math.abs(splitGroup.remaining_balance) <= BALANCE_EPSILON) {
++        splitGroup.remaining_balance = 0;
++        splitGroup.is_finalized = true;
++        splitGroup.payment_confirmed_at = new Date();
++      }
++
++      await splitGroup.save({ transaction });
++
++      const existingConfirmation = await SplitPaymentConfirmation.findOne({
++        where: { split_participant_id: participant.id },
++        transaction,
++      });
++
++      if (existingConfirmation) {
++        existingConfirmation.confirmed_by_user_id = input.userId;
++        existingConfirmation.amount_confirmed = participant.owed_amount;
++        existingConfirmation.reversed_at = null;
++        existingConfirmation.reversed_by_user_id = null;
++        await existingConfirmation.save({ transaction });
++      } else {
++        await SplitPaymentConfirmation.create(
++          {
++            split_group_id: splitGroup.id,
++            split_participant_id: participant.id,
++            confirmed_by_user_id: input.userId,
++            amount_confirmed: participant.owed_amount,
++          },
++          { transaction }
++        );
++      }
++    }
++
++    await transaction.commit();
++
++    return (await loadGroupForResponse(splitGroup.id))!;
++  } catch (error) {
++    await transaction.rollback();
++    throw error;
++  }
++};
++
++/**
++ * @description Atomically reverse a mistaken payment confirmation: restore
++ * the participant to pending, add their `owed_amount` back to the group's
++ * `remaining_balance`, and un-finalize the group if reversing this payment
++ * means it's no longer fully settled.
++ *
++ * Mirrors `confirmParticipantPayment`'s own locking and ownership checks
++ * exactly (see its documentation), so the same guarantee holds here too: a
++ * concurrent reversal or confirmation for a different participant of the
++ * same group serializes rather than racing.
++ *
++ * If the participant is not currently marked paid - never confirmed, or
++ * already reversed - this call is a no-op, and the group's current state
++ * is returned as it stood; reversing something that was never paid has
++ * nothing to undo.
++ *
++ * @param input.groupId - the split group whose participant's payment is
++ *   being reversed.
++ * @param input.participantId - the participant being marked unpaid again;
++ *   must belong to `groupId`.
++ * @param input.userId - the id of the authenticated user making the
++ *   request; must match the split group's owner.
++ * @returns the updated split group, with its participants and payment
++ *   confirmations attached.
++ * @throws {NotFoundError} when the split group, or a participant belonging
++ *   to it, does not exist.
++ * @throws {ForbiddenError} when `userId` does not own the split group.
++ */
++export const reverseParticipantPayment = async (
++  input: SplitPaymentParticipantActionInput
++): Promise<InstanceType<typeof SplitGroup>> => {
++  const transaction: Transaction = await sequelize.transaction();
++
++  try {
++    const { splitGroup, participant } = await lockOwnedGroupAndParticipant(
++      input,
++      transaction
++    );
++
++    if (participant.status === ParticipantStatus.PAID) {
++      participant.status = ParticipantStatus.PENDING;
++      await participant.save({ transaction });
++
++      splitGroup.remaining_balance += participant.owed_amount;
++      splitGroup.is_finalized = false;
++      splitGroup.payment_confirmed_at = null;
++      await splitGroup.save({ transaction });
++
++      const confirmation = await SplitPaymentConfirmation.findOne({
++        where: { split_participant_id: participant.id },
++        transaction,
++      });
++
++      if (confirmation) {
++        confirmation.reversed_at = new Date();
++        confirmation.reversed_by_user_id = input.userId;
++        await confirmation.save({ transaction });
++      }
++    }
++
++    await transaction.commit();
++
++    return (await loadGroupForResponse(splitGroup.id))!;
++  } catch (error) {
++    await transaction.rollback();
++    throw error;
++  }
++};
+diff --git a/rateeat_backend/src/types/split-payment.types.ts b/rateeat_backend/src/types/split-payment.types.ts
+new file mode 100644
+index 0000000..0c394d4
+--- /dev/null
++++ b/rateeat_backend/src/types/split-payment.types.ts
+@@ -0,0 +1,14 @@
++/**
++ * Shared shapes for the manual split-payment-settlement feature (PUT and
++ * DELETE /api/v1/split-group/:groupId/member/:participantId/payment). Kept
++ * separate from the service module so the contract is visible without
++ * reading the implementation.
++ */
++
++/** Input to both the confirm- and reverse-payment service calls. */
++export interface SplitPaymentParticipantActionInput {
++  groupId: string;
++  participantId: string;
++  /** The id of the authenticated user; must own the split group. */
++  userId: string;
++}

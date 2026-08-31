@@ -1,0 +1,1748 @@
+diff --git a/rateeat_backend/src/__tests__/db_setup.ts b/rateeat_backend/src/__tests__/db_setup.ts
+index e60a6e1f2..5c57a987d 100644
+--- a/rateeat_backend/src/__tests__/db_setup.ts
++++ b/rateeat_backend/src/__tests__/db_setup.ts
+@@ -17,6 +17,7 @@ import {
+   ItemVideo,
+   UserLocation,
+   RestaurantLocation,
++  Neighborhood,
+   ItemReviewImage,
+   ItemReviewVideo,
+   RestaurantReview,
+@@ -103,6 +104,12 @@ class Database {
+     if (!Database.instance) {
+       Database.instance = new Sequelize({
+         ...configFile,
++
++        // Gold tests use the local PostgreSQL instance.
++        // The repository test config forces SSL, but local
++        // PostgreSQL does not provide SSL.
++        dialectOptions: {},
++
+         models: [
+           User,
+           AdminUser,
+@@ -116,6 +123,7 @@ class Database {
+           ItemVideo,
+           UserLocation,
+           RestaurantLocation,
++          Neighborhood,
+           ItemReviewImage,
+           ItemReviewVideo,
+           RestaurantReview,
+diff --git a/rateeat_backend/src/__tests__/unit/candidate_item_moderation_auth_behavior.test.ts b/rateeat_backend/src/__tests__/unit/candidate_item_moderation_auth_behavior.test.ts
+new file mode 100644
+index 000000000..8c8d59f49
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/candidate_item_moderation_auth_behavior.test.ts
+@@ -0,0 +1,29 @@
++import express from "express";
++import request from "supertest";
++
++import candidateItemRouter from "../../routes/candidate_item.route";
++
++describe("candidate item batch moderation authorization", () => {
++  const app = express();
++
++  app.use(express.json());
++  app.use("/api/v1/candidate-items", candidateItemRouter);
++
++  it("requires admin authorization for batch moderation", async () => {
++    const response = await request(app)
++      .put("/api/v1/candidate-items/moderate-batch")
++      .send({
++        items: [
++          {
++            id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa6",
++            isApproved: true,
++          },
++        ],
++      });
++
++    expect(response.status).toBe(401);
++    expect(response.body).toEqual({
++      error: "Not authorized to access this route",
++    });
++  });
++});
+diff --git a/rateeat_backend/src/__tests__/unit/candidate_item_moderation_behavior.test.ts b/rateeat_backend/src/__tests__/unit/candidate_item_moderation_behavior.test.ts
+new file mode 100644
+index 000000000..dcaf9accc
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/candidate_item_moderation_behavior.test.ts
+@@ -0,0 +1,1674 @@
++import express, { NextFunction, Response } from "express";
++import request from "supertest";
++
++import Database from "../db_setup";
++import {
++  manageCandidateItem } from "../../controllers/candidate_item.controller";
++import {
++  Category,
++  Incentive,
++  Item,
++  ItemImage,
++  ItemVideo,
++  Notification,
++} from "../../models";
++import candidateItemRouter from "../../routes/candidate_item.route";
++jest.mock("../../middlewares/auth", () => ({
++  protectRoute: (req: any, _res: any, next: any) => {
++    req.user = { id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd" };
++    next();
++  },
++  protectRouteForAdmin: (req: any, _res: any, next: any) => {
++    req.user = { id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd" };
++    next();
++  },
++}));
++
++const ROLE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1";
++const USER_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2";
++const RESTAURANT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3";
++const MENU_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4";
++const CATEGORY_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa5";
++const ITEM_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa6";
++const CANDIDATE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa7";
++const INCENTIVE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa8";
++const SECOND_CATEGORY_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb0";
++const SECOND_ITEM_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1";
++const SECOND_CANDIDATE_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2";
++const MISSING_ITEM_ID = "cccccccc-cccc-4ccc-8ccc-ccccccccccc1";
++
++const FAIL_TRIGGER = "gold_candidate_incentive_failure";
++const FAIL_FUNCTION = "gold_fail_candidate_incentive_write";
++
++const batchApp = express();
++batchApp.use(express.json());
++batchApp.use("/api/v1/candidate-items", candidateItemRouter);
++batchApp.use((err: any, _req: any, res: any, _next: any) => {
++  res.status(err?.statusCode || 500).json({
++    success: false,
++    message: err?.message || "Internal server error",
++    statusCode: err?.statusCode || 500,
++    error: err?.details || null,
++  });
++});
++
++type BatchModerationItem = {
++  id: string;
++  isApproved: boolean;
++  mediaImages?: Array<{
++    highQualityImg: string;
++    mediumQualityImg?: string;
++    lowQualityImg?: string;
++  }>;
++  mediaVideos?: string[];
++};
++
++const executeBatchModeration = (items: BatchModerationItem[]) =>
++  request(batchApp)
++    .put("/api/v1/candidate-items/moderate-batch")
++    .send({ items });
++
++const responseFor = () => {
++  const response: any = {
++    statusCode: 200,
++    body: undefined,
++  };
++
++  response.status = jest.fn((statusCode: number) => {
++    response.statusCode = statusCode;
++    return response;
++  });
++
++  response.json = jest.fn((body: unknown) => {
++    response.body = JSON.parse(JSON.stringify(body));
++    return response;
++  });
++
++  return response as Response & {
++    statusCode: number;
++    body: any;
++  };
++};
++
++const executeModeration = async (
++  isApproved: boolean | string,
++  mediaImages?: Array<{
++    highQualityImg: string;
++    mediumQualityImg?: string;
++    lowQualityImg?: string;
++  }>,
++  mediaVideos?: string[],
++  bodyOverrides: Record<string, unknown> = {},
++  itemId: string = ITEM_ID
++) => {
++  const res = responseFor();
++  let forwardedError: any;
++
++  const next = ((error?: unknown) => {
++    forwardedError = error;
++  }) as NextFunction;
++
++  await manageCandidateItem(
++    {
++      params: { id: itemId },
++      body: { ...bodyOverrides, isApproved },
++      user: { id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd" },
++      mediaImages,
++      mediaVideos,
++    } as any,
++    res,
++    next
++  );
++
++  return { res, error: forwardedError };
++};
++
++const removeFailingIncentiveTrigger = async () => {
++  const sequelize = await Database.getInstance();
++  await sequelize.query(
++    `DROP TRIGGER IF EXISTS ${FAIL_TRIGGER} ON incentives;`
++  );
++  await sequelize.query(`DROP FUNCTION IF EXISTS ${FAIL_FUNCTION}();`);
++};
++
++const installFailingIncentiveTrigger = async () => {
++  const sequelize = await Database.getInstance();
++
++  await removeFailingIncentiveTrigger();
++  await sequelize.query(`
++    CREATE FUNCTION ${FAIL_FUNCTION}()
++    RETURNS trigger AS $$
++    BEGIN
++      IF NEW.user_id = '${USER_ID}'::uuid THEN
++        RAISE EXCEPTION 'forced candidate incentive write failure';
++      END IF;
++      RETURN NEW;
++    END;
++    $$ LANGUAGE plpgsql;
++  `);
++  await sequelize.query(`
++    CREATE TRIGGER ${FAIL_TRIGGER}
++    BEFORE INSERT OR UPDATE ON incentives
++    FOR EACH ROW
++    EXECUTE FUNCTION ${FAIL_FUNCTION}();
++  `);
++};
++
++const resetFixture = async ({
++  approval = null,
++  categoryApproved = false,
++  incentiveTotal = 25,
++  owner = true,
++}: {
++  approval?: boolean | null;
++  categoryApproved?: boolean;
++  incentiveTotal?: number;
++  owner?: boolean;
++} = {}) => {
++  const sequelize = await Database.getInstance();
++
++  await removeFailingIncentiveTrigger();
++
++  await sequelize.query(
++    `UPDATE categories SET is_approved = ?, "updatedAt" = NOW() WHERE id = ?`,
++    { replacements: [categoryApproved, CATEGORY_ID] }
++  );
++  await sequelize.query(
++    `UPDATE items SET is_approved = ?, name = 'Gold Candidate Item', "updatedAt" = NOW() WHERE id = ?`,
++    { replacements: [approval, ITEM_ID] }
++  );
++  await sequelize.query(`DELETE FROM item_images WHERE item_id = ?`, {
++    replacements: [ITEM_ID],
++  });
++  await sequelize.query(`DELETE FROM item_videos WHERE item_id = ?`, {
++    replacements: [ITEM_ID],
++  });
++  await sequelize.query(`DELETE FROM candidate_item_users WHERE item_id = ?`, {
++    replacements: [ITEM_ID],
++  });
++  await sequelize.query(`DELETE FROM incentives WHERE user_id = ?`, {
++    replacements: [USER_ID],
++  });
++
++  if (owner) {
++    await sequelize.query(
++      `
++      INSERT INTO candidate_item_users (
++        id, user_id, item_id, "createdAt", "updatedAt"
++      ) VALUES (?, ?, ?, NOW(), NOW())
++      `,
++      { replacements: [CANDIDATE_ID, USER_ID, ITEM_ID] }
++    );
++  }
++
++  await sequelize.query(
++    `
++    INSERT INTO incentives (
++      id, user_id, all_time_total, current_total, "createdAt", "updatedAt"
++    ) VALUES (?, ?, 0, ?, NOW(), NOW())
++    `,
++    { replacements: [INCENTIVE_ID, USER_ID, incentiveTotal] }
++  );
++};
++
++const resetSecondCandidate = async ({
++  approval = null,
++  owner = true,
++}: {
++  approval?: boolean | null;
++  owner?: boolean;
++} = {}) => {
++  const sequelize = await Database.getInstance();
++
++  await sequelize.query(
++    `UPDATE categories SET is_approved = false, "updatedAt" = NOW() WHERE id = ?`,
++    { replacements: [SECOND_CATEGORY_ID] }
++  );
++  await sequelize.query(
++    `UPDATE items SET is_approved = ?, name = 'Gold Candidate Item Two', "updatedAt" = NOW() WHERE id = ?`,
++    { replacements: [approval, SECOND_ITEM_ID] }
++  );
++  await sequelize.query(`DELETE FROM item_images WHERE item_id = ?`, {
++    replacements: [SECOND_ITEM_ID],
++  });
++  await sequelize.query(`DELETE FROM item_videos WHERE item_id = ?`, {
++    replacements: [SECOND_ITEM_ID],
++  });
++  await sequelize.query(`DELETE FROM candidate_item_users WHERE item_id = ?`, {
++    replacements: [SECOND_ITEM_ID],
++  });
++
++  if (owner) {
++    await sequelize.query(
++      `
++      INSERT INTO candidate_item_users (
++        id, user_id, item_id, "createdAt", "updatedAt"
++      ) VALUES (?, ?, ?, NOW(), NOW())
++      `,
++      { replacements: [SECOND_CANDIDATE_ID, USER_ID, SECOND_ITEM_ID] }
++    );
++  }
++};
++
++describe("candidate item moderation persistence", () => {
++  beforeAll(async () => {
++    const sequelize = await Database.getInstance();
++
++    await sequelize.query(
++      `
++      INSERT INTO roles (id, name, "createdAt", "updatedAt")
++      VALUES (?, 'gold-candidate-user', NOW(), NOW())
++      ON CONFLICT (id) DO NOTHING
++      `,
++      { replacements: [ROLE_ID] }
++    );
++
++    await sequelize.query(
++      `
++      INSERT INTO users (
++        id, first_name, last_name, email, role_id, phone_number,
++        password, username, verified, acquisition_channel, is_active,
++        "createdAt", "updatedAt"
++      ) VALUES (
++        ?, 'Gold', 'Candidate', 'gold-candidate-task3@example.com', ?,
++        '+251900009903', '', 'gold_candidate_task3', 4,
++        'direct-signup', true, NOW(), NOW()
++      )
++      ON CONFLICT (id) DO NOTHING
++      `,
++      { replacements: [USER_ID, ROLE_ID] }
++    );
++
++    await sequelize.query(
++      `
++      INSERT INTO restaurants (id, name, currency, "createdAt", "updatedAt")
++      VALUES (?, 'Gold Candidate Cafe', 'ETB', NOW(), NOW())
++      ON CONFLICT (id) DO NOTHING
++      `,
++      { replacements: [RESTAURANT_ID] }
++    );
++
++    await sequelize.query(
++      `
++      INSERT INTO menus (id, restaurant_id, menu_updated_at, "createdAt", "updatedAt")
++      VALUES (?, ?, NOW(), NOW(), NOW())
++      ON CONFLICT (id) DO NOTHING
++      `,
++      { replacements: [MENU_ID, RESTAURANT_ID] }
++    );
++
++    await sequelize.query(
++      `
++      INSERT INTO categories (
++        id, name, menu_id, is_approved, "createdAt", "updatedAt"
++      ) VALUES (?, 'Gold Candidate Category', ?, false, NOW(), NOW())
++      ON CONFLICT (id) DO NOTHING
++      `,
++      { replacements: [CATEGORY_ID, MENU_ID] }
++    );
++
++    await sequelize.query(
++      `
++      INSERT INTO categories (
++        id, name, menu_id, is_approved, "createdAt", "updatedAt"
++      ) VALUES (?, 'Gold Candidate Category Two', ?, false, NOW(), NOW())
++      ON CONFLICT (id) DO NOTHING
++      `,
++      { replacements: [SECOND_CATEGORY_ID, MENU_ID] }
++    );
++
++    await sequelize.query(
++      `
++      INSERT INTO items (
++        id, name, description, price, price_updated_at, category_id, is_approved,
++        is_available_for_order, "createdAt", "updatedAt"
++      ) VALUES (
++        ?, 'Gold Candidate Item', 'task 3 fixture', 12, NOW(), ?, NULL,
++        false, NOW(), NOW()
++      )
++      ON CONFLICT (id) DO NOTHING
++      `,
++      { replacements: [ITEM_ID, CATEGORY_ID] }
++    );
++
++    await sequelize.query(
++      `
++      INSERT INTO items (
++        id, name, description, price, price_updated_at, category_id, is_approved,
++        is_available_for_order, "createdAt", "updatedAt"
++      ) VALUES (
++        ?, 'Gold Candidate Item Two', 'task 3 shared owner fixture', 14, NOW(), ?, NULL,
++        false, NOW(), NOW()
++      )
++      ON CONFLICT (id) DO NOTHING
++      `,
++      { replacements: [SECOND_ITEM_ID, SECOND_CATEGORY_ID] }
++    );
++  });
++
++  afterAll(async () => {
++    const sequelize = await Database.getInstance();
++
++    await removeFailingIncentiveTrigger();
++    await sequelize.query(`DELETE FROM item_images WHERE item_id IN (?, ?)`, {
++      replacements: [ITEM_ID, SECOND_ITEM_ID],
++    });
++    await sequelize.query(`DELETE FROM item_videos WHERE item_id IN (?, ?)`, {
++      replacements: [ITEM_ID, SECOND_ITEM_ID],
++    });
++    await sequelize.query(
++      `DELETE FROM candidate_item_users WHERE item_id IN (?, ?)`,
++      {
++        replacements: [ITEM_ID, SECOND_ITEM_ID],
++      }
++    );
++    await sequelize.query(`DELETE FROM incentives WHERE user_id = ?`, {
++      replacements: [USER_ID],
++    });
++    await sequelize.query(`DELETE FROM items WHERE id IN (?, ?)`, {
++      replacements: [ITEM_ID, SECOND_ITEM_ID],
++    });
++    await sequelize.query(`DELETE FROM categories WHERE id IN (?, ?)`, {
++      replacements: [CATEGORY_ID, SECOND_CATEGORY_ID],
++    });
++    await sequelize.query(`DELETE FROM menus WHERE id = ?`, {
++      replacements: [MENU_ID],
++    });
++    await sequelize.query(`DELETE FROM restaurants WHERE id = ?`, {
++      replacements: [RESTAURANT_ID],
++    });
++    await sequelize.query(`DELETE FROM users WHERE id = ?`, {
++      replacements: [USER_ID],
++    });
++    await sequelize.query(`DELETE FROM roles WHERE id = ?`, {
++      replacements: [ROLE_ID],
++    });
++
++    await Database.close();
++  });
++
++  beforeEach(async () => {
++    await Notification.destroy({
++      where: {
++        notifiable_id: [
++          ITEM_ID,
++          SECOND_ITEM_ID,
++        ],
++      },
++    });
++
++    await resetFixture();
++    await resetSecondCandidate();
++
++    const sequelize = await Database.getInstance();
++
++    });
++
++  describe("approval rewards", () => {
++    it("persists the ten point reward when a pending user candidate is approved", async () => {
++      const { res, error } = await executeModeration(true);
++
++      expect(error).toBeUndefined();
++      expect(res.statusCode).toBe(200);
++
++      const item = await Item.findByPk(ITEM_ID);
++      const incentive = await Incentive.findOne({
++        where: { user_id: USER_ID },
++      });
++
++      expect(item?.is_approved).toBe(true);
++      expect(incentive?.current_total).toBe(35);
++    });
++
++    it("awards the same reward when a previously rejected candidate is approved", async () => {
++      await resetFixture({ approval: false, incentiveTotal: 7 });
++
++      const { error } = await executeModeration(true);
++      const incentive = await Incentive.findOne({
++        where: { user_id: USER_ID },
++      });
++
++      expect(error).toBeUndefined();
++      expect(incentive?.current_total).toBe(17);
++    });
++
++    it("creates and persists the approval reward when the owner has no incentive row", async () => {
++      const sequelize = await Database.getInstance();
++      await sequelize.query(`DELETE FROM incentives WHERE user_id = ?`, {
++        replacements: [USER_ID],
++      });
++
++      const { res, error } = await executeModeration(true);
++      const incentive = await Incentive.findOne({
++        where: { user_id: USER_ID },
++      });
++
++      expect(error).toBeUndefined();
++      expect(res.statusCode).toBe(200);
++      expect(incentive).not.toBeNull();
++      expect(incentive?.current_total).toBe(10);
++    });
++
++    it("rejects an approved candidate and removes exactly one approval reward", async () => {
++      await resetFixture({ approval: true, incentiveTotal: 35 });
++
++      const { res, error } = await executeModeration(false);
++      const item = await Item.findByPk(ITEM_ID);
++      const incentive = await Incentive.findOne({
++        where: { user_id: USER_ID },
++      });
++
++      expect(error).toBeUndefined();
++      expect(res.statusCode).toBe(200);
++      expect(item?.is_approved).toBe(false);
++      expect(incentive?.current_total).toBe(25);
++    });
++
++    it("rejects a pending candidate without changing the incentive total", async () => {
++      await resetFixture({ approval: null, incentiveTotal: 25 });
++
++      const { res, error } = await executeModeration(false);
++      const item = await Item.findByPk(ITEM_ID);
++      const incentive = await Incentive.findOne({
++        where: { user_id: USER_ID },
++      });
++
++      expect(error).toBeUndefined();
++      expect(res.statusCode).toBe(200);
++      expect(item?.is_approved).toBe(false);
++      expect(incentive?.current_total).toBe(25);
++    });
++  });
++
++  describe("state guards", () => {
++    it("keeps the existing already-approved error and does not change the reward", async () => {
++      await resetFixture({ approval: true, incentiveTotal: 35 });
++
++      const { res, error } = await executeModeration(true);
++      const incentive = await Incentive.findOne({
++        where: { user_id: USER_ID },
++      });
++
++      expect(res.body).toBeUndefined();
++      expect(error).toEqual(
++        expect.objectContaining({
++          statusCode: 400,
++          message: "Bad request",
++          details: "The item is already approved",
++        })
++      );
++      expect(incentive?.current_total).toBe(35);
++    });
++
++    it("reports an already-rejected candidate when rejection is repeated", async () => {
++      await resetFixture({ approval: false, incentiveTotal: 25 });
++
++      const { error } = await executeModeration(false);
++
++      expect(error).toEqual(
++        expect.objectContaining({
++          statusCode: 400,
++          message: "Bad request",
++          details: "The item is already rejected",
++        })
++      );
++    });
++
++    it("keeps the successful response envelope unchanged", async () => {
++      const { res, error } = await executeModeration(true);
++
++      expect(error).toBeUndefined();
++      expect(Object.keys(res.body).sort()).toEqual(["data", "success"]);
++      expect(Object.keys(res.body.data).sort()).toEqual(
++        [
++          "average_rating",
++          "category_id",
++          "createdAt",
++          "description",
++          "down_vote",
++          "fasting",
++          "id",
++          "is_approved",
++          "is_available_for_order",
++          "item_images",
++          "item_videos",
++          "name",
++          "number_of_reviews",
++          "popularity_index",
++          "price",
++          "price_updated_at",
++          "up_vote",
++          "updatedAt",
++        ].sort()
++      );
++      expect(res.body.success).toBe(true);
++      expect(res.body.data.id).toBe(ITEM_ID);
++      expect(res.body.data.is_approved).toBe(true);
++    });
++
++    it("still approves the candidate category when moderation succeeds", async () => {
++      await executeModeration(true);
++      const category = await Category.findByPk(CATEGORY_ID);
++
++      expect(category?.is_approved).toBe(true);
++    });
++
++    it("still allows moderation when the candidate has no user owner record", async () => {
++      await resetFixture({ owner: false, incentiveTotal: 25 });
++
++      const { res, error } = await executeModeration(true);
++      const incentive = await Incentive.findOne({
++        where: { user_id: USER_ID },
++      });
++
++      expect(error).toBeUndefined();
++      expect(res.statusCode).toBe(200);
++      expect(incentive?.current_total).toBe(25);
++    });
++
++    it("does not create an incentive when the candidate has no user owner record", async () => {
++      const sequelize = await Database.getInstance();
++      await resetFixture({ owner: false, incentiveTotal: 25 });
++      await sequelize.query(`DELETE FROM incentives WHERE user_id = ?`, {
++        replacements: [USER_ID],
++      });
++
++      const { res, error } = await executeModeration(true);
++      const incentive = await Incentive.findOne({
++        where: { user_id: USER_ID },
++      });
++
++      expect(error).toBeUndefined();
++      expect(res.statusCode).toBe(200);
++      expect(incentive).toBeNull();
++    });
++
++    it("keeps the existing image replacement behavior on successful moderation", async () => {
++      await ItemImage.create({
++        item_id: ITEM_ID,
++        url: "https://images.example/old-candidate.jpg",
++      } as any);
++
++      const { error } = await executeModeration(true, [
++        {
++          highQualityImg: "https://images.example/new-candidate.jpg",
++          mediumQualityImg: "https://images.example/new-candidate-medium.jpg",
++          lowQualityImg: "https://images.example/new-candidate-low.jpg",
++        },
++      ]);
++
++      const images = await ItemImage.findAll({
++        where: { item_id: ITEM_ID },
++        order: [["url", "ASC"]],
++      });
++
++      expect(error).toBeUndefined();
++      expect(images.map((image) => image.url)).toEqual([
++        "https://images.example/new-candidate.jpg",
++      ]);
++    });
++    it("keeps the existing video replacement behavior on successful moderation", async () => {
++      await ItemVideo.create({
++        item_id: ITEM_ID,
++        url: "https://videos.example/old-candidate.mp4",
++      } as any);
++
++      const { error } = await executeModeration(true, undefined, [
++        "https://videos.example/new-candidate.mp4",
++      ]);
++
++      const videos = await ItemVideo.findAll({
++        where: { item_id: ITEM_ID },
++        order: [["url", "ASC"]],
++      });
++
++      expect(error).toBeUndefined();
++      expect(videos.map((video) => video.url)).toEqual([
++        "https://videos.example/new-candidate.mp4",
++      ]);
++    });
++  });
++describe("atomicity", () => {
++    it("rolls back item, category, and incentive state when reward persistence fails", async () => {
++      await installFailingIncentiveTrigger();
++
++      const { res, error } = await executeModeration(
++        true,
++        undefined,
++        undefined,
++        { name: "This name must roll back" }
++      );
++
++      expect(res.body).toBeUndefined();
++      expect(error).toBeDefined();
++
++      const item = await Item.findByPk(ITEM_ID);
++      const category = await Category.findByPk(CATEGORY_ID);
++      const incentive = await Incentive.findOne({
++        where: { user_id: USER_ID },
++      });
++
++      expect(item?.is_approved).toBeNull();
++      expect(item?.name).toBe("Gold Candidate Item");
++      expect(category?.is_approved).toBe(false);
++      expect(incentive?.current_total).toBe(25);
++    });
++
++    it("rolls back an image replacement when the replacement write fails", async () => {
++      await ItemImage.create({
++        item_id: ITEM_ID,
++        url: "https://images.example/original-candidate.jpg",
++      } as any);
++
++      const invalidUrl = `https://images.example/${"x".repeat(300)}`;
++      const { error } = await executeModeration(true, [
++        { highQualityImg: invalidUrl },
++      ]);
++
++      expect(error).toBeDefined();
++
++      const item = await Item.findByPk(ITEM_ID);
++      const category = await Category.findByPk(CATEGORY_ID);
++      const incentive = await Incentive.findOne({
++        where: { user_id: USER_ID },
++      });
++      const images = await ItemImage.findAll({ where: { item_id: ITEM_ID } });
++
++      expect(item?.is_approved).toBeNull();
++      expect(category?.is_approved).toBe(false);
++      expect(incentive?.current_total).toBe(25);
++      expect(images.map((image) => image.url)).toEqual([
++        "https://images.example/original-candidate.jpg",
++      ]);
++    });
++
++    it("rolls back a video replacement when the replacement write fails", async () => {
++      await ItemVideo.create({
++        item_id: ITEM_ID,
++        url: "https://videos.example/original-candidate.mp4",
++      } as any);
++
++      const invalidUrl = `https://videos.example/${"x".repeat(300)}`;
++      const { error } = await executeModeration(true, undefined, [invalidUrl]);
++
++      expect(error).toBeDefined();
++
++      const item = await Item.findByPk(ITEM_ID);
++      const category = await Category.findByPk(CATEGORY_ID);
++      const incentive = await Incentive.findOne({
++        where: { user_id: USER_ID },
++      });
++      const videos = await ItemVideo.findAll({ where: { item_id: ITEM_ID } });
++
++      expect(item?.is_approved).toBeNull();
++      expect(category?.is_approved).toBe(false);
++      expect(incentive?.current_total).toBe(25);
++      expect(videos.map((video) => video.url)).toEqual([
++        "https://videos.example/original-candidate.mp4",
++      ]);
++    });
++
++    it("rolls back a rejection when reward removal persistence fails", async () => {
++      await resetFixture({
++        approval: true,
++        categoryApproved: true,
++        incentiveTotal: 35,
++      });
++      await installFailingIncentiveTrigger();
++
++      const { res, error } = await executeModeration("false");
++
++      expect(res.body).toBeUndefined();
++      expect(error).toBeDefined();
++
++      const item = await Item.findByPk(ITEM_ID);
++      const category = await Category.findByPk(CATEGORY_ID);
++      const incentive = await Incentive.findOne({
++        where: { user_id: USER_ID },
++      });
++
++      expect(item?.is_approved).toBe(true);
++      expect(category?.is_approved).toBe(true);
++      expect(incentive?.current_total).toBe(35);
++    });
++
++    it("allows the approval to be retried after a rolled-back reward failure", async () => {
++      await installFailingIncentiveTrigger();
++      await executeModeration(true);
++      await removeFailingIncentiveTrigger();
++
++      const retry = await executeModeration(true);
++      const item = await Item.findByPk(ITEM_ID);
++      const incentive = await Incentive.findOne({
++        where: { user_id: USER_ID },
++      });
++
++      expect(retry.error).toBeUndefined();
++      expect(retry.res.statusCode).toBe(200);
++      expect(item?.is_approved).toBe(true);
++      expect(incentive?.current_total).toBe(35);
++    });
++  });
++
++  describe("concurrent moderation", () => {
++    it("serializes simultaneous approvals so the reward is applied once", async () => {
++      const [first, second] = await Promise.all([
++        executeModeration(true),
++        executeModeration(true),
++      ]);
++
++      const item = await Item.findByPk(ITEM_ID);
++      const incentive = await Incentive.findOne({
++        where: { user_id: USER_ID },
++      });
++      const results = [first, second];
++
++      expect(item?.is_approved).toBe(true);
++      expect(incentive?.current_total).toBe(35);
++      expect(results.filter((result) => result.res.body?.success)).toHaveLength(
++        1
++      );
++      expect(
++        results.filter(
++          (result) =>
++            result.error?.statusCode === 400 &&
++            result.error?.details === "The item is already approved"
++        )
++      ).toHaveLength(1);
++    });
++
++    it("serializes simultaneous rejections so the reward is removed once", async () => {
++      await resetFixture({ approval: true, incentiveTotal: 35 });
++
++      const [first, second] = await Promise.all([
++        executeModeration(false),
++        executeModeration(false),
++      ]);
++
++      const item = await Item.findByPk(ITEM_ID);
++      const incentive = await Incentive.findOne({
++        where: { user_id: USER_ID },
++      });
++      const results = [first, second];
++
++      expect(item?.is_approved).toBe(false);
++      expect(incentive?.current_total).toBe(25);
++      expect(results.filter((result) => result.res.body?.success)).toHaveLength(
++        1
++      );
++      expect(
++        results.filter(
++          (result) =>
++            result.error?.statusCode === 400 &&
++            result.error?.details === "The item is already rejected"
++        )
++      ).toHaveLength(1);
++    });
++
++    it("keeps both rewards when different candidates from the same user are approved together", async () => {
++      const [first, second] = await Promise.all([
++        executeModeration(true),
++        executeModeration(true, undefined, undefined, {}, SECOND_ITEM_ID),
++      ]);
++
++      const firstItem = await Item.findByPk(ITEM_ID);
++      const secondItem = await Item.findByPk(SECOND_ITEM_ID);
++      const incentives = await Incentive.findAll({
++        where: { user_id: USER_ID },
++      });
++
++      expect(first.error).toBeUndefined();
++      expect(second.error).toBeUndefined();
++      expect(first.res.statusCode).toBe(200);
++      expect(second.res.statusCode).toBe(200);
++      expect(firstItem?.is_approved).toBe(true);
++      expect(secondItem?.is_approved).toBe(true);
++      expect(incentives).toHaveLength(1);
++      expect(incentives[0].current_total).toBe(45);
++    });
++
++    it("creates one incentive row and keeps both rewards when shared owner has no incentive yet", async () => {
++      const sequelize = await Database.getInstance();
++      await sequelize.query(`DELETE FROM incentives WHERE user_id = ?`, {
++        replacements: [USER_ID],
++      });
++
++      const [first, second] = await Promise.all([
++        executeModeration(true),
++        executeModeration(true, undefined, undefined, {}, SECOND_ITEM_ID),
++      ]);
++
++      const firstItem = await Item.findByPk(ITEM_ID);
++      const secondItem = await Item.findByPk(SECOND_ITEM_ID);
++      const incentives = await Incentive.findAll({
++        where: { user_id: USER_ID },
++      });
++
++      expect(first.error).toBeUndefined();
++      expect(second.error).toBeUndefined();
++      expect(first.res.statusCode).toBe(200);
++      expect(second.res.statusCode).toBe(200);
++      expect(firstItem?.is_approved).toBe(true);
++      expect(secondItem?.is_approved).toBe(true);
++      expect(incentives).toHaveLength(1);
++      expect(incentives[0].current_total).toBe(20);
++    });
++  });
++
++  describe("batch moderation", () => {
++    it("approves two pending candidates as one batch", async () => {
++      const response = await executeBatchModeration([
++        { id: ITEM_ID, isApproved: true },
++        { id: SECOND_ITEM_ID, isApproved: true },
++      ]);
++
++      const firstItem = await Item.findByPk(ITEM_ID);
++      const secondItem = await Item.findByPk(SECOND_ITEM_ID);
++      const firstCategory = await Category.findByPk(CATEGORY_ID);
++      const secondCategory = await Category.findByPk(SECOND_CATEGORY_ID);
++
++      expect(response.status).toBe(200);
++      expect(response.body.success).toBe(true);
++      expect(response.body.data).toHaveLength(2);
++      expect(firstItem?.is_approved).toBe(true);
++      expect(secondItem?.is_approved).toBe(true);
++      expect(firstCategory?.is_approved).toBe(true);
++      expect(secondCategory?.is_approved).toBe(true);
++    });
++
++    it("keeps existing images and videos unchanged during batch moderation", async () => {
++      await ItemImage.create({
++        item_id: ITEM_ID,
++        url: "https://images.example/batch-existing-first.jpg",
++      } as any);
++
++      await ItemVideo.create({
++        item_id: ITEM_ID,
++        url: "https://videos.example/batch-existing-first.mp4",
++      } as any);
++
++      await ItemImage.create({
++        item_id: SECOND_ITEM_ID,
++        url: "https://images.example/batch-existing-second.jpg",
++      } as any);
++
++      await ItemVideo.create({
++        item_id: SECOND_ITEM_ID,
++        url: "https://videos.example/batch-existing-second.mp4",
++      } as any);
++
++      const response = await executeBatchModeration([
++        { id: ITEM_ID, isApproved: true },
++        { id: SECOND_ITEM_ID, isApproved: true },
++      ]);
++
++      const firstImages = await ItemImage.findAll({
++        where: { item_id: ITEM_ID },
++      });
++      const firstVideos = await ItemVideo.findAll({
++        where: { item_id: ITEM_ID },
++      });
++      const secondImages = await ItemImage.findAll({
++        where: { item_id: SECOND_ITEM_ID },
++      });
++      const secondVideos = await ItemVideo.findAll({
++        where: { item_id: SECOND_ITEM_ID },
++      });
++
++      expect(response.status).toBe(200);
++      expect(firstImages.map((image) => image.url)).toEqual([
++        "https://images.example/batch-existing-first.jpg",
++      ]);
++      expect(firstVideos.map((video) => video.url)).toEqual([
++        "https://videos.example/batch-existing-first.mp4",
++      ]);
++      expect(secondImages.map((image) => image.url)).toEqual([
++        "https://images.example/batch-existing-second.jpg",
++      ]);
++      expect(secondVideos.map((video) => video.url)).toEqual([
++        "https://videos.example/batch-existing-second.mp4",
++      ]);
++    });
++
++    it("replaces only the media fields supplied for each batch item", async () => {
++      await ItemImage.create({
++        item_id: ITEM_ID,
++        url: "https://images.example/first-old.jpg",
++      } as any);
++
++      await ItemVideo.create({
++        item_id: ITEM_ID,
++        url: "https://videos.example/first-old.mp4",
++      } as any);
++
++      await ItemImage.create({
++        item_id: SECOND_ITEM_ID,
++        url: "https://images.example/second-old.jpg",
++      } as any);
++
++      await ItemVideo.create({
++        item_id: SECOND_ITEM_ID,
++        url: "https://videos.example/second-old.mp4",
++      } as any);
++
++      const response = await executeBatchModeration([
++        {
++          id: ITEM_ID,
++          isApproved: true,
++          mediaImages: [
++            {
++              highQualityImg: "https://images.example/first-new.jpg",
++              mediumQualityImg: "https://images.example/first-new-medium.jpg",
++              lowQualityImg: "https://images.example/first-new-low.jpg",
++            },
++          ],
++        },
++        {
++          id: SECOND_ITEM_ID,
++          isApproved: true,
++          mediaVideos: ["https://videos.example/second-new.mp4"],
++        },
++      ]);
++
++      const firstImages = await ItemImage.findAll({
++        where: { item_id: ITEM_ID },
++      });
++      const firstVideos = await ItemVideo.findAll({
++        where: { item_id: ITEM_ID },
++      });
++      const secondImages = await ItemImage.findAll({
++        where: { item_id: SECOND_ITEM_ID },
++      });
++      const secondVideos = await ItemVideo.findAll({
++        where: { item_id: SECOND_ITEM_ID },
++      });
++
++      expect(response.status).toBe(200);
++
++      expect(firstImages.map((image) => image.url)).toEqual([
++        "https://images.example/first-new.jpg",
++      ]);
++
++      expect(firstVideos.map((video) => video.url)).toEqual([
++        "https://videos.example/first-old.mp4",
++      ]);
++
++      expect(secondImages.map((image) => image.url)).toEqual([
++        "https://images.example/second-old.jpg",
++      ]);
++
++      expect(secondVideos.map((video) => video.url)).toEqual([
++        "https://videos.example/second-new.mp4",
++      ]);
++    });
++
++    it("treats empty batch media arrays as replacements that clear existing media", async () => {
++      await ItemImage.create({
++        item_id: ITEM_ID,
++        url: "https://images.example/to-be-cleared.jpg",
++      } as any);
++
++      await ItemVideo.create({
++        item_id: ITEM_ID,
++        url: "https://videos.example/to-be-cleared.mp4",
++      } as any);
++
++      const response = await executeBatchModeration([
++        {
++          id: ITEM_ID,
++          isApproved: true,
++          mediaImages: [],
++          mediaVideos: [],
++        },
++        {
++          id: SECOND_ITEM_ID,
++          isApproved: true,
++        },
++      ]);
++
++      const images = await ItemImage.findAll({
++        where: { item_id: ITEM_ID },
++      });
++      const videos = await ItemVideo.findAll({
++        where: { item_id: ITEM_ID },
++      });
++
++      expect(response.status).toBe(200);
++      expect(images).toHaveLength(0);
++      expect(videos).toHaveLength(0);
++    });
++
++    it("rolls back batch media replacement when another candidate cannot transition", async () => {
++      await ItemImage.create({
++        item_id: ITEM_ID,
++        url: "https://images.example/original-before-rollback.jpg",
++      } as any);
++
++      await ItemVideo.create({
++        item_id: ITEM_ID,
++        url: "https://videos.example/original-before-rollback.mp4",
++      } as any);
++
++      await resetSecondCandidate({
++        approval: true,
++      });
++
++      const response = await executeBatchModeration([
++        {
++          id: ITEM_ID,
++          isApproved: true,
++          mediaImages: [
++            {
++              highQualityImg: "https://images.example/must-not-survive.jpg",
++            },
++          ],
++          mediaVideos: ["https://videos.example/must-not-survive.mp4"],
++        },
++        {
++          id: SECOND_ITEM_ID,
++          isApproved: true,
++        },
++      ]);
++
++      const item = await Item.findByPk(ITEM_ID);
++      const images = await ItemImage.findAll({
++        where: { item_id: ITEM_ID },
++      });
++      const videos = await ItemVideo.findAll({
++        where: { item_id: ITEM_ID },
++      });
++
++      expect(response.status).toBe(400);
++      expect(item?.is_approved).toBeNull();
++
++      expect(images.map((image) => image.url)).toEqual([
++        "https://images.example/original-before-rollback.jpg",
++      ]);
++
++      expect(videos.map((video) => video.url)).toEqual([
++        "https://videos.example/original-before-rollback.mp4",
++      ]);
++    });
++
++    it("rolls back batch media replacement when incentive persistence fails", async () => {
++      await ItemImage.create({
++        item_id: ITEM_ID,
++        url: "https://images.example/original-incentive-failure.jpg",
++      } as any);
++
++      await ItemVideo.create({
++        item_id: ITEM_ID,
++        url: "https://videos.example/original-incentive-failure.mp4",
++      } as any);
++
++      await installFailingIncentiveTrigger();
++
++      const response = await executeBatchModeration([
++        {
++          id: ITEM_ID,
++          isApproved: true,
++          mediaImages: [
++            {
++              highQualityImg: "https://images.example/should-rollback.jpg",
++            },
++          ],
++          mediaVideos: ["https://videos.example/should-rollback.mp4"],
++        },
++        {
++          id: SECOND_ITEM_ID,
++          isApproved: true,
++        },
++      ]);
++
++      const firstItem = await Item.findByPk(ITEM_ID);
++      const secondItem = await Item.findByPk(SECOND_ITEM_ID);
++
++      const images = await ItemImage.findAll({
++        where: { item_id: ITEM_ID },
++      });
++
++      const videos = await ItemVideo.findAll({
++        where: { item_id: ITEM_ID },
++      });
++
++      expect(response.status).toBe(500);
++
++      expect(firstItem?.is_approved).toBeNull();
++      expect(secondItem?.is_approved).toBeNull();
++
++      expect(images.map((image) => image.url)).toEqual([
++        "https://images.example/original-incentive-failure.jpg",
++      ]);
++
++      expect(videos.map((video) => video.url)).toEqual([
++        "https://videos.example/original-incentive-failure.mp4",
++      ]);
++    });
++
++it("returns batch results in the same order as the request", async () => {
++      const response = await executeBatchModeration([
++        { id: SECOND_ITEM_ID, isApproved: true },
++        { id: ITEM_ID, isApproved: true },
++      ]);
++
++      expect(response.status).toBe(200);
++      expect(response.body.data.map((item: any) => item.id)).toEqual([
++        SECOND_ITEM_ID,
++        ITEM_ID,
++      ]);
++    });
++
++    it("keeps every reward when two batch items have the same owner", async () => {
++      const response = await executeBatchModeration([
++        { id: ITEM_ID, isApproved: true },
++        { id: SECOND_ITEM_ID, isApproved: true },
++      ]);
++
++      const incentive = await Incentive.findOne({
++        where: { user_id: USER_ID },
++      });
++
++      expect(response.status).toBe(200);
++      expect(incentive?.current_total).toBe(45);
++    });
++
++    it("creates one incentive row with both rewards when batch owner has no incentive", async () => {
++      const sequelize = await Database.getInstance();
++      await sequelize.query(`DELETE FROM incentives WHERE user_id = ?`, {
++        replacements: [USER_ID],
++      });
++
++      const response = await executeBatchModeration([
++        { id: ITEM_ID, isApproved: true },
++        { id: SECOND_ITEM_ID, isApproved: true },
++      ]);
++
++      const incentives = await Incentive.findAll({
++        where: { user_id: USER_ID },
++      });
++
++      expect(response.status).toBe(200);
++      expect(incentives).toHaveLength(1);
++      expect(incentives[0].current_total).toBe(20);
++    });
++
++    it("applies mixed approval and rejection deltas for the same owner", async () => {
++      await resetSecondCandidate({ approval: true });
++
++      const response = await executeBatchModeration([
++        { id: ITEM_ID, isApproved: true },
++        { id: SECOND_ITEM_ID, isApproved: false },
++      ]);
++
++      const firstItem = await Item.findByPk(ITEM_ID);
++      const secondItem = await Item.findByPk(SECOND_ITEM_ID);
++      const incentive = await Incentive.findOne({
++        where: { user_id: USER_ID },
++      });
++
++      expect(response.status).toBe(200);
++      expect(firstItem?.is_approved).toBe(true);
++      expect(secondItem?.is_approved).toBe(false);
++      expect(incentive?.current_total).toBe(25);
++    });
++
++    it("rolls back the whole batch when one candidate does not exist", async () => {
++      const response = await executeBatchModeration([
++        { id: ITEM_ID, isApproved: true },
++        { id: MISSING_ITEM_ID, isApproved: true },
++      ]);
++
++      const item = await Item.findByPk(ITEM_ID);
++      const category = await Category.findByPk(CATEGORY_ID);
++      const incentive = await Incentive.findOne({
++        where: { user_id: USER_ID },
++      });
++
++      expect(response.status).toBe(404);
++      expect(item?.is_approved).toBeNull();
++      expect(category?.is_approved).toBe(false);
++      expect(incentive?.current_total).toBe(25);
++    });
++
++    it("rolls back the whole batch when one candidate is already in the requested state", async () => {
++      await resetSecondCandidate({ approval: true });
++
++      const response = await executeBatchModeration([
++        { id: ITEM_ID, isApproved: true },
++        { id: SECOND_ITEM_ID, isApproved: true },
++      ]);
++
++      const firstItem = await Item.findByPk(ITEM_ID);
++      const secondItem = await Item.findByPk(SECOND_ITEM_ID);
++      const firstCategory = await Category.findByPk(CATEGORY_ID);
++      const incentive = await Incentive.findOne({
++        where: { user_id: USER_ID },
++      });
++
++      expect(response.status).toBe(400);
++      expect(response.body.error).toBe("The item is already approved");
++      expect(firstItem?.is_approved).toBeNull();
++      expect(secondItem?.is_approved).toBe(true);
++      expect(firstCategory?.is_approved).toBe(false);
++      expect(incentive?.current_total).toBe(25);
++    });
++
++    it("rejects duplicate ids before changing any batch state", async () => {
++      const response = await executeBatchModeration([
++        { id: ITEM_ID, isApproved: true },
++        { id: ITEM_ID, isApproved: true },
++      ]);
++
++      const item = await Item.findByPk(ITEM_ID);
++      const category = await Category.findByPk(CATEGORY_ID);
++      const incentive = await Incentive.findOne({
++        where: { user_id: USER_ID },
++      });
++
++      expect(response.status).toBe(400);
++      expect(response.body.error).toBe("Duplicate candidate item id");
++      expect(item?.is_approved).toBeNull();
++      expect(category?.is_approved).toBe(false);
++      expect(incentive?.current_total).toBe(25);
++    });
++
++    it("rolls back every batch write when incentive persistence fails", async () => {
++      await installFailingIncentiveTrigger();
++
++      const response = await executeBatchModeration([
++        { id: ITEM_ID, isApproved: true },
++        { id: SECOND_ITEM_ID, isApproved: true },
++      ]);
++
++      const firstItem = await Item.findByPk(ITEM_ID);
++      const secondItem = await Item.findByPk(SECOND_ITEM_ID);
++      const firstCategory = await Category.findByPk(CATEGORY_ID);
++      const secondCategory = await Category.findByPk(SECOND_CATEGORY_ID);
++      const incentive = await Incentive.findOne({
++        where: { user_id: USER_ID },
++      });
++
++      expect(response.status).toBe(500);
++      expect(firstItem?.is_approved).toBeNull();
++      expect(secondItem?.is_approved).toBeNull();
++      expect(firstCategory?.is_approved).toBe(false);
++      expect(secondCategory?.is_approved).toBe(false);
++      expect(incentive?.current_total).toBe(25);
++    });
++
++    it("serializes overlapping batches even when candidate order is reversed", async () => {
++      const [first, second] = await Promise.all([
++        executeBatchModeration([
++          { id: ITEM_ID, isApproved: true },
++          { id: SECOND_ITEM_ID, isApproved: true },
++        ]),
++        executeBatchModeration([
++          { id: SECOND_ITEM_ID, isApproved: true },
++          { id: ITEM_ID, isApproved: true },
++        ]),
++      ]);
++
++      const firstItem = await Item.findByPk(ITEM_ID);
++      const secondItem = await Item.findByPk(SECOND_ITEM_ID);
++      const incentive = await Incentive.findOne({
++        where: { user_id: USER_ID },
++      });
++      const responses = [first, second];
++
++      expect(firstItem?.is_approved).toBe(true);
++      expect(secondItem?.is_approved).toBe(true);
++      expect(incentive?.current_total).toBe(45);
++      expect(
++        responses.filter((response) => response.status === 200)
++      ).toHaveLength(1);
++      expect(
++        responses.filter((response) => response.status === 400)
++      ).toHaveLength(1);
++      expect(responses.some((response) => response.status >= 500)).toBe(false);
++      expect(
++        responses
++          .filter((response) => response.status === 400)
++          .map((response) => response.body.error)
++      ).toEqual(["The item is already approved"]);
++    });
++    it("rolls back the batch when notification persistence fails", async () => {
++      const sequelize = await Database.getInstance();
++
++      await sequelize.query(`
++        DROP TRIGGER IF EXISTS task3_fail_notification_insert
++        ON notifications
++      `);
++
++      await sequelize.query(`
++        DROP FUNCTION IF EXISTS task3_fail_notification_insert()
++      `);
++
++      await sequelize.query(`
++        CREATE FUNCTION task3_fail_notification_insert()
++        RETURNS trigger
++        AS $$
++        BEGIN
++          RAISE EXCEPTION 'forced notification persistence failure';
++        END;
++        $$
++        LANGUAGE plpgsql
++      `);
++
++      await sequelize.query(`
++        CREATE TRIGGER task3_fail_notification_insert
++        BEFORE INSERT ON notifications
++        FOR EACH ROW
++        EXECUTE FUNCTION task3_fail_notification_insert()
++      `);
++
++      try {
++        const response = await executeBatchModeration([
++          {
++            id: ITEM_ID,
++            isApproved: true,
++          },
++          {
++            id: SECOND_ITEM_ID,
++            isApproved: true,
++          },
++        ]);
++
++        const firstItem = await Item.findByPk(ITEM_ID);
++        const secondItem = await Item.findByPk(SECOND_ITEM_ID);
++
++        const firstCategory = await Category.findByPk(CATEGORY_ID);
++        const secondCategory = await Category.findByPk(
++          SECOND_CATEGORY_ID
++        );
++
++        const incentive = await Incentive.findOne({
++          where: {
++            user_id: USER_ID,
++          },
++        });
++
++        const notifications = await Notification.findAll({
++          where: {
++            notifiable_id: [
++              ITEM_ID,
++              SECOND_ITEM_ID,
++            ],
++          },
++        });
++
++        expect(response.status).toBe(500);
++
++        expect(firstItem?.is_approved).toBeNull();
++        expect(secondItem?.is_approved).toBeNull();
++
++        expect(firstCategory?.is_approved).toBe(false);
++        expect(secondCategory?.is_approved).toBe(false);
++
++        expect(incentive?.current_total).toBe(25);
++        expect(notifications).toHaveLength(0);
++      } finally {
++        await sequelize.query(`
++          DROP TRIGGER IF EXISTS task3_fail_notification_insert
++          ON notifications
++        `);
++
++        await sequelize.query(`
++          DROP FUNCTION IF EXISTS task3_fail_notification_insert()
++        `);
++      }
++    });
++
++    it("moderates an ownerless batch candidate without incentive or notification", async () => {
++      await resetFixture({
++        owner: false,
++        incentiveTotal: 25,
++      });
++
++      await Incentive.destroy({
++        where: {
++          user_id: USER_ID,
++        },
++      });
++
++      const response = await executeBatchModeration([
++        {
++          id: ITEM_ID,
++          isApproved: true,
++        },
++      ]);
++
++      const item = await Item.findByPk(ITEM_ID);
++
++      const incentive = await Incentive.findOne({
++        where: {
++          user_id: USER_ID,
++        },
++      });
++
++      const notifications = await Notification.findAll({
++        where: {
++          notifiable_id: ITEM_ID,
++        },
++      });
++
++      expect(response.status).toBe(200);
++      expect(response.body.success).toBe(true);
++      expect(item?.is_approved).toBe(true);
++      expect(incentive).toBeNull();
++      expect(notifications).toHaveLength(0);
++    });
++
++    it("creates one notification for a successful owned batch candidate", async () => {
++      const response = await executeBatchModeration([
++        {
++          id: ITEM_ID,
++          isApproved: true,
++        },
++      ]);
++
++      const notifications = await Notification.findAll({
++        where: {
++          notifiable_id: ITEM_ID,
++          user_id: USER_ID,
++        },
++      });
++
++      expect(response.status).toBe(200);
++      expect(notifications).toHaveLength(1);
++    });
++
++    it("creates one candidate notification for each owned batch item", async () => {
++      const response = await executeBatchModeration([
++        {
++          id: ITEM_ID,
++          isApproved: true,
++        },
++        {
++          id: SECOND_ITEM_ID,
++          isApproved: true,
++        },
++      ]);
++
++      const firstNotifications = await Notification.findAll({
++        where: {
++          notifiable_id: ITEM_ID,
++          user_id: USER_ID,
++        },
++      });
++
++      const secondNotifications = await Notification.findAll({
++        where: {
++          notifiable_id: SECOND_ITEM_ID,
++          user_id: USER_ID,
++        },
++      });
++
++      expect(response.status).toBe(200);
++      expect(firstNotifications).toHaveLength(1);
++      expect(secondNotifications).toHaveLength(1);
++    });
++
++    it("leaves no notification rows when batch moderation rolls back", async () => {
++      await Item.update(
++        {
++          is_approved: true,
++        },
++        {
++          where: {
++            id: SECOND_ITEM_ID,
++          },
++        }
++      );
++
++      const response = await executeBatchModeration([
++        {
++          id: ITEM_ID,
++          isApproved: true,
++        },
++        {
++          id: SECOND_ITEM_ID,
++          isApproved: true,
++        },
++      ]);
++
++      const firstNotifications = await Notification.findAll({
++        where: {
++          notifiable_id: ITEM_ID,
++        },
++      });
++
++      const secondNotifications = await Notification.findAll({
++        where: {
++          notifiable_id: SECOND_ITEM_ID,
++        },
++      });
++
++      expect(response.status).toBe(400);
++      expect(firstNotifications).toHaveLength(0);
++      expect(secondNotifications).toHaveLength(0);
++    });
++
++    it("does not duplicate notifications when overlapping batches conflict", async () => {
++      const [first, second] = await Promise.all([
++        executeBatchModeration([
++          {
++            id: ITEM_ID,
++            isApproved: true,
++          },
++          {
++            id: SECOND_ITEM_ID,
++            isApproved: true,
++          },
++        ]),
++        executeBatchModeration([
++          {
++            id: SECOND_ITEM_ID,
++            isApproved: true,
++          },
++          {
++            id: ITEM_ID,
++            isApproved: true,
++          },
++        ]),
++      ]);
++
++      const firstNotifications = await Notification.findAll({
++        where: {
++          notifiable_id: ITEM_ID,
++          user_id: USER_ID,
++        },
++      });
++
++      const secondNotifications = await Notification.findAll({
++        where: {
++          notifiable_id: SECOND_ITEM_ID,
++          user_id: USER_ID,
++        },
++      });
++
++      const responses = [first, second];
++
++      expect(
++        responses.filter(
++          (response) => response.status === 200
++        )
++      ).toHaveLength(1);
++
++      expect(firstNotifications).toHaveLength(1);
++      expect(secondNotifications).toHaveLength(1);
++    });
++
++    it("returns 400 when the batch items field is missing", async () => {
++      const response = await request(batchApp)
++        .put("/api/v1/candidate-items/moderate-batch")
++        .send({});
++
++      const item = await Item.findByPk(ITEM_ID);
++
++      expect(response.status).toBe(400);
++      expect(item?.is_approved).toBeNull();
++    });
++
++    it("returns 400 when a batch item is missing id", async () => {
++      const response = await request(batchApp)
++        .put("/api/v1/candidate-items/moderate-batch")
++        .send({
++          items: [
++            {
++              isApproved: true,
++            },
++          ],
++        });
++
++      const item = await Item.findByPk(ITEM_ID);
++
++      expect(response.status).toBe(400);
++      expect(item?.is_approved).toBeNull();
++    });
++
++    it("returns 400 when a batch item is missing isApproved", async () => {
++      const response = await request(batchApp)
++        .put("/api/v1/candidate-items/moderate-batch")
++        .send({
++          items: [
++            {
++              id: ITEM_ID,
++            },
++          ],
++        });
++
++      const item = await Item.findByPk(ITEM_ID);
++
++      expect(response.status).toBe(400);
++      expect(item?.is_approved).toBeNull();
++    });
++
++    it("returns 400 when a batch image is missing highQualityImg", async () => {
++      const response = await request(batchApp)
++        .put("/api/v1/candidate-items/moderate-batch")
++        .send({
++          items: [
++            {
++              id: ITEM_ID,
++              isApproved: true,
++              mediaImages: [
++                {
++                  mediumQualityImg: "https://images.example/medium.jpg",
++                  lowQualityImg: "https://images.example/low.jpg",
++                },
++              ],
++            },
++          ],
++        });
++
++      const item = await Item.findByPk(ITEM_ID);
++      const incentive = await Incentive.findOne({
++        where: { user_id: USER_ID },
++      });
++
++      expect(response.status).toBe(400);
++      expect(item?.is_approved).toBeNull();
++      expect(incentive?.current_total).toBe(25);
++    });
++  });
++});

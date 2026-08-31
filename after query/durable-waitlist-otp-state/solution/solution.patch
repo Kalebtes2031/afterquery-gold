@@ -1,0 +1,836 @@
+diff --git a/rateeat_backend/migrations/20260828000000-enforce-waitlist-otp-counter-bounds.js b/rateeat_backend/migrations/20260828000000-enforce-waitlist-otp-counter-bounds.js
+new file mode 100644
+index 000000000..eb5335613
+--- /dev/null
++++ b/rateeat_backend/migrations/20260828000000-enforce-waitlist-otp-counter-bounds.js
+@@ -0,0 +1,57 @@
++"use strict";
++
++module.exports = {
++  async up(queryInterface, Sequelize) {
++    await queryInterface.sequelize.transaction(async (transaction) => {
++      // Old application code kept these limits in memory, so existing rows can
++      // safely be normalized before the database starts enforcing the bounds.
++      await queryInterface.sequelize.query(
++        `UPDATE phone_otps
++         SET attempts = GREATEST(0, LEAST(COALESCE(attempts, 0), 3)),
++             resend_count = GREATEST(0, LEAST(COALESCE(resend_count, 0), 3))`,
++        { transaction }
++      );
++
++      await queryInterface.addConstraint("phone_otps", {
++        fields: ["attempts"],
++        type: "check",
++        name: "phone_otps_attempts_range_check",
++        where: {
++          attempts: {
++            [Sequelize.Op.gte]: 0,
++            [Sequelize.Op.lte]: 3,
++          },
++        },
++        transaction,
++      });
++
++      await queryInterface.addConstraint("phone_otps", {
++        fields: ["resend_count"],
++        type: "check",
++        name: "phone_otps_resend_count_range_check",
++        where: {
++          resend_count: {
++            [Sequelize.Op.gte]: 0,
++            [Sequelize.Op.lte]: 3,
++          },
++        },
++        transaction,
++      });
++    });
++  },
++
++  async down(queryInterface) {
++    await queryInterface.sequelize.transaction(async (transaction) => {
++      await queryInterface.removeConstraint(
++        "phone_otps",
++        "phone_otps_resend_count_range_check",
++        { transaction }
++      );
++      await queryInterface.removeConstraint(
++        "phone_otps",
++        "phone_otps_attempts_range_check",
++        { transaction }
++      );
++    });
++  },
++};
+diff --git a/rateeat_backend/src/controllers/waitlist.controller.ts b/rateeat_backend/src/controllers/waitlist.controller.ts
+index 6607b4e7e..1fefa61cc 100644
+--- a/rateeat_backend/src/controllers/waitlist.controller.ts
++++ b/rateeat_backend/src/controllers/waitlist.controller.ts
+@@ -2,15 +2,13 @@ import { NextFunction, Request, Response } from "express";
+ import { Waitlist, PhoneOtp, PendingVerification } from "../models";
+ import asyncAwaitHandler from "../middlewares/async-handler";
+ import ErrorResponse from "../utils/error-response.utils";
+-import { generateOTP } from "../utils/otp.utils";
+ import { sendTelegramMessage } from "../utils/telegram.utils";
+ import { sendWhatsAppOTP } from "../utils/whatsapp.utils";
+-
+-// simple in-memory limits for resends and attempts
+-const resendMap: Map<string, number> = new Map();
+-const attemptsMap: Map<string, number> = new Map();
+-const maxResend = 3;
+-const maxAttempts = 3;
++import {
++  getActiveWaitlistOtpRegistrationState,
++  issueWaitlistOtp,
++  verifyPersistedWaitlistOtp,
++} from "../services/waitlist-otp.service";
+ 
+ const sendPlatformMessage = async (
+   phone: string,
+@@ -128,23 +126,17 @@ const registerWaitlist = asyncAwaitHandler(
+             });
+           }
+         } else if (existing.method === "whatsapp") {
+-          const otpRow = await PhoneOtp.findOne({
+-            where: { phoneNumber: phone },
+-          });
+-          // If an unexpired OTP exists, return the resend and attempt counts
+-          if (
+-            otpRow &&
+-            otpRow.expires_at &&
+-            new Date(otpRow.expires_at) > new Date()
+-          ) {
+-            const resendCount = resendMap.get(phone) || 0;
+-            const attemptsCount = attemptsMap.get(phone) || 0;
++          const activeOtpState =
++            await getActiveWaitlistOtpRegistrationState(phone);
++
++          if (activeOtpState) {
+             return res.status(409).json({
+               message:
+                 "You have an active pending WhatsApp registration. OTP already sent.",
+-              resendAttempts: resendCount,
+-              verificationAttempts: attemptsCount,
+-              expiresAt: otpRow.expires_at,
++              resendAttempts: activeOtpState.resendCount,
++              verificationAttempts:
++                activeOtpState.verificationAttempts,
++              expiresAt: activeOtpState.expiresAt,
+             });
+           }
+         }
+@@ -202,82 +194,25 @@ const sendWaitlistOtp = asyncAwaitHandler(
+     const { phone, method, telegramChatId } = req.body;
+     if (!phone) return next(new ErrorResponse("Phone is required", 400));
+ 
+-    // simple phone validation for +250, will be added later
+-    // const phoneRegex = /^\+250[0-9]{9}$/;
+-    // if (!phoneRegex.test(phone)) {
+-    //   return next(
+-    //     new ErrorResponse(
+-    //       "Phone must be a valid Rwandan number with +250 prefix",
+-    //       400,
+-    //     ),
+-    //   );
+-    // }
+-
+-    const waitEntry = await Waitlist.findOne({ where: { phone } });
+-    if (!waitEntry) {
+-      return next(new ErrorResponse("Phone not found on waitlist", 404));
+-    }
+-
+-    const resendCount = resendMap.get(phone) || 0;
+-    if (resendCount >= maxResend) {
+-      return next(new ErrorResponse("Max resend attempts reached", 429));
+-    }
+-
+-    const otp = generateOTP(6);
+-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+-
+-    // upsert into Otp table
+-    const existingOtp = await PhoneOtp.findOne({
+-      where: { phoneNumber: phone },
++    const result = await issueWaitlistOtp({
++      phone,
++      method,
++      telegramChatId,
++      deliver: async (targetPhone, otp, sendMethod, chatId) => {
++        await sendPlatformMessage(targetPhone, otp, sendMethod, chatId);
++      },
+     });
+-    if (existingOtp) {
+-      existingOtp.phoneOtpCode = otp;
+-      existingOtp.expires_at = expiresAt as any;
+-      await existingOtp.save();
+-    } else {
+-      const newOtp = new PhoneOtp({
+-        phoneNumber: phone,
+-        phoneOtpCode: otp,
+-        expires_at: expiresAt,
+-      });
+-      await newOtp.save();
+-    }
+-
+-    // increment resend map
+-    resendMap.set(phone, resendCount + 1);
+-
+-    // send via selected method
+-    const sendMethod = method || waitEntry.method || "whatsapp";
+-    try {
+-      await sendPlatformMessage(phone, `${otp}`, sendMethod, telegramChatId);
+-    } catch (error: any) {
+-      console.error("Failed to send OTP:", error?.message || error);
+-
+-      // Cleanup operations
+-      try {
+-        resendMap.set(phone, resendCount);
+-        await waitEntry.destroy();
+-        await PendingVerification.destroy({ where: { phone } });
+-        await PhoneOtp.destroy({ where: { phoneNumber: phone } });
+-      } catch (cleanupError: any) {
+-        console.error(
+-          "Error in deleting waitlist entry after sending verification fail:",
+-          cleanupError?.message || cleanupError
+-        );
+-      }
+-      return next(new ErrorResponse("Error sending verification", 500));
+-    }
+ 
+     sendAnalyticsEvent("waitlist_otp_sent", {
+       phone,
+-      method: sendMethod,
++      method: result.method,
+     }).catch((error) =>
+       console.error("Analytics event 'waitlist_otp_sent' failed:", error)
+     );
+ 
+-    // In development include the OTP in the response for easier local testing only
++    // Keep the existing development-only OTP response for local testing.
+     if (process.env.NODE_ENV === "development") {
+-      return res.status(200).json({ message: "OTP sent", otp });
++      return res.status(200).json({ message: "OTP sent", otp: result.otp });
+     }
+ 
+     return res.status(200).json({ message: "OTP sent" });
+@@ -291,47 +226,12 @@ const verifyWaitlistOtp = asyncAwaitHandler(
+     if (!phone || !otp)
+       return next(new ErrorResponse("Phone and otp are required", 400));
+ 
+-    // simple phone validation for +250, will be added later
+-    // const phoneRegex = /^\+250[0-9]{9}$/;
+-    // if (!phoneRegex.test(phone)) {
+-    //   return next(
+-    //     new ErrorResponse(
+-    //       "Phone must be a valid Rwandan number with +250 prefix",
+-    //       400
+-    //     )
+-    //   );
+-    // }
+-
+-    const waitEntry = await Waitlist.findOne({ where: { phone } });
+-    if (!waitEntry)
+-      return next(new ErrorResponse("Phone not found on waitlist", 404));
+-
+-    const otpRow = await PhoneOtp.findOne({ where: { phoneNumber: phone } });
+-    if (!otpRow) return next(new ErrorResponse("OTP is not correct", 401));
++    const result = await verifyPersistedWaitlistOtp(phone, otp);
+ 
+-    // check expiry
+-    if (otpRow.expires_at && new Date(otpRow.expires_at) < new Date()) {
+-      return next(new ErrorResponse("OTP expired", 401));
++    if ("message" in result) {
++      return next(new ErrorResponse(result.message, result.status));
+     }
+ 
+-    const attempts = attemptsMap.get(phone) || 0;
+-    if (attempts >= maxAttempts) {
+-      return next(new ErrorResponse("Max verification attempts reached", 429));
+-    }
+-
+-    if (otpRow.phoneOtpCode !== otp) {
+-      attemptsMap.set(phone, attempts + 1);
+-      return next(new ErrorResponse("OTP is not correct", 401));
+-    }
+-
+-    // success
+-    waitEntry.verified = true;
+-    waitEntry.verified_at = new Date();
+-    await waitEntry.save();
+-
+-    // remove otp row
+-    await otpRow.destroy();
+-
+     sendAnalyticsEvent("waitlist_otp_verified", { phone }).catch((error) =>
+       console.error("Analytics event 'waitlist_otp_verified' failed:", error)
+     );
+diff --git a/rateeat_backend/src/models/OTP/PhoneOtp.ts b/rateeat_backend/src/models/OTP/PhoneOtp.ts
+index a757ae2d9..faed33393 100644
+--- a/rateeat_backend/src/models/OTP/PhoneOtp.ts
++++ b/rateeat_backend/src/models/OTP/PhoneOtp.ts
+@@ -35,16 +35,55 @@ class PhoneOtp extends Model<PhoneOtp> {
+   phoneNumber!: string;
+ 
+   @Column({
+-    type: DataType.STRING(6),
++    type: DataType.STRING(255),
+     allowNull: false,
+   })
+   phoneOtpCode!: string;
+ 
+   @Column({
+     type: DataType.DATE,
+-    defaultValue: new Date(Date.now() + 3600 * 1000), // expires after 3600 seconds
++    allowNull: true,
+   })
+-  expires_at!: Date;
++  expires_at!: Date | null;
++
++  @Column({
++    type: DataType.INTEGER,
++    allowNull: false,
++    defaultValue: 0,
++  })
++  attempts!: number;
++
++  @Column({
++    type: DataType.INTEGER,
++    allowNull: false,
++    defaultValue: 0,
++  })
++  resend_count!: number;
++
++  @Column({
++    type: DataType.STRING(20),
++    allowNull: true,
++  })
++  method!: string | null;
++
++  @Column({
++    type: DataType.DATE,
++    allowNull: true,
++  })
++  last_sent_at!: Date | null;
++
++  @Column({
++    type: DataType.BOOLEAN,
++    allowNull: false,
++    defaultValue: false,
++  })
++  verified!: boolean;
++
++  @Column({
++    type: DataType.DATE,
++    allowNull: true,
++  })
++  verified_at!: Date | null;
+ }
+ 
+ export default PhoneOtp;
+diff --git a/rateeat_backend/src/services/waitlist-otp.service.ts b/rateeat_backend/src/services/waitlist-otp.service.ts
+new file mode 100644
+index 000000000..d38ec65e9
+--- /dev/null
++++ b/rateeat_backend/src/services/waitlist-otp.service.ts
+@@ -0,0 +1,275 @@
++import { Transaction } from "sequelize";
++
++import { PhoneOtp, Waitlist } from "../models";
++import ErrorResponse from "../utils/error-response.utils";
++import { generateOTP } from "../utils/otp.utils";
++import {
++  durableCount,
++  isExpiredWaitlistOtp,
++  resolveWaitlistOtpMethod,
++} from "../utils/waitlist-otp.utils";
++import {
++  applyWaitlistOtpIssueState,
++  buildWaitlistOtpIssueState,
++  canAttemptWaitlistOtpVerification,
++  canResendWaitlistOtp,
++  persistedWaitlistOtpCounters,
++  recordFailedWaitlistOtpAttempt,
++  WAITLIST_OTP_ATTEMPT_FIELDS,
++  WAITLIST_OTP_ISSUE_FIELDS,
++  WaitlistOtpIssueState,
++} from "../utils/waitlist-otp-state.utils";
++import {
++  IssueWaitlistOtpInput,
++  IssuedWaitlistOtp,
++  WaitlistOtpCounters,
++  WaitlistOtpVerificationResult,
++} from "../types/waitlist-otp.types";
++
++class WaitlistOtpDeliveryError extends Error {
++  constructor() {
++    super("Error sending verification");
++    this.name = "WaitlistOtpDeliveryError";
++  }
++}
++
++const getSequelize = () => {
++  const sequelize = Waitlist.sequelize || PhoneOtp.sequelize;
++  if (!sequelize) {
++    throw new Error("Waitlist OTP models are not connected to a database");
++  }
++  return sequelize;
++};
++
++const lockWaitlistEntry = async (
++  phone: string,
++  transaction: Transaction
++): Promise<Waitlist | null> =>
++  Waitlist.findOne({
++    where: { phone },
++    transaction,
++    lock: transaction.LOCK.UPDATE,
++  });
++
++const lockOtpRow = async (
++  phone: string,
++  transaction: Transaction
++): Promise<PhoneOtp | null> =>
++  PhoneOtp.findOne({
++    where: { phoneNumber: phone },
++    transaction,
++    lock: transaction.LOCK.UPDATE,
++  });
++
++const persistIssuedOtp = async (
++  current: PhoneOtp | null,
++  phone: string,
++  issueState: WaitlistOtpIssueState,
++  transaction: Transaction
++): Promise<PhoneOtp> => {
++  if (!current) {
++    return PhoneOtp.create(
++      {
++        phoneNumber: phone,
++        phoneOtpCode: issueState.phoneOtpCode,
++        expires_at: issueState.expiresAt,
++        attempts: issueState.attempts,
++        resend_count: issueState.resendCount,
++        method: issueState.method,
++        last_sent_at: issueState.lastSentAt,
++        verified: false,
++        verified_at: null,
++      } as any,
++      { transaction }
++    );
++  }
++
++  applyWaitlistOtpIssueState(current, issueState);
++
++  await current.save({
++    transaction,
++    fields: WAITLIST_OTP_ISSUE_FIELDS,
++  });
++
++  return current;
++};
++
++export const issueWaitlistOtp = async (
++  input: IssueWaitlistOtpInput
++): Promise<IssuedWaitlistOtp> => {
++  const sequelize = getSequelize();
++
++  try {
++    return await sequelize.transaction(async (transaction) => {
++      // The waitlist row is the per-phone serialization point. Lock it before
++      // reading the OTP row so concurrent sends and verifies use one order.
++      const waitEntry = await lockWaitlistEntry(input.phone, transaction);
++      if (!waitEntry) {
++        throw new ErrorResponse("Phone not found on waitlist", 404);
++      }
++
++      const currentOtp = await lockOtpRow(input.phone, transaction);
++      if (!canResendWaitlistOtp(currentOtp)) {
++        throw new ErrorResponse("Max resend attempts reached", 429);
++      }
++
++      const otp = generateOTP(6);
++      const method = resolveWaitlistOtpMethod(input.method, waitEntry.method);
++      const issueState = buildWaitlistOtpIssueState(currentOtp, otp, method);
++
++      await persistIssuedOtp(
++        currentOtp,
++        input.phone,
++        issueState,
++        transaction
++      );
++
++      // Delivery is intentionally part of this transaction's success boundary.
++      // If the provider rejects the send, the newly generated code and resend
++      // count are rolled back together, leaving the previous usable state intact.
++      try {
++        await input.deliver(
++          input.phone,
++          otp,
++          method,
++          input.telegramChatId
++        );
++      } catch (_error) {
++        throw new WaitlistOtpDeliveryError();
++      }
++
++      return {
++        otp,
++        method,
++        expiresAt: issueState.expiresAt,
++        resendCount: issueState.resendCount,
++      };
++    });
++  } catch (error) {
++    if (error instanceof WaitlistOtpDeliveryError) {
++      throw new ErrorResponse("Error sending verification", 500);
++    }
++    throw error;
++  }
++};
++
++const verificationFailure = (
++  status: 401 | 404 | 429,
++  message:
++    | "Phone not found on waitlist"
++    | "OTP is not correct"
++    | "OTP expired"
++    | "Max verification attempts reached"
++): WaitlistOtpVerificationResult => ({
++  ok: false,
++  status,
++  message,
++});
++
++export const verifyPersistedWaitlistOtp = async (
++  phone: string,
++  otp: string
++): Promise<WaitlistOtpVerificationResult> => {
++  const sequelize = getSequelize();
++
++  return sequelize.transaction(async (transaction) => {
++    const waitEntry = await lockWaitlistEntry(phone, transaction);
++    if (!waitEntry) {
++      return verificationFailure(404, "Phone not found on waitlist");
++    }
++
++    const otpRow = await lockOtpRow(phone, transaction);
++    if (!otpRow) {
++      return verificationFailure(401, "OTP is not correct");
++    }
++
++    if (isExpiredWaitlistOtp(otpRow.expires_at)) {
++      return verificationFailure(401, "OTP expired");
++    }
++
++    if (!canAttemptWaitlistOtpVerification(otpRow)) {
++      return verificationFailure(429, "Max verification attempts reached");
++    }
++
++    if (otpRow.phoneOtpCode !== otp) {
++      recordFailedWaitlistOtpAttempt(otpRow);
++      await otpRow.save({
++        transaction,
++        fields: WAITLIST_OTP_ATTEMPT_FIELDS,
++      });
++
++      // Return the failure instead of throwing it here. Throwing inside the
++      // callback would roll back the persisted attempt increment.
++      return verificationFailure(401, "OTP is not correct");
++    }
++
++    const verifiedAt = new Date();
++    waitEntry.verified = true;
++    waitEntry.verified_at = verifiedAt;
++    await waitEntry.save({
++      transaction,
++      fields: ["verified", "verified_at", "updatedAt"],
++    });
++
++    await otpRow.destroy({ transaction });
++
++    return {
++      ok: true,
++      verifiedAt,
++    };
++  });
++};
++
++export const getActiveWaitlistOtpRegistrationState = async (
++  phone: string
++) => {
++  const sequelize = getSequelize();
++
++  return sequelize.transaction(async (transaction) => {
++    // Registration participates in the same per-phone lock order
++    // as send and verify.
++    const waitEntry = await lockWaitlistEntry(phone, transaction);
++
++    // A verification that committed while registration waited on
++    // this lock must be observed here.
++    if (!waitEntry || waitEntry.verified) {
++      return null;
++    }
++
++    const otpRow = await lockOtpRow(phone, transaction);
++
++    if (
++      !otpRow ||
++      isExpiredWaitlistOtp(otpRow.expires_at)
++    ) {
++      return null;
++    }
++
++    const counters = persistedWaitlistOtpCounters(otpRow);
++
++    return {
++      resendCount: counters.resendCount,
++      verificationAttempts: counters.verificationAttempts,
++      expiresAt: otpRow.expires_at
++        ? new Date(otpRow.expires_at)
++        : null,
++    };
++  });
++};
++
++export const getWaitlistOtpCounters = async (
++  phone: string
++): Promise<WaitlistOtpCounters> => {
++  const sequelize = getSequelize();
++
++  return sequelize.transaction(async (transaction) => {
++    // Registration uses the same per-phone serialization
++    // boundary as send and verify. This prevents it from
++    // observing stale counters during an in-flight resend.
++    await lockWaitlistEntry(phone, transaction);
++
++    const otpRow = await lockOtpRow(phone, transaction);
++
++    return persistedWaitlistOtpCounters(otpRow);
++  });
++};
+diff --git a/rateeat_backend/src/types/waitlist-otp.types.ts b/rateeat_backend/src/types/waitlist-otp.types.ts
+new file mode 100644
+index 000000000..a3bc2f7c5
+--- /dev/null
++++ b/rateeat_backend/src/types/waitlist-otp.types.ts
+@@ -0,0 +1,46 @@
++export type WaitlistOtpMethod = "whatsapp" | "telegram" | string;
++
++export type WaitlistOtpDelivery = (
++  phone: string,
++  otp: string,
++  method: WaitlistOtpMethod,
++  telegramChatId?: string
++) => Promise<void>;
++
++export interface IssueWaitlistOtpInput {
++  phone: string;
++  method?: WaitlistOtpMethod;
++  telegramChatId?: string;
++  deliver: WaitlistOtpDelivery;
++}
++
++export interface IssuedWaitlistOtp {
++  otp: string;
++  method: WaitlistOtpMethod;
++  expiresAt: Date;
++  resendCount: number;
++}
++
++export interface WaitlistOtpCounters {
++  resendCount: number;
++  verificationAttempts: number;
++}
++
++export type WaitlistOtpVerificationFailure = {
++  ok: false;
++  status: 401 | 404 | 429;
++  message:
++    | "Phone not found on waitlist"
++    | "OTP is not correct"
++    | "OTP expired"
++    | "Max verification attempts reached";
++};
++
++export type WaitlistOtpVerificationSuccess = {
++  ok: true;
++  verifiedAt: Date;
++};
++
++export type WaitlistOtpVerificationResult =
++  | WaitlistOtpVerificationFailure
++  | WaitlistOtpVerificationSuccess;
+diff --git a/rateeat_backend/src/utils/waitlist-otp-state.utils.ts b/rateeat_backend/src/utils/waitlist-otp-state.utils.ts
+new file mode 100644
+index 000000000..e25126461
+--- /dev/null
++++ b/rateeat_backend/src/utils/waitlist-otp-state.utils.ts
+@@ -0,0 +1,124 @@
++import { PhoneOtp } from "../models";
++import { WaitlistOtpMethod } from "../types/waitlist-otp.types";
++import {
++  durableCount,
++  WAITLIST_OTP_MAX_ATTEMPTS,
++  WAITLIST_OTP_MAX_RESENDS,
++  waitlistOtpExpiry,
++  isExpiredWaitlistOtp,
++} from "./waitlist-otp.utils";
++
++export interface WaitlistOtpIssueState {
++  phoneOtpCode: string;
++  expiresAt: Date;
++  attempts: number;
++  resendCount: number;
++  method: WaitlistOtpMethod;
++  lastSentAt: Date;
++}
++
++export const WAITLIST_OTP_ISSUE_FIELDS: (keyof PhoneOtp)[] = [
++  "phoneOtpCode",
++  "expires_at",
++  "attempts",
++  "resend_count",
++  "method",
++  "last_sent_at",
++  "verified",
++  "verified_at",
++  "updatedAt",
++];
++
++export const WAITLIST_OTP_ATTEMPT_FIELDS: (keyof PhoneOtp)[] = [
++  "attempts",
++  "updatedAt",
++];
++
++export const persistedResendCount = (otpRow: PhoneOtp | null): number =>
++  durableCount(otpRow?.get("resend_count"));
++
++export const persistedVerificationAttempts = (
++  otpRow: PhoneOtp | null
++): number => durableCount(otpRow?.get("attempts"));
++
++export interface WaitlistOtpCounterSnapshot {
++  resendCount: number;
++  verificationAttempts: number;
++}
++
++export const persistedWaitlistOtpCounters = (
++  otpRow: PhoneOtp | null
++): WaitlistOtpCounterSnapshot => ({
++  resendCount: persistedResendCount(otpRow),
++  verificationAttempts: persistedVerificationAttempts(otpRow),
++});
++
++export const canResendWaitlistOtp = (
++  otpRow: PhoneOtp | null
++): boolean =>
++  !otpRow ||
++  isExpiredWaitlistOtp(otpRow.expires_at) ||
++  persistedResendCount(otpRow) < WAITLIST_OTP_MAX_RESENDS;
++
++export const canAttemptWaitlistOtpVerification = (
++  otpRow: PhoneOtp | null
++): boolean => persistedVerificationAttempts(otpRow) < WAITLIST_OTP_MAX_ATTEMPTS;
++
++export const nextWaitlistOtpResendCount = (
++  otpRow: PhoneOtp | null
++): number =>
++  otpRow && isExpiredWaitlistOtp(otpRow.expires_at)
++    ? 1
++    : persistedResendCount(otpRow) + 1;
++
++export const nextWaitlistOtpVerificationAttempt = (otpRow: PhoneOtp): number =>
++  persistedVerificationAttempts(otpRow) + 1;
++
++export const buildWaitlistOtpIssueState = (
++  otpRow: PhoneOtp | null,
++  otp: string,
++  method: WaitlistOtpMethod,
++  now: Date = new Date()
++): WaitlistOtpIssueState => {
++  const nextResendCount = nextWaitlistOtpResendCount(otpRow);
++
++  if (nextResendCount < 1 || nextResendCount > WAITLIST_OTP_MAX_RESENDS) {
++    throw new RangeError("Waitlist OTP resend count is outside its supported range");
++  }
++
++  return {
++    phoneOtpCode: otp,
++    expiresAt: waitlistOtpExpiry(now),
++    attempts: 0,
++    resendCount: nextResendCount,
++    method,
++    lastSentAt: now,
++  };
++};
++
++export const applyWaitlistOtpIssueState = (
++  otpRow: PhoneOtp,
++  state: WaitlistOtpIssueState
++): void => {
++  otpRow.set("phoneOtpCode", state.phoneOtpCode);
++  otpRow.set("expires_at", state.expiresAt);
++  otpRow.set("attempts", state.attempts);
++  otpRow.set("resend_count", state.resendCount);
++  otpRow.set("method", state.method);
++  otpRow.set("last_sent_at", state.lastSentAt);
++  otpRow.set("verified", false);
++  otpRow.set("verified_at", null);
++};
++
++export const recordFailedWaitlistOtpAttempt = (otpRow: PhoneOtp): number => {
++  const nextAttempt = nextWaitlistOtpVerificationAttempt(otpRow);
++
++  if (nextAttempt < 1 || nextAttempt > WAITLIST_OTP_MAX_ATTEMPTS) {
++    throw new RangeError(
++      "Waitlist OTP verification attempts are outside their supported range"
++    );
++  }
++
++  otpRow.set("attempts", nextAttempt);
++  return nextAttempt;
++};
+diff --git a/rateeat_backend/src/utils/waitlist-otp.utils.ts b/rateeat_backend/src/utils/waitlist-otp.utils.ts
+new file mode 100644
+index 000000000..bfdfa738c
+--- /dev/null
++++ b/rateeat_backend/src/utils/waitlist-otp.utils.ts
+@@ -0,0 +1,40 @@
++import { WaitlistOtpMethod } from "../types/waitlist-otp.types";
++
++export const WAITLIST_OTP_MAX_RESENDS = 3;
++export const WAITLIST_OTP_MAX_ATTEMPTS = 3;
++export const WAITLIST_OTP_TTL_MS = 10 * 60 * 1000;
++
++export const durableCount = (value: unknown): number => {
++  const parsed = Number(value);
++  if (!Number.isFinite(parsed) || parsed < 0) {
++    return 0;
++  }
++  return Math.floor(parsed);
++};
++
++export const resolveWaitlistOtpMethod = (
++  requestedMethod: unknown,
++  storedMethod: unknown
++): WaitlistOtpMethod => {
++  const requested = String(requestedMethod || "").trim();
++  if (requested) {
++    return requested;
++  }
++
++  const stored = String(storedMethod || "").trim();
++  return stored || "whatsapp";
++};
++
++export const isExpiredWaitlistOtp = (
++  expiresAt: Date | string | null | undefined,
++  now: Date = new Date()
++): boolean => {
++  if (!expiresAt) {
++    return false;
++  }
++
++  return new Date(expiresAt).getTime() < now.getTime();
++};
++
++export const waitlistOtpExpiry = (now: Date = new Date()): Date =>
++  new Date(now.getTime() + WAITLIST_OTP_TTL_MS);

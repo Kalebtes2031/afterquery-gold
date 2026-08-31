@@ -1,0 +1,1380 @@
+diff --git a/rateeat_backend/migrations/20260827000000-enforce-review-vote-uniqueness.js b/rateeat_backend/migrations/20260827000000-enforce-review-vote-uniqueness.js
+new file mode 100644
+index 000000000..05e20a2b0
+--- /dev/null
++++ b/rateeat_backend/migrations/20260827000000-enforce-review-vote-uniqueness.js
+@@ -0,0 +1,53 @@
++"use strict";
++
++module.exports = {
++  async up(queryInterface) {
++    await queryInterface.sequelize.transaction(async (transaction) => {
++      // Keep the newest row if an older deployment already contains duplicate
++      // votes for one user/review pair, then make that state impossible again.
++      await queryInterface.sequelize.query(
++        `DELETE FROM item_votes older
++         USING item_votes newer
++         WHERE older.voter_id = newer.voter_id
++           AND older.item_review_id = newer.item_review_id
++           AND (older."updatedAt", older.id) < (newer."updatedAt", newer.id)`,
++        { transaction }
++      );
++      await queryInterface.sequelize.query(
++        `DELETE FROM restaurant_votes older
++         USING restaurant_votes newer
++         WHERE older.voter_id = newer.voter_id
++           AND older.restaurant_review_id = newer.restaurant_review_id
++           AND (older."updatedAt", older.id) < (newer."updatedAt", newer.id)`,
++        { transaction }
++      );
++      await queryInterface.addConstraint("item_votes", {
++        fields: ["voter_id", "item_review_id"],
++        type: "unique",
++        name: "item_votes_voter_review_unique",
++        transaction,
++      });
++      await queryInterface.addConstraint("restaurant_votes", {
++        fields: ["voter_id", "restaurant_review_id"],
++        type: "unique",
++        name: "restaurant_votes_voter_review_unique",
++        transaction,
++      });
++    });
++  },
++
++  async down(queryInterface) {
++    await queryInterface.sequelize.transaction(async (transaction) => {
++      await queryInterface.removeConstraint(
++        "restaurant_votes",
++        "restaurant_votes_voter_review_unique",
++        { transaction }
++      );
++      await queryInterface.removeConstraint(
++        "item_votes",
++        "item_votes_voter_review_unique",
++        { transaction }
++      );
++    });
++  },
++};
+diff --git a/rateeat_backend/src/controllers/vote.controller.ts b/rateeat_backend/src/controllers/vote.controller.ts
+index ec3964863..aa9dac428 100644
+--- a/rateeat_backend/src/controllers/vote.controller.ts
++++ b/rateeat_backend/src/controllers/vote.controller.ts
+@@ -1,686 +1,64 @@
+ import { Request, Response, NextFunction } from "express";
+-import {
+-  Interaction,
+-  ItemReview,
+-  ItemVote,
+-  RestaurantReview,
+-  RestaurantVote,
+-  User,
+-} from "../models";
++import { ItemReview, ItemVote, RestaurantReview, RestaurantVote } from "../models";
+ import asyncAwaitHandler from "../middlewares/async-handler";
+-import { BadRequestError } from "../utils/error-response.utils";
+-import { Op, literal } from "sequelize";
+-import Notification, {
+-  NotificationCategory,
+-} from "../models/Feedback/Notification";
++import { Op } from "sequelize";
+ import sendNotification from "../utils/notification.utils";
++import {
++  transitionItemReviewVote,
++  transitionRestaurantReviewVote,
++} from "../services/review-vote-transition.service";
++import { ReviewVoteResult } from "../types/review-vote.types";
++
++const respondWithVote = async (res: Response, result: ReviewVoteResult) => {
++  const push = result.pushNotification;
++  if (push) {
++    await sendNotification(
++      push.registrationToken,
++      push.title,
++      push.message,
++      push.appName
++    );
++  }
++  return res.status(201).json(result.response);
++};
+ 
+-// @desc    upvote a item review
+-// @route   POST votes/upvote-item-review
+ const upvoteItemReview = asyncAwaitHandler(
+   async (req: Request, res: Response, next: NextFunction) => {
+     const { userId, reviewId } = req.body;
+-
+-    const review = await ItemReview.findByPk(reviewId);
+-
+-    if (!review) {
+-      return next(new BadRequestError("Review Not Found"));
+-    }
+-
+-    const itemId = review?.item_id;
+-
+-    const voter = await User.findByPk(userId);
+-
+-    if (!voter) {
+-      return next(new BadRequestError("User Not Found"));
+-    }
+-
+-    const vote = await ItemVote.findOne({
+-      where: {
+-        item_review_id: reviewId,
+-        voter_id: userId,
+-      },
+-    });
+-
+-    if (vote) {
+-      if (vote.flag) {
+-        await ItemReview.update(
+-          {
+-            up_vote: literal(
+-              "CASE WHEN up_vote > 0 THEN up_vote - 1 ELSE 0 END"
+-            ),
+-          },
+-          { where: { id: reviewId } }
+-        );
+-
+-        await ItemVote.destroy({
+-          where: {
+-            item_review_id: reviewId,
+-            voter_id: userId,
+-          },
+-        });
+-
+-        const newReview = await ItemReview.findOne({
+-          where: { id: reviewId },
+-        });
+-
+-        return res.status(201).json({
+-          message: "Vote deleted",
+-          data: { ...newReview.dataValues, voted: 0 }, // voted: 0 = not voted, 1 = upvoted, -1 = downvoted
+-        });
+-      } else {
+-        await ItemReview.update(
+-          {
+-            up_vote: literal("up_vote + 1"),
+-            down_vote: literal(
+-              "CASE WHEN down_vote > 0 THEN down_vote - 1 ELSE 0 END"
+-            ),
+-          },
+-          { where: { id: reviewId } }
+-        );
+-
+-        await ItemVote.update(
+-          { flag: true },
+-          { where: { item_review_id: reviewId, voter_id: userId } }
+-        );
+-
+-        // Create a notification when a user review is upvoted
+-        if (review.user_id !== userId) {
+-          const message = `Your review received an upvote from user.`;
+-          const existingNotification = await Notification.findOne({
+-            where: {
+-              notifiable_type: "ItemReview",
+-              notifiable_id: reviewId,
+-              user_id: review.user_id,
+-              reactor_id: userId,
+-              notification_category: NotificationCategory.Mentions,
+-            },
+-          });
+-          if (existingNotification) {
+-            await existingNotification.update({
+-              read_status: false,
+-            });
+-          } else {
+-            await Notification.create({
+-              notifiable_type: "ItemReview",
+-              notifiable_id: reviewId,
+-              user_id: review.user_id, // The user who wrote the review
+-              reactor_id: userId,
+-              message,
+-              notification_category: NotificationCategory.Mentions,
+-            });
+-
+-            // send a notification to FCM
+-            const owner = await User.findByPk(review.user_id);
+-            const registrationToken = owner.fcm_token;
+-            // console.log(registrationToken);
+-            await sendNotification(
+-              registrationToken,
+-              "👍 Your review got an upvote! 🎉",
+-              message,
+-              "clientApp"
+-            );
+-          }
+-        }
+-
+-        // create interaction for the user recommending the item
+-        await Interaction.create({
+-          userId,
+-          itemId,
+-          type: "upvote item review",
+-        });
+-
+-        const newReview = await ItemReview.findOne({
+-          where: { id: reviewId },
+-        });
+-
+-        return res.status(201).json({
+-          message: "Vote updated",
+-          data: { ...newReview.dataValues, voted: 1 },
+-        });
+-      }
+-    } else {
+-      await ItemReview.update(
+-        { up_vote: literal("up_vote + 1") },
+-        { where: { id: reviewId } }
+-      );
+-
+-      const newVote = await ItemVote.create({
+-        item_review_id: reviewId,
+-        voter_id: userId,
+-        flag: true,
+-        value: 1,
+-      });
+-
+-      // Create a notification when a user review is upvoted
+-      if (review.user_id !== userId) {
+-        const message = `Your item review received an upvote from user.`;
+-        const existingNotification = await Notification.findOne({
+-          where: {
+-            notifiable_type: "ItemReview",
+-            notifiable_id: reviewId,
+-            user_id: review.user_id,
+-            reactor_id: userId,
+-            notification_category: NotificationCategory.Mentions,
+-          },
+-        });
+-        if (existingNotification) {
+-          await existingNotification.update({
+-            read_status: false,
+-          });
+-        } else {
+-          await Notification.create({
+-            notifiable_type: "ItemReview",
+-            notifiable_id: reviewId,
+-            user_id: review.user_id, // The user who wrote the review
+-            reactor_id: userId,
+-            message,
+-            notification_category: NotificationCategory.Mentions,
+-          });
+-
+-          // send a notification to FCM
+-          const owner = await User.findByPk(review.user_id);
+-          const registrationToken = owner.fcm_token;
+-          await sendNotification(
+-            registrationToken,
+-            "👍 Your review got an upvote! 🎉",
+-            message,
+-            "clientApp"
+-          );
+-        }
+-      }
+-
+-      // create interaction for the user recommending the item
+-      await Interaction.create({
+-        userId,
+-        itemId,
+-        type: "upvote item review",
+-      });
+-
+-      const newReview = await ItemReview.findOne({
+-        where: { id: reviewId },
+-      });
+-
+-      return res.status(201).json({
+-        message: "Vote created",
+-        data: { ...newReview.dataValues, voted: 1 },
+-      });
+-    }
++    return respondWithVote(
++      res,
++      await transitionItemReviewVote(userId, reviewId, "up")
++    );
+   }
+ );
+ 
+-// @desc    downvote a item review
+-// @route   POST votes/downvote-item-review
+ const downvoteItemReview = asyncAwaitHandler(
+   async (req: Request, res: Response, next: NextFunction) => {
+     const { userId, reviewId } = req.body;
+-
+-    const review = await ItemReview.findByPk(reviewId);
+-
+-    if (!review) {
+-      return next(new BadRequestError("Review Not Found"));
+-    }
+-
+-    const voter = await User.findByPk(userId);
+-
+-    if (!voter) {
+-      return next(new BadRequestError("User Not Found"));
+-    }
+-
+-    const vote = await ItemVote.findOne({
+-      where: {
+-        item_review_id: reviewId,
+-        voter_id: userId,
+-      },
+-    });
+-
+-    if (vote) {
+-      if (!vote.flag) {
+-        await ItemReview.update(
+-          {
+-            down_vote: literal(
+-              "CASE WHEN down_vote > 0 THEN down_vote - 1 ELSE 0 END"
+-            ),
+-          },
+-          { where: { id: reviewId } }
+-        );
+-
+-        await ItemVote.destroy({
+-          where: {
+-            item_review_id: reviewId,
+-            voter_id: userId,
+-          },
+-        });
+-
+-        const newReview = await ItemReview.findByPk(reviewId);
+-
+-        return res.status(201).json({
+-          message: "Vote deleted",
+-          data: { ...newReview.dataValues, voted: 0 },
+-        });
+-      } else {
+-        await ItemReview.update(
+-          {
+-            down_vote: literal("down_vote + 1"),
+-            up_vote: literal(
+-              "CASE WHEN up_vote > 0 THEN up_vote - 1 ELSE 0 END"
+-            ),
+-          },
+-          { where: { id: reviewId } }
+-        );
+-
+-        await ItemVote.update(
+-          { flag: false },
+-          { where: { item_review_id: reviewId, voter_id: userId } }
+-        );
+-
+-        // Create a notification when a user review is downvoted
+-        if (review.user_id !== userId) {
+-          const message = `Your item review received a downvote from user.`;
+-          const existingNotification = await Notification.findOne({
+-            where: {
+-              notifiable_type: "ItemReview",
+-              notifiable_id: reviewId,
+-              user_id: review.user_id,
+-              reactor_id: userId,
+-              notification_category: NotificationCategory.Mentions,
+-            },
+-          });
+-          if (existingNotification) {
+-            await existingNotification.update({
+-              read_status: false,
+-            });
+-          } else {
+-            await Notification.create({
+-              notifiable_type: "ItemReview",
+-              notifiable_id: reviewId,
+-              user_id: review.user_id,
+-              reactor_id: userId,
+-              message,
+-              notification_category: NotificationCategory.Mentions,
+-            });
+-          }
+-        }
+-
+-        const newReview = await ItemReview.findByPk(reviewId);
+-
+-        return res.status(201).json({
+-          message: "Vote updated",
+-          data: { ...newReview.dataValues, voted: -1 },
+-        });
+-      }
+-    } else {
+-      await ItemReview.update(
+-        { down_vote: literal("down_vote + 1") },
+-        { where: { id: reviewId } }
+-      );
+-
+-      const newVote = await ItemVote.create({
+-        item_review_id: reviewId,
+-        voter_id: userId,
+-        flag: false,
+-        value: -1,
+-      });
+-
+-      // Create a notification when a user review is downvote
+-      if (review.user_id !== userId) {
+-        const message = `Your item review received a downvote from user.`;
+-        const existingNotification = await Notification.findOne({
+-          where: {
+-            notifiable_type: "ItemReview",
+-            notifiable_id: reviewId,
+-            user_id: review.user_id,
+-            reactor_id: userId,
+-            notification_category: NotificationCategory.Mentions,
+-          },
+-        });
+-        if (existingNotification) {
+-          await existingNotification.update({
+-            read_status: false,
+-          });
+-        } else {
+-          await Notification.create({
+-            notifiable_type: "ItemReview",
+-            notifiable_id: reviewId,
+-            user_id: review.user_id, // The user who wrote the review
+-            reactor_id: userId,
+-            message,
+-            notification_category: NotificationCategory.Mentions,
+-          });
+-        }
+-      }
+-      const newReview = await ItemReview.findByPk(reviewId);
+-      return res.status(201).json({
+-        message: "Vote created",
+-        data: { ...newReview.dataValues, voted: -1 },
+-      });
+-    }
++    return respondWithVote(
++      res,
++      await transitionItemReviewVote(userId, reviewId, "down")
++    );
+   }
+ );
+ 
+-// @desc    upvote-restaurant-review
+-// @route   POST votes/upvote-restaurant-review
+ const upvoteRestaurantReview = asyncAwaitHandler(
+   async (req: Request, res: Response, next: NextFunction) => {
+     const { userId, reviewId } = req.body;
+-
+-    const review = await RestaurantReview.findByPk(reviewId);
+-
+-    if (!review) {
+-      return next(new BadRequestError("Review Not Found"));
+-    }
+-
+-    const voter = await User.findByPk(userId);
+-
+-    if (!voter) {
+-      return next(new BadRequestError("User Not Found"));
+-    }
+-
+-    const vote = await RestaurantVote.findOne({
+-      where: {
+-        restaurant_review_id: reviewId,
+-        voter_id: userId,
+-      },
+-    });
+-
+-    if (vote) {
+-      if (vote.flag) {
+-        await RestaurantReview.update(
+-          {
+-            up_vote: literal(
+-              "CASE WHEN up_vote > 0 THEN up_vote - 1 ELSE 0 END"
+-            ),
+-          },
+-          { where: { id: reviewId } }
+-        );
+-
+-        await RestaurantVote.destroy({
+-          where: {
+-            restaurant_review_id: reviewId,
+-            voter_id: userId,
+-          },
+-        });
+-
+-        const newReview = await RestaurantReview.findOne({
+-          where: { id: reviewId },
+-        });
+-
+-        return res.status(201).json({
+-          message: "Vote deleted",
+-          data: { ...newReview.dataValues, voted: 0 }, // voted: 0 = not voted, 1 = upvoted, -1 = downvoted
+-        });
+-      } else {
+-        await RestaurantReview.update(
+-          {
+-            up_vote: literal("up_vote + 1"),
+-            down_vote: literal(
+-              "CASE WHEN down_vote > 0 THEN down_vote - 1 ELSE 0 END"
+-            ),
+-          },
+-          { where: { id: reviewId } }
+-        );
+-
+-        await RestaurantVote.update(
+-          { flag: true },
+-          { where: { restaurant_review_id: reviewId, voter_id: userId } }
+-        );
+-
+-        // Create a notification when a user review is upvoted
+-        if (review.user_id !== userId) {
+-          const message = `Your restaurant review received an upvote from user.`;
+-          const existingNotification = await Notification.findOne({
+-            where: {
+-              notifiable_type: "RestaurantReview",
+-              notifiable_id: reviewId,
+-              user_id: review.user_id,
+-              reactor_id: userId,
+-              notification_category: NotificationCategory.Mentions,
+-            },
+-          });
+-          if (existingNotification) {
+-            await existingNotification.update({
+-              read_status: false,
+-            });
+-          } else {
+-            await Notification.create({
+-              notifiable_type: "RestaurantReview",
+-              notifiable_id: reviewId,
+-              user_id: review.user_id, // The user who wrote the review
+-              reactor_id: userId,
+-              message,
+-              notification_category: NotificationCategory.Mentions,
+-            });
+-
+-            // send a notification to FCM
+-            const owner = await User.findByPk(review.user_id);
+-            const registrationToken = owner.fcm_token;
+-            await sendNotification(
+-              registrationToken,
+-              "👍 You got an upvote! 🎉",
+-              message,
+-              "clientApp"
+-            );
+-          }
+-        }
+-        const newReview = await RestaurantReview.findOne({
+-          where: { id: reviewId },
+-        });
+-
+-        return res.status(201).json({
+-          message: "Vote updated",
+-          data: { ...newReview.dataValues, voted: 1 },
+-        });
+-      }
+-    } else {
+-      await RestaurantReview.update(
+-        { up_vote: literal("up_vote + 1") },
+-        { where: { id: reviewId } }
+-      );
+-
+-      const newVote = await RestaurantVote.create({
+-        restaurant_review_id: reviewId,
+-        voter_id: userId,
+-        flag: true,
+-        value: 1,
+-      });
+-
+-      // Create a notification when a user review is upvoted
+-      if (review.user_id !== userId) {
+-        const message = `Your restaurant review received an upvote from user.`;
+-        const existingNotification = await Notification.findOne({
+-          where: {
+-            notifiable_type: "RestaurantReview",
+-            notifiable_id: reviewId,
+-            user_id: review.user_id,
+-            reactor_id: userId,
+-            notification_category: NotificationCategory.Mentions,
+-          },
+-        });
+-        if (existingNotification) {
+-          await existingNotification.update({
+-            read_status: false,
+-          });
+-        } else {
+-          await Notification.create({
+-            notifiable_type: "RestaurantReview",
+-            notifiable_id: reviewId,
+-            user_id: review.user_id, // The user who wrote the review
+-            reactor_id: userId,
+-            message,
+-            notification_category: NotificationCategory.Mentions,
+-          });
+-
+-          // send a notification to FCM
+-          const owner = await User.findByPk(review.user_id);
+-          const registrationToken = owner.fcm_token;
+-          await sendNotification(
+-            registrationToken,
+-            "👍 You got an upvote! 🎉",
+-            message,
+-            "clientApp"
+-          );
+-        }
+-      }
+-
+-      const newReview = await RestaurantReview.findOne({
+-        where: { id: reviewId },
+-      });
+-
+-      return res.status(201).json({
+-        message: "Vote created",
+-        data: { ...newReview.dataValues, voted: 1 },
+-      });
+-    }
++    return respondWithVote(
++      res,
++      await transitionRestaurantReviewVote(userId, reviewId, "up")
++    );
+   }
+ );
+ 
+-// @desc    downvote a restaurant review
+-// @route   POST votes/downvote-restaurant-review
+ const downVoteRestaurantReview = asyncAwaitHandler(
+   async (req: Request, res: Response, next: NextFunction) => {
+     const { userId, reviewId } = req.body;
+-
+-    const review = await RestaurantReview.findByPk(reviewId);
+-
+-    if (!review) {
+-      return next(new BadRequestError("Review Not Found"));
+-    }
+-
+-    const voter = await User.findByPk(userId);
+-
+-    if (!voter) {
+-      return next(new BadRequestError("User Not Found"));
+-    }
+-
+-    const vote = await RestaurantVote.findOne({
+-      where: {
+-        restaurant_review_id: reviewId,
+-        voter_id: userId,
+-      },
+-    });
+-
+-    if (vote) {
+-      if (!vote.flag) {
+-        await RestaurantReview.update(
+-          {
+-            down_vote: literal(
+-              "CASE WHEN down_vote > 0 THEN down_vote - 1 ELSE 0 END"
+-            ),
+-          },
+-          { where: { id: reviewId } }
+-        );
+-
+-        await RestaurantVote.destroy({
+-          where: {
+-            restaurant_review_id: reviewId,
+-            voter_id: userId,
+-          },
+-        });
+-
+-        const newReview = await RestaurantReview.findByPk(reviewId);
+-
+-        return res.status(201).json({
+-          message: "Vote deleted",
+-          data: { ...newReview.dataValues, voted: 0 },
+-        });
+-      } else {
+-        await RestaurantReview.update(
+-          {
+-            down_vote: literal("down_vote + 1"),
+-            up_vote: literal(
+-              "CASE WHEN up_vote > 0 THEN up_vote - 1 ELSE 0 END"
+-            ),
+-          },
+-          { where: { id: reviewId } }
+-        );
+-
+-        await RestaurantVote.update(
+-          { flag: false },
+-          { where: { restaurant_review_id: reviewId, voter_id: userId } }
+-        );
+-
+-        // Create a notification when a user review is downvoted
+-        if (review.user_id !== userId) {
+-          const message = `Your restaurant review received a downvote from user.`;
+-          const existingNotification = await Notification.findOne({
+-            where: {
+-              notifiable_type: "RestaurantReview",
+-              notifiable_id: reviewId,
+-              user_id: review.user_id,
+-              reactor_id: userId,
+-              notification_category: NotificationCategory.Mentions,
+-            },
+-          });
+-          if (existingNotification) {
+-            await existingNotification.update({
+-              read_status: false,
+-            });
+-          } else {
+-            await Notification.create({
+-              notifiable_type: "RestaurantReview",
+-              notifiable_id: reviewId,
+-              user_id: review.user_id,
+-              reactor_id: userId,
+-              message,
+-              notification_category: NotificationCategory.Mentions,
+-            });
+-          }
+-        }
+-        const newReview = await RestaurantReview.findByPk(reviewId);
+-
+-        return res.status(201).json({
+-          message: "Vote updated",
+-          data: { ...newReview.dataValues, voted: -1 },
+-        });
+-      }
+-    } else {
+-      await RestaurantReview.update(
+-        { down_vote: literal("down_vote + 1") },
+-        { where: { id: reviewId } }
+-      );
+-
+-      const newVote = await RestaurantVote.create({
+-        restaurant_review_id: reviewId,
+-        voter_id: userId,
+-        flag: false,
+-        value: -1,
+-      });
+-
+-      // Create a notification when a user review is downvoted
+-      if (review.user_id !== userId) {
+-        const message = `Your restaurant review received downvote from user.`;
+-        const existingNotification = await Notification.findOne({
+-          where: {
+-            notifiable_type: "RestaurantReview",
+-            notifiable_id: reviewId,
+-            user_id: review.user_id,
+-            reactor_id: userId,
+-            notification_category: NotificationCategory.Mentions,
+-          },
+-        });
+-        if (existingNotification) {
+-          await existingNotification.update({
+-            read_status: false,
+-          });
+-        } else {
+-          await Notification.create({
+-            notifiable_type: "RestaurantReview",
+-            notifiable_id: reviewId,
+-            user_id: review.user_id, // The user who wrote the review
+-            reactor_id: userId,
+-            message,
+-            notification_category: NotificationCategory.Mentions,
+-          });
+-        }
+-      }
+-
+-      const newReview = await RestaurantReview.findByPk(reviewId);
+-
+-      return res.status(201).json({
+-        message: "Vote created",
+-        data: { ...newReview.dataValues, voted: -1 },
+-      });
+-    }
++    return respondWithVote(
++      res,
++      await transitionRestaurantReviewVote(userId, reviewId, "down")
++    );
+   }
+ );
+ 
+@@ -696,60 +74,40 @@ const normalizeVotes = asyncAwaitHandler(
+         [Op.or]: [{ up_vote: { [Op.lt]: 0 } }, { down_vote: { [Op.lt]: 0 } }],
+       },
+     });
+-    // find all item votes for each review
++
+     for (const review of itemReview) {
+       const upVotes = await ItemVote.count({
+-        where: {
+-          item_review_id: review.id,
+-          flag: true,
+-        },
++        where: { item_review_id: review.id, flag: true },
+       });
+       const downVotes = await ItemVote.count({
+-        where: {
+-          item_review_id: review.id,
+-          flag: false,
+-        },
++        where: { item_review_id: review.id, flag: false },
+       });
+       await ItemReview.update(
+-        {
+-          up_vote: upVotes,
+-          down_vote: downVotes,
+-        },
++        { up_vote: upVotes, down_vote: downVotes },
+         { where: { id: review.id } }
+       );
+     }
+ 
+-    // find all restaurant votes for each review
+     for (const review of restaurantReview) {
+       const upVotes = await RestaurantVote.count({
+-        where: {
+-          restaurant_review_id: review.id,
+-          flag: true,
+-        },
++        where: { restaurant_review_id: review.id, flag: true },
+       });
+       const downVotes = await RestaurantVote.count({
+-        where: {
+-          restaurant_review_id: review.id,
+-          flag: false,
+-        },
++        where: { restaurant_review_id: review.id, flag: false },
+       });
+       await RestaurantReview.update(
+-        {
+-          up_vote: upVotes,
+-          down_vote: downVotes,
+-        },
++        { up_vote: upVotes, down_vote: downVotes },
+         { where: { id: review.id } }
+       );
+     }
++
+     return res.status(200).json({
+       message: "Votes normalized",
+-      data: {
+-        itemReview,
+-        restaurantReview,
+-      },
++      data: { itemReview, restaurantReview },
+     });
+   }
+ );
++
+ export {
+   upvoteItemReview,
+   downvoteItemReview,
+diff --git a/rateeat_backend/src/models/Vote/ItemVote.ts b/rateeat_backend/src/models/Vote/ItemVote.ts
+index 725caeac1..cb5a6cd33 100644
+--- a/rateeat_backend/src/models/Vote/ItemVote.ts
++++ b/rateeat_backend/src/models/Vote/ItemVote.ts
+@@ -13,6 +13,13 @@ import ItemReview from "../Item/ItemReview";
+ @Table({
+   tableName: "item_votes",
+   timestamps: true,
++  indexes: [
++    {
++      name: "item_votes_voter_review_unique",
++      unique: true,
++      fields: ["voter_id", "item_review_id"],
++    },
++  ],
+ })
+ class ItemVote extends Model<ItemVote> {
+   @PrimaryKey
+diff --git a/rateeat_backend/src/models/Vote/RestaurantVote.ts b/rateeat_backend/src/models/Vote/RestaurantVote.ts
+index 25f0e6f92..598c335dd 100644
+--- a/rateeat_backend/src/models/Vote/RestaurantVote.ts
++++ b/rateeat_backend/src/models/Vote/RestaurantVote.ts
+@@ -13,6 +13,13 @@ import RestaurantReview from "../Restaurant/RestaurantReview";
+ @Table({
+   tableName: "restaurant_votes",
+   timestamps: true,
++  indexes: [
++    {
++      name: "restaurant_votes_voter_review_unique",
++      unique: true,
++      fields: ["voter_id", "restaurant_review_id"],
++    },
++  ],
+ })
+ class RestaurantVote extends Model<RestaurantVote> {
+   @PrimaryKey
+diff --git a/rateeat_backend/src/services/review-vote-consistency.service.ts b/rateeat_backend/src/services/review-vote-consistency.service.ts
+new file mode 100644
+index 000000000..65031decf
+--- /dev/null
++++ b/rateeat_backend/src/services/review-vote-consistency.service.ts
+@@ -0,0 +1,123 @@
++import { Transaction } from "sequelize";
++import {
++  ItemReview,
++  ItemVote,
++  RestaurantReview,
++  RestaurantVote,
++} from "../models";
++import { ReviewVoteDirection, ReviewVoteKind } from "../types/review-vote.types";
++
++interface ConsistencyAdapter {
++  kind: ReviewVoteKind;
++  reviewModel: typeof ItemReview | typeof RestaurantReview;
++  voteModel: typeof ItemVote | typeof RestaurantVote;
++  foreignKey: "item_review_id" | "restaurant_review_id";
++}
++
++interface ReconcileInput {
++  adapter: ConsistencyAdapter;
++  review: ItemReview | RestaurantReview;
++  reviewId: string;
++  userId: string;
++  expectedDirection: ReviewVoteDirection | null;
++  transaction: Transaction;
++}
++
++const expectedFlag = (direction: ReviewVoteDirection) => direction === "up";
++const expectedValue = (direction: ReviewVoteDirection) =>
++  direction === "up" ? 1 : -1;
++
++const countVotes = async (
++  adapter: ConsistencyAdapter,
++  reviewId: string,
++  transaction: Transaction
++) => {
++  const where = { [adapter.foreignKey]: reviewId };
++  const [up, down] = await Promise.all([
++    (adapter.voteModel as any).count({
++      where: { ...where, flag: true },
++      transaction,
++    }),
++    (adapter.voteModel as any).count({
++      where: { ...where, flag: false },
++      transaction,
++    }),
++  ]);
++  return { up, down };
++};
++
++const verifyCurrentUserVote = async (
++  adapter: ConsistencyAdapter,
++  reviewId: string,
++  userId: string,
++  expectedDirection: ReviewVoteDirection | null,
++  transaction: Transaction
++) => {
++  const votes = await (adapter.voteModel as any).findAll({
++    where: {
++      [adapter.foreignKey]: reviewId,
++      voter_id: userId,
++    },
++    transaction,
++  });
++
++  if (expectedDirection === null) {
++    if (votes.length !== 0) {
++      throw new Error("Vote deletion did not leave a consistent current vote");
++    }
++    return;
++  }
++
++  if (votes.length !== 1) {
++    throw new Error("Vote transition did not leave exactly one current vote");
++  }
++
++  const vote = votes[0];
++  if (
++    vote.flag !== expectedFlag(expectedDirection) ||
++    vote.value !== expectedValue(expectedDirection)
++  ) {
++    throw new Error("Stored vote direction does not match the requested vote");
++  }
++};
++
++export const reconcileReviewVoteState = async ({
++  adapter,
++  review,
++  reviewId,
++  userId,
++  expectedDirection,
++  transaction,
++}: ReconcileInput): Promise<ItemReview | RestaurantReview> => {
++  const counts = await countVotes(adapter, reviewId, transaction);
++
++  await (review as any).update(
++    { up_vote: counts.up, down_vote: counts.down },
++    { transaction }
++  );
++
++  await verifyCurrentUserVote(
++    adapter,
++    reviewId,
++    userId,
++    expectedDirection,
++    transaction
++  );
++
++  const persistedReview = await (adapter.reviewModel as any).findByPk(reviewId, {
++    transaction,
++  });
++  if (!persistedReview) {
++    throw new Error("Review disappeared during vote transition");
++  }
++
++  const confirmed = await countVotes(adapter, reviewId, transaction);
++  if (
++    Number(persistedReview.up_vote) !== confirmed.up ||
++    Number(persistedReview.down_vote) !== confirmed.down
++  ) {
++    throw new Error("Review vote totals do not match stored votes");
++  }
++
++  return persistedReview;
++};
+diff --git a/rateeat_backend/src/services/review-vote-transition.service.ts b/rateeat_backend/src/services/review-vote-transition.service.ts
+new file mode 100644
+index 000000000..7ed88d213
+--- /dev/null
++++ b/rateeat_backend/src/services/review-vote-transition.service.ts
+@@ -0,0 +1,240 @@
++import { Transaction } from "sequelize";
++import {
++  Interaction,
++  ItemReview,
++  ItemVote,
++  RestaurantReview,
++  RestaurantVote,
++  User,
++} from "../models";
++import { BadRequestError } from "../utils/error-response.utils";
++import { persistReviewVoteNotification } from "../utils/review-vote-notification.utils";
++import { reconcileReviewVoteState } from "./review-vote-consistency.service";
++import {
++  ReviewVoteDirection,
++  ReviewVoteKind,
++  ReviewVoteMessage,
++  ReviewVoteResult,
++} from "../types/review-vote.types";
++
++interface ReviewAdapter {
++  kind: ReviewVoteKind;
++  reviewModel: typeof ItemReview | typeof RestaurantReview;
++  voteModel: typeof ItemVote | typeof RestaurantVote;
++  foreignKey: "item_review_id" | "restaurant_review_id";
++}
++
++interface TransitionState {
++  message: ReviewVoteMessage;
++  nextDirection: ReviewVoteDirection | null;
++}
++
++const itemAdapter: ReviewAdapter = {
++  kind: "item",
++  reviewModel: ItemReview,
++  voteModel: ItemVote,
++  foreignKey: "item_review_id",
++};
++
++const restaurantAdapter: ReviewAdapter = {
++  kind: "restaurant",
++  reviewModel: RestaurantReview,
++  voteModel: RestaurantVote,
++  foreignKey: "restaurant_review_id",
++};
++
++const voteFlag = (direction: ReviewVoteDirection) => direction === "up";
++const voteValue = (direction: ReviewVoteDirection) =>
++  direction === "up" ? 1 : -1;
++const responseVote = (direction: ReviewVoteDirection | null): -1 | 0 | 1 =>
++  direction === "up" ? 1 : direction === "down" ? -1 : 0;
++
++const getTransition = (
++  currentFlag: boolean | null,
++  requested: ReviewVoteDirection
++): TransitionState => {
++  if (currentFlag === null) {
++    return { message: "Vote created", nextDirection: requested };
++  }
++  if (currentFlag === voteFlag(requested)) {
++    return { message: "Vote deleted", nextDirection: null };
++  }
++  return { message: "Vote updated", nextDirection: requested };
++};
++
++const requireReview = async (
++  adapter: ReviewAdapter,
++  reviewId: string,
++  transaction: Transaction
++): Promise<ItemReview | RestaurantReview> => {
++  const review = await (adapter.reviewModel as any).findByPk(reviewId, {
++    transaction,
++    lock: transaction.LOCK.UPDATE,
++  });
++  if (!review) throw new BadRequestError("Review Not Found");
++  return review;
++};
++
++const requireVoter = async (userId: string, transaction: Transaction) => {
++  const voter = await User.findByPk(userId, { transaction });
++  if (!voter) throw new BadRequestError("User Not Found");
++};
++
++const findVote = async (
++  adapter: ReviewAdapter,
++  reviewId: string,
++  userId: string,
++  transaction: Transaction
++): Promise<ItemVote | RestaurantVote | null> =>
++  (adapter.voteModel as any).findOne({
++    where: { [adapter.foreignKey]: reviewId, voter_id: userId },
++    transaction,
++    lock: transaction.LOCK.UPDATE,
++  });
++
++const mutateVote = async (
++  adapter: ReviewAdapter,
++  reviewId: string,
++  userId: string,
++  currentVote: ItemVote | RestaurantVote | null,
++  transition: TransitionState,
++  transaction: Transaction
++) => {
++  if (transition.nextDirection === null) {
++    if (currentVote) await currentVote.destroy({ transaction });
++    return;
++  }
++
++  const flag = voteFlag(transition.nextDirection);
++  const value = voteValue(transition.nextDirection);
++  if (currentVote) {
++    await (currentVote as any).update(
++      { flag, value },
++      { transaction }
++    );
++    return;
++  }
++
++  await (adapter.voteModel as any).create(
++    {
++      [adapter.foreignKey]: reviewId,
++      voter_id: userId,
++      flag,
++      value,
++    },
++    { transaction }
++  );
++};
++
++const persistItemInteraction = async (
++  adapter: ReviewAdapter,
++  review: ItemReview | RestaurantReview,
++  userId: string,
++  requested: ReviewVoteDirection,
++  nextDirection: ReviewVoteDirection | null,
++  transaction: Transaction
++) => {
++  if (
++    adapter.kind !== "item" ||
++    requested !== "up" ||
++    nextDirection !== "up"
++  ) {
++    return;
++  }
++  await Interaction.create(
++    {
++      userId,
++      itemId: (review as ItemReview).item_id,
++      type: "upvote item review",
++    },
++    { transaction }
++  );
++};
++
++const transitionReviewVote = async (
++  adapter: ReviewAdapter,
++  userId: string,
++  reviewId: string,
++  requested: ReviewVoteDirection
++): Promise<ReviewVoteResult> => {
++  const sequelize = (adapter.reviewModel as any).sequelize;
++  if (!sequelize) throw new Error("Review model is not connected to a database");
++
++  let pushNotification: ReviewVoteResult["pushNotification"];
++  const response = await sequelize.transaction(async (transaction: Transaction) => {
++    // One review row is the serialization point for every transition on that
++    // review. Nothing reads or mutates the user's vote until this lock is held.
++    const review = await requireReview(adapter, reviewId, transaction);
++    await requireVoter(userId, transaction);
++
++    const currentVote = await findVote(adapter, reviewId, userId, transaction);
++    const transition = getTransition(
++      currentVote ? currentVote.flag : null,
++      requested
++    );
++
++    await mutateVote(
++      adapter,
++      reviewId,
++      userId,
++      currentVote,
++      transition,
++      transaction
++    );
++
++    // Stored vote rows are authoritative. Reconcile the aggregate totals and
++    // verify the current user's durable vote before any side effects commit.
++    const freshReview = await reconcileReviewVoteState({
++      adapter,
++      review,
++      reviewId,
++      userId,
++      expectedDirection: transition.nextDirection,
++      transaction,
++    });
++
++    if (transition.nextDirection !== null) {
++      pushNotification = await persistReviewVoteNotification({
++        kind: adapter.kind,
++        reviewId,
++        ownerId: review.user_id,
++        voterId: userId,
++        direction: transition.nextDirection,
++        transaction,
++      });
++    }
++
++    // Keep the existing item recommendation activity, but commit it with the
++    // vote instead of leaving a half-finished transition if this final write fails.
++    await persistItemInteraction(
++      adapter,
++      review,
++      userId,
++      requested,
++      transition.nextDirection,
++      transaction
++    );
++
++    return {
++      message: transition.message,
++      data: {
++        ...freshReview.dataValues,
++        voted: responseVote(transition.nextDirection),
++      },
++    };
++  });
++
++  return { response, pushNotification };
++};
++
++export const transitionItemReviewVote = (
++  userId: string,
++  reviewId: string,
++  direction: ReviewVoteDirection
++) => transitionReviewVote(itemAdapter, userId, reviewId, direction);
++
++export const transitionRestaurantReviewVote = (
++  userId: string,
++  reviewId: string,
++  direction: ReviewVoteDirection
++) => transitionReviewVote(restaurantAdapter, userId, reviewId, direction);
+diff --git a/rateeat_backend/src/types/review-vote.types.ts b/rateeat_backend/src/types/review-vote.types.ts
+new file mode 100644
+index 000000000..e2e636a76
+--- /dev/null
++++ b/rateeat_backend/src/types/review-vote.types.ts
+@@ -0,0 +1,18 @@
++export type ReviewVoteDirection = "up" | "down";
++export type ReviewVoteKind = "item" | "restaurant";
++export type ReviewVoteMessage = "Vote created" | "Vote updated" | "Vote deleted";
++
++export interface ReviewVoteDelivery {
++  registrationToken: string;
++  title: string;
++  message: string;
++  appName: "clientApp";
++}
++
++export interface ReviewVoteResult {
++  response: {
++    message: ReviewVoteMessage;
++    data: Record<string, unknown> & { voted: -1 | 0 | 1 };
++  };
++  pushNotification?: ReviewVoteDelivery;
++}
+diff --git a/rateeat_backend/src/utils/review-vote-notification.utils.ts b/rateeat_backend/src/utils/review-vote-notification.utils.ts
+new file mode 100644
+index 000000000..04e631b67
+--- /dev/null
++++ b/rateeat_backend/src/utils/review-vote-notification.utils.ts
+@@ -0,0 +1,82 @@
++import { Transaction } from "sequelize";
++import { User } from "../models";
++import Notification, {
++  NotificationCategory,
++} from "../models/Feedback/Notification";
++import {
++  ReviewVoteDelivery,
++  ReviewVoteDirection,
++  ReviewVoteKind,
++} from "../types/review-vote.types";
++
++interface NotificationInput {
++  kind: ReviewVoteKind;
++  reviewId: string;
++  ownerId: string;
++  voterId: string;
++  direction: ReviewVoteDirection;
++  transaction: Transaction;
++}
++
++const notificationType = (kind: ReviewVoteKind) =>
++  kind === "item" ? "ItemReview" : "RestaurantReview";
++
++const notificationMessage = (
++  kind: ReviewVoteKind,
++  direction: ReviewVoteDirection
++) =>
++  `Your ${kind === "item" ? "item review" : "restaurant review"} received a ${
++    direction === "up" ? "upvote" : "downvote"
++  } from user.`;
++
++export const persistReviewVoteNotification = async (
++  input: NotificationInput
++): Promise<ReviewVoteDelivery | undefined> => {
++  if (input.ownerId === input.voterId) return undefined;
++
++  const message = notificationMessage(input.kind, input.direction);
++  const where = {
++    notifiable_type: notificationType(input.kind),
++    notifiable_id: input.reviewId,
++    user_id: input.ownerId,
++    reactor_id: input.voterId,
++    notification_category: NotificationCategory.Mentions,
++  };
++
++  const existing = await Notification.findOne({
++    where,
++    transaction: input.transaction,
++    lock: input.transaction.LOCK.UPDATE,
++  });
++
++  if (existing) {
++    await existing.update(
++      { message, read_status: false },
++      { transaction: input.transaction }
++    );
++    return undefined;
++  }
++
++  await Notification.create(
++    { ...where, message },
++    { transaction: input.transaction }
++  );
++
++  if (input.direction !== "up") return undefined;
++
++  const owner = await User.findByPk(input.ownerId, {
++    transaction: input.transaction,
++    attributes: ["fcm_token"],
++  });
++  if (!owner?.fcm_token) return undefined;
++
++  return {
++    registrationToken: owner.fcm_token,
++    title:
++      input.kind === "item"
++        ? "👍 Your review got an upvote! 🎉"
++        : "👍 You got an upvote! 🎉",
++    message,
++    appName: "clientApp",
++  };
++};
