@@ -340,10 +340,10 @@ index 0000000..bc4b487
 +}
 diff --git a/rateeat_backend/src/utils/candidate-restaurant-workflow.utils.ts b/rateeat_backend/src/utils/candidate-restaurant-workflow.utils.ts
 new file mode 100644
-index 0000000..10e07f5
+index 0000000..4798e24
 --- /dev/null
 +++ b/rateeat_backend/src/utils/candidate-restaurant-workflow.utils.ts
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,198 @@
 +import { BadRequestError } from "../utils/error-response.utils";
 +import {
 +  BatchCandidateReviewItem,
@@ -541,19 +541,4 @@ index 0000000..10e07f5
 +export function isValidCandidateIdentifier(id: string): boolean {
 +  if (!id || typeof id !== "string") return false;
 +  return id.trim().length > 0;
-+}
-+
-+/**
-+ * Checks if a candidate restaurant is eligible for active promotion.
-+ */
-+export function isCandidateEligibleForPromotion(candidate: any): boolean {
-+  return Boolean(candidate && candidate.name && (candidate.address || candidate.phone_number));
-+}
-+
-+/**
-+ * Validates candidate review transition state changes.
-+ */
-+export function validateCandidateReviewAction(action: string): boolean {
-+  const norm = typeof action === "string" ? action.toLowerCase().trim() : "";
-+  return norm === "approve" || norm === "reject";
 +}

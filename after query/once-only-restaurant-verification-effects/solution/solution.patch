@@ -240,10 +240,10 @@ index 0000000..3095dd0
 +}
 diff --git a/rateeat_backend/src/utils/candidate-item-review-effects.utils.ts b/rateeat_backend/src/utils/candidate-item-review-effects.utils.ts
 new file mode 100644
-index 0000000..3cd88ae
+index 0000000..33fc411
 --- /dev/null
 +++ b/rateeat_backend/src/utils/candidate-item-review-effects.utils.ts
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,203 @@
 +import { BadRequestError } from "../utils/error-response.utils";
 +import {
 +  BatchReviewModerationItem,
@@ -446,29 +446,4 @@ index 0000000..3cd88ae
 +  if (rank <= 3) return 5;
 +  if (rank <= 5) return 3;
 +  return 0;
-+}
-+
-+/**
-+ * Validates whether an incentive reward is eligible for deduction.
-+ */
-+export function isIncentiveDeductible(amount: number, userBalance: number): boolean {
-+  return amount > 0 && userBalance >= 0;
-+}
-+
-+/**
-+ * Builds user moderation summary envelope.
-+ */
-+export function buildUserModerationSummary(
-+  userId: string,
-+  approvedCount: number,
-+  rejectedCount: number,
-+  totalPoints: number
-+): Record<string, any> {
-+  return {
-+    userId,
-+    approvedReviews: approvedCount,
-+    rejectedReviews: rejectedCount,
-+    totalPointsEarned: totalPoints,
-+    calculatedAt: new Date().toISOString(),
-+  };
 +}
