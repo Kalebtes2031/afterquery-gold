@@ -1,0 +1,9 @@
+# Set default behavior to line feed (LF) for all files
+* text=auto eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+*.patch text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.ts text eol=lf
+*.js text eol=lf
