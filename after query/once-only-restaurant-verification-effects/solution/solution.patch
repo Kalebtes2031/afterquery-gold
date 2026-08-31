@@ -1,0 +1,589 @@
+diff --git a/rateeat_backend/src/controllers/candidate_item_review.controller.ts b/rateeat_backend/src/controllers/candidate_item_review.controller.ts
+index 39671d9..73bcc00 100644
+--- a/rateeat_backend/src/controllers/candidate_item_review.controller.ts
++++ b/rateeat_backend/src/controllers/candidate_item_review.controller.ts
+@@ -9,6 +9,9 @@ import {
+   User,
+ } from "../models";
+ import { FileRequest } from "../middlewares/upload-image";
++import { CandidateItemReviewEffectsService } from "../services/candidate-item-review-effects.service";
++import { CandidateItemReviewModerationService } from "../services/candidate-item-review-moderation.service";
++import { validateBatchReviewPayload } from "../utils/candidate-item-review-effects.utils";
+ import { Op, WhereOptions } from "sequelize";
+ 
+ import {
+@@ -337,8 +340,37 @@ const manageCandidateItemReview = asyncHandler(
+   }
+ );
+ 
++
++const batchManageCandidateItemReviews = asyncHandler(
++  async (req: Request, res: Response, next: NextFunction) => {
++    const user: any = req.user;
++    if (!user) {
++      return next(new AuthorizationError());
++    }
++
++    try {
++      const validatedPayload = validateBatchReviewPayload(req.body);
++      const batchResult =
++        await CandidateItemReviewModerationService.executeBatchManage(
++          validatedPayload.reviews,
++          user.id
++        );
++
++      return res.status(200).json({
++        success: true,
++        message: "Batch candidate item reviews managed successfully",
++        data: batchResult,
++      });
++    } catch (error) {
++      return next(error);
++    }
++  }
++);
++
+ export {
+   createCandidateItemReview,
+   getCandidateItemReviews,
+   manageCandidateItemReview,
++  batchManageCandidateItemReviews,
+ };
++
+diff --git a/rateeat_backend/src/services/candidate-item-review-effects.service.ts b/rateeat_backend/src/services/candidate-item-review-effects.service.ts
+new file mode 100644
+index 0000000..cc83a28
+--- /dev/null
++++ b/rateeat_backend/src/services/candidate-item-review-effects.service.ts
+@@ -0,0 +1,178 @@
++import { Op, Transaction } from "sequelize";
++import sequelize from "../config/db";
++import {
++  Incentive,
++  Item,
++  ItemReview,
++  ItemReviewImage,
++  ItemReviewVideo,
++} from "../models";
++import {
++  BadRequestError,
++  NotFoundError,
++} from "../utils/error-response.utils";
++import {
++  ReviewEffectResult,
++  ReviewFilterOptions,
++} from "../types/candidate-item-review-effects.types";
++import { createReviewEffectAuditEntry } from "../utils/candidate-item-review-effects.utils";
++
++export class CandidateItemReviewEffectsService {
++  /**
++   * Evaluates review approval and executes once-only incentive awards within a locked transaction.
++   */
++  public static async manageReviewWithLock(
++    reviewId: string,
++    isApproved: boolean,
++    reviewerId: string,
++    externalTransaction?: Transaction
++  ): Promise<ReviewEffectResult> {
++    const executeEffect = async (tx: Transaction) => {
++      const review = await ItemReview.findByPk(reviewId, {
++        include: [
++          { model: ItemReviewImage, as: "item_review_images" },
++          { model: ItemReviewVideo, as: "item_review_videos" },
++        ],
++        transaction: tx,
++        lock: tx.LOCK.UPDATE,
++      });
++
++      if (!review) {
++        throw new NotFoundError("Candidate item review not found");
++      }
++
++      const currentStatus = review.is_approved;
++      if (currentStatus === isApproved) {
++        const msg = isApproved
++          ? "Candidate item review already approved"
++          : "Candidate item review already rejected";
++        throw new BadRequestError(msg);
++      }
++
++      const item = await Item.findByPk(review.item_id, { transaction: tx });
++      if (!item || !item.is_approved) {
++        throw new BadRequestError(
++          "Item not approved yet, first approve the item"
++        );
++      }
++
++      review.is_approved = isApproved;
++      await review.save({ transaction: tx });
++
++      let moneyEarned = 0;
++      const hasImages = (review as any).item_review_images && (review as any).item_review_images.length > 0;
++      const hasVideos = (review as any).item_review_videos && (review as any).item_review_videos.length > 0;
++
++      if (hasImages || hasVideos) {
++        const approvedReviews = await ItemReview.findAll({
++          where: {
++            is_approved: true,
++            item_id: item.id,
++            [Op.or]: [
++              { "$item_review_images.url$": { [Op.not]: null } },
++              { "$item_review_videos.url$": { [Op.not]: null } },
++            ],
++          },
++          include: [
++            { model: ItemReviewImage, as: "item_review_images" },
++            { model: ItemReviewVideo, as: "item_review_videos" },
++          ],
++          order: [["createdAt", "ASC"]],
++          transaction: tx,
++        });
++
++        const rankInTime = approvedReviews.findIndex((r) => r.id === review.id);
++        moneyEarned =
++          rankInTime < 3 ? 10 : rankInTime < 6 ? 5 : rankInTime < 10 ? 3 : 0;
++      }
++
++      let currentBalance = 0;
++      let incentiveDelta = 0;
++
++      if (moneyEarned > 0) {
++        let incentive = await Incentive.findOne({
++          where: { user_id: review.user_id },
++          transaction: tx,
++          lock: tx.LOCK.UPDATE,
++        });
++
++        if (!incentive) {
++          incentive = await Incentive.create(
++            { user_id: review.user_id, current_total: 0 },
++            { transaction: tx }
++          );
++        }
++
++        if (isApproved) {
++          incentive.current_total += moneyEarned;
++          incentiveDelta = moneyEarned;
++        } else if (!isApproved && currentStatus === true && incentive.current_total >= moneyEarned) {
++          incentive.current_total -= moneyEarned;
++          incentiveDelta = -moneyEarned;
++        }
++        await incentive.save({ transaction: tx });
++        currentBalance = incentive.current_total;
++      }
++
++      createReviewEffectAuditEntry(
++        review.id,
++        review.item_id,
++        review.user_id,
++        isApproved,
++        currentStatus,
++        incentiveDelta,
++        currentBalance,
++        reviewerId
++      );
++
++      return {
++        id: review.id,
++        item_id: review.item_id,
++        user_id: review.user_id,
++        is_approved: isApproved,
++        incentive_awarded: isApproved ? moneyEarned : 0,
++        reviewed_at: new Date(),
++        reviewed_by: reviewerId,
++      };
++    };
++
++    if (externalTransaction) {
++      return executeEffect(externalTransaction);
++    } else {
++      return sequelize.transaction(async (tx) => executeEffect(tx));
++    }
++  }
++
++  /**
++   * Retrieves candidate item reviews matching filter options.
++   */
++  public static async queryReviewsWithFilters(
++    filters: ReviewFilterOptions = {}
++  ): Promise<any[]> {
++    const where: any = {};
++    if (filters.itemId) where.item_id = filters.itemId;
++    if (filters.userId) where.user_id = filters.userId;
++    if (filters.isApproved !== undefined) where.is_approved = filters.isApproved;
++
++    return ItemReview.findAll({
++      where,
++      limit: filters.limit || 50,
++      offset: filters.offset || 0,
++      order: [["createdAt", "DESC"]],
++    });
++  }
++
++  /**
++   * Counts reviews by approval status.
++   */
++  public static async getReviewStatusCounts(): Promise<{
++    pending: number;
++    approved: number;
++    rejected: number;
++  }> {
++    const pending = await ItemReview.count({ where: { is_approved: null } });
++    const approved = await ItemReview.count({ where: { is_approved: true } });
++    const rejected = await ItemReview.count({ where: { is_approved: false } });
++    return { pending, approved, rejected };
++  }
++}
+diff --git a/rateeat_backend/src/services/candidate-item-review-moderation.service.ts b/rateeat_backend/src/services/candidate-item-review-moderation.service.ts
+new file mode 100644
+index 0000000..51ad4a0
+--- /dev/null
++++ b/rateeat_backend/src/services/candidate-item-review-moderation.service.ts
+@@ -0,0 +1,51 @@
++import sequelize from "../config/db";
++import {
++  BatchCandidateItemReviewPayload,
++  BatchReviewEffectsResponse,
++  CandidateItemReviewDecision,
++  ReviewEffectResult,
++} from "../types/candidate-item-review-effects.types";
++import { CandidateItemReviewEffectsService } from "./candidate-item-review-effects.service";
++
++export class CandidateItemReviewModerationService {
++  /**
++   * Executes a batch of review moderation actions atomically in transaction.
++   */
++  public static async executeBatchManage(
++    decisions: CandidateItemReviewDecision[],
++    reviewerId: string
++  ): Promise<BatchReviewEffectsResponse> {
++    return sequelize.transaction(async (tx) => {
++      const results: ReviewEffectResult[] = [];
++      let totalIncentivesAwarded = 0;
++
++      for (const d of decisions) {
++        const res = await CandidateItemReviewEffectsService.manageReviewWithLock(
++          d.reviewId,
++          d.isApproved,
++          reviewerId,
++          tx
++        );
++        results.push(res);
++        totalIncentivesAwarded += res.incentive_awarded;
++      }
++
++      return {
++        totalProcessed: results.length,
++        totalIncentivesAwarded,
++        results,
++      };
++    });
++  }
++
++  /**
++   * Validates uniqueness of review IDs in batch decision payload.
++   */
++  public static async validateBatchUniqueness(
++    reviewIds: string[]
++  ): Promise<boolean> {
++    if (!reviewIds || reviewIds.length === 0) return false;
++    const set = new Set(reviewIds.map((r) => r.trim()));
++    return set.size === reviewIds.length;
++  }
++}
+diff --git a/rateeat_backend/src/types/candidate-item-review-effects.types.ts b/rateeat_backend/src/types/candidate-item-review-effects.types.ts
+new file mode 100644
+index 0000000..e842827
+--- /dev/null
++++ b/rateeat_backend/src/types/candidate-item-review-effects.types.ts
+@@ -0,0 +1,104 @@
++/**
++ * Individual decision structure for candidate item review moderation.
++ */
++export interface CandidateItemReviewDecision {
++  reviewId: string;
++  isApproved: boolean;
++  notes?: string;
++}
++
++/**
++ * Request payload schema for PUT /api/v1/candidate-item-reviews/batch-manage.
++ */
++export interface BatchCandidateItemReviewPayload {
++  reviews: CandidateItemReviewDecision[];
++}
++
++/**
++ * Result representation for once-only review side effects.
++ */
++export interface ReviewEffectResult {
++  id: string;
++  item_id: string;
++  user_id: string;
++  is_approved: boolean;
++  incentive_awarded: number;
++  reviewed_at: Date;
++  reviewed_by: string;
++}
++
++/**
++ * Batch response representation for review side effects.
++ */
++export interface BatchReviewEffectsResponse {
++  totalProcessed: number;
++  totalIncentivesAwarded: number;
++  results: ReviewEffectResult[];
++}
++
++/**
++ * Filter options for querying candidate item reviews.
++ */
++export interface ReviewFilterOptions {
++  itemId?: string;
++  userId?: string;
++  isApproved?: boolean | null;
++  limit?: number;
++  offset?: number;
++  startDate?: Date;
++  endDate?: Date;
++}
++
++/**
++ * Immutable audit log record for incentive and verification side effects.
++ */
++export interface ReviewSideEffectAuditRecord {
++  auditId: string;
++  reviewId: string;
++  itemId: string;
++  userId: string;
++  isApproved: boolean;
++  previousApprovalStatus: boolean | null;
++  incentiveDelta: number;
++  resultingBalance: number;
++  reviewerId: string;
++  timestamp: string;
++}
++
++/**
++ * Summary metrics of incentive awards across reviews.
++ */
++export interface ReviewIncentiveMetrics {
++  totalAwardsDistributed: number;
++  totalPointsValue: number;
++  distinctRecipients: number;
++  averageRewardPerApprovedReview: number;
++}
++
++export interface IncentiveTransactionAuditRecord {
++  transactionId: string;
++  userId: string;
++  reviewId: string;
++  delta: number;
++  balanceBefore: number;
++  balanceAfter: number;
++  reason: string;
++  timestamp: string;
++}
++
++export interface ReviewModerationBatchReport {
++  batchId: string;
++  totalSubmissions: number;
++  approvedCount: number;
++  rejectedCount: number;
++  totalIncentivesDistributed: number;
++  executionDurationMs: number;
++}
++
++export interface CandidateItemReviewQueryCriteria {
++  minRating?: number;
++  maxRating?: number;
++  hasMediaOnly?: boolean;
++  limit?: number;
++  offset?: number;
++}
+diff --git a/rateeat_backend/src/utils/candidate-item-review-effects.utils.ts b/rateeat_backend/src/utils/candidate-item-review-effects.utils.ts
+new file mode 100644
+index 0000000..a6835a8
+--- /dev/null
++++ b/rateeat_backend/src/utils/candidate-item-review-effects.utils.ts
+@@ -0,0 +1,180 @@
++import { BadRequestError } from "../utils/error-response.utils";
++import {
++  BatchCandidateItemReviewPayload,
++  CandidateItemReviewDecision,
++  ReviewEffectResult,
++  ReviewFilterOptions,
++  ReviewIncentiveMetrics,
++  ReviewSideEffectAuditRecord,
++} from "../types/candidate-item-review-effects.types";
++
++/**
++ * Validates the batch moderation payload, ensuring arrays are well-formed and unique.
++ */
++export function validateBatchReviewPayload(
++  body: any
++): BatchCandidateItemReviewPayload {
++  if (!body || typeof body !== "object") {
++    throw new BadRequestError("Request body must be a valid JSON object");
++  }
++
++  const { reviews } = body;
++  if (!Array.isArray(reviews)) {
++    throw new BadRequestError("Field 'reviews' must be an array");
++  }
++
++  if (reviews.length === 0) {
++    throw new BadRequestError("Field 'reviews' cannot be an empty array");
++  }
++
++  const seenIds = new Set<string>();
++  const validatedDecisions: CandidateItemReviewDecision[] = [];
++
++  for (let i = 0; i < reviews.length; i++) {
++    const item = reviews[i];
++    if (!item || typeof item !== "object") {
++      throw new BadRequestError(`Review item at index ${i} must be an object`);
++    }
++
++    const { reviewId, isApproved, notes } = item;
++    if (!reviewId || typeof reviewId !== "string" || reviewId.trim().length === 0) {
++      throw new BadRequestError(
++        `Review item at index ${i} is missing a valid 'reviewId'`
++      );
++    }
++
++    const cleanId = reviewId.trim();
++    if (seenIds.has(cleanId)) {
++      throw new BadRequestError(
++        `Duplicate review id '${cleanId}' detected in batch payload`
++      );
++    }
++    seenIds.add(cleanId);
++
++    if (typeof isApproved !== "boolean") {
++      throw new BadRequestError(
++        `Review item at index ${i} has invalid 'isApproved' field. Must be boolean`
++      );
++    }
++
++    validatedDecisions.push({
++      reviewId: cleanId,
++      isApproved,
++      notes: typeof notes === "string" ? notes.trim() : undefined,
++    });
++  }
++
++  return { reviews: validatedDecisions };
++}
++
++/**
++ * Summarizes the total incentives awarded and processed reviews.
++ */
++export function formatReviewEffectsSummary(
++  results: ReviewEffectResult[]
++): { totalAwarded: number; count: number } {
++  let totalAwarded = 0;
++  for (const res of results) {
++    totalAwarded += res.incentive_awarded;
++  }
++  return { totalAwarded, count: results.length };
++}
++
++/**
++ * Parses query options into structured filter parameters for review searches.
++ */
++export function parseReviewFilters(query: any): ReviewFilterOptions {
++  const options: ReviewFilterOptions = {};
++  if (query.itemId && typeof query.itemId === "string") {
++    options.itemId = query.itemId.trim();
++  }
++  if (query.userId && typeof query.userId === "string") {
++    options.userId = query.userId.trim();
++  }
++  if (query.isApproved !== undefined) {
++    if (query.isApproved === "true" || query.isApproved === true) options.isApproved = true;
++    else if (query.isApproved === "false" || query.isApproved === false) options.isApproved = false;
++    else if (query.isApproved === "null" || query.isApproved === null) options.isApproved = null;
++  }
++  if (query.limit) {
++    const lim = parseInt(query.limit, 10);
++    if (!isNaN(lim) && lim > 0) options.limit = Math.min(lim, 100);
++  }
++  if (query.offset) {
++    const off = parseInt(query.offset, 10);
++    if (!isNaN(off) && off >= 0) options.offset = off;
++  }
++  return options;
++}
++
++/**
++ * Creates an audit log record for incentive adjustments and side effects.
++ */
++export function createReviewEffectAuditEntry(
++  reviewId: string,
++  itemId: string,
++  userId: string,
++  isApproved: boolean,
++  prevStatus: boolean | null,
++  incentiveDelta: number,
++  balance: number,
++  reviewerId: string
++): ReviewSideEffectAuditRecord {
++  return {
++    auditId: `rev_effect_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
++    reviewId,
++    itemId,
++    userId,
++    isApproved,
++    previousApprovalStatus: prevStatus,
++    incentiveDelta,
++    resultingBalance: balance,
++    reviewerId,
++    timestamp: new Date().toISOString(),
++  };
++}
++
++/**
++ * Computes statistical metrics across a list of review side effect executions.
++ */
++export function computeIncentiveMetrics(
++  results: ReviewEffectResult[]
++): ReviewIncentiveMetrics {
++  const recipients = new Set<string>();
++  let totalAwards = 0;
++  let totalPoints = 0;
++
++  for (const r of results) {
++    if (r.incentive_awarded > 0) {
++      totalAwards++;
++      totalPoints += r.incentive_awarded;
++      recipients.add(r.user_id);
++    }
++  }
++
++  const avg =
++    totalAwards > 0 ? Math.round((totalPoints / totalAwards) * 100) / 100 : 0;
++
++  return {
++    totalAwardsDistributed: totalAwards,
++    totalPointsValue: totalPoints,
++    distinctRecipients: recipients.size,
++    averageRewardPerApprovedReview: avg,
++  };
++}
++
++export function parseReviewQueryCriteria(query: any): CandidateItemReviewQueryCriteria {
++  const criteria: CandidateItemReviewQueryCriteria = {};
++  if (query.minRating) {
++    const min = parseFloat(query.minRating);
++    if (!isNaN(min)) criteria.minRating = min;
++  }
++  if (query.maxRating) {
++    const max = parseFloat(query.maxRating);
++    if (!isNaN(max)) criteria.maxRating = max;
++  }
++  if (query.hasMediaOnly === "true" || query.hasMediaOnly === true) {
++    criteria.hasMediaOnly = true;
++  }
++  return criteria;
++}

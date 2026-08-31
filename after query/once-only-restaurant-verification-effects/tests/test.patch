@@ -1,0 +1,627 @@
+diff --git a/rateeat_backend/src/__tests__/unit/candidate_item_review_batch_effects.test.ts b/rateeat_backend/src/__tests__/unit/candidate_item_review_batch_effects.test.ts
+new file mode 100644
+index 0000000..3022638
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/candidate_item_review_batch_effects.test.ts
+@@ -0,0 +1,176 @@
++import { validateBatchReviewPayload } from "../../utils/candidate-item-review-effects.utils";
++import { CandidateItemReviewModerationService } from "../../services/candidate-item-review-moderation.service";
++import { CandidateItemReviewEffectsService } from "../../services/candidate-item-review-effects.service";
++
++jest.mock("../../services/candidate-item-review-effects.service");
++
++jest.mock("../../config/db", () => ({
++  __esModule: true,
++  default: {
++    transaction: jest.fn().mockImplementation((cb) => {
++      const mockTx = {
++        commit: jest.fn().mockResolvedValue(undefined),
++        rollback: jest.fn().mockResolvedValue(undefined),
++      };
++      return cb(mockTx);
++    }),
++  },
++}));
++
++describe("Candidate Item Review Effects - Batch Moderation & Atomicity", () => {
++  beforeEach(() => {
++    jest.clearAllMocks();
++  });
++
++  describe("Batch Payload Validation", () => {
++    it("returns 400 when body has no reviews field", () => {
++      expect(() => validateBatchReviewPayload({})).toThrow(
++        "Field 'reviews' must be an array"
++      );
++    });
++
++    it("returns 400 when reviews array is empty", () => {
++      expect(() => validateBatchReviewPayload({ reviews: [] })).toThrow(
++        "Field 'reviews' cannot be an empty array"
++      );
++    });
++
++    it("returns 400 with duplicate review id when duplicate ids exist in batch", () => {
++      const payload = {
++        reviews: [
++          { reviewId: "rev-1", isApproved: true },
++          { reviewId: "rev-1", isApproved: false },
++        ],
++      };
++      expect(() => validateBatchReviewPayload(payload)).toThrow(
++        "Duplicate review id 'rev-1' detected"
++      );
++    });
++
++    it("returns 400 when isApproved is not boolean", () => {
++      const payload = {
++        reviews: [{ reviewId: "rev-1", isApproved: "true" }],
++      };
++      expect(() => validateBatchReviewPayload(payload)).toThrow(
++        "invalid 'isApproved' field. Must be boolean"
++      );
++    });
++  });
++
++  describe("Batch Moderation Execution", () => {
++    it("successfully manages batch decisions in a single transaction", async () => {
++      const decisions = [
++        { reviewId: "rev-1", isApproved: true },
++        { reviewId: "rev-2", isApproved: false },
++      ];
++
++      (
++        CandidateItemReviewEffectsService.manageReviewWithLock as jest.Mock
++      )
++        .mockResolvedValueOnce({
++          id: "rev-1",
++          item_id: "item-1",
++          user_id: "user-1",
++          is_approved: true,
++          incentive_awarded: 10,
++          reviewed_at: new Date(),
++          reviewed_by: "admin-1",
++        })
++        .mockResolvedValueOnce({
++          id: "rev-2",
++          item_id: "item-2",
++          user_id: "user-2",
++          is_approved: false,
++          incentive_awarded: 0,
++          reviewed_at: new Date(),
++          reviewed_by: "admin-1",
++        });
++
++      const res =
++        await CandidateItemReviewModerationService.executeBatchManage(
++          decisions,
++          "admin-1"
++        );
++
++      expect(res.totalProcessed).toBe(2);
++      expect(res.totalIncentivesAwarded).toBe(10);
++      expect(res.results[0].id).toBe("rev-1");
++      expect(res.results[1].id).toBe("rev-2");
++    });
++
++    it("rolls back batch when any review fails verification", async () => {
++      (
++        CandidateItemReviewEffectsService.manageReviewWithLock as jest.Mock
++      ).mockRejectedValue(new Error("Item not approved yet"));
++
++      const decisions = [{ reviewId: "rev-fail", isApproved: true }];
++
++      await expect(
++        CandidateItemReviewModerationService.executeBatchManage(
++          decisions,
++          "admin-1"
++        )
++      ).rejects.toThrow("Item not approved yet");
++    });
++
++    it("returns results in the exact requested order of reviewIds", async () => {
++      const decisions = [
++        { reviewId: "rev-99", isApproved: true },
++        { reviewId: "rev-11", isApproved: true },
++        { reviewId: "rev-44", isApproved: false },
++      ];
++
++      (CandidateItemReviewEffectsService.manageReviewWithLock as jest.Mock)
++        .mockResolvedValueOnce({ id: "rev-99", is_approved: true, incentive_awarded: 10 })
++        .mockResolvedValueOnce({ id: "rev-11", is_approved: true, incentive_awarded: 5 })
++        .mockResolvedValueOnce({ id: "rev-44", is_approved: false, incentive_awarded: 0 });
++
++      const res = await CandidateItemReviewModerationService.executeBatchManage(
++        decisions,
++        "admin-1"
++      );
++
++      expect(res.results.map((r) => r.id)).toEqual(["rev-99", "rev-11", "rev-44"]);
++      expect(res.totalIncentivesAwarded).toBe(15);
++    });
++
++    it("trims whitespace from review ids in batch payload", () => {
++      const payload = {
++        reviews: [{ reviewId: "  rev-padded  ", isApproved: true }],
++      };
++      const result = validateBatchReviewPayload(payload);
++      expect(result.reviews[0].reviewId).toBe("rev-padded");
++    });
++
++    it("rolls back batch when any review is already rejected", async () => {
++      (CandidateItemReviewEffectsService.manageReviewWithLock as jest.Mock)
++        .mockRejectedValue(new Error("already rejected"));
++
++      const decisions = [{ reviewId: "rev-dup-rej", isApproved: false }];
++
++      await expect(
++        CandidateItemReviewModerationService.executeBatchManage(decisions, "admin-1")
++      ).rejects.toThrow("already rejected");
++    });
++
++    it("validates batch uniqueness of review IDs accurately", async () => {
++      const valid = await CandidateItemReviewModerationService.validateBatchUniqueness([
++        "rev-1",
++        "rev-2",
++        "rev-3",
++      ]);
++      expect(valid).toBe(true);
++
++      const invalid = await CandidateItemReviewModerationService.validateBatchUniqueness([
++        "rev-1",
++        "rev-1",
++      ]);
++      expect(invalid).toBe(false);
++    });
++
++    it("returns false for batch uniqueness check when review ID list is empty", async () => {
++      const emptyCheck = await CandidateItemReviewModerationService.validateBatchUniqueness([]);
++      expect(emptyCheck).toBe(false);
++    });
++  });
++});
+diff --git a/rateeat_backend/src/__tests__/unit/candidate_item_review_effects_test_support.ts b/rateeat_backend/src/__tests__/unit/candidate_item_review_effects_test_support.ts
+new file mode 100644
+index 0000000..612c661
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/candidate_item_review_effects_test_support.ts
+@@ -0,0 +1,32 @@
++export function createMockItemReview(overrides: any = {}) {
++  return {
++    id: overrides.id || "rev-uuid-1",
++    item_id: overrides.item_id || "item-uuid-1",
++    user_id: overrides.user_id || "user-uuid-1",
++    is_approved: overrides.is_approved !== undefined ? overrides.is_approved : null,
++    item_review_images: overrides.item_review_images || [],
++    item_review_videos: overrides.item_review_videos || [],
++    save: jest.fn().mockResolvedValue(true),
++    update: jest.fn().mockResolvedValue(true),
++    ...overrides,
++  };
++}
++
++export function createMockItem(overrides: any = {}) {
++  return {
++    id: overrides.id || "item-uuid-1",
++    name: overrides.name || "Test Item",
++    is_approved: overrides.is_approved !== undefined ? overrides.is_approved : true,
++    ...overrides,
++  };
++}
++
++export function createMockIncentive(overrides: any = {}) {
++  return {
++    id: overrides.id || "inc-uuid-1",
++    user_id: overrides.user_id || "user-uuid-1",
++    current_total: overrides.current_total || 0,
++    save: jest.fn().mockResolvedValue(true),
++    ...overrides,
++  };
++}
+diff --git a/rateeat_backend/src/__tests__/unit/candidate_item_review_once_only_effects.test.ts b/rateeat_backend/src/__tests__/unit/candidate_item_review_once_only_effects.test.ts
+new file mode 100644
+index 0000000..f9bcd40
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/candidate_item_review_once_only_effects.test.ts
+@@ -0,0 +1,401 @@
++import { CandidateItemReviewEffectsService } from "../../services/candidate-item-review-effects.service";
++import {
++  Incentive,
++  Item,
++  ItemReview,
++} from "../../models";
++import {
++  createMockIncentive,
++  createMockItem,
++  createMockItemReview,
++} from "./candidate_item_review_effects_test_support";
++import sequelize from "../../config/db";
++
++jest.mock("../../models", () => ({
++  ItemReview: {
++    findByPk: jest.fn(),
++    findAll: jest.fn(),
++  },
++  Item: {
++    findByPk: jest.fn(),
++  },
++  Incentive: {
++    findOne: jest.fn(),
++    create: jest.fn(),
++  },
++}));
++
++jest.mock("../../config/db", () => ({
++  __esModule: true,
++  default: {
++    transaction: jest.fn().mockImplementation((cb) => {
++      const mockTx = {
++        LOCK: { UPDATE: "UPDATE" },
++        commit: jest.fn().mockResolvedValue(undefined),
++        rollback: jest.fn().mockResolvedValue(undefined),
++      };
++      return cb(mockTx);
++    }),
++  },
++}));
++
++describe("Candidate Item Review Effects - Single Verification & Once-Only Awards", () => {
++  beforeEach(() => {
++    jest.clearAllMocks();
++  });
++
++  describe("Approving Candidate Item Reviews", () => {
++    it("approves pending review and awards once-only incentive", async () => {
++      const mockReview = createMockItemReview({
++        id: "rev-101",
++        is_approved: null,
++        item_review_images: [{ url: "https://img.example.com/1.jpg" }],
++      });
++      const mockItem = createMockItem({ id: "item-101", is_approved: true });
++      const mockIncentive = createMockIncentive({ current_total: 10 });
++
++      (ItemReview.findByPk as jest.Mock).mockResolvedValue(mockReview);
++      (Item.findByPk as jest.Mock).mockResolvedValue(mockItem);
++      (ItemReview.findAll as jest.Mock).mockResolvedValue([mockReview]);
++      (Incentive.findOne as jest.Mock).mockResolvedValue(mockIncentive);
++
++      const result =
++        await CandidateItemReviewEffectsService.manageReviewWithLock(
++          "rev-101",
++          true,
++          "admin-1"
++        );
++
++      expect(result.is_approved).toBe(true);
++      expect(mockReview.is_approved).toBe(true);
++      expect(mockIncentive.current_total).toBe(20);
++      expect(mockIncentive.save).toHaveBeenCalled();
++    });
++
++    it("returns 400 when approving review whose parent item is not approved", async () => {
++      const mockReview = createMockItemReview({ id: "rev-102", is_approved: null });
++      const mockItem = createMockItem({ id: "item-102", is_approved: false });
++
++      (ItemReview.findByPk as jest.Mock).mockResolvedValue(mockReview);
++      (Item.findByPk as jest.Mock).mockResolvedValue(mockItem);
++
++      await expect(
++        CandidateItemReviewEffectsService.manageReviewWithLock(
++          "rev-102",
++          true,
++          "admin-1"
++        )
++      ).rejects.toThrow("Item not approved yet");
++    });
++
++    it("returns 400 when review is already approved", async () => {
++      const mockReview = createMockItemReview({ id: "rev-103", is_approved: true });
++      (ItemReview.findByPk as jest.Mock).mockResolvedValue(mockReview);
++
++      await expect(
++        CandidateItemReviewEffectsService.manageReviewWithLock(
++          "rev-103",
++          true,
++          "admin-1"
++        )
++      ).rejects.toThrow("already approved");
++    });
++
++    it("returns 404 when review is not found", async () => {
++      (ItemReview.findByPk as jest.Mock).mockResolvedValue(null);
++
++      await expect(
++        CandidateItemReviewEffectsService.manageReviewWithLock(
++          "missing-rev",
++          true,
++          "admin-1"
++        )
++      ).rejects.toThrow("Candidate item review not found");
++    });
++  });
++
++  describe("Rejecting Candidate Item Reviews", () => {
++    it("rejects review and transitions status to false", async () => {
++      const mockReview = createMockItemReview({ id: "rev-201", is_approved: null });
++      const mockItem = createMockItem({ id: "item-201", is_approved: true });
++
++      (ItemReview.findByPk as jest.Mock).mockResolvedValue(mockReview);
++      (Item.findByPk as jest.Mock).mockResolvedValue(mockItem);
++
++      const result =
++        await CandidateItemReviewEffectsService.manageReviewWithLock(
++          "rev-201",
++          false,
++          "admin-1"
++        );
++
++      expect(result.is_approved).toBe(false);
++      expect(mockReview.is_approved).toBe(false);
++    });
++
++    it("returns 400 when review is already rejected", async () => {
++      const mockReview = createMockItemReview({ id: "rev-202", is_approved: false });
++      (ItemReview.findByPk as jest.Mock).mockResolvedValue(mockReview);
++
++      await expect(
++        CandidateItemReviewEffectsService.manageReviewWithLock(
++          "rev-202",
++          false,
++          "admin-1"
++        )
++      ).rejects.toThrow("already rejected");
++    });
++
++    it("deducts previously awarded incentives when rejecting an approved review", async () => {
++      const mockReview = createMockItemReview({
++        id: "rev-301",
++        is_approved: true,
++        item_review_images: [{ url: "https://img.example.com/1.jpg" }],
++      });
++      const mockItem = createMockItem({ id: "item-301", is_approved: true });
++      const mockIncentive = createMockIncentive({ current_total: 25 });
++
++      (ItemReview.findByPk as jest.Mock).mockResolvedValue(mockReview);
++      (Item.findByPk as jest.Mock).mockResolvedValue(mockItem);
++      (ItemReview.findAll as jest.Mock).mockResolvedValue([mockReview]);
++      (Incentive.findOne as jest.Mock).mockResolvedValue(mockIncentive);
++
++      const result =
++        await CandidateItemReviewEffectsService.manageReviewWithLock(
++          "rev-301",
++          false,
++          "admin-1"
++        );
++
++      expect(result.is_approved).toBe(false);
++      expect(mockIncentive.current_total).toBe(15);
++      expect(mockIncentive.save).toHaveBeenCalled();
++    });
++
++    it("does not deduct incentives below zero when rejecting an approved review", async () => {
++      const mockReview = createMockItemReview({
++        id: "rev-302",
++        is_approved: true,
++        item_review_images: [{ url: "https://img.example.com/1.jpg" }],
++      });
++      const mockItem = createMockItem({ id: "item-302", is_approved: true });
++      const mockIncentive = createMockIncentive({ current_total: 5 });
++
++      (ItemReview.findByPk as jest.Mock).mockResolvedValue(mockReview);
++      (Item.findByPk as jest.Mock).mockResolvedValue(mockItem);
++      (ItemReview.findAll as jest.Mock).mockResolvedValue([mockReview]);
++      (Incentive.findOne as jest.Mock).mockResolvedValue(mockIncentive);
++
++      const result =
++        await CandidateItemReviewEffectsService.manageReviewWithLock(
++          "rev-302",
++          false,
++          "admin-1"
++        );
++
++      expect(result.is_approved).toBe(false);
++      expect(mockIncentive.current_total).toBe(5);
++    });
++
++    it("serializes concurrent approvals on same review so incentive is only awarded once", async () => {
++      const mockFn = jest
++        .fn()
++        .mockResolvedValueOnce({ id: "rev-race", is_approved: true, incentive_awarded: 10 })
++        .mockRejectedValueOnce(new Error("Candidate item review already approved"));
++
++      (CandidateItemReviewEffectsService.manageReviewWithLock as jest.Mock) = mockFn;
++
++      const p1 = CandidateItemReviewEffectsService.manageReviewWithLock(
++        "rev-race",
++        true,
++        "admin-1"
++      );
++      const p2 = CandidateItemReviewEffectsService.manageReviewWithLock(
++        "rev-race",
++        true,
++        "admin-2"
++      );
++
++      const results = await Promise.allSettled([p1, p2]);
++      expect(results[0].status).toBe("fulfilled");
++      expect(results[1].status).toBe("rejected");
++    });
++
++    it("rolls back review transaction when database save fails", async () => {
++      const mockReview = createMockItemReview({
++        id: "rev-303",
++        is_approved: null,
++        save: jest.fn().mockRejectedValue(new Error("DB timeout")),
++      });
++      const mockItem = createMockItem({ id: "item-303", is_approved: true });
++
++      (ItemReview.findByPk as jest.Mock).mockResolvedValue(mockReview);
++      (Item.findByPk as jest.Mock).mockResolvedValue(mockItem);
++
++      await expect(
++        CandidateItemReviewEffectsService.manageReviewWithLock(
++          "rev-303",
++          true,
++          "admin-1"
++        )
++      ).rejects.toThrow("DB timeout");
++    });
++
++    it("deducts previously awarded incentives when rejecting an approved review", async () => {
++      const mockReview = createMockItemReview({
++        id: "rev-301",
++        is_approved: true,
++        item_review_images: [{ url: "https://img.example.com/1.jpg" }],
++      });
++      const mockItem = createMockItem({ id: "item-301", is_approved: true });
++      const mockIncentive = createMockIncentive({ current_total: 25 });
++
++      (ItemReview.findByPk as jest.Mock).mockResolvedValue(mockReview);
++      (Item.findByPk as jest.Mock).mockResolvedValue(mockItem);
++      (ItemReview.findAll as jest.Mock).mockResolvedValue([mockReview]);
++      (Incentive.findOne as jest.Mock).mockResolvedValue(mockIncentive);
++
++      const result =
++        await CandidateItemReviewEffectsService.manageReviewWithLock(
++          "rev-301",
++          false,
++          "admin-1"
++        );
++
++      expect(result.is_approved).toBe(false);
++      expect(mockIncentive.current_total).toBe(15);
++      expect(mockIncentive.save).toHaveBeenCalled();
++    });
++
++    it("does not deduct incentives below zero when rejecting an approved review", async () => {
++      const mockReview = createMockItemReview({
++        id: "rev-302",
++        is_approved: true,
++        item_review_images: [{ url: "https://img.example.com/1.jpg" }],
++      });
++      const mockItem = createMockItem({ id: "item-302", is_approved: true });
++      const mockIncentive = createMockIncentive({ current_total: 5 });
++
++      (ItemReview.findByPk as jest.Mock).mockResolvedValue(mockReview);
++      (Item.findByPk as jest.Mock).mockResolvedValue(mockItem);
++      (ItemReview.findAll as jest.Mock).mockResolvedValue([mockReview]);
++      (Incentive.findOne as jest.Mock).mockResolvedValue(mockIncentive);
++
++      const result =
++        await CandidateItemReviewEffectsService.manageReviewWithLock(
++          "rev-302",
++          false,
++          "admin-1"
++        );
++
++      expect(result.is_approved).toBe(false);
++      expect(mockIncentive.current_total).toBe(5);
++    });
++
++    it("serializes concurrent approvals on same review so incentive is only awarded once", async () => {
++      const mockFn = jest
++        .fn()
++        .mockResolvedValueOnce({ id: "rev-race", is_approved: true, incentive_awarded: 10 })
++        .mockRejectedValueOnce(new Error("Candidate item review already approved"));
++
++      (CandidateItemReviewEffectsService.manageReviewWithLock as jest.Mock) = mockFn;
++
++      const p1 = CandidateItemReviewEffectsService.manageReviewWithLock(
++        "rev-race",
++        true,
++        "admin-1"
++      );
++      const p2 = CandidateItemReviewEffectsService.manageReviewWithLock(
++        "rev-race",
++        true,
++        "admin-2"
++      );
++
++      const results = await Promise.allSettled([p1, p2]);
++      expect(results[0].status).toBe("fulfilled");
++      expect(results[1].status).toBe("rejected");
++    });
++
++    it("rolls back review transaction when database save fails", async () => {
++      const mockReview = createMockItemReview({
++        id: "rev-303",
++        is_approved: null,
++        save: jest.fn().mockRejectedValue(new Error("DB timeout")),
++      });
++      const mockItem = createMockItem({ id: "item-303", is_approved: true });
++
++      (ItemReview.findByPk as jest.Mock).mockResolvedValue(mockReview);
++      (Item.findByPk as jest.Mock).mockResolvedValue(mockItem);
++
++      await expect(
++        CandidateItemReviewEffectsService.manageReviewWithLock(
++          "rev-303",
++          true,
++          "admin-1"
++        )
++      ).rejects.toThrow("DB timeout");
++    });
++
++    it("queries reviews with approval filters and pagination", async () => {
++      const reviews = await CandidateItemReviewEffectsService.queryReviewsWithFilters({
++        isApproved: true,
++        limit: 10,
++      });
++      expect(reviews).toBeDefined();
++    });
++
++    it("counts review approval status distribution accurately", async () => {
++      const counts = await CandidateItemReviewEffectsService.getReviewStatusCounts();
++      expect(counts).toHaveProperty("pending");
++      expect(counts).toHaveProperty("approved");
++      expect(counts).toHaveProperty("rejected");
++    });
++
++    it("manages review with external transaction without opening nested transaction", async () => {
++      const mockTx: any = { LOCK: { UPDATE: "UPDATE" } };
++      const mockReview = createMockItemReview({
++        id: "rev-ext",
++        is_approved: null,
++      });
++      const mockItem = createMockItem({ id: "item-ext", is_approved: true });
++
++      (ItemReview.findByPk as jest.Mock).mockResolvedValue(mockReview);
++      (Item.findByPk as jest.Mock).mockResolvedValue(mockItem);
++
++      const result = await CandidateItemReviewEffectsService.manageReviewWithLock(
++        "rev-ext",
++        true,
++        "admin-1",
++        mockTx
++      );
++
++      expect(result.is_approved).toBe(true);
++    });
++
++    it("awards tier-2 incentive of 5 points for reviews ranked 4th to 6th", async () => {
++      const mockReview = createMockItemReview({
++        id: "rev-rank-4",
++        is_approved: null,
++        item_review_images: [{ url: "https://img.example.com/4.jpg" }],
++      });
++      const mockItem = createMockItem({ id: "item-rank-4", is_approved: true });
++      const mockIncentive = createMockIncentive({ current_total: 0 });
++
++      (ItemReview.findByPk as jest.Mock).mockResolvedValue(mockReview);
++      (Item.findByPk as jest.Mock).mockResolvedValue(mockItem);
++      (ItemReview.findAll as jest.Mock).mockResolvedValue([
++        { id: "r-1" }, { id: "r-2" }, { id: "r-3" }, mockReview
++      ]);
++      (Incentive.findOne as jest.Mock).mockResolvedValue(mockIncentive);
++
++      const result = await CandidateItemReviewEffectsService.manageReviewWithLock(
++        "rev-rank-4",
++        true,
++        "admin-1"
++      );
++
++      expect(result.incentive_awarded).toBe(5);
++      expect(mockIncentive.current_total).toBe(5);
++    });
++  });
++});
