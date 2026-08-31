@@ -51,7 +51,7 @@ CTRF_REPORTER="$(
   '
 )"
 
-cat > /tmp/rateeat-claim-verifier-jest.config.cjs <<'JEST_CONFIG'
+cat > /tmp/rateeat-verifier-jest.config.cjs <<'JEST_CONFIG'
 module.exports = {
   rootDir: "/app/rateeat_backend",
   testEnvironment: "node",
@@ -99,7 +99,7 @@ rm -rf ctrf
 
 timeout --kill-after=10s 300s \
   "$JEST_BIN" \
-  --config /tmp/rateeat-claim-verifier-jest.config.cjs \
+  --config /tmp/rateeat-verifier-jest.config.cjs \
   --no-cache \
   --runInBand \
   --forceExit \
@@ -117,7 +117,7 @@ rm -rf ctrf
 
 timeout --kill-after=10s 300s \
   "$JEST_BIN" \
-  --config /tmp/rateeat-claim-verifier-jest.config.cjs \
+  --config /tmp/rateeat-verifier-jest.config.cjs \
   --no-cache \
   --runInBand \
   --forceExit \
