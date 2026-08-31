@@ -2,12 +2,12 @@ schema_version = "1.1"
 artifacts = ["/logs/artifacts/model.patch"]
 
 [task]
-name = "afterquery/race-safe-restaurant-verification-review"
+name = "afterquery/deterministic-restaurant-verification-outcomes"
 
 [metadata]
-task_id = "race-safe-restaurant-verification-review"
-display_title = "Race-Safe Restaurant Verification Review"
-display_description = "Make candidate restaurant verification reviews behave correctly when multiple admins act on the same restaurant concurrently with deterministic batch processing."
+task_id = "deterministic-restaurant-verification-outcomes"
+display_title = "Deterministic Restaurant Verification Outcomes"
+display_description = "Ensure restaurant claim verification workflow produces deterministic outcomes, strict terminal state transitions, and atomic batch review."
 category = "feature_request"
 language = "typescript"
 repository_url = "https://github.com/dawit2119/Rate_eat"

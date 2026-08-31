@@ -1,0 +1,580 @@
+diff --git a/rateeat_backend/src/controllers/candidate_restaurant.controller.ts b/rateeat_backend/src/controllers/candidate_restaurant.controller.ts
+index 6855d94..842f7e6 100644
+--- a/rateeat_backend/src/controllers/candidate_restaurant.controller.ts
++++ b/rateeat_backend/src/controllers/candidate_restaurant.controller.ts
+@@ -1,5 +1,8 @@
+ import { NextFunction, Request, Response } from "express";
+ import { FileRequest } from "../middlewares/upload-image";
++import { CandidateRestaurantWorkflowService } from "../services/candidate-restaurant-workflow.service";
++import { CandidateRestaurantConflictService } from "../services/candidate-restaurant-conflict.service";
++import { validateBatchCandidatePayload } from "../utils/candidate-restaurant-workflow.utils";
+ import {
+   AdminUser,
+   CandidateRestaurantPhoneNumber,
+diff --git a/rateeat_backend/src/services/candidate-restaurant-conflict.service.ts b/rateeat_backend/src/services/candidate-restaurant-conflict.service.ts
+new file mode 100644
+index 0000000..4074338
+--- /dev/null
++++ b/rateeat_backend/src/services/candidate-restaurant-conflict.service.ts
+@@ -0,0 +1,63 @@
++import sequelize from "../config/db";
++import {
++  BatchCandidateReviewItem,
++  BatchCandidateReviewResponse,
++  CandidateReviewResult,
++  CandidateVerificationAction,
++} from "../types/candidate-restaurant-workflow.types";
++import { CandidateRestaurantWorkflowService } from "./candidate-restaurant-workflow.service";
++
++export class CandidateRestaurantConflictService {
++  /**
++   * Executes multiple candidate restaurant reviews atomically in a single transaction.
++   */
++  public static async executeBatchReview(
++    items: BatchCandidateReviewItem[],
++    reviewerId: string
++  ): Promise<BatchCandidateReviewResponse> {
++    return sequelize.transaction(async (tx) => {
++      const results: CandidateReviewResult[] = [];
++      let approvedCount = 0;
++      let rejectedCount = 0;
++
++      for (const item of items) {
++        const result =
++          await CandidateRestaurantWorkflowService.verifyCandidateWithLock(
++            item.candidateRestaurantId,
++            item.action,
++            reviewerId,
++            item.rejectionReason,
++            tx
++          );
++
++        results.push(result);
++        if (
++          item.action === CandidateVerificationAction.Approve ||
++          item.action === "approve"
++        ) {
++          approvedCount++;
++        } else {
++          rejectedCount++;
++        }
++      }
++
++      return {
++        totalReviewed: results.length,
++        approvedCount,
++        rejectedCount,
++        results,
++      };
++    });
++  }
++
++  /**
++   * Validates that batch review candidate identifiers are distinct.
++   */
++  public static async validateBatchDistinctness(
++    candidateIds: string[]
++  ): Promise<boolean> {
++    if (!candidateIds || candidateIds.length === 0) return false;
++    const set = new Set(candidateIds.map((c) => c.trim()));
++    return set.size === candidateIds.length;
++  }
++}
+diff --git a/rateeat_backend/src/services/candidate-restaurant-workflow.service.ts b/rateeat_backend/src/services/candidate-restaurant-workflow.service.ts
+new file mode 100644
+index 0000000..82afa43
+--- /dev/null
++++ b/rateeat_backend/src/services/candidate-restaurant-workflow.service.ts
+@@ -0,0 +1,193 @@
++import { Transaction } from "sequelize";
++import sequelize from "../config/db";
++import {
++  AdminUser,
++  CandidateRestaurant,
++  CandidateRestaurantImage,
++  CandidateRestaurantVideo,
++  Notification,
++  Restaurant,
++  RestaurantMedia,
++} from "../models";
++import { NotificationCategory } from "../models/Feedback/Notification";
++import {
++  ConflictError,
++  NotFoundError,
++} from "../utils/error-response.utils";
++import {
++  CandidateReviewResult,
++  CandidateVerificationAction,
++  CandidateWorkflowFilterOptions,
++} from "../types/candidate-restaurant-workflow.types";
++import { createCandidateAuditEntry } from "../utils/candidate-restaurant-workflow.utils";
++
++export class CandidateRestaurantWorkflowService {
++  /**
++   * Evaluates and updates a single candidate restaurant atomically under a row lock.
++   */
++  public static async verifyCandidateWithLock(
++    candidateId: string,
++    action: CandidateVerificationAction | "approve" | "reject",
++    reviewerId: string,
++    rejectionReason?: string,
++    externalTransaction?: Transaction
++  ): Promise<CandidateReviewResult> {
++    const executeReview = async (tx: Transaction) => {
++      const candidate = await CandidateRestaurant.findByPk(candidateId, {
++        include: [
++          { model: CandidateRestaurantImage, as: "candidate_restaurant_images" },
++          { model: CandidateRestaurantVideo, as: "candidate_restaurant_videos" },
++        ],
++        transaction: tx,
++        lock: tx.LOCK.UPDATE,
++      });
++
++      if (!candidate) {
++        throw new NotFoundError("Candidate restaurant not found");
++      }
++
++      const initialStatus = candidate.is_approved;
++
++      if (candidate.is_approved === true) {
++        throw new ConflictError(
++          `Candidate restaurant '${candidateId}' is already approved`
++        );
++      }
++
++      if (candidate.is_approved === false) {
++        throw new ConflictError(
++          `Candidate restaurant '${candidateId}' is already rejected`
++        );
++      }
++
++      const now = new Date();
++
++      if (action === CandidateVerificationAction.Approve || action === "approve") {
++        candidate.is_approved = true;
++        await candidate.save({ transaction: tx });
++
++        const createdRestaurant = await Restaurant.create(
++          {
++            name: candidate.name,
++            address: (candidate as any).address || null,
++            phone_number: (candidate as any).phone_number || null,
++            description: (candidate as any).description || null,
++            is_active: true,
++          },
++          { transaction: tx }
++        );
++
++        if ((candidate as any).candidate_restaurant_images) {
++          for (const img of (candidate as any).candidate_restaurant_images) {
++            await RestaurantMedia.create(
++              {
++                restaurant_id: createdRestaurant.id,
++                url: img.url,
++                media_type: "image",
++              },
++              { transaction: tx }
++            );
++          }
++        }
++
++        const superAdmins = await AdminUser.findAll({
++          where: { is_super_admin: true },
++          transaction: tx,
++        });
++
++        for (const admin of superAdmins) {
++          await Notification.create(
++            {
++              user_id: admin.id,
++              category: NotificationCategory.RestaurantClaim,
++              title: "Candidate Restaurant Approved",
++              message: `Candidate restaurant '${candidate.name}' approved and restaurant '${createdRestaurant.id}' created.`,
++            },
++            { transaction: tx }
++          );
++        }
++
++        createCandidateAuditEntry(
++          candidate.id,
++          candidate.name,
++          CandidateVerificationAction.Approve,
++          initialStatus,
++          true,
++          createdRestaurant.id,
++          reviewerId
++        );
++
++        return {
++          id: candidate.id,
++          name: candidate.name,
++          is_approved: true,
++          reviewed_by: reviewerId,
++          reviewed_at: now,
++          created_restaurant_id: createdRestaurant.id,
++          rejection_reason: null,
++        };
++      } else {
++        candidate.is_approved = false;
++        if (rejectionReason) {
++          (candidate as any).rejection_reason = rejectionReason;
++        }
++        await candidate.save({ transaction: tx });
++
++        createCandidateAuditEntry(
++          candidate.id,
++          candidate.name,
++          CandidateVerificationAction.Reject,
++          initialStatus,
++          false,
++          null,
++          reviewerId
++        );
++
++        return {
++          id: candidate.id,
++          name: candidate.name,
++          is_approved: false,
++          reviewed_by: reviewerId,
++          reviewed_at: now,
++          created_restaurant_id: null,
++          rejection_reason: rejectionReason || null,
++        };
++      }
++    };
++
++    if (externalTransaction) {
++      return executeReview(externalTransaction);
++    } else {
++      return sequelize.transaction(async (tx) => executeReview(tx));
++    }
++  }
++
++  /**
++   * Retrieves pending candidate restaurants.
++   */
++  public static async getPendingCandidates(
++    filters: CandidateWorkflowFilterOptions = {}
++  ): Promise<any[]> {
++    const where: any = { is_approved: null };
++    return CandidateRestaurant.findAll({
++      where,
++      limit: filters.limit || 50,
++      offset: filters.offset || 0,
++      order: [["createdAt", "ASC"]],
++    });
++  }
++
++  /**
++   * Counts candidate restaurants by approval status.
++   */
++  public static async getCandidateStatusCounts(): Promise<{
++    pending: number;
++    approved: number;
++    rejected: number;
++  }> {
++    const pending = await CandidateRestaurant.count({ where: { is_approved: null } });
++    const approved = await CandidateRestaurant.count({ where: { is_approved: true } });
++    const rejected = await CandidateRestaurant.count({ where: { is_approved: false } });
++    return { pending, approved, rejected };
++  }
++}
+diff --git a/rateeat_backend/src/types/candidate-restaurant-workflow.types.ts b/rateeat_backend/src/types/candidate-restaurant-workflow.types.ts
+new file mode 100644
+index 0000000..3163cbf
+--- /dev/null
++++ b/rateeat_backend/src/types/candidate-restaurant-workflow.types.ts
+@@ -0,0 +1,103 @@
++/**
++ * Action type for candidate restaurant review.
++ */
++export enum CandidateVerificationAction {
++  Approve = "approve",
++  Reject = "reject",
++}
++
++/**
++ * Valid approval states for candidate restaurants.
++ */
++export enum CandidateApprovalState {
++  Pending = "Pending",
++  Approved = "Approved",
++  Rejected = "Rejected",
++}
++
++/**
++ * Item inside the batch review payload for candidate restaurants.
++ */
++export interface BatchCandidateReviewItem {
++  candidateRestaurantId: string;
++  action: CandidateVerificationAction | "approve" | "reject";
++  rejectionReason?: string;
++}
++
++/**
++ * Payload structure for PUT /api/v1/candidate-restaurants/batch-review.
++ */
++export interface BatchCandidateReviewPayload {
++  reviews: BatchCandidateReviewItem[];
++}
++
++/**
++ * Output format for an individual candidate restaurant review.
++ */
++export interface CandidateReviewResult {
++  id: string;
++  name: string;
++  is_approved: boolean | null;
++  reviewed_by: string;
++  reviewed_at: Date;
++  created_restaurant_id?: string | null;
++  rejection_reason?: string | null;
++}
++
++/**
++ * Batch review response schema.
++ */
++export interface BatchCandidateReviewResponse {
++  totalReviewed: number;
++  approvedCount: number;
++  rejectedCount: number;
++  results: CandidateReviewResult[];
++}
++
++/**
++ * Audit log entry for candidate review transitions.
++ */
++export interface CandidateReviewAuditRecord {
++  auditId: string;
++  candidateRestaurantId: string;
++  restaurantName: string;
++  action: CandidateVerificationAction;
++  previousApprovalState: boolean | null;
++  newApprovalState: boolean;
++  createdRestaurantId?: string | null;
++  reviewerId: string;
++  timestamp: string;
++}
++
++/**
++ * Query filter options for candidate restaurant reviews.
++ */
++export interface CandidateWorkflowFilterOptions {
++  status?: string;
++  adminId?: string;
++  limit?: number;
++  offset?: number;
++  createdAfter?: Date;
++  createdBefore?: Date;
++}
++
++/**
++ * Aggregated statistics for candidate restaurant reviews.
++ */
++export interface CandidateWorkflowStatistics {
++  totalPending: number;
++  totalApproved: number;
++  totalRejected: number;
++  conversionRatePercentage: number;
++}
++
++/**
++ * Detailed candidate restaurant notification payload.
++ */
++export interface CandidateNotificationEvent {
++  eventId: string;
++  candidateId: string;
++  adminRecipientIds: string[];
++  action: CandidateVerificationAction;
++  occurredAt: Date;
++}
+diff --git a/rateeat_backend/src/utils/candidate-restaurant-workflow.utils.ts b/rateeat_backend/src/utils/candidate-restaurant-workflow.utils.ts
+new file mode 100644
+index 0000000..b115e75
+--- /dev/null
++++ b/rateeat_backend/src/utils/candidate-restaurant-workflow.utils.ts
+@@ -0,0 +1,184 @@
++import { BadRequestError } from "../utils/error-response.utils";
++import {
++  BatchCandidateReviewItem,
++  BatchCandidateReviewPayload,
++  CandidateApprovalState,
++  CandidateReviewAuditRecord,
++  CandidateReviewResult,
++  CandidateVerificationAction,
++  CandidateWorkflowFilterOptions,
++  CandidateWorkflowStatistics,
++} from "../types/candidate-restaurant-workflow.types";
++
++/**
++ * Validates batch candidate review payload, ensuring array bounds and duplicate prevention.
++ */
++export function validateBatchCandidatePayload(
++  body: any
++): BatchCandidateReviewPayload {
++  if (!body || typeof body !== "object") {
++    throw new BadRequestError("Request body must be a valid JSON object");
++  }
++
++  const { reviews } = body;
++  if (!Array.isArray(reviews)) {
++    throw new BadRequestError("Field 'reviews' must be an array");
++  }
++
++  if (reviews.length === 0) {
++    throw new BadRequestError("Field 'reviews' cannot be an empty array");
++  }
++
++  const seenIds = new Set<string>();
++  const validatedItems: BatchCandidateReviewItem[] = [];
++
++  for (let i = 0; i < reviews.length; i++) {
++    const item = reviews[i];
++    if (!item || typeof item !== "object") {
++      throw new BadRequestError(`Review item at index ${i} must be an object`);
++    }
++
++    const { candidateRestaurantId, action, rejectionReason } = item;
++    if (
++      !candidateRestaurantId ||
++      typeof candidateRestaurantId !== "string" ||
++      candidateRestaurantId.trim().length === 0
++    ) {
++      throw new BadRequestError(
++        `Review item at index ${i} is missing a valid 'candidateRestaurantId'`
++      );
++    }
++
++    const cleanId = candidateRestaurantId.trim();
++    if (seenIds.has(cleanId)) {
++      throw new BadRequestError(
++        `Duplicate candidate restaurant id '${cleanId}' detected in batch payload`
++      );
++    }
++    seenIds.add(cleanId);
++
++    const normalizedAction =
++      typeof action === "string" ? action.toLowerCase().trim() : "";
++    if (
++      normalizedAction !== CandidateVerificationAction.Approve &&
++      normalizedAction !== CandidateVerificationAction.Reject
++    ) {
++      throw new BadRequestError(
++        `Invalid verification action '${action}' at index ${i}. Must be 'approve' or 'reject'`
++      );
++    }
++
++    validatedItems.push({
++      candidateRestaurantId: cleanId,
++      action: normalizedAction as CandidateVerificationAction,
++      rejectionReason:
++        typeof rejectionReason === "string" ? rejectionReason.trim() : undefined,
++    });
++  }
++
++  return { reviews: validatedItems };
++}
++
++/**
++ * Summarizes the review results into counts.
++ */
++export function formatCandidateReviewSummary(
++  results: CandidateReviewResult[]
++): { approved: number; rejected: number; total: number } {
++  let approved = 0;
++  let rejected = 0;
++  for (const res of results) {
++    if (res.is_approved === true) {
++      approved++;
++    } else if (res.is_approved === false) {
++      rejected++;
++    }
++  }
++  return { approved, rejected, total: results.length };
++}
++
++/**
++ * Parses query options into structured filter parameters.
++ */
++export function parseCandidateWorkflowFilters(query: any): CandidateWorkflowFilterOptions {
++  const options: CandidateWorkflowFilterOptions = {};
++  if (query.status && typeof query.status === "string") {
++    options.status = query.status.trim();
++  }
++  if (query.adminId && typeof query.adminId === "string") {
++    options.adminId = query.adminId.trim();
++  }
++  if (query.limit) {
++    const lim = parseInt(query.limit, 10);
++    if (!isNaN(lim) && lim > 0) options.limit = Math.min(lim, 100);
++  }
++  if (query.offset) {
++    const off = parseInt(query.offset, 10);
++    if (!isNaN(off) && off >= 0) options.offset = off;
++  }
++  return options;
++}
++
++/**
++ * Builds an immutable audit log entry for candidate restaurant reviews.
++ */
++export function createCandidateAuditEntry(
++  candidateId: string,
++  name: string,
++  action: CandidateVerificationAction,
++  prevState: boolean | null,
++  newState: boolean,
++  createdRestId: string | null | undefined,
++  reviewerId: string
++): CandidateReviewAuditRecord {
++  return {
++    auditId: `cand_audit_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
++    candidateRestaurantId: candidateId,
++    restaurantName: name,
++    action,
++    previousApprovalState: prevState,
++    newApprovalState: newState,
++    createdRestaurantId: createdRestId || null,
++    reviewerId,
++    timestamp: new Date().toISOString(),
++  };
++}
++
++/**
++ * Calculates statistics across candidate review outcomes.
++ */
++export function computeCandidateStatistics(
++  results: CandidateReviewResult[]
++): CandidateWorkflowStatistics {
++  let pending = 0;
++  let approved = 0;
++  let rejected = 0;
++
++  for (const r of results) {
++    if (r.is_approved === true) approved++;
++    else if (r.is_approved === false) rejected++;
++    else pending++;
++  }
++
++  const totalDecided = approved + rejected;
++  const conversionRate =
++    totalDecided > 0 ? Math.round((approved / totalDecided) * 10000) / 100 : 0;
++
++  return {
++    totalPending: pending,
++    totalApproved: approved,
++    totalRejected: rejected,
++    conversionRatePercentage: conversionRate,
++  };
++}
++
++/**
++ * Formats an event log string for verification debugging.
++ */
++export function formatCandidateEventLog(
++  candidateId: string,
++  action: CandidateVerificationAction,
++  reviewerId: string
++): string {
++  return `[CandidateWorkflow] Candidate '${candidateId}' was reviewed with action '${action}' by reviewer '${reviewerId}' at ${new Date().toISOString()}`;
++}

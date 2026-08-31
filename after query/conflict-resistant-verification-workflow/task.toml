@@ -2,12 +2,12 @@ schema_version = "1.1"
 artifacts = ["/logs/artifacts/model.patch"]
 
 [task]
-name = "afterquery/race-safe-restaurant-verification-review"
+name = "afterquery/conflict-resistant-verification-workflow"
 
 [metadata]
-task_id = "race-safe-restaurant-verification-review"
-display_title = "Race-Safe Restaurant Verification Review"
-display_description = "Make candidate restaurant verification reviews behave correctly when multiple admins act on the same restaurant concurrently with deterministic batch processing."
+task_id = "conflict-resistant-verification-workflow"
+display_title = "Conflict-Resistant Restaurant Verification Workflow"
+display_description = "Strengthen candidate restaurant verification workflow so competing reviews cannot create inconsistent state and batch reviews remain atomic."
 category = "feature_request"
 language = "typescript"
 repository_url = "https://github.com/dawit2119/Rate_eat"

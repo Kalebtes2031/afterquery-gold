@@ -103,7 +103,7 @@ timeout --kill-after=10s 300s \
   --no-cache \
   --runInBand \
   --forceExit \
-  --testPathIgnorePatterns='restaurant_claim_(verification_behavior|batch_verification)\.test\.ts$' \
+  --testPathIgnorePatterns='candidate_restaurant_(conflict_workflow|batch_conflict)\.test\.ts$' \
   --reporters=default \
   --reporters="$CTRF_REPORTER" \
   2>&1 | tee -a "$RUN_LOG"
@@ -122,8 +122,8 @@ timeout --kill-after=10s 300s \
   --runInBand \
   --forceExit \
   --runTestsByPath \
-  src/__tests__/unit/restaurant_claim_verification_behavior.test.ts \
-  src/__tests__/unit/restaurant_claim_batch_verification.test.ts \
+  src/__tests__/unit/candidate_restaurant_conflict_workflow.test.ts \
+  src/__tests__/unit/candidate_restaurant_batch_conflict.test.ts \
   --reporters=default \
   --reporters="$CTRF_REPORTER" \
   2>&1 | tee -a "$RUN_LOG"
