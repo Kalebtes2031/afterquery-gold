@@ -160,10 +160,10 @@ index 94fc6ee..e3373a5 100644
    protectRouteForAdmin,
 diff --git a/rateeat_backend/src/services/restaurant-claim-state.service.ts b/rateeat_backend/src/services/restaurant-claim-state.service.ts
 new file mode 100644
-index 0000000..32a99d1
+index 0000000..d78a8c8
 --- /dev/null
 +++ b/rateeat_backend/src/services/restaurant-claim-state.service.ts
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,70 @@
 +import {
 +  BadRequestError,
 +  ConflictError,
@@ -216,7 +216,10 @@ index 0000000..32a99d1
 +    }
 +  }
 +
-+  public static validateTransition(currentStatus: Status, targetAction: "approve" | "reject"): void {
++  public static validateTransition(
++    currentStatus: Status,
++    targetAction: "approve" | "reject"
++  ): void {
 +    if (currentStatus === Status.Approved) {
 +      throw new ConflictError("Claim request already approved");
 +    }
@@ -224,13 +227,19 @@ index 0000000..32a99d1
 +      throw new ConflictError("Claim request already rejected");
 +    }
 +  }
++
++  public static getTerminalStateForAction(
++    action: "approve" | "reject"
++  ): Status {
++    return action === "approve" ? Status.Approved : Status.Rejected;
++  }
 +}
 diff --git a/rateeat_backend/src/services/restaurant-claim-verification.service.ts b/rateeat_backend/src/services/restaurant-claim-verification.service.ts
 new file mode 100644
-index 0000000..f7edcc1
+index 0000000..60a1278
 --- /dev/null
 +++ b/rateeat_backend/src/services/restaurant-claim-verification.service.ts
-@@ -0,0 +1,225 @@
+@@ -0,0 +1,246 @@
 +import { Transaction } from "sequelize";
 +import sequelize from "../config/db";
 +import RestaurantClaimRequest, {
@@ -243,10 +252,12 @@ index 0000000..f7edcc1
 +  RestaurantClaimAuditRecord,
 +  RestaurantClaimBatchItem,
 +  RestaurantClaimBatchVerificationResult,
++  RestaurantClaimTransitionContext,
 +} from "../types/restaurant-claim-verification.types";
 +import { RestaurantClaimStateService } from "./restaurant-claim-state.service";
 +import {
 +  buildClaimNotificationMessage,
++  createClaimAuditRecord,
 +  formatClaimResponse,
 +} from "../utils/restaurant-claim-verification.utils";
 +import { NotFoundError } from "../utils/error-response.utils";
@@ -269,6 +280,7 @@ index 0000000..f7edcc1
 +
 +      RestaurantClaimStateService.validateClaimForApproval(claim);
 +
++      const previousStatus = claim.status;
 +      claim.status = Status.Approved;
 +      await claim.save({ transaction });
 +
@@ -325,6 +337,14 @@ index 0000000..f7edcc1
 +        }
 +      }
 +
++      const auditContext: RestaurantClaimTransitionContext = {
++        claimId: claim.id,
++        initiatorAdminId: adminUserId,
++        action: "approve",
++        timestamp: new Date(),
++      };
++      const audit = createClaimAuditRecord(auditContext, previousStatus, Status.Approved);
++
 +      if (!isOuterTransaction) {
 +        await transaction.commit();
 +      }
@@ -360,6 +380,7 @@ index 0000000..f7edcc1
 +
 +      RestaurantClaimStateService.validateClaimForRejection(claim);
 +
++      const previousStatus = claim.status;
 +      claim.status = Status.Rejected;
 +      await claim.save({ transaction });
 +
@@ -394,6 +415,15 @@ index 0000000..f7edcc1
 +          { transaction }
 +        );
 +      }
++
++      const auditContext: RestaurantClaimTransitionContext = {
++        claimId: claim.id,
++        initiatorAdminId: adminUserId,
++        action: "reject",
++        timestamp: new Date(),
++        reason,
++      };
++      const audit = createClaimAuditRecord(auditContext, previousStatus, Status.Rejected);
 +
 +      if (!isOuterTransaction) {
 +        await transaction.commit();
@@ -458,10 +488,10 @@ index 0000000..f7edcc1
 +}
 diff --git a/rateeat_backend/src/types/restaurant-claim-verification.types.ts b/rateeat_backend/src/types/restaurant-claim-verification.types.ts
 new file mode 100644
-index 0000000..8b7c61a
+index 0000000..1eadba9
 --- /dev/null
 +++ b/rateeat_backend/src/types/restaurant-claim-verification.types.ts
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,52 @@
 +export enum RestaurantClaimVerificationAction {
 +  Approve = "approve",
 +  Reject = "reject",
@@ -503,16 +533,28 @@ index 0000000..8b7c61a
 +  decision: "approve" | "reject";
 +  decidedAt: string;
 +  reason?: string;
++  previousStatus: string;
++  targetStatus: string;
++}
++
++export interface RestaurantClaimTransitionContext {
++  claimId: string;
++  initiatorAdminId: string;
++  action: "approve" | "reject";
++  timestamp: Date;
++  reason?: string;
 +}
 diff --git a/rateeat_backend/src/utils/restaurant-claim-verification.utils.ts b/rateeat_backend/src/utils/restaurant-claim-verification.utils.ts
 new file mode 100644
-index 0000000..7ae0b73
+index 0000000..2fc3055
 --- /dev/null
 +++ b/rateeat_backend/src/utils/restaurant-claim-verification.utils.ts
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,131 @@
 +import { BadRequestError } from "./error-response.utils";
 +import {
++  RestaurantClaimAuditRecord,
 +  RestaurantClaimBatchItem,
++  RestaurantClaimTransitionContext,
 +  RestaurantClaimVerificationAction,
 +} from "../types/restaurant-claim-verification.types";
 +
@@ -622,4 +664,20 @@ index 0000000..7ae0b73
 +    return `Claim request for restaurant ${restaurantName} has been approved.`;
 +  }
 +  return `Claim request for restaurant ${restaurantName} has been rejected.${reason ? ` Reason: ${reason}` : ""}`;
++};
++
++export const createClaimAuditRecord = (
++  context: RestaurantClaimTransitionContext,
++  previousStatus: string,
++  targetStatus: string
++): RestaurantClaimAuditRecord => {
++  return {
++    claimId: context.claimId,
++    adminUserId: context.initiatorAdminId,
++    decision: context.action,
++    decidedAt: context.timestamp.toISOString(),
++    reason: context.reason,
++    previousStatus,
++    targetStatus,
++  };
 +};
