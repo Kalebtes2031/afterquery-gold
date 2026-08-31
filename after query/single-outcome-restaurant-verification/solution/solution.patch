@@ -160,15 +160,14 @@ index 94fc6ee..e3373a5 100644
    protectRouteForAdmin,
 diff --git a/rateeat_backend/src/services/restaurant-claim-state.service.ts b/rateeat_backend/src/services/restaurant-claim-state.service.ts
 new file mode 100644
-index 0000000..d78a8c8
+index 0000000..7f675d2
 --- /dev/null
 +++ b/rateeat_backend/src/services/restaurant-claim-state.service.ts
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,69 @@
 +import {
-+  BadRequestError,
-+  ConflictError,
-+  NotFoundError,
-+} from "../utils/error-response.utils";
++  VerificationConflictError as ConflictError,
++  VerificationNotFoundError as NotFoundError,
++} from "../utils/verification-errors";
 +import { Status } from "../models/RestaurantClaim/RestaurantClaimRequest";
 +
 +export class RestaurantClaimStateService {
@@ -546,11 +545,11 @@ index 0000000..1eadba9
 +}
 diff --git a/rateeat_backend/src/utils/restaurant-claim-verification.utils.ts b/rateeat_backend/src/utils/restaurant-claim-verification.utils.ts
 new file mode 100644
-index 0000000..2fc3055
+index 0000000..7894566
 --- /dev/null
 +++ b/rateeat_backend/src/utils/restaurant-claim-verification.utils.ts
 @@ -0,0 +1,131 @@
-+import { BadRequestError } from "./error-response.utils";
++import { VerificationValidationError as BadRequestError } from "./verification-errors";
 +import {
 +  RestaurantClaimAuditRecord,
 +  RestaurantClaimBatchItem,
@@ -681,3 +680,44 @@ index 0000000..2fc3055
 +    targetStatus,
 +  };
 +};
+diff --git a/rateeat_backend/src/utils/verification-errors.ts b/rateeat_backend/src/utils/verification-errors.ts
+new file mode 100644
+index 0000000..e309307
+--- /dev/null
++++ b/rateeat_backend/src/utils/verification-errors.ts
+@@ -0,0 +1,35 @@
++import {
++  BadRequestError,
++  ConflictError,
++  NotFoundError,
++} from "./error-response.utils";
++
++/**
++ * The shared error helpers in error-response.utils.ts decorate the text they
++ * are given ("<resource> not found", "<resource> already exists", a fixed
++ * "Bad request"). The verification workflows need to surface exact,
++ * caller-facing messages while still being recognisable as the same HTTP error
++ * families, so these thin subclasses keep the status codes and the instanceof
++ * relationships intact and replace the message with the literal string.
++ */
++
++export class VerificationNotFoundError extends NotFoundError {
++  constructor(message: string) {
++    super(message);
++    this.message = message;
++  }
++}
++
++export class VerificationConflictError extends ConflictError {
++  constructor(message: string) {
++    super(message);
++    this.message = message;
++  }
++}
++
++export class VerificationValidationError extends BadRequestError {
++  constructor(message: string) {
++    super(message);
++    this.message = message;
++  }
++}

@@ -421,15 +421,14 @@ index ec8c574..c2a8962 100644
    .get(
 diff --git a/rateeat_backend/src/services/candidate-restaurant-state.service.ts b/rateeat_backend/src/services/candidate-restaurant-state.service.ts
 new file mode 100644
-index 0000000..cc6ac38
+index 0000000..bc5027d
 --- /dev/null
 +++ b/rateeat_backend/src/services/candidate-restaurant-state.service.ts
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,48 @@
 +import {
-+  BadRequestError,
-+  ConflictError,
-+  NotFoundError,
-+} from "../utils/error-response.utils";
++  ReviewConflictError as ConflictError,
++  ReviewNotFoundError as NotFoundError,
++} from "../utils/candidate-restaurant-verification.errors";
 +import { CandidateRestaurantReviewAction } from "../types/candidate-restaurant-verification.types";
 +
 +export class CandidateRestaurantStateService {
@@ -476,12 +475,11 @@ index 0000000..cc6ac38
 +}
 diff --git a/rateeat_backend/src/services/candidate-restaurant-verification.service.ts b/rateeat_backend/src/services/candidate-restaurant-verification.service.ts
 new file mode 100644
-index 0000000..a291e31
+index 0000000..aa92f2b
 --- /dev/null
 +++ b/rateeat_backend/src/services/candidate-restaurant-verification.service.ts
-@@ -0,0 +1,316 @@
+@@ -0,0 +1,327 @@
 +import { Transaction } from "sequelize";
-+import sequelize from "../config/db";
 +import {
 +  AdminUser,
 +  CandidateAdminUser,
@@ -503,10 +501,22 @@ index 0000000..a291e31
 +import { extractChainName } from "../utils/candidate-restaurant-verification.utils";
 +import { CandidateRestaurantStateService } from "./candidate-restaurant-state.service";
 +import {
-+  BadRequestError,
-+  InternalServerError,
-+  NotFoundError,
-+} from "../utils/error-response.utils";
++  ReviewValidationError as BadRequestError,
++  ReviewInternalError as InternalServerError,
++  ReviewNotFoundError as NotFoundError,
++} from "../utils/candidate-restaurant-verification.errors";
++
++/**
++ * Resolve the shared Sequelize instance lazily. Importing "../config/db"
++ * eagerly would register every model as a side effect of loading this service
++ * through the controller, which breaks unit suites that stub "../models" with a
++ * partial mock. Deferring the lookup keeps the transaction boundary intact
++ * without that coupling.
++ */
++const getSequelize = (): typeof import("../config/db").default => {
++  const mod = require("../config/db");
++  return mod && "default" in mod ? mod.default : mod;
++};
 +
 +export class CandidateRestaurantVerificationService {
 +  public static async approveCandidateRestaurantWithLock(
@@ -516,7 +526,7 @@ index 0000000..a291e31
 +    accumulatedIncentives?: Map<string, number>
 +  ): Promise<any> {
 +    const isOuterTransaction = !!existingTransaction;
-+    const transaction = existingTransaction || (await sequelize.transaction());
++    const transaction = existingTransaction || (await getSequelize().transaction());
 +
 +    try {
 +      const candidateRestaurant = await CandidateRestaurant.findOne({
@@ -693,7 +703,7 @@ index 0000000..a291e31
 +    existingTransaction?: Transaction
 +  ): Promise<any> {
 +    const isOuterTransaction = !!existingTransaction;
-+    const transaction = existingTransaction || (await sequelize.transaction());
++    const transaction = existingTransaction || (await getSequelize().transaction());
 +
 +    try {
 +      const candidateRestaurant = await CandidateRestaurant.findOne({
@@ -755,7 +765,7 @@ index 0000000..a291e31
 +    items: CandidateRestaurantBatchItem[],
 +    adminUserId: string
 +  ): Promise<CandidateRestaurantBatchReviewResult> {
-+    const transaction = await sequelize.transaction();
++    const transaction = await getSequelize().transaction();
 +    const accumulatedIncentives = new Map<string, number>();
 +    const results: any[] = [];
 +
@@ -830,13 +840,63 @@ index 0000000..b3ee739
 +  success: boolean;
 +  data: any[];
 +}
+diff --git a/rateeat_backend/src/utils/candidate-restaurant-verification.errors.ts b/rateeat_backend/src/utils/candidate-restaurant-verification.errors.ts
+new file mode 100644
+index 0000000..1dbd49c
+--- /dev/null
++++ b/rateeat_backend/src/utils/candidate-restaurant-verification.errors.ts
+@@ -0,0 +1,44 @@
++import {
++  BadRequestError,
++  ConflictError,
++  InternalServerError,
++  NotFoundError,
++} from "./error-response.utils";
++
++/**
++ * The shared error helpers in error-response.utils.ts rewrite the text they are
++ * handed ("<resource> not found", "<resource> already exists", a fixed
++ * "Bad request" / "An unexpected error occurred"). The candidate restaurant
++ * review flow needs to return exact, caller-facing messages while still being
++ * recognisable as the same HTTP error families, so these thin subclasses keep
++ * the status codes and instanceof relationships and swap in the literal
++ * message.
++ */
++
++export class ReviewNotFoundError extends NotFoundError {
++  constructor(message: string) {
++    super(message);
++    this.message = message;
++  }
++}
++
++export class ReviewConflictError extends ConflictError {
++  constructor(message: string) {
++    super(message);
++    this.message = message;
++  }
++}
++
++export class ReviewValidationError extends BadRequestError {
++  constructor(message: string) {
++    super(message);
++    this.message = message;
++  }
++}
++
++export class ReviewInternalError extends InternalServerError {
++  constructor(message: string) {
++    super(message);
++    this.message = message;
++  }
++}
 diff --git a/rateeat_backend/src/utils/candidate-restaurant-verification.utils.ts b/rateeat_backend/src/utils/candidate-restaurant-verification.utils.ts
 new file mode 100644
-index 0000000..49d95f4
+index 0000000..950e507
 --- /dev/null
 +++ b/rateeat_backend/src/utils/candidate-restaurant-verification.utils.ts
 @@ -0,0 +1,78 @@
-+import { BadRequestError } from "./error-response.utils";
++import { ReviewValidationError as BadRequestError } from "./candidate-restaurant-verification.errors";
 +import {
 +  CandidateRestaurantBatchItem,
 +  CandidateRestaurantReviewAction,
