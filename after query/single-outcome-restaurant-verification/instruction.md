@@ -1,0 +1,9 @@
+Guarantee deterministic, single-outcome verification lifecycles for restaurant claim requests.
+
+Admin endpoints `PUT /api/v1/restaurant-claim-request/:claimId/approve` and `PUT /api/v1/restaurant-claim-request/:claimId/reject` must process claim verification decisions atomically. Each claim request starts in Pending status and must transition into exactly one terminal state: Approved or Rejected. Once finalized, the decision is immutable. Approving or rejecting an already approved request returns HTTP 409 with message "Claim request already approved". Approving or rejecting an already rejected request returns HTTP 409 with message "Claim request already rejected". A non-existent claim ID returns HTTP 404 with message "Request not found".
+
+Add admin batch verification endpoint `PUT /api/v1/restaurant-claim-request/verify-batch` accepting `{ "claims": [{ "claimId": string, "action": "approve" | "reject", "reason"?: string }] }`. The `claims` array must be non-empty, and each entry must contain a valid ID and action. If duplicate claim IDs appear in the request, return HTTP 400 with "Duplicate claim request id".
+
+Batch verification executes within a single database transaction. If any claim fails validation, does not exist, or has already reached a terminal state, roll back the entire batch completely without leaving partial updates or orphaned notifications. When approved, associate chain metadata and dispatch administrative notification side effects exactly once. Return HTTP 200 with `{ "success": true, "data": [...] }` containing updated claims in the exact order requested.
+
+IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.

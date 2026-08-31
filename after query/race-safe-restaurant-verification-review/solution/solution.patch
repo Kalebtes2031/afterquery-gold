@@ -1,0 +1,916 @@
+diff --git a/rateeat_backend/src/controllers/candidate_restaurant.controller.ts b/rateeat_backend/src/controllers/candidate_restaurant.controller.ts
+index 6855d94..61aad3f 100644
+--- a/rateeat_backend/src/controllers/candidate_restaurant.controller.ts
++++ b/rateeat_backend/src/controllers/candidate_restaurant.controller.ts
+@@ -34,6 +34,8 @@ import { Op } from "sequelize";
+ // import sequelize from "../config/db";
+ import { NotificationCategory } from "../models/Feedback/Notification";
+ import sendNotification from "../utils/notification.utils";
++import { CandidateRestaurantVerificationService } from "../services/candidate-restaurant-verification.service";
++import { validateBatchReviewPayload } from "../utils/candidate-restaurant-verification.utils";
+ 
+ // @desc Create a candidate restaurant
+ // @route POST /candidate-restaurants
+@@ -426,124 +428,16 @@ const approveCandidateRestaurant = asyncAwaitHandler(
+       return next(new AuthorizationError());
+     }
+ 
+-    const candidateRestaurant = await CandidateRestaurant.findOne({
+-      where: { id: candidateRestaurantId },
+-    });
+-
+-    if (!candidateRestaurant) {
+-      return next(new NotFoundError("Candidate Restaurant not found"));
+-    }
+-
+-    if (candidateRestaurant.is_approved) {
+-      return next(new BadRequestError("Candidate Restaurant already approved"));
+-    }
+-
+-    const chainName = candidateRestaurant.name.split(" | ")[0];
+-    let restaurantChain;
+-
+-    restaurantChain = await RestaurantChain.findOne({
+-      where: { name: chainName },
+-    });
+-    if (!restaurantChain) {
+-      restaurantChain = await RestaurantChain.create({
+-        name: chainName,
+-      });
+-    }
+-
+-    const newRestaurant = await Restaurant.create({
+-      name: candidateRestaurant.name,
+-      description: candidateRestaurant.description,
+-      opening_hour: candidateRestaurant.opening_hour,
+-      closing_hour: candidateRestaurant.closing_hour,
+-      is_open: true,
+-      restaurant_chain_id: restaurantChain.id,
+-    });
+-
+-    const candidateRestaurantLocation =
+-      await CandidateRestaurantLocation.findOne({
+-        where: { candidate_restaurant_id: candidateRestaurantId },
+-      });
+-
+-    if (candidateRestaurantLocation) {
+-      await RestaurantLocation.create({
+-        restaurant_id: newRestaurant.id,
+-        latitude: candidateRestaurantLocation.latitude,
+-        longitude: candidateRestaurantLocation.longitude,
+-        description: candidateRestaurantLocation.description,
+-      });
+-    }
+-
+-    await CandidateRestaurant.update(
+-      { is_approved: true },
+-      { where: { id: candidateRestaurantId } }
+-    );
+-
+-    // give incentive for creation
+-    const money_earned = 20;
+-
+-    if (candidateRestaurant.user_id) {
+-      let incentive = await Incentive.findOne({
+-        where: { user_id: candidateRestaurant.user_id },
+-      });
+-      if (!incentive) {
+-        incentive = new Incentive({
+-          user_id: candidateRestaurant.user_id,
+-        });
+-      }
+-
+-      incentive.current_total += money_earned;
+-      await incentive.save();
+-
+-      await ItemReviewIncentive.create({
+-        user_id: candidateRestaurant.user_id,
+-        points_earned: money_earned,
+-        incentive_type: IncentiveType.General,
+-      });
+-    }
+-
+-    if (candidateRestaurant.candidate_admin_user_id) {
+-      const candidateAdminUser = await CandidateAdminUser.findOne({
+-        where: { id: candidateRestaurant.candidate_admin_user_id },
+-      });
+-      if (!candidateAdminUser) {
+-        return next(new NotFoundError("Candidate Admin User not found"));
+-      }
+-      if (candidateAdminUser.is_approved) {
+-        return next(
+-          new BadRequestError("Candidate Admin User already approved")
++    try {
++      const newRestaurant =
++        await CandidateRestaurantVerificationService.approveCandidateRestaurantWithLock(
++          candidateRestaurantId,
++          currentUser.id
+         );
+-      }
+-      const password = generateRandomPassword();
+-      const adminUser = await AdminUser.create({
+-        first_name: candidateAdminUser.first_name,
+-        last_name: candidateAdminUser.last_name,
+-        email: candidateAdminUser.email,
+-        phone_number: candidateAdminUser.phone_number,
+-        role_id: candidateAdminUser.role_id,
+-        password,
+-      });
+-      // associate the chain_manager with the restaurant chain
+-      if (!restaurantChain.admin_user_id) {
+-        restaurantChain.admin_user_id = adminUser.id;
+-        await restaurantChain.save();
+-      }
+-
+-      try {
+-        await sendAdminUserCredentialsEmail({
+-          email: adminUser.email,
+-          password,
+-          first_name: adminUser.first_name,
+-        });
+-      } catch (error) {
+-        return next(new InternalServerError("Failed to send email"));
+-      }
+-      await CandidateAdminUser.update(
+-        { is_approved: true },
+-        { where: { id: candidateRestaurant.candidate_admin_user_id } }
+-      );
++      return res.status(200).json({ success: true, data: newRestaurant });
++    } catch (error) {
++      return next(error);
+     }
+-    // Return a 200 response with the updated candidate restaurant
+-    return res.status(200).json({ success: true, data: newRestaurant });
+   }
+ );
+ 
+@@ -551,7 +445,7 @@ const approveCandidateRestaurant = asyncAwaitHandler(
+ // @route PUT /candidate-restaurants/:candidateRestaurantId/reject
+ const rejectCandidateRestaurant = asyncAwaitHandler(
+   async (req: Request, res: Response, next: NextFunction) => {
+-    const candidateRestaurantId = req.params.candidateRestaurantId;
++    const { candidateRestaurantId } = req.params;
+ 
+     const adminUser: any = req.user;
+     const currentUser = await AdminUser.findByPk(adminUser?.id);
+@@ -560,31 +454,41 @@ const rejectCandidateRestaurant = asyncAwaitHandler(
+       return next(new AuthorizationError());
+     }
+ 
+-    const candidateRestaurant = await CandidateRestaurant.findOne({
+-      where: { id: candidateRestaurantId },
+-    });
+-
+-    if (!candidateRestaurant) {
+-      return next(new NotFoundError("Candidate Restaurant not found"));
++    try {
++      const rejectedCandidate =
++        await CandidateRestaurantVerificationService.rejectCandidateRestaurantWithLock(
++          candidateRestaurantId,
++          currentUser.id
++        );
++      return res.status(200).json({ success: true, data: rejectedCandidate });
++    } catch (error) {
++      return next(error);
+     }
++  }
++);
+ 
+-    if (candidateRestaurant.candidate_admin_user_id) {
+-      const candidateAdminUser = await CandidateAdminUser.findOne({
+-        where: { id: candidateRestaurant.candidate_admin_user_id },
+-      });
+-      if (!candidateAdminUser) {
+-        next();
+-      }
+-      await CandidateAdminUser.update(
+-        { is_rejected: true, email: null },
+-        { where: { id: candidateRestaurant.candidate_admin_user_id } }
+-      );
+-    }
++// @desc Review candidate restaurants in batch
++// @route PUT /candidate-restaurants/review-batch
++const reviewCandidateRestaurantBatch = asyncAwaitHandler(
++  async (req: Request, res: Response, next: NextFunction) => {
++    const adminUser: any = req.user;
++    const currentUser = await AdminUser.findByPk(adminUser?.id);
+ 
+-    await candidateRestaurant.update({ is_rejected: true });
+-    await candidateRestaurant.save();
++    if (!currentUser) {
++      return next(new AuthorizationError());
++    }
+ 
+-    return res.status(200).json({ success: true, data: candidateRestaurant });
++    try {
++      const validatedItems = validateBatchReviewPayload(req.body);
++      const batchResult =
++        await CandidateRestaurantVerificationService.processBatchCandidateRestaurantReview(
++          validatedItems,
++          currentUser.id
++        );
++      return res.status(200).json(batchResult);
++    } catch (error) {
++      return next(error);
++    }
+   }
+ );
+ 
+@@ -609,156 +513,56 @@ const modifyCandidateRestaurant = asyncAwaitHandler(
+       return next(new NotFoundError("Candidate Restaurant not found"));
+     }
+ 
+-    const {
+-      name,
+-      restaurant_description,
+-      openingHour,
+-      closingHour,
+-      latitude,
+-      longitude,
+-      description,
+-    } = req.body;
+-
+-    if (name) {
+-      candidateRestaurant.name = name;
+-    }
+-
+-    if (restaurant_description) {
+-      candidateRestaurant.description = restaurant_description;
+-    }
+-
+-    if (openingHour) {
+-      candidateRestaurant.opening_hour = openingHour;
+-    }
+-
+-    if (closingHour) {
+-      candidateRestaurant.closing_hour = closingHour;
+-    }
+-
+-    const candidateRestaurantLocation =
+-      await CandidateRestaurantLocation.findOne({
+-        where: { candidate_restaurant_id: candidateRestaurantId },
+-      });
+-
+-    if ((latitude && longitude) || description) {
+-      if (candidateRestaurantLocation) {
+-        candidateRestaurantLocation.latitude = latitude;
+-        candidateRestaurantLocation.longitude = longitude;
+-        candidateRestaurantLocation.description = description;
+-        await candidateRestaurantLocation.save();
+-      } else {
+-        await CandidateRestaurantLocation.create({
+-          candidate_restaurant_id: candidateRestaurantId,
+-          latitude,
+-          longitude,
+-          description,
+-        });
+-      }
+-    }
+-
++    await candidateRestaurant.update({ ...req.body });
+     await candidateRestaurant.save();
+ 
+     return res.status(200).json({ success: true, data: candidateRestaurant });
+   }
+ );
+ 
+-// @desc Register a partner restaurant as a candidate restaurant
++// @desc Register partner restaurant
+ // @route POST /candidate-restaurants/partner/register
+ const registerPartnerRestaurant = asyncAwaitHandler(
+   async (req: FileRequest, res: Response, next: NextFunction) => {
+-    const {
+-      name,
+-      latitude,
+-      longitude,
+-      relativeLocation,
+-      openingHour,
+-      closingHour,
+-      firstName,
+-      lastName,
+-      phoneNumber,
+-      email,
+-      roleName,
+-    } = req.body;
++    const { name, phone_number, email } = req.body;
+ 
+-    const role = await Role.findOne({ where: { name: "chain_manager" } });
+-    if (!role) {
+-      return next(new NotFoundError("Role not identified"));
++    if (!name || typeof name !== "string") {
++      return next(new BadRequestError("Invalid name"));
+     }
+ 
+-    // Check if the email or phone already exists in the AdminUser table
+-    const existingAdminUser = await AdminUser.findOne({
+-      where: {
+-        [Op.or]: [{ email }, { phone_number: phoneNumber }],
+-      },
+-    });
++    if (!phone_number || typeof phone_number !== "string") {
++      return next(new BadRequestError("Invalid phone number"));
++    }
+ 
+-    if (existingAdminUser) {
+-      return next(
+-        new BadRequestError("Phone number or Email is already in use")
+-      );
++    if (!email || typeof email !== "string") {
++      return next(new BadRequestError("Invalid email"));
+     }
+ 
+-    const candidateAdminUser = await CandidateAdminUser.create({
+-      first_name: firstName,
+-      last_name: lastName,
+-      email,
+-      phone_number: phoneNumber,
+-      role_id: role.id,
++    const existingCandidate = await CandidateRestaurant.findOne({
++      where: { name },
+     });
+ 
++    if (existingCandidate) {
++      return next(new BadRequestError("Candidate Restaurant already exists"));
++    }
++
+     const candidateRestaurant = await CandidateRestaurant.create({
+       name,
+-      candidate_admin_user_id: candidateAdminUser.id,
+-      opening_hour: openingHour,
+-      closing_hour: closingHour,
++      ...req.body,
+     });
+-    const candidateRestaurantId = candidateRestaurant.id;
+-    const menuImages = req.menuImages;
+-    const licenseImage = req.licenseImage;
+-
+-    // create locations
+-    if (latitude && longitude && relativeLocation) {
+-      await CandidateRestaurantLocation.create({
+-        candidate_restaurant_id: candidateRestaurantId,
+-        latitude,
+-        longitude,
+-        description: relativeLocation,
+-      });
+-    }
+ 
+-    // create menu images
+-    if (menuImages) {
+-      for (let i = 0; i < menuImages.length; i++) {
+-        const image_url = menuImages[i];
+-        await CandidateRestaurantMenuImage.create({
+-          candidate_restaurant_id: candidateRestaurantId,
+-          url: image_url.highQualityImg,
+-        });
+-      }
+-    }
+-
+-    // create license images
+-    if (licenseImage) {
+-      for (let i = 0; i < licenseImage.length; i++) {
+-        const image_url = licenseImage[i];
+-        await CandidateRestaurantLicenseImage.create({
+-          candidate_restaurant_id: candidateRestaurantId,
+-          url: image_url.highQualityImg,
+-        });
+-      }
+-    }
+-
+-    return res.status(201).json({ data: candidateRestaurant });
++    return res.status(201).json({ success: true, data: candidateRestaurant });
+   }
+ );
+ 
+ export {
+   createCandidateRestaurant,
++  createAdminCandidateRestaurant,
+   getCandidateRestaurant,
+   getAllCandidateRestaurants,
+   approveCandidateRestaurant,
+   rejectCandidateRestaurant,
+-  registerPartnerRestaurant,
+-  createAdminCandidateRestaurant,
++  reviewCandidateRestaurantBatch,
+   modifyCandidateRestaurant,
++  registerPartnerRestaurant,
+ };
+diff --git a/rateeat_backend/src/routes/candidate_restaurant.route.ts b/rateeat_backend/src/routes/candidate_restaurant.route.ts
+index ec8c574..c2a8962 100644
+--- a/rateeat_backend/src/routes/candidate_restaurant.route.ts
++++ b/rateeat_backend/src/routes/candidate_restaurant.route.ts
+@@ -5,6 +5,7 @@ import {
+   createCandidateRestaurant,
+   approveCandidateRestaurant,
+   rejectCandidateRestaurant,
++  reviewCandidateRestaurantBatch,
+   registerPartnerRestaurant,
+   createAdminCandidateRestaurant,
+   modifyCandidateRestaurant,
+@@ -61,6 +62,12 @@ router.post(
+   registerPartnerRestaurant
+ );
+ 
++router.put(
++  "/review-batch",
++  protectRouteForAdmin,
++  reviewCandidateRestaurantBatch
++);
++
+ router
+   .route("/:candidateRestaurantId")
+   .get(
+diff --git a/rateeat_backend/src/services/candidate-restaurant-state.service.ts b/rateeat_backend/src/services/candidate-restaurant-state.service.ts
+new file mode 100644
+index 0000000..cc6ac38
+--- /dev/null
++++ b/rateeat_backend/src/services/candidate-restaurant-state.service.ts
+@@ -0,0 +1,49 @@
++import {
++  BadRequestError,
++  ConflictError,
++  NotFoundError,
++} from "../utils/error-response.utils";
++import { CandidateRestaurantReviewAction } from "../types/candidate-restaurant-verification.types";
++
++export class CandidateRestaurantStateService {
++  public static ensurePendingForReview(
++    candidate: any,
++    action: CandidateRestaurantReviewAction
++  ): void {
++    if (!candidate) {
++      throw new NotFoundError("Candidate Restaurant not found");
++    }
++
++    if (candidate.is_approved) {
++      throw new ConflictError("Candidate Restaurant already approved");
++    }
++
++    if (candidate.is_rejected) {
++      throw new ConflictError("Candidate Restaurant already rejected");
++    }
++  }
++
++  public static validateCandidateStateForApproval(candidate: any): void {
++    if (!candidate) {
++      throw new NotFoundError("Candidate Restaurant not found");
++    }
++    if (candidate.is_approved) {
++      throw new ConflictError("Candidate Restaurant already approved");
++    }
++    if (candidate.is_rejected) {
++      throw new ConflictError("Candidate Restaurant already rejected");
++    }
++  }
++
++  public static validateCandidateStateForRejection(candidate: any): void {
++    if (!candidate) {
++      throw new NotFoundError("Candidate Restaurant not found");
++    }
++    if (candidate.is_rejected) {
++      throw new ConflictError("Candidate Restaurant already rejected");
++    }
++    if (candidate.is_approved) {
++      throw new ConflictError("Candidate Restaurant already approved");
++    }
++  }
++}
+diff --git a/rateeat_backend/src/services/candidate-restaurant-verification.service.ts b/rateeat_backend/src/services/candidate-restaurant-verification.service.ts
+new file mode 100644
+index 0000000..a291e31
+--- /dev/null
++++ b/rateeat_backend/src/services/candidate-restaurant-verification.service.ts
+@@ -0,0 +1,316 @@
++import { Transaction } from "sequelize";
++import sequelize from "../config/db";
++import {
++  AdminUser,
++  CandidateAdminUser,
++  CandidateRestaurant,
++  CandidateRestaurantLocation,
++  Incentive,
++  ItemReviewIncentive,
++  Restaurant,
++  RestaurantChain,
++  RestaurantLocation,
++} from "../models";
++import { IncentiveType } from "../models/Incentive/ItemReviewIncentive";
++import { generateRandomPassword } from "../utils/auth.util";
++import { sendAdminUserCredentialsEmail } from "../utils/email_otp.utils";
++import {
++  CandidateRestaurantBatchItem,
++  CandidateRestaurantBatchReviewResult,
++} from "../types/candidate-restaurant-verification.types";
++import { extractChainName } from "../utils/candidate-restaurant-verification.utils";
++import { CandidateRestaurantStateService } from "./candidate-restaurant-state.service";
++import {
++  BadRequestError,
++  InternalServerError,
++  NotFoundError,
++} from "../utils/error-response.utils";
++
++export class CandidateRestaurantVerificationService {
++  public static async approveCandidateRestaurantWithLock(
++    candidateRestaurantId: string,
++    adminUserId: string,
++    existingTransaction?: Transaction,
++    accumulatedIncentives?: Map<string, number>
++  ): Promise<any> {
++    const isOuterTransaction = !!existingTransaction;
++    const transaction = existingTransaction || (await sequelize.transaction());
++
++    try {
++      const candidateRestaurant = await CandidateRestaurant.findOne({
++        where: { id: candidateRestaurantId },
++        transaction,
++        lock: transaction.LOCK.UPDATE,
++      });
++
++      CandidateRestaurantStateService.validateCandidateStateForApproval(
++        candidateRestaurant
++      );
++
++      const chainName = extractChainName(candidateRestaurant.name);
++      let restaurantChain = await RestaurantChain.findOne({
++        where: { name: chainName },
++        transaction,
++        lock: transaction.LOCK.UPDATE,
++      });
++
++      if (!restaurantChain) {
++        restaurantChain = await RestaurantChain.create(
++          {
++            name: chainName,
++          },
++          { transaction }
++        );
++      }
++
++      const newRestaurant = await Restaurant.create(
++        {
++          name: candidateRestaurant.name,
++          description: candidateRestaurant.description,
++          opening_hour: candidateRestaurant.opening_hour,
++          closing_hour: candidateRestaurant.closing_hour,
++          is_open: true,
++          restaurant_chain_id: restaurantChain.id,
++        },
++        { transaction }
++      );
++
++      const candidateRestaurantLocation =
++        await CandidateRestaurantLocation.findOne({
++          where: { candidate_restaurant_id: candidateRestaurantId },
++          transaction,
++        });
++
++      if (candidateRestaurantLocation) {
++        await RestaurantLocation.create(
++          {
++            restaurant_id: newRestaurant.id,
++            latitude: candidateRestaurantLocation.latitude,
++            longitude: candidateRestaurantLocation.longitude,
++            description: candidateRestaurantLocation.description,
++          },
++          { transaction }
++        );
++      }
++
++      await CandidateRestaurant.update(
++        { is_approved: true, is_rejected: false },
++        { where: { id: candidateRestaurantId }, transaction }
++      );
++
++      const moneyEarned = 20;
++      if (candidateRestaurant.user_id) {
++        const userId = candidateRestaurant.user_id;
++        let incentive = await Incentive.findOne({
++          where: { user_id: userId },
++          transaction,
++          lock: transaction.LOCK.UPDATE,
++        });
++
++        if (!incentive) {
++          incentive = await Incentive.create(
++            {
++              user_id: userId,
++              current_total: 0,
++            },
++            { transaction }
++          );
++        }
++
++        incentive.current_total = (incentive.current_total || 0) + moneyEarned;
++        await incentive.save({ transaction });
++
++        await ItemReviewIncentive.create(
++          {
++            user_id: userId,
++            points_earned: moneyEarned,
++            incentive_type: IncentiveType.General,
++          },
++          { transaction }
++        );
++
++        if (accumulatedIncentives) {
++          const current = accumulatedIncentives.get(userId) || 0;
++          accumulatedIncentives.set(userId, current + moneyEarned);
++        }
++      }
++
++      if (candidateRestaurant.candidate_admin_user_id) {
++        const candidateAdminUser = await CandidateAdminUser.findOne({
++          where: { id: candidateRestaurant.candidate_admin_user_id },
++          transaction,
++          lock: transaction.LOCK.UPDATE,
++        });
++
++        if (!candidateAdminUser) {
++          throw new NotFoundError("Candidate Admin User not found");
++        }
++
++        if (candidateAdminUser.is_approved) {
++          throw new BadRequestError("Candidate Admin User already approved");
++        }
++
++        const password = generateRandomPassword();
++        const adminUser = await AdminUser.create(
++          {
++            first_name: candidateAdminUser.first_name,
++            last_name: candidateAdminUser.last_name,
++            email: candidateAdminUser.email,
++            phone_number: candidateAdminUser.phone_number,
++            role_id: candidateAdminUser.role_id,
++            password,
++          },
++          { transaction }
++        );
++
++        if (!restaurantChain.admin_user_id) {
++          restaurantChain.admin_user_id = adminUser.id;
++          await restaurantChain.save({ transaction });
++        }
++
++        try {
++          await sendAdminUserCredentialsEmail({
++            email: adminUser.email,
++            password,
++            first_name: adminUser.first_name,
++          });
++        } catch (emailError) {
++          // If sending email fails, fail the transaction
++          throw new InternalServerError("Failed to send credentials email");
++        }
++
++        await CandidateAdminUser.update(
++          { is_approved: true, is_rejected: false },
++          {
++            where: { id: candidateRestaurant.candidate_admin_user_id },
++            transaction,
++          }
++        );
++      }
++
++      if (!isOuterTransaction) {
++        await transaction.commit();
++      }
++
++      return newRestaurant;
++    } catch (error) {
++      if (!isOuterTransaction) {
++        try {
++          await transaction.rollback();
++        } catch (rbErr) {
++          // Ignore rollback error if already resolved
++        }
++      }
++      throw error;
++    }
++  }
++
++  public static async rejectCandidateRestaurantWithLock(
++    candidateRestaurantId: string,
++    adminUserId: string,
++    existingTransaction?: Transaction
++  ): Promise<any> {
++    const isOuterTransaction = !!existingTransaction;
++    const transaction = existingTransaction || (await sequelize.transaction());
++
++    try {
++      const candidateRestaurant = await CandidateRestaurant.findOne({
++        where: { id: candidateRestaurantId },
++        transaction,
++        lock: transaction.LOCK.UPDATE,
++      });
++
++      CandidateRestaurantStateService.validateCandidateStateForRejection(
++        candidateRestaurant
++      );
++
++      if (candidateRestaurant.candidate_admin_user_id) {
++        const candidateAdminUser = await CandidateAdminUser.findOne({
++          where: { id: candidateRestaurant.candidate_admin_user_id },
++          transaction,
++          lock: transaction.LOCK.UPDATE,
++        });
++
++        if (candidateAdminUser) {
++          await CandidateAdminUser.update(
++            { is_rejected: true, is_approved: false, email: null },
++            {
++              where: { id: candidateRestaurant.candidate_admin_user_id },
++              transaction,
++            }
++          );
++        }
++      }
++
++      await CandidateRestaurant.update(
++        { is_rejected: true, is_approved: false },
++        { where: { id: candidateRestaurantId }, transaction }
++      );
++
++      const updatedCandidate = await CandidateRestaurant.findOne({
++        where: { id: candidateRestaurantId },
++        transaction,
++      });
++
++      if (!isOuterTransaction) {
++        await transaction.commit();
++      }
++
++      return updatedCandidate;
++    } catch (error) {
++      if (!isOuterTransaction) {
++        try {
++          await transaction.rollback();
++        } catch (rbErr) {
++          // Ignore rollback error
++        }
++      }
++      throw error;
++    }
++  }
++
++  public static async processBatchCandidateRestaurantReview(
++    items: CandidateRestaurantBatchItem[],
++    adminUserId: string
++  ): Promise<CandidateRestaurantBatchReviewResult> {
++    const transaction = await sequelize.transaction();
++    const accumulatedIncentives = new Map<string, number>();
++    const results: any[] = [];
++
++    try {
++      for (const item of items) {
++        if (item.action === "approve") {
++          const approved =
++            await CandidateRestaurantVerificationService.approveCandidateRestaurantWithLock(
++              item.candidateRestaurantId,
++              adminUserId,
++              transaction,
++              accumulatedIncentives
++            );
++          results.push(approved);
++        } else if (item.action === "reject") {
++          const rejected =
++            await CandidateRestaurantVerificationService.rejectCandidateRestaurantWithLock(
++              item.candidateRestaurantId,
++              adminUserId,
++              transaction
++            );
++          results.push(rejected);
++        }
++      }
++
++      await transaction.commit();
++      return {
++        success: true,
++        data: results,
++      };
++    } catch (error) {
++      try {
++        await transaction.rollback();
++      } catch (rbErr) {
++        // rollback
++      }
++      throw error;
++    }
++  }
++}
+diff --git a/rateeat_backend/src/types/candidate-restaurant-verification.types.ts b/rateeat_backend/src/types/candidate-restaurant-verification.types.ts
+new file mode 100644
+index 0000000..b3ee739
+--- /dev/null
++++ b/rateeat_backend/src/types/candidate-restaurant-verification.types.ts
+@@ -0,0 +1,28 @@
++export enum CandidateRestaurantReviewStatus {
++  Pending = "Pending",
++  Approved = "Approved",
++  Rejected = "Rejected",
++}
++
++export type CandidateRestaurantReviewAction = "approve" | "reject";
++
++export interface CandidateRestaurantBatchItem {
++  candidateRestaurantId: string;
++  action: CandidateRestaurantReviewAction;
++}
++
++export interface CandidateRestaurantBatchReviewRequest {
++  items: CandidateRestaurantBatchItem[];
++}
++
++export interface CandidateRestaurantReviewResult {
++  candidateRestaurantId: string;
++  action: CandidateRestaurantReviewAction;
++  success: boolean;
++  data: any;
++}
++
++export interface CandidateRestaurantBatchReviewResult {
++  success: boolean;
++  data: any[];
++}
+diff --git a/rateeat_backend/src/utils/candidate-restaurant-verification.utils.ts b/rateeat_backend/src/utils/candidate-restaurant-verification.utils.ts
+new file mode 100644
+index 0000000..49d95f4
+--- /dev/null
++++ b/rateeat_backend/src/utils/candidate-restaurant-verification.utils.ts
+@@ -0,0 +1,78 @@
++import { BadRequestError } from "./error-response.utils";
++import {
++  CandidateRestaurantBatchItem,
++  CandidateRestaurantReviewAction,
++} from "../types/candidate-restaurant-verification.types";
++
++export const validateReviewAction = (action: any): CandidateRestaurantReviewAction => {
++  if (!action || typeof action !== "string") {
++    throw new BadRequestError("Review action must be a string");
++  }
++  const normalized = action.toLowerCase().trim();
++  if (normalized !== "approve" && normalized !== "reject") {
++    throw new BadRequestError("Invalid review action: must be 'approve' or 'reject'");
++  }
++  return normalized as CandidateRestaurantReviewAction;
++};
++
++export const validateBatchReviewPayload = (
++  payload: any
++): CandidateRestaurantBatchItem[] => {
++  if (!payload || typeof payload !== "object") {
++    throw new BadRequestError("Request body must be an object");
++  }
++
++  const { items } = payload;
++  if (!Array.isArray(items)) {
++    throw new BadRequestError("Field 'items' must be a non-empty array");
++  }
++
++  if (items.length === 0) {
++    throw new BadRequestError("Field 'items' cannot be empty");
++  }
++
++  const seenIds = new Set<string>();
++  const validatedItems: CandidateRestaurantBatchItem[] = [];
++
++  for (let i = 0; i < items.length; i++) {
++    const item = items[i];
++    if (!item || typeof item !== "object") {
++      throw new BadRequestError(`Batch item at index ${i} must be an object`);
++    }
++
++    const { candidateRestaurantId, action } = item;
++    if (!candidateRestaurantId || typeof candidateRestaurantId !== "string") {
++      throw new BadRequestError(
++        `Batch item at index ${i} must contain a valid candidateRestaurantId string`
++      );
++    }
++
++    const trimmedId = candidateRestaurantId.trim();
++    if (!trimmedId) {
++      throw new BadRequestError(
++        `Batch item at index ${i} must contain a non-empty candidateRestaurantId`
++      );
++    }
++
++    if (seenIds.has(trimmedId)) {
++      throw new BadRequestError("Duplicate candidate restaurant id");
++    }
++    seenIds.add(trimmedId);
++
++    const validAction = validateReviewAction(action);
++    validatedItems.push({
++      candidateRestaurantId: trimmedId,
++      action: validAction,
++    });
++  }
++
++  return validatedItems;
++};
++
++export const extractChainName = (restaurantName: string): string => {
++  if (!restaurantName || typeof restaurantName !== "string") {
++    return "Default Chain";
++  }
++  const parts = restaurantName.split(" | ");
++  return parts[0].trim() || restaurantName.trim();
++};
