@@ -6,8 +6,8 @@ name = "afterquery/deterministic-restaurant-verification-outcomes"
 
 [metadata]
 task_id = "deterministic-restaurant-verification-outcomes"
-display_title = "Deterministic Restaurant Verification Outcomes"
-display_description = "Ensure restaurant claim verification workflow produces deterministic outcomes, strict terminal state transitions, and atomic batch review."
+display_title = "Reliable Restaurant Claim Verification Workflow"
+display_description = "Enforce strict terminal state transitions, chain synchronization, and atomic batch moderation for restaurant claims."
 category = "feature_request"
 language = "typescript"
 repository_url = "https://github.com/dawit2119/Rate_eat"

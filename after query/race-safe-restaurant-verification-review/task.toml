@@ -6,8 +6,8 @@ name = "afterquery/race-safe-restaurant-verification-review"
 
 [metadata]
 task_id = "race-safe-restaurant-verification-review"
-display_title = "Race-Safe Restaurant Verification Review"
-display_description = "Make candidate restaurant verification reviews behave correctly when multiple admins act on the same restaurant concurrently with deterministic batch processing."
+display_title = "Reliable Candidate Restaurant Verification Workflow"
+display_description = "Enforce race-safe review serialization, media synchronization, and atomic batch moderation for candidate restaurants."
 category = "feature_request"
 language = "typescript"
 repository_url = "https://github.com/dawit2119/Rate_eat"

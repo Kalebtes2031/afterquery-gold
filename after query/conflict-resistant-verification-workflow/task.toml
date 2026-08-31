@@ -6,8 +6,8 @@ name = "afterquery/conflict-resistant-verification-workflow"
 
 [metadata]
 task_id = "conflict-resistant-verification-workflow"
-display_title = "Conflict-Resistant Restaurant Verification Workflow"
-display_description = "Strengthen candidate restaurant verification workflow so competing reviews cannot create inconsistent state and batch reviews remain atomic."
+display_title = "Reliable Candidate Restaurant Verification Workflow"
+display_description = "Enforce race-safe review serialization, media synchronization, and atomic batch moderation for candidate restaurants."
 category = "feature_request"
 language = "typescript"
 repository_url = "https://github.com/dawit2119/Rate_eat"

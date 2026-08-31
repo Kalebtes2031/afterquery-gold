@@ -1,17 +1,25 @@
-We need to introduce a reliable and stable solution for restaurant claim verification processes.
+Reliable Restaurant Claim Verification Workflow
 
-At this moment, it does not require moving requests to a terminal state which results in duplicate processing of claims and differences in responses.
+Update restaurant claim verification to enforce strict terminal state transitions, chain synchronization, and atomic batch moderation.
 
-The approach to restaurant claim verification should be revised so that at least the following rules should be met:
+- State Transitions & Guards:
+  `PUT /api/v1/restaurant-claim-request/:claimId/approve` and `PUT /api/v1/restaurant-claim-request/:claimId/reject` transition a Pending claim to Approved or Rejected. Once in a terminal state, subsequent approval or rejection attempts must return HTTP 409 Conflict with `{"success": false, "message": "..."}`.
+  Rejecting accepts optional `rejectionReason` in the request body.
 
-- On the way to the terminal states, only valid statuses should be assumed (Pending -> Approved or Pending -> Rejected) so that if any attempt at the approval or disapproval of the already verified claim is made, a 409 Conflict message is shown.
+- Side Effects on Approval:
+  When approving a claim with `restaurant_chain_id`, set the associated `RestaurantChain.is_verified = true` in the same transaction.
+  Create a `Notification` for every super admin user (`AdminUser` with `is_super_admin: true`) with category `RestaurantClaim`.
 
-- If restaurant chain (with restaurant_chain_id) is approval relevant, the restaurant chain should be validated in the same transaction together with the claim approval.
+- Batch Verification Endpoint:
+  Add `POST /api/v1/restaurant-claim-request/batch-verify` accepting `{ "claims": [...] }`. Each item requires `claimId` and `action` (`"approve"` or `"reject"`), with optional `rejectionReason`.
+  Return HTTP 200 with `{ "success": true, "message": "...", "data": [...] }` containing verified claim records in the exact order requested.
 
-- When the claim is approved, super admins should receive notifications about the newly-verified claim.
+- Strict Validation & Atomic Rollback:
+  Missing, non-array, or empty `claims` returns HTTP 400.
+  Duplicate `claimId` values in a batch return HTTP 400 with `Duplicate claim request id`.
+  Unknown actions return HTTP 400.
+  If any claim in a batch fails, is not found (HTTP 404), or conflicts with an existing terminal state (HTTP 409), roll back the entire batch transaction.
 
-- Provide a batch verification endpoint `POST /api/v1/restaurant-claim-request/batch-verify` which accepts `{ claims: [{ claimId, action, rejectionReason? }] }` and processes approvals and rejections in the order specified.
-- Batch payloads should be validated strictly: requests missing required fields, requests that contain actions we don't know, and those with claims that violate duplicate claim IDs will automatically be rejected with 400 Bad Request.
-- Must roll back the entire transaction batch if any claim fails validation, cannot be found or if its state is invalid.
+Keep existing authorization and error handling conventions.
 
 IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.

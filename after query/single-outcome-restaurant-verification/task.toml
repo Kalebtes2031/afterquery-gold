@@ -6,8 +6,8 @@ name = "afterquery/single-outcome-restaurant-verification"
 
 [metadata]
 task_id = "single-outcome-restaurant-verification"
-display_title = "Single-Outcome Restaurant Claim Verification"
-display_description = "Enforce single-outcome terminal state verification and atomic batch review for restaurant claim requests with once-only side effects."
+display_title = "Reliable Restaurant Claim Verification Workflow"
+display_description = "Enforce strict terminal state transitions, chain synchronization, and atomic batch moderation for restaurant claims."
 category = "feature_request"
 language = "typescript"
 repository_url = "https://github.com/dawit2119/Rate_eat"

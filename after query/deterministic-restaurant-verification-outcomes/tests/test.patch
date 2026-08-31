@@ -1,268 +1,25 @@
-diff --git a/rateeat_backend/src/__tests__/unit/restaurant_claim_batch_outcomes.test.ts b/rateeat_backend/src/__tests__/unit/restaurant_claim_batch_outcomes.test.ts
+diff --git a/rateeat_backend/src/__tests__/unit/restaurant_claim_batch_verification_behavior.test.ts b/rateeat_backend/src/__tests__/unit/restaurant_claim_batch_verification_behavior.test.ts
 new file mode 100644
-index 0000000..e77bfa2
+index 0000000..85b1611
 --- /dev/null
-+++ b/rateeat_backend/src/__tests__/unit/restaurant_claim_batch_outcomes.test.ts
-@@ -0,0 +1,240 @@
-+import { validateBatchClaimPayload } from "../../utils/restaurant-claim-outcome.utils";
-+import { RestaurantClaimDeterminismService } from "../../services/restaurant-claim-determinism.service";
-+import { RestaurantClaimOutcomeService } from "../../services/restaurant-claim-outcome.service";
-+import { Status } from "../../models/RestaurantClaim/RestaurantClaimRequest";
-+import { ClaimVerificationAction } from "../../types/restaurant-claim-outcome.types";
-+
-+jest.mock("../../services/restaurant-claim-outcome.service");
-+
-+jest.mock("../../config/db", () => ({
-+  __esModule: true,
-+  default: {
-+    transaction: jest.fn().mockImplementation((cb) => {
-+      const mockTx = {
-+        commit: jest.fn().mockResolvedValue(undefined),
-+        rollback: jest.fn().mockResolvedValue(undefined),
-+      };
-+      return cb(mockTx);
-+    }),
-+  },
-+}));
-+
-+describe("Restaurant Claim Outcome Determinism - Batch Moderation & Ordering", () => {
-+  beforeEach(() => {
-+    jest.clearAllMocks();
-+  });
-+
-+  describe("Batch Verification Payload Validation", () => {
-+    it("returns 400 when body has no claims field", () => {
-+      expect(() => validateBatchClaimPayload({})).toThrow(
-+        "Field 'claims' must be an array"
-+      );
-+    });
-+
-+    it("returns 400 when claims array is empty", () => {
-+      expect(() => validateBatchClaimPayload({ claims: [] })).toThrow(
-+        "Field 'claims' cannot be an empty array"
-+      );
-+    });
-+
-+    it("returns 400 with duplicate claim request id when duplicate ids exist in claims array", () => {
-+      const payload = {
-+        claims: [
-+          { claimId: "claim-1", action: "approve" },
-+          { claimId: "claim-1", action: "reject" },
-+        ],
-+      };
-+      expect(() => validateBatchClaimPayload(payload)).toThrow(
-+        "Duplicate claim request id 'claim-1' detected"
-+      );
-+    });
-+
-+    it("returns 400 when an action in claims array is invalid", () => {
-+      const payload = {
-+        claims: [{ claimId: "claim-1", action: "delete" }],
-+      };
-+      expect(() => validateBatchClaimPayload(payload)).toThrow(
-+        "Invalid verification action 'delete'"
-+      );
-+    });
-+
-+    it("returns 400 when an item in claims array is not an object", () => {
-+      const payload = {
-+        claims: ["invalid-string-item"],
-+      };
-+      expect(() => validateBatchClaimPayload(payload)).toThrow(
-+        "Claim item at index 0 must be an object"
-+      );
-+    });
-+  });
-+
-+  describe("Batch Execution & Ordering", () => {
-+    it("successfully verifies mixed approval and rejection claims in single transaction", async () => {
-+      const items = [
-+        { claimId: "c-1", action: ClaimVerificationAction.Approve },
-+        {
-+          claimId: "c-2",
-+          action: ClaimVerificationAction.Reject,
-+          rejectionReason: "Incomplete docs",
-+        },
-+      ];
-+
-+      (
-+        RestaurantClaimOutcomeService.verifySingleClaimWithLock as jest.Mock
-+      )
-+        .mockResolvedValueOnce({
-+          id: "c-1",
-+          restaurant_id: "r-1",
-+          status: "Approved",
-+          rejection_reason: null,
-+          reviewed_at: new Date(),
-+          reviewed_by: "admin-1",
-+        })
-+        .mockResolvedValueOnce({
-+          id: "c-2",
-+          restaurant_id: "r-2",
-+          status: "Rejected",
-+          rejection_reason: "Incomplete docs",
-+          reviewed_at: new Date(),
-+          reviewed_by: "admin-1",
-+        });
-+
-+      const response =
-+        await RestaurantClaimDeterminismService.executeBatchVerification(
-+          items,
-+          "admin-1"
-+        );
-+
-+      expect(response.totalProcessed).toBe(2);
-+      expect(response.approvedCount).toBe(1);
-+      expect(response.rejectedCount).toBe(1);
-+      expect(response.results[0].id).toBe("c-1");
-+      expect(response.results[1].id).toBe("c-2");
-+    });
-+
-+    it("returns results in the exact requested order of claimIds", async () => {
-+      const items = [
-+        { claimId: "c-99", action: ClaimVerificationAction.Approve },
-+        { claimId: "c-11", action: ClaimVerificationAction.Approve },
-+        { claimId: "c-44", action: ClaimVerificationAction.Reject },
-+      ];
-+
-+      (
-+        RestaurantClaimOutcomeService.verifySingleClaimWithLock as jest.Mock
-+      )
-+        .mockResolvedValueOnce({ id: "c-99", status: "Approved" })
-+        .mockResolvedValueOnce({ id: "c-11", status: "Approved" })
-+        .mockResolvedValueOnce({ id: "c-44", status: "Rejected" });
-+
-+      const response =
-+        await RestaurantClaimDeterminismService.executeBatchVerification(
-+          items,
-+          "admin-1"
-+        );
-+
-+      expect(response.results.map((r) => r.id)).toEqual([
-+        "c-99",
-+        "c-11",
-+        "c-44",
-+      ]);
-+    });
-+
-+    it("trims whitespace from claim ids in batch", () => {
-+      const payload = {
-+        claims: [{ claimId: "  claim-padded  ", action: "approve" }],
-+      };
-+      const result = validateBatchClaimPayload(payload);
-+      expect(result.claims[0].claimId).toBe("claim-padded");
-+    });
-+  });
-+
-+  describe("Batch Rollback on Failures", () => {
-+    it("rolls back entire batch when one claim request is not found", async () => {
-+      (
-+        RestaurantClaimOutcomeService.verifySingleClaimWithLock as jest.Mock
-+      )
-+        .mockResolvedValueOnce({ id: "c-1", status: "Approved" })
-+        .mockRejectedValueOnce(new Error("Restaurant claim request not found"));
-+
-+      const items = [
-+        { claimId: "c-1", action: ClaimVerificationAction.Approve },
-+        { claimId: "c-missing", action: ClaimVerificationAction.Approve },
-+      ];
-+
-+      await expect(
-+        RestaurantClaimDeterminismService.executeBatchVerification(
-+          items,
-+          "admin-1"
-+        )
-+      ).rejects.toThrow("Restaurant claim request not found");
-+    });
-+
-+    it("rolls back entire batch when one claim request is already approved", async () => {
-+      (
-+        RestaurantClaimOutcomeService.verifySingleClaimWithLock as jest.Mock
-+      )
-+        .mockRejectedValueOnce(
-+          new Error("already in terminal state 'Approved'")
-+        );
-+
-+      const items = [
-+        { claimId: "c-already-approved", action: ClaimVerificationAction.Approve },
-+      ];
-+
-+      await expect(
-+        RestaurantClaimDeterminismService.executeBatchVerification(
-+          items,
-+          "admin-1"
-+        )
-+      ).rejects.toThrow("already in terminal state 'Approved'");
-+    });
-+
-+    it("rolls back entire batch when one claim request is already rejected", async () => {
-+      (
-+        RestaurantClaimOutcomeService.verifySingleClaimWithLock as jest.Mock
-+      )
-+        .mockRejectedValueOnce(
-+          new Error("already in terminal state 'Rejected'")
-+        );
-+
-+      const items = [
-+        { claimId: "c-already-rejected", action: ClaimVerificationAction.Reject },
-+      ];
-+
-+      await expect(
-+        RestaurantClaimDeterminismService.executeBatchVerification(
-+          items,
-+          "admin-1"
-+        )
-+      ).rejects.toThrow("already in terminal state 'Rejected'");
-+    });
-+
-+    it("serializes concurrent reviews on same claim request so only one succeeds", async () => {
-+      const mockFn = jest
-+        .fn()
-+        .mockResolvedValueOnce({ id: "c-race", status: "Approved" })
-+        .mockRejectedValueOnce(
-+          new Error("already in terminal state 'Approved'")
-+        );
-+
-+      (
-+        RestaurantClaimOutcomeService.verifySingleClaimWithLock as jest.Mock
-+      ) = mockFn;
-+
-+      const p1 = RestaurantClaimOutcomeService.verifySingleClaimWithLock(
-+        "c-race",
-+        "approve",
-+        "admin-1"
-+      );
-+      const p2 = RestaurantClaimOutcomeService.verifySingleClaimWithLock(
-+        "c-race",
-+        "approve",
-+        "admin-2"
-+      );
-+
-+      const results = await Promise.allSettled([p1, p2]);
-+      expect(results[0].status).toBe("fulfilled");
-+      expect(results[1].status).toBe("rejected");
-+    });
-+  });
-+});
-diff --git a/rateeat_backend/src/__tests__/unit/restaurant_claim_outcome_determinism.test.ts b/rateeat_backend/src/__tests__/unit/restaurant_claim_outcome_determinism.test.ts
-new file mode 100644
-index 0000000..d4ee0f2
---- /dev/null
-+++ b/rateeat_backend/src/__tests__/unit/restaurant_claim_outcome_determinism.test.ts
-@@ -0,0 +1,339 @@
-+import { RestaurantClaimOutcomeService } from "../../services/restaurant-claim-outcome.service";
++++ b/rateeat_backend/src/__tests__/unit/restaurant_claim_batch_verification_behavior.test.ts
+@@ -0,0 +1,177 @@
++import express from "express";
++import request from "supertest";
++import restaurantClaimRouter from "../../routes/restaurant_claim_request.route";
 +import {
 +  AdminUser,
-+  Notification,
-+  RestaurantChain,
 +  RestaurantClaimRequest,
 +} from "../../models";
 +import { Status } from "../../models/RestaurantClaim/RestaurantClaimRequest";
-+import {
-+  createMockRestaurantChain,
-+  createMockRestaurantClaim,
-+} from "./restaurant_claim_outcome_test_support";
-+import sequelize from "../../config/db";
++
++jest.mock("../../middlewares/auth", () => ({
++  authenticateToken: (req: any, _res: any, next: any) => {
++    req.user = { id: "admin-uuid-1", is_super_admin: true };
++    next();
++  },
++  authorizeRole: (_roles: any) => (_req: any, _res: any, next: any) => next(),
++}));
 +
 +jest.mock("../../models", () => ({
 +  RestaurantClaimRequest: {
@@ -272,7 +29,8 @@ index 0000000..d4ee0f2
 +    findByPk: jest.fn(),
 +  },
 +  AdminUser: {
-+    findAll: jest.fn(),
++    findAll: jest.fn().mockResolvedValue([]),
++    findByPk: jest.fn().mockResolvedValue({ id: "admin-uuid-1" }),
 +  },
 +  Notification: {
 +    create: jest.fn(),
@@ -293,329 +51,493 @@ index 0000000..d4ee0f2
 +  },
 +}));
 +
-+describe("Restaurant Claim Outcome Determinism - Single Verification Lifecycle", () => {
++describe("Restaurant Claim Verification - Batch Verification Endpoint", () => {
++  const app = express();
++  app.use(express.json());
++  app.use("/api/v1/restaurant-claim-request", restaurantClaimRouter);
++  app.use((err: any, _req: any, res: any, _next: any) => {
++    res.status(err.statusCode || 500).json({
++      success: false,
++      message: err.message || "Internal Server Error",
++    });
++  });
++
 +  beforeEach(() => {
 +    jest.clearAllMocks();
 +  });
 +
-+  describe("Approving Restaurant Claim Requests", () => {
-+    it("approves a pending claim request and transitions to Approved", async () => {
-+      const mockClaim = createMockRestaurantClaim({
-+        id: "claim-101",
-+        status: Status.Pending,
-+        restaurant_chain_id: null,
++  it("returns 400 when body does not contain claims array", async () => {
++    const res = await request(app)
++      .post("/api/v1/restaurant-claim-request/batch-verify")
++      .send({});
++
++    expect(res.status).toBe(400);
++  });
++
++  it("returns 400 when claims array is empty", async () => {
++    const res = await request(app)
++      .post("/api/v1/restaurant-claim-request/batch-verify")
++      .send({ claims: [] });
++
++    expect(res.status).toBe(400);
++  });
++
++  it("returns 400 when duplicate claim IDs are detected in batch payload", async () => {
++    const res = await request(app)
++      .post("/api/v1/restaurant-claim-request/batch-verify")
++      .send({
++        claims: [
++          { claimId: "c-dup-1", action: "approve" },
++          { claimId: "c-dup-1", action: "reject" },
++        ],
 +      });
++
++    expect(res.status).toBe(400);
++    expect(res.body.message).toContain("Duplicate claim request id");
++  });
++
++  it("returns 400 when an invalid verification action is specified", async () => {
++    const res = await request(app)
++      .post("/api/v1/restaurant-claim-request/batch-verify")
++      .send({
++        claims: [{ claimId: "c-1", action: "unknown_action" }],
++      });
++
++    expect(res.status).toBe(400);
++  });
++
++  it("returns 400 when claimId is missing or empty whitespace", async () => {
++    const res = await request(app)
++      .post("/api/v1/restaurant-claim-request/batch-verify")
++      .send({
++        claims: [{ claimId: "   ", action: "approve" }],
++      });
++
++    expect(res.status).toBe(400);
++  });
++
++  it("successfully verifies mixed batch claims in exact requested order", async () => {
++    const mockClaim1 = {
++      id: "c-b1",
++      restaurant_id: "r-b1",
++      status: Status.Pending,
++      save: jest.fn().mockResolvedValue(true),
++    };
++    const mockClaim2 = {
++      id: "c-b2",
++      restaurant_id: "r-b2",
++      status: Status.Pending,
++      save: jest.fn().mockResolvedValue(true),
++    };
++
++    (RestaurantClaimRequest.findByPk as jest.Mock)
++      .mockResolvedValueOnce(mockClaim1)
++      .mockResolvedValueOnce(mockClaim2);
++    (AdminUser.findAll as jest.Mock).mockResolvedValue([]);
++
++    const res = await request(app)
++      .post("/api/v1/restaurant-claim-request/batch-verify")
++      .send({
++        claims: [
++          { claimId: "c-b1", action: "approve" },
++          { claimId: "c-b2", action: "reject", rejectionReason: "Bad photo" },
++        ],
++      });
++
++    expect(res.status).toBe(200);
++    expect(res.body.success).toBe(true);
++    expect(res.body.data).toHaveLength(2);
++    expect(res.body.data[0].id).toBe("c-b1");
++    expect(res.body.data[0].status).toBe("Approved");
++    expect(res.body.data[1].id).toBe("c-b2");
++    expect(res.body.data[1].status).toBe("Rejected");
++  });
++
++  it("rolls back batch when any claim fails or is not found", async () => {
++    (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(null);
++
++    const res = await request(app)
++      .post("/api/v1/restaurant-claim-request/batch-verify")
++      .send({
++        claims: [{ claimId: "c-missing", action: "approve" }],
++      });
++
++    expect(res.status).toBe(404);
++  });
++
++  it("rolls back batch when any claim is already in a terminal state", async () => {
++    const mockClaim = {
++      id: "c-term",
++      status: Status.Approved,
++    };
++    (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(mockClaim);
++
++    const res = await request(app)
++      .post("/api/v1/restaurant-claim-request/batch-verify")
++      .send({
++        claims: [{ claimId: "c-term", action: "approve" }],
++      });
++
++    expect(res.status).toBe(409);
++  });
++});
+diff --git a/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_audit.test.ts b/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_audit.test.ts
+new file mode 100644
+index 0000000..d232db9
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_audit.test.ts
+@@ -0,0 +1,64 @@
++import {
++  formatClaimVerificationSummary,
++  parseVerificationFilters,
++  isValidClaimIdentifier,
++  sanitizeVerificationMetrics,
++  createVerificationErrorEnvelope,
++} from "../../utils/restaurant-claim-outcome.utils";
++import { ClaimVerificationStatus } from "../../types/restaurant-claim-outcome.types";
++
++describe("Restaurant Claim Verification - Utility & Filter Logic", () => {
++  it("formats claim verification summary correctly for approved and rejected sets", () => {
++    const summary = formatClaimVerificationSummary([
++      {
++        id: "c-1",
++        restaurant_id: "r-1",
++        status: ClaimVerificationStatus.Approved,
++        reviewed_at: new Date(),
++        reviewed_by: "u-1",
++      },
++      {
++        id: "c-2",
++        restaurant_id: "r-2",
++        status: ClaimVerificationStatus.Rejected,
++        reviewed_at: new Date(),
++        reviewed_by: "u-1",
++      },
++    ]);
++
++    expect(summary.total).toBe(2);
++    expect(summary.approved).toBe(1);
++    expect(summary.rejected).toBe(1);
++  });
++
++  it("parses verification filters with limit, offset, and status", () => {
++    const filters = parseVerificationFilters({
++      status: "Approved",
++      restaurantId: "r-100",
++      limit: "25",
++      offset: "10",
++    });
++
++    expect(filters.status).toBe(ClaimVerificationStatus.Approved);
++    expect(filters.restaurantId).toBe("r-100");
++    expect(filters.limit).toBe(25);
++    expect(filters.offset).toBe(10);
++  });
++
++  it("validates claim identifier formats accurately", () => {
++    expect(isValidClaimIdentifier("c-12345")).toBe(true);
++    expect(isValidClaimIdentifier("claim-abcd-1234")).toBe(true);
++    expect(isValidClaimIdentifier("123e4567-e89b-12d3-a456-426614174000")).toBe(true);
++    expect(isValidClaimIdentifier("")).toBe(false);
++  });
++
++  it("sanitizes verification metrics and builds standardized error envelopes", () => {
++    const metrics = sanitizeVerificationMetrics({ pending: 4, approved: 10, rejected: 2 });
++    expect(metrics.totalClaims).toBe(16);
++    expect(metrics.approvedCount).toBe(10);
++
++    const errorBody = createVerificationErrorEnvelope(409, "Claim conflict detected");
++    expect(errorBody.success).toBe(false);
++    expect(errorBody.message).toBe("Claim conflict detected");
++  });
++});
+diff --git a/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_auth.test.ts b/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_auth.test.ts
+new file mode 100644
+index 0000000..e7c0dd5
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_auth.test.ts
+@@ -0,0 +1,32 @@
++import express from "express";
++import request from "supertest";
++import restaurantClaimRouter from "../../routes/restaurant_claim_request.route";
++
++describe("Restaurant Claim Verification - Route Authorization", () => {
++  const app = express();
++  app.use(express.json());
++  app.use("/api/v1/restaurant-claim-request", restaurantClaimRouter);
++
++  it("returns 401 when batch-verify is requested without authorization token", async () => {
++    const res = await request(app)
++      .post("/api/v1/restaurant-claim-request/batch-verify")
++      .send({
++        claims: [{ claimId: "claim-101", action: "approve" }],
++      });
++    expect(res.status).toBe(401);
++  });
++
++  it("returns 401 when approve claim is requested without authorization token", async () => {
++    const res = await request(app)
++      .put("/api/v1/restaurant-claim-request/claim-101/approve")
++      .send();
++    expect(res.status).toBe(401);
++  });
++
++  it("returns 401 when metrics endpoint is requested without authorization token", async () => {
++    const res = await request(app)
++      .get("/api/v1/restaurant-claim-request/metrics")
++      .send();
++    expect(res.status).toBe(401);
++  });
++});
+diff --git a/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_behavior.test.ts b/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_behavior.test.ts
+new file mode 100644
+index 0000000..ab7c8df
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_behavior.test.ts
+@@ -0,0 +1,246 @@
++import express from "express";
++import request from "supertest";
++import restaurantClaimRouter from "../../routes/restaurant_claim_request.route";
++import {
++  AdminUser,
++  Notification,
++  RestaurantChain,
++  RestaurantClaimRequest,
++} from "../../models";
++import { Status } from "../../models/RestaurantClaim/RestaurantClaimRequest";
++
++jest.mock("../../middlewares/auth", () => ({
++  authenticateToken: (req: any, _res: any, next: any) => {
++    req.user = { id: "admin-uuid-1", is_super_admin: true };
++    next();
++  },
++  authorizeRole: (_roles: any) => (_req: any, _res: any, next: any) => next(),
++}));
++
++jest.mock("../../models", () => ({
++  RestaurantClaimRequest: {
++    findByPk: jest.fn(),
++    count: jest.fn(),
++    findAndCountAll: jest.fn(),
++  },
++  RestaurantChain: {
++    findByPk: jest.fn(),
++  },
++  AdminUser: {
++    findAll: jest.fn(),
++    findByPk: jest.fn().mockResolvedValue({ id: "admin-uuid-1" }),
++  },
++  Notification: {
++    create: jest.fn(),
++  },
++}));
++
++jest.mock("../../config/db", () => ({
++  __esModule: true,
++  default: {
++    transaction: jest.fn().mockImplementation((cb) => {
++      const mockTx = {
++        LOCK: { UPDATE: "UPDATE" },
++        commit: jest.fn().mockResolvedValue(undefined),
++        rollback: jest.fn().mockResolvedValue(undefined),
++      };
++      return cb(mockTx);
++    }),
++  },
++}));
++
++describe("Restaurant Claim Verification - Public HTTP Endpoint Behavior", () => {
++  const app = express();
++  app.use(express.json());
++  app.use("/api/v1/restaurant-claim-request", restaurantClaimRouter);
++  app.use((err: any, _req: any, res: any, _next: any) => {
++    res.status(err.statusCode || 500).json({
++      success: false,
++      message: err.message || "Internal Server Error",
++    });
++  });
++
++  beforeEach(() => {
++    jest.clearAllMocks();
++  });
++
++  describe("PUT /api/v1/restaurant-claim-request/:claimId/approve", () => {
++    it("approves pending claim request and returns 200 with approved data", async () => {
++      const mockClaim = {
++        id: "c-101",
++        restaurant_id: "r-101",
++        restaurant_chain_id: null,
++        status: Status.Pending,
++        save: jest.fn().mockResolvedValue(true),
++      };
 +      (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(mockClaim);
 +      (AdminUser.findAll as jest.Mock).mockResolvedValue([]);
 +
-+      const result =
-+        await RestaurantClaimOutcomeService.verifySingleClaimWithLock(
-+          "claim-101",
-+          "approve",
-+          "admin-1"
-+        );
++      const res = await request(app)
++        .put("/api/v1/restaurant-claim-request/c-101/approve")
++        .send();
 +
-+      expect(result.status).toBe("Approved");
++      expect(res.status).toBe(200);
++      expect(res.body.success).toBe(true);
++      expect(res.body.data.status).toBe("Approved");
 +      expect(mockClaim.status).toBe(Status.Approved);
 +      expect(mockClaim.save).toHaveBeenCalled();
 +    });
 +
-+    it("creates notification records for super admins upon approval", async () => {
-+      const mockClaim = createMockRestaurantClaim({
-+        id: "claim-102",
-+        status: Status.Pending,
-+        restaurant_chain_id: null,
-+      });
-+      (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(mockClaim);
-+      (AdminUser.findAll as jest.Mock).mockResolvedValue([
-+        { id: "super-admin-1", is_super_admin: true },
-+        { id: "super-admin-2", is_super_admin: true },
-+      ]);
-+
-+      await RestaurantClaimOutcomeService.verifySingleClaimWithLock(
-+        "claim-102",
-+        "approve",
-+        "admin-1"
-+      );
-+
-+      expect(Notification.create).toHaveBeenCalledTimes(2);
-+    });
-+
 +    it("verifies and synchronizes associated restaurant chain when chainId is present", async () => {
-+      const mockClaim = createMockRestaurantClaim({
-+        id: "claim-103",
++      const mockClaim = {
++        id: "c-102",
++        restaurant_id: "r-102",
++        restaurant_chain_id: "chain-102",
 +        status: Status.Pending,
-+        restaurant_chain_id: "chain-55",
-+      });
-+      const mockChain = createMockRestaurantChain({
-+        id: "chain-55",
++        save: jest.fn().mockResolvedValue(true),
++      };
++      const mockChain = {
++        id: "chain-102",
 +        is_verified: false,
-+      });
-+
++        save: jest.fn().mockResolvedValue(true),
++      };
 +      (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(mockClaim);
 +      (RestaurantChain.findByPk as jest.Mock).mockResolvedValue(mockChain);
 +      (AdminUser.findAll as jest.Mock).mockResolvedValue([]);
 +
-+      await RestaurantClaimOutcomeService.verifySingleClaimWithLock(
-+        "claim-103",
-+        "approve",
-+        "admin-1"
-+      );
++      const res = await request(app)
++        .put("/api/v1/restaurant-claim-request/c-102/approve")
++        .send();
 +
++      expect(res.status).toBe(200);
 +      expect(mockChain.is_verified).toBe(true);
 +      expect(mockChain.save).toHaveBeenCalled();
 +    });
 +
-+    it("approving claim with null restaurant_chain_id does not query or save chain", async () => {
-+      const mockClaim = createMockRestaurantClaim({
-+        id: "claim-104",
++    it("creates notification records for super admins on approval", async () => {
++      const mockClaim = {
++        id: "c-103",
++        restaurant_id: "r-103",
 +        status: Status.Pending,
-+        restaurant_chain_id: null,
-+      });
++        save: jest.fn().mockResolvedValue(true),
++      };
 +      (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(mockClaim);
-+      (AdminUser.findAll as jest.Mock).mockResolvedValue([]);
++      (AdminUser.findAll as jest.Mock).mockResolvedValue([
++        { id: "super-1", is_super_admin: true },
++      ]);
 +
-+      await RestaurantClaimOutcomeService.verifySingleClaimWithLock(
-+        "claim-104",
-+        "approve",
-+        "admin-1"
-+      );
++      const res = await request(app)
++        .put("/api/v1/restaurant-claim-request/c-103/approve")
++        .send();
 +
-+      expect(RestaurantChain.findByPk).not.toHaveBeenCalled();
++      expect(res.status).toBe(200);
++      expect(Notification.create).toHaveBeenCalledTimes(1);
 +    });
 +
-+    it("returns 409 when attempting to approve an already approved claim request", async () => {
-+      const mockClaim = createMockRestaurantClaim({
-+        id: "claim-105",
++    it("returns 409 when approving an already approved claim request", async () => {
++      const mockClaim = {
++        id: "c-104",
 +        status: Status.Approved,
-+      });
++        save: jest.fn(),
++      };
 +      (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(mockClaim);
 +
-+      await expect(
-+        RestaurantClaimOutcomeService.verifySingleClaimWithLock(
-+          "claim-105",
-+          "approve",
-+          "admin-1"
-+        )
-+      ).rejects.toThrow("already in terminal state 'Approved'");
++      const res = await request(app)
++        .put("/api/v1/restaurant-claim-request/c-104/approve")
++        .send();
++
++      expect(res.status).toBe(409);
++      expect(res.body.success).toBe(false);
 +    });
 +
-+    it("returns 409 when attempting to approve an already rejected claim request", async () => {
-+      const mockClaim = createMockRestaurantClaim({
-+        id: "claim-106",
++    it("returns 409 when approving an already rejected claim request", async () => {
++      const mockClaim = {
++        id: "c-105",
 +        status: Status.Rejected,
-+      });
++        save: jest.fn(),
++      };
 +      (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(mockClaim);
 +
-+      await expect(
-+        RestaurantClaimOutcomeService.verifySingleClaimWithLock(
-+          "claim-106",
-+          "approve",
-+          "admin-1"
-+        )
-+      ).rejects.toThrow("already in terminal state 'Rejected'");
++      const res = await request(app)
++        .put("/api/v1/restaurant-claim-request/c-105/approve")
++        .send();
++
++      expect(res.status).toBe(409);
 +    });
 +
-+    it("returns 404 when claim request does not exist", async () => {
++    it("returns 404 when claim request is not found", async () => {
 +      (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(null);
 +
-+      await expect(
-+        RestaurantClaimOutcomeService.verifySingleClaimWithLock(
-+          "claim-missing",
-+          "approve",
-+          "admin-1"
-+        )
-+      ).rejects.toThrow("Restaurant claim request not found");
++      const res = await request(app)
++        .put("/api/v1/restaurant-claim-request/c-missing/approve")
++        .send();
++
++      expect(res.status).toBe(404);
 +    });
 +  });
 +
-+  describe("Rejecting Restaurant Claim Requests", () => {
-+    it("rejects a pending claim request and transitions to Rejected with reason", async () => {
-+      const mockClaim = createMockRestaurantClaim({
-+        id: "claim-201",
++  describe("PUT /api/v1/restaurant-claim-request/:claimId/reject", () => {
++    it("rejects pending claim request with rejection reason and returns 200", async () => {
++      const mockClaim = {
++        id: "c-201",
++        restaurant_id: "r-201",
 +        status: Status.Pending,
-+      });
++        save: jest.fn().mockResolvedValue(true),
++      };
 +      (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(mockClaim);
 +
-+      const result =
-+        await RestaurantClaimOutcomeService.verifySingleClaimWithLock(
-+          "claim-201",
-+          "reject",
-+          "admin-1",
-+          "Invalid documentation"
-+        );
++      const res = await request(app)
++        .put("/api/v1/restaurant-claim-request/c-201/reject")
++        .send({ rejectionReason: "Invalid business tax document" });
 +
-+      expect(result.status).toBe("Rejected");
-+      expect(result.rejection_reason).toBe("Invalid documentation");
-+      expect(mockClaim.status).toBe(Status.Rejected);
-+      expect(mockClaim.save).toHaveBeenCalled();
++      expect(res.status).toBe(200);
++      expect(res.body.success).toBe(true);
++      expect(res.body.data.status).toBe("Rejected");
++      expect(res.body.data.rejection_reason).toBe("Invalid business tax document");
 +    });
 +
-+    it("rejects a pending claim request without reason when none provided", async () => {
-+      const mockClaim = createMockRestaurantClaim({
-+        id: "claim-202",
-+        status: Status.Pending,
-+      });
-+      (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(mockClaim);
-+
-+      const result =
-+        await RestaurantClaimOutcomeService.verifySingleClaimWithLock(
-+          "claim-202",
-+          "reject",
-+          "admin-1"
-+        );
-+
-+      expect(result.status).toBe("Rejected");
-+      expect(result.rejection_reason).toBeNull();
-+    });
-+
-+    it("returns 409 when attempting to reject an already rejected claim request", async () => {
-+      const mockClaim = createMockRestaurantClaim({
-+        id: "claim-203",
++    it("returns 409 when rejecting an already rejected claim request", async () => {
++      const mockClaim = {
++        id: "c-202",
 +        status: Status.Rejected,
-+      });
++      };
 +      (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(mockClaim);
 +
-+      await expect(
-+        RestaurantClaimOutcomeService.verifySingleClaimWithLock(
-+          "claim-203",
-+          "reject",
-+          "admin-1"
-+        )
-+      ).rejects.toThrow("already in terminal state 'Rejected'");
++      const res = await request(app)
++        .put("/api/v1/restaurant-claim-request/c-202/reject")
++        .send();
++
++      expect(res.status).toBe(409);
 +    });
 +
-+    it("returns 409 when attempting to reject an already approved claim request", async () => {
-+      const mockClaim = createMockRestaurantClaim({
-+        id: "claim-204",
++    it("returns 409 when rejecting an already approved claim request", async () => {
++      const mockClaim = {
++        id: "c-203",
 +        status: Status.Approved,
-+      });
++      };
 +      (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(mockClaim);
 +
-+      await expect(
-+        RestaurantClaimOutcomeService.verifySingleClaimWithLock(
-+          "claim-204",
-+          "reject",
-+          "admin-1"
-+        )
-+      ).rejects.toThrow("already in terminal state 'Approved'");
-+    });
++      const res = await request(app)
++        .put("/api/v1/restaurant-claim-request/c-203/reject")
++        .send();
 +
-+    it("returns 404 when claim request to reject is not found", async () => {
-+      (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(null);
-+
-+      await expect(
-+        RestaurantClaimOutcomeService.verifySingleClaimWithLock(
-+          "claim-notfound",
-+          "reject",
-+          "admin-1"
-+        )
-+      ).rejects.toThrow("Restaurant claim request not found");
++      expect(res.status).toBe(409);
 +    });
 +  });
 +
-+  describe("Transactional Integrity", () => {
-+    it("rolls back approval transaction if database save fails", async () => {
-+      const mockClaim = createMockRestaurantClaim({
-+        id: "claim-301",
-+        status: Status.Pending,
-+        save: jest.fn().mockRejectedValue(new Error("DB Connection Lost")),
-+      });
-+      (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(mockClaim);
++  describe("GET /api/v1/restaurant-claim-request/metrics", () => {
++    it("returns aggregated claim verification metrics with 200 status", async () => {
++      (RestaurantClaimRequest.count as jest.Mock)
++        .mockResolvedValueOnce(5)
++        .mockResolvedValueOnce(12)
++        .mockResolvedValueOnce(3)
++        .mockResolvedValueOnce(8);
 +
-+      await expect(
-+        RestaurantClaimOutcomeService.verifySingleClaimWithLock(
-+          "claim-301",
-+          "approve",
-+          "admin-1"
-+        )
-+      ).rejects.toThrow("DB Connection Lost");
-+    });
++      const res = await request(app)
++        .get("/api/v1/restaurant-claim-request/metrics")
++        .send();
 +
-+    it("handles concurrent approval and rejection where first action wins deterministically", async () => {
-+      const mockFn = jest
-+        .fn()
-+        .mockResolvedValueOnce({ id: "c-concurrent", status: "Approved" })
-+        .mockRejectedValueOnce(new Error("already in terminal state 'Approved'"));
-+
-+      (RestaurantClaimOutcomeService.verifySingleClaimWithLock as jest.Mock) = mockFn;
-+
-+      const p1 = RestaurantClaimOutcomeService.verifySingleClaimWithLock(
-+        "c-concurrent",
-+        "approve",
-+        "admin-1"
-+      );
-+      const p2 = RestaurantClaimOutcomeService.verifySingleClaimWithLock(
-+        "c-concurrent",
-+        "reject",
-+        "admin-2"
-+      );
-+
-+      const res = await Promise.allSettled([p1, p2]);
-+      expect(res[0].status).toBe("fulfilled");
-+      expect(res[1].status).toBe("rejected");
-+    });
-+
-+    it("verifies single claim with external transaction without opening nested transaction", async () => {
-+      const mockTx: any = { LOCK: { UPDATE: "UPDATE" } };
-+      const mockClaim = createMockRestaurantClaim({ id: "c-ext", status: Status.Pending });
-+      (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(mockClaim);
-+      (AdminUser.findAll as jest.Mock).mockResolvedValue([]);
-+
-+      const result = await RestaurantClaimOutcomeService.verifySingleClaimWithLock(
-+        "c-ext",
-+        "approve",
-+        "admin-1",
-+        undefined,
-+        mockTx
-+      );
-+
-+      expect(result.status).toBe("Approved");
-+    });
-+
-+    it("returns empty history when no claims exist for given restaurant filter", async () => {
-+      (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(null);
-+      const history = await RestaurantClaimOutcomeService.queryVerificationHistory({
-+        restaurantId: "non-existent-rest",
-+      });
-+      expect(history).toBeDefined();
-+    });
-+
-+    it("counts claim requests accurately across pending, approved, and rejected", async () => {
-+      const counts = await RestaurantClaimOutcomeService.getClaimStatusCounts();
-+      expect(counts).toHaveProperty("pending");
-+      expect(counts).toHaveProperty("approved");
-+      expect(counts).toHaveProperty("rejected");
++      expect(res.status).toBe(200);
++      expect(res.body.success).toBe(true);
++      expect(res.body.data).toHaveProperty("totalClaims");
++      expect(res.body.data.pendingCount).toBe(5);
++      expect(res.body.data.approvedCount).toBe(12);
 +    });
 +  });
 +});
-diff --git a/rateeat_backend/src/__tests__/unit/restaurant_claim_outcome_test_support.ts b/rateeat_backend/src/__tests__/unit/restaurant_claim_outcome_test_support.ts
-new file mode 100644
-index 0000000..733036a
---- /dev/null
-+++ b/rateeat_backend/src/__tests__/unit/restaurant_claim_outcome_test_support.ts
-@@ -0,0 +1,24 @@
-+import { Status } from "../../models/RestaurantClaim/RestaurantClaimRequest";
-+
-+export function createMockRestaurantClaim(overrides: any = {}) {
-+  return {
-+    id: overrides.id || "claim-uuid-1",
-+    restaurant_id: overrides.restaurant_id || "rest-uuid-1",
-+    restaurant_chain_id: overrides.restaurant_chain_id !== undefined ? overrides.restaurant_chain_id : "chain-uuid-1",
-+    user_id: overrides.user_id || "user-uuid-1",
-+    status: overrides.status || Status.Pending,
-+    save: jest.fn().mockResolvedValue(true),
-+    update: jest.fn().mockResolvedValue(true),
-+    ...overrides,
-+  };
-+}
-+
-+export function createMockRestaurantChain(overrides: any = {}) {
-+  return {
-+    id: overrides.id || "chain-uuid-1",
-+    name: overrides.name || "Test Chain",
-+    is_verified: overrides.is_verified || false,
-+    save: jest.fn().mockResolvedValue(true),
-+    ...overrides,
-+  };
-+}

@@ -1,19 +1,23 @@
-Our goal is ensuring that verification process of reviews in restaurants shall be done only once and repeated attempts shall not have any impact on results.
+Once-Only Candidate Item Review Verification Effects
 
-Presently, approving or disapproving candidates’ reviews may lead to multiple monetary awards being paid, simultaneous notifications being issued or monetary balance being ruined when the duplicates arise or reviews are processed simultaneously.
+Ensure candidate item review verification side effects occur only once, even under concurrent or retried reviews.
 
-Amend the procedure of verifying candidate reviews:
+- State Transitions & Incentive Adjustment:
+  `PUT /api/v1/candidate-item-reviews/:id` manages review status (`{ "isApproved": boolean }`). Approving an unmoderated review awards monetary incentives to the reviewer. Subsequent approvals on an already approved review must not repeat incentive awards.
+  Rejecting an approved review deducts previously awarded incentives from the reviewer and marks the review as unapproved.
 
-- Apply the principle of monetary rewards payment only once. Approving the review will lead to the payment; however any repeated attempts of approval or simultaneous applications shall not cause any payment.
+- Parent Item Verification Guard:
+  Before approving a candidate item review, verify that the parent Item is already approved. If the item is not approved, return HTTP 400 Bad Request with `{"success": false, "message": "Item is not approved yet"}`.
 
-- Deduct the payments already made in case the review approved in advance is rejected. Update the terminal status properly.
+- Batch Moderation Endpoint:
+  Add `PUT /api/v1/candidate-item-reviews/batch-manage` accepting `{ "reviews": [...] }`. Each item requires `reviewId` and `isApproved`.
+  Return HTTP 200 with `{ "success": true, "message": "...", "data": [...] }` containing moderated review records in the exact order requested.
 
-- Check the approval status for each review. It should return 400 Bad Request status in case the item is not approved yet.
+- Strict Validation & Atomic Rollback:
+  Missing, non-array, or empty `reviews` returns HTTP 400.
+  Duplicate `reviewId` values return HTTP 400 with `Duplicate review id`.
+  If any review in a batch fails validation, is not found (HTTP 404), or encounters an error, roll back the entire batch.
 
-- Provide an opportunity to process reviews in batches using the endpoint PUT /api/v1/candidate-item-reviews/batch-manage with payload { reviews: [{ reviewId, isApproved }] }.
-
-- Validate the incoming request to return 400 Bad Request in case of missing array, empty array or duplicate IDs.
-
-- Database updates, media synchronization and payment operations shall happen in an atomic manner.
+Keep existing authorization and error conventions.
 
 IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.

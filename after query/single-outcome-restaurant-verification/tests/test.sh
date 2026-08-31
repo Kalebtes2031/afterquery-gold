@@ -19,6 +19,7 @@ export RUN_LOG=/logs/verifier/run.log
 run_log() { echo "+ $*" >> "$RUN_LOG" 2>/dev/null; "$@" 2>&1 | tee -a "$RUN_LOG"; return "${PIPESTATUS[0]}"; }
 
 # >>> RUN TESTS (task-specific) <<<
+
 export NODE_PATH="/opt/ctrf/node_modules:/app/rateeat_backend/node_modules"
 set +e
 
@@ -103,7 +104,7 @@ timeout --kill-after=10s 300s \
   --no-cache \
   --runInBand \
   --forceExit \
-  --testPathIgnorePatterns='restaurant_claim_(verification_behavior|batch_verification)\.test\.ts$' \
+  --testPathIgnorePatterns='restaurant_claim_.*verification.*\.test\.ts$' \
   --reporters=default \
   --reporters="$CTRF_REPORTER" \
   2>&1 | tee -a "$RUN_LOG"
@@ -122,8 +123,10 @@ timeout --kill-after=10s 300s \
   --runInBand \
   --forceExit \
   --runTestsByPath \
+  src/__tests__/unit/restaurant_claim_verification_auth.test.ts \
   src/__tests__/unit/restaurant_claim_verification_behavior.test.ts \
-  src/__tests__/unit/restaurant_claim_batch_verification.test.ts \
+  src/__tests__/unit/restaurant_claim_batch_verification_behavior.test.ts \
+  src/__tests__/unit/restaurant_claim_verification_audit.test.ts \
   --reporters=default \
   --reporters="$CTRF_REPORTER" \
   2>&1 | tee -a "$RUN_LOG"
@@ -133,6 +136,7 @@ if [ -f ctrf/ctrf-report.json ]; then
 fi
 
 set -e
+
 # >>> END RUN TESTS <<<
 
 # Surface raw suite output into stdout (the harness captures it) so failures

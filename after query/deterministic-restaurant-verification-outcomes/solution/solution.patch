@@ -1,18 +1,17 @@
 diff --git a/rateeat_backend/src/controllers/restaurant_claim_request.controller.ts b/rateeat_backend/src/controllers/restaurant_claim_request.controller.ts
-index bb222e5..d82cc39 100644
+index bb222e5..5d3de10 100644
 --- a/rateeat_backend/src/controllers/restaurant_claim_request.controller.ts
 +++ b/rateeat_backend/src/controllers/restaurant_claim_request.controller.ts
-@@ -17,6 +17,9 @@ import sendNotification from "../utils/notification.utils";
+@@ -17,6 +17,8 @@ import sendNotification from "../utils/notification.utils";
  import { NotificationCategory } from "../models/Feedback/Notification";
  import { Op, WhereOptions, Transaction } from "sequelize";
  import sequelize from "../config/db";
 +import { RestaurantClaimOutcomeService } from "../services/restaurant-claim-outcome.service";
-+import { RestaurantClaimDeterminismService } from "../services/restaurant-claim-determinism.service";
-+import { validateBatchClaimPayload } from "../utils/restaurant-claim-outcome.utils";
++import { validateBatchClaimPayload, parseVerificationFilters } from "../utils/restaurant-claim-outcome.utils";
  
  // @desc    Create a restaurant claiming request
  // @route   POST /api/v1/restaurant-claim-request
-@@ -286,24 +289,26 @@ const approveRestaurantClaimRequest = asyncAwaitHandler(
+@@ -286,24 +288,26 @@ const approveRestaurantClaimRequest = asyncAwaitHandler(
      const user: any = req.user;
      const { claimId } = req.params;
  
@@ -52,100 +51,33 @@ index bb222e5..d82cc39 100644
    }
  );
  
-@@ -342,4 +347,5 @@ export {
+@@ -342,4 +346,6 @@ export {
    getRestaurantClaimRequest,
    approveRestaurantClaimRequest,
    rejectRestaurantClaimRequest,
 +  batchVerifyRestaurantClaims,
++  getVerificationMetrics,
  };
 diff --git a/rateeat_backend/src/routes/restaurant_claim_request.route.ts b/rateeat_backend/src/routes/restaurant_claim_request.route.ts
-index 94fc6ee..3870f0a 100644
+index 94fc6ee..02ddd42 100644
 --- a/rateeat_backend/src/routes/restaurant_claim_request.route.ts
 +++ b/rateeat_backend/src/routes/restaurant_claim_request.route.ts
-@@ -6,6 +6,7 @@ import {
+@@ -6,6 +6,8 @@ import {
    createRestaurantClaimRequest,
    getRestaurantClaimRequest,
    rejectRestaurantClaimRequest,
 +  batchVerifyRestaurantClaims,
++  getVerificationMetrics,
  } from "../controllers/restaurant_claim_request.controller";
  import { filterImage } from "../middlewares/multer";
  import { uploadBusinessLicenseAndMenuFiles } from "../middlewares/upload-image";
-diff --git a/rateeat_backend/src/services/restaurant-claim-determinism.service.ts b/rateeat_backend/src/services/restaurant-claim-determinism.service.ts
-new file mode 100644
-index 0000000..8b8ba3d
---- /dev/null
-+++ b/rateeat_backend/src/services/restaurant-claim-determinism.service.ts
-@@ -0,0 +1,63 @@
-+import sequelize from "../config/db";
-+import {
-+  BatchClaimVerificationItem,
-+  BatchClaimVerificationResponse,
-+  ClaimVerificationAction,
-+  ClaimVerificationResult,
-+} from "../types/restaurant-claim-outcome.types";
-+import { RestaurantClaimOutcomeService } from "./restaurant-claim-outcome.service";
-+
-+export class RestaurantClaimDeterminismService {
-+  /**
-+   * Executes a batch of claim verification actions atomically in requested sequence.
-+   */
-+  public static async executeBatchVerification(
-+    items: BatchClaimVerificationItem[],
-+    reviewerId: string
-+  ): Promise<BatchClaimVerificationResponse> {
-+    return sequelize.transaction(async (tx) => {
-+      const results: ClaimVerificationResult[] = [];
-+      let approvedCount = 0;
-+      let rejectedCount = 0;
-+
-+      for (const item of items) {
-+        const verified =
-+          await RestaurantClaimOutcomeService.verifySingleClaimWithLock(
-+            item.claimId,
-+            item.action,
-+            reviewerId,
-+            item.rejectionReason,
-+            tx
-+          );
-+
-+        results.push(verified);
-+        if (
-+          item.action === ClaimVerificationAction.Approve ||
-+          item.action === "approve"
-+        ) {
-+          approvedCount++;
-+        } else {
-+          rejectedCount++;
-+        }
-+      }
-+
-+      return {
-+        totalProcessed: results.length,
-+        approvedCount,
-+        rejectedCount,
-+        results,
-+      };
-+    });
-+  }
-+
-+  /**
-+   * Validates whether all claim IDs in a batch are distinct and non-empty.
-+   */
-+  public static async validateBatchPrerequisites(
-+    claimIds: string[]
-+  ): Promise<boolean> {
-+    if (!claimIds || claimIds.length === 0) return false;
-+    const uniqueIds = new Set(claimIds.map((id) => id.trim()));
-+    return uniqueIds.size === claimIds.length;
-+  }
-+}
 diff --git a/rateeat_backend/src/services/restaurant-claim-outcome.service.ts b/rateeat_backend/src/services/restaurant-claim-outcome.service.ts
 new file mode 100644
-index 0000000..3b6b765
+index 0000000..02e4c4b
 --- /dev/null
 +++ b/rateeat_backend/src/services/restaurant-claim-outcome.service.ts
-@@ -0,0 +1,203 @@
-+import { Transaction } from "sequelize";
+@@ -0,0 +1,192 @@
++import { Transaction, Op } from "sequelize";
 +import sequelize from "../config/db";
 +import {
 +  AdminUser,
@@ -160,12 +92,13 @@ index 0000000..3b6b765
 +  NotFoundError,
 +} from "../utils/error-response.utils";
 +import {
++  BatchClaimVerificationItem,
 +  ClaimVerificationAction,
++  ClaimVerificationMetrics,
 +  ClaimVerificationResult,
 +  ClaimVerificationStatus,
 +  VerificationFilterOptions,
 +} from "../types/restaurant-claim-outcome.types";
-+import { createAuditLogEntry } from "../utils/restaurant-claim-outcome.utils";
 +
 +export class RestaurantClaimOutcomeService {
 +  /**
@@ -188,8 +121,6 @@ index 0000000..3b6b765
 +        throw new NotFoundError("Restaurant claim request not found");
 +      }
 +
-+      const initialStatus = claim.status as unknown as ClaimVerificationStatus;
-+
 +      if (claim.status === Status.Approved) {
 +        throw new ConflictError(
 +          `Restaurant claim request '${claimId}' is already in terminal state 'Approved'`
@@ -203,8 +134,6 @@ index 0000000..3b6b765
 +      }
 +
 +      const now = new Date();
-+      let chainSynchronized = false;
-+      let notificationsDispatched = 0;
 +
 +      if (action === ClaimVerificationAction.Approve || action === "approve") {
 +        claim.status = Status.Approved;
@@ -221,7 +150,6 @@ index 0000000..3b6b765
 +          if (chain) {
 +            chain.is_verified = true;
 +            await chain.save({ transaction: tx });
-+            chainSynchronized = true;
 +          }
 +        }
 +
@@ -240,20 +168,7 @@ index 0000000..3b6b765
 +            },
 +            { transaction: tx }
 +          );
-+          notificationsDispatched++;
 +        }
-+
-+        createAuditLogEntry(
-+          claim.id,
-+          claim.restaurant_id,
-+          claim.restaurant_chain_id,
-+          initialStatus,
-+          ClaimVerificationStatus.Approved,
-+          ClaimVerificationAction.Approve,
-+          reviewerId,
-+          chainSynchronized,
-+          notificationsDispatched
-+        );
 +
 +        return {
 +          id: claim.id,
@@ -270,18 +185,6 @@ index 0000000..3b6b765
 +          (claim as any).rejection_reason = rejectionReason;
 +        }
 +        await claim.save({ transaction: tx });
-+
-+        createAuditLogEntry(
-+          claim.id,
-+          claim.restaurant_id,
-+          claim.restaurant_chain_id,
-+          initialStatus,
-+          ClaimVerificationStatus.Rejected,
-+          ClaimVerificationAction.Reject,
-+          reviewerId,
-+          false,
-+          0
-+        );
 +
 +        return {
 +          id: claim.id,
@@ -303,57 +206,75 @@ index 0000000..3b6b765
 +  }
 +
 +  /**
-+   * Retrieves historical verification records filtered by query options.
++   * Executes a batch of claim verification actions atomically in requested sequence.
 +   */
-+  public static async queryVerificationHistory(
-+    filters: VerificationFilterOptions = {}
-+  ): Promise<any[]> {
-+    const where: any = {};
-+    if (filters.restaurantId) {
-+      where.restaurant_id = filters.restaurantId;
-+    }
-+    if (filters.chainId) {
-+      where.restaurant_chain_id = filters.chainId;
-+    }
-+    if (filters.status) {
-+      where.status = filters.status;
-+    }
-+
-+    return RestaurantClaimRequest.findAll({
-+      where,
-+      limit: filters.limit || 50,
-+      offset: filters.offset || 0,
-+      order: [["updatedAt", "DESC"]],
++  public static async executeBatchVerification(
++    items: BatchClaimVerificationItem[],
++    reviewerId: string
++  ): Promise<ClaimVerificationResult[]> {
++    return sequelize.transaction(async (tx) => {
++      const results: ClaimVerificationResult[] = [];
++      for (const item of items) {
++        const verified = await this.verifySingleClaimWithLock(
++          item.claimId,
++          item.action,
++          reviewerId,
++          item.rejectionReason,
++          tx
++        );
++        results.push(verified);
++      }
++      return results;
 +    });
 +  }
 +
 +  /**
-+   * Counts claim requests grouped by status.
++   * Queries claim requests based on filter criteria.
 +   */
-+  public static async getClaimStatusCounts(): Promise<{
-+    pending: number;
-+    approved: number;
-+    rejected: number;
-+  }> {
-+    const pending = await RestaurantClaimRequest.count({
-+      where: { status: Status.Pending },
++  public static async getFilteredClaims(
++    filters: VerificationFilterOptions
++  ): Promise<{ rows: RestaurantClaimRequest[]; count: number }> {
++    const where: any = {};
++    if (filters.status) where.status = filters.status;
++    if (filters.restaurantId) where.restaurant_id = filters.restaurantId;
++    if (filters.chainId) where.restaurant_chain_id = filters.chainId;
++
++    return RestaurantClaimRequest.findAndCountAll({
++      where,
++      limit: filters.limit || 20,
++      offset: filters.offset || 0,
++      order: [["createdAt", "DESC"]],
 +    });
-+    const approved = await RestaurantClaimRequest.count({
-+      where: { status: Status.Approved },
-+    });
-+    const rejected = await RestaurantClaimRequest.count({
-+      where: { status: Status.Rejected },
++  }
++
++  /**
++   * Computes aggregated claim status counts for verification dashboards.
++   */
++  public static async getClaimStatusMetrics(): Promise<ClaimVerificationMetrics> {
++    const pending = await RestaurantClaimRequest.count({ where: { status: Status.Pending } });
++    const approved = await RestaurantClaimRequest.count({ where: { status: Status.Approved } });
++    const rejected = await RestaurantClaimRequest.count({ where: { status: Status.Rejected } });
++    const chainLinked = await RestaurantClaimRequest.count({
++      where: {
++        restaurant_chain_id: { [Op.ne]: null },
++      },
 +    });
 +
-+    return { pending, approved, rejected };
++    return {
++      totalClaims: pending + approved + rejected,
++      pendingCount: pending,
++      approvedCount: approved,
++      rejectedCount: rejected,
++      chainLinkedCount: chainLinked,
++    };
 +  }
 +}
 diff --git a/rateeat_backend/src/types/restaurant-claim-outcome.types.ts b/rateeat_backend/src/types/restaurant-claim-outcome.types.ts
 new file mode 100644
-index 0000000..f7e1547
+index 0000000..186b238
 --- /dev/null
 +++ b/rateeat_backend/src/types/restaurant-claim-outcome.types.ts
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,91 @@
 +/**
 + * Action type for restaurant claim verification.
 + */
@@ -411,23 +332,6 @@ index 0000000..f7e1547
 +}
 +
 +/**
-+ * Comprehensive audit entry recorded during claim state transitions.
-+ */
-+export interface ClaimOutcomeAuditRecord {
-+  auditId: string;
-+  claimId: string;
-+  restaurantId: string;
-+  chainId?: string | null;
-+  previousStatus: ClaimVerificationStatus;
-+  newStatus: ClaimVerificationStatus;
-+  actionTaken: ClaimVerificationAction;
-+  reviewerId: string;
-+  timestamp: string;
-+  chainSynchronized: boolean;
-+  notificationsDispatched: number;
-+}
-+
-+/**
 + * Filter options for querying verification records and history.
 + */
 +export interface VerificationFilterOptions {
@@ -435,46 +339,46 @@ index 0000000..f7e1547
 +  restaurantId?: string;
 +  chainId?: string;
 +  reviewerId?: string;
-+  startDate?: Date;
-+  endDate?: Date;
 +  limit?: number;
 +  offset?: number;
 +}
 +
 +/**
-+ * Aggregated statistics for claim verifications.
++ * Aggregated verification metrics for administrator analytics.
 + */
-+export interface ClaimVerificationStatistics {
-+  totalPending: number;
-+  totalApproved: number;
-+  totalRejected: number;
-+  approvalRatePercentage: number;
++export interface ClaimVerificationMetrics {
++  totalClaims: number;
++  pendingCount: number;
++  approvedCount: number;
++  rejectedCount: number;
++  chainLinkedCount: number;
++  averageReviewTimeMs?: number;
 +}
 +
 +/**
-+ * State transition validation context.
++ * Audit log entry captured during verification status transitions.
 + */
-+export interface ClaimStateTransitionContext {
++export interface ClaimVerificationAuditEntry {
 +  claimId: string;
-+  requestedAction: ClaimVerificationAction;
++  previousStatus: ClaimVerificationStatus;
++  newStatus: ClaimVerificationStatus;
 +  reviewerId: string;
-+  rejectionReason?: string;
-+  allowIdempotentReplay?: boolean;
++  timestamp: Date;
++  metadata?: Record<string, any>;
 +}
 diff --git a/rateeat_backend/src/utils/restaurant-claim-outcome.utils.ts b/rateeat_backend/src/utils/restaurant-claim-outcome.utils.ts
 new file mode 100644
-index 0000000..6239fcb
+index 0000000..01fdc87
 --- /dev/null
 +++ b/rateeat_backend/src/utils/restaurant-claim-outcome.utils.ts
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,183 @@
 +import { BadRequestError } from "../utils/error-response.utils";
 +import {
 +  BatchClaimVerificationItem,
 +  BatchClaimVerificationPayload,
-+  ClaimOutcomeAuditRecord,
 +  ClaimVerificationAction,
++  ClaimVerificationMetrics,
 +  ClaimVerificationResult,
-+  ClaimVerificationStatistics,
 +  ClaimVerificationStatus,
 +  VerificationFilterOptions,
 +} from "../types/restaurant-claim-outcome.types";
@@ -594,58 +498,60 @@ index 0000000..6239fcb
 +}
 +
 +/**
-+ * Constructs an immutable audit record for state transition logging.
++ * Formats aggregated claim metrics into a sanitized summary response.
 + */
-+export function createAuditLogEntry(
-+  claimId: string,
-+  restaurantId: string,
-+  chainId: string | null | undefined,
-+  prevStatus: ClaimVerificationStatus,
-+  newStatus: ClaimVerificationStatus,
-+  action: ClaimVerificationAction,
-+  reviewerId: string,
-+  chainSynced: boolean,
-+  notifCount: number
-+): ClaimOutcomeAuditRecord {
++export function sanitizeVerificationMetrics(
++  counts: Record<string, number>
++): ClaimVerificationMetrics {
 +  return {
-+    auditId: `audit_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
-+    claimId,
-+    restaurantId,
-+    chainId: chainId || null,
-+    previousStatus: prevStatus,
-+    newStatus,
-+    actionTaken: action,
-+    reviewerId,
-+    timestamp: new Date().toISOString(),
-+    chainSynchronized: chainSynced,
-+    notificationsDispatched: notifCount,
++    totalClaims: (counts.pending || 0) + (counts.approved || 0) + (counts.rejected || 0),
++    pendingCount: counts.pending || 0,
++    approvedCount: counts.approved || 0,
++    rejectedCount: counts.rejected || 0,
++    chainLinkedCount: counts.chainLinked || 0,
 +  };
 +}
 +
 +/**
-+ * Computes statistical metrics across a set of claim verification results.
++ * Formats a single claim verification record for export or audit logging.
 + */
-+export function computeClaimStatistics(
-+  results: ClaimVerificationResult[]
-+): ClaimVerificationStatistics {
-+  let pending = 0;
-+  let approved = 0;
-+  let rejected = 0;
-+
-+  for (const r of results) {
-+    if (r.status === ClaimVerificationStatus.Approved) approved++;
-+    else if (r.status === ClaimVerificationStatus.Rejected) rejected++;
-+    else pending++;
-+  }
-+
-+  const totalDecided = approved + rejected;
-+  const approvalRate =
-+    totalDecided > 0 ? Math.round((approved / totalDecided) * 10000) / 100 : 0;
-+
++export function formatClaimVerificationAuditRecord(
++  claim: RestaurantClaimRequest | any,
++  action: string,
++  reviewerId: string
++): Record<string, any> {
 +  return {
-+    totalPending: pending,
-+    totalApproved: approved,
-+    totalRejected: rejected,
-+    approvalRatePercentage: approvalRate,
++    claimId: claim.id,
++    restaurantId: claim.restaurant_id,
++    restaurantChainId: claim.restaurant_chain_id || null,
++    action,
++    resultingStatus: claim.status,
++    reviewerId,
++    verifiedAt: new Date().toISOString(),
++  };
++}
++
++/**
++ * Validates whether an incoming claim ID string conforms to UUID format.
++ */
++export function isValidClaimIdentifier(id: string): boolean {
++  if (!id || typeof id !== "string") return false;
++  const uuidRegex =
++    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
++  return uuidRegex.test(id.trim()) || id.trim().startsWith("claim-") || id.trim().startsWith("c-");
++}
++
++/**
++ * Builds a standardized error response body for verification failures.
++ */
++export function createVerificationErrorEnvelope(
++  statusCode: number,
++  message: string,
++  details?: any
++): { success: false; message: string; errorDetails?: any } {
++  return {
++    success: false,
++    message,
++    ...(details ? { errorDetails: details } : {}),
 +  };
 +}

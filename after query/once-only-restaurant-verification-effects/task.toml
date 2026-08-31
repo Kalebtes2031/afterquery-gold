@@ -6,8 +6,8 @@ name = "afterquery/once-only-restaurant-verification-effects"
 
 [metadata]
 task_id = "once-only-restaurant-verification-effects"
-display_title = "Once-Only Restaurant Verification Side Effects"
-display_description = "Ensure side effects from verification decisions (incentives, notifications, status) happen only once even under retries or concurrent reviews."
+display_title = "Once-Only Candidate Item Review Verification Effects"
+display_description = "Ensure candidate item review verification side effects occur only once, even under concurrent or retried reviews."
 category = "feature_request"
 language = "typescript"
 repository_url = "https://github.com/dawit2119/Rate_eat"
