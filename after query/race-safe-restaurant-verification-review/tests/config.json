@@ -1,6 +1,17 @@
 {
   "base_commit": "220d10014c0bac8a924aa5ed50a989b1bab19a94",
   "f2p_node_ids": [
+    "Candidate Restaurant Verification - Batch Moderation & Concurrency Batch Review Payload Validation returns 400 when body has no items field",
+    "Candidate Restaurant Verification - Batch Moderation & Concurrency Batch Review Payload Validation returns 400 when items array is empty",
+    "Candidate Restaurant Verification - Batch Moderation & Concurrency Batch Review Payload Validation returns 400 with ",
+    "Candidate Restaurant Verification - Batch Moderation & Concurrency Batch Review Payload Validation returns 400 when action is invalid",
+    "Candidate Restaurant Verification - Batch Moderation & Concurrency Batch Execution & Ordering successfully approves and rejects mixed candidates in single transaction",
+    "Candidate Restaurant Verification - Batch Moderation & Concurrency Batch Execution & Ordering returns results in the exact requested order of candidateRestaurantIds",
+    "Candidate Restaurant Verification - Batch Moderation & Concurrency Batch Execution & Ordering accumulates user incentives correctly across multiple approved candidates from same user",
+    "Candidate Restaurant Verification - Batch Moderation & Concurrency Batch Rollback on Partial Failures rolls back entire batch when one candidate restaurant does not exist",
+    "Candidate Restaurant Verification - Batch Moderation & Concurrency Batch Rollback on Partial Failures rolls back entire batch when one candidate is already approved",
+    "Candidate Restaurant Verification - Batch Moderation & Concurrency Batch Rollback on Partial Failures rolls back entire batch when one candidate is already rejected",
+    "Candidate Restaurant Verification - Batch Moderation & Concurrency Concurrency & Race Condition Serialization serializes concurrent reviews on the same candidate using row lock",
     "Candidate Restaurant Verification - Lifecycle & Single Review Behavior Approving Candidate Restaurants approves a pending candidate restaurant and creates restaurant",
     "Candidate Restaurant Verification - Lifecycle & Single Review Behavior Approving Candidate Restaurants creates restaurant chain when chain does not exist",
     "Candidate Restaurant Verification - Lifecycle & Single Review Behavior Approving Candidate Restaurants copies candidate restaurant location to restaurant location",
@@ -16,18 +27,7 @@
     "Candidate Restaurant Verification - Lifecycle & Single Review Behavior Rejecting Candidate Restaurants returns 409 when attempting to reject an already approved candidate",
     "Candidate Restaurant Verification - Lifecycle & Single Review Behavior Rejecting Candidate Restaurants returns 404 when candidate restaurant to reject is not found",
     "Candidate Restaurant Verification - Lifecycle & Single Review Behavior Transactional Rollback on Failures rolls back approval and throws when restaurant creation fails",
-    "Candidate Restaurant Verification - Lifecycle & Single Review Behavior Transactional Rollback on Failures rolls back approval when credential email sending fails",
-    "Candidate Restaurant Verification - Batch Moderation & Concurrency Batch Review Payload Validation returns 400 when body has no items field",
-    "Candidate Restaurant Verification - Batch Moderation & Concurrency Batch Review Payload Validation returns 400 when items array is empty",
-    "Candidate Restaurant Verification - Batch Moderation & Concurrency Batch Review Payload Validation returns 400 with 'Duplicate candidate restaurant id' when duplicate ids exist in batch",
-    "Candidate Restaurant Verification - Batch Moderation & Concurrency Batch Review Payload Validation returns 400 when action is invalid",
-    "Candidate Restaurant Verification - Batch Moderation & Concurrency Batch Execution & Ordering successfully approves and rejects mixed candidates in single transaction",
-    "Candidate Restaurant Verification - Batch Moderation & Concurrency Batch Execution & Ordering returns results in the exact requested order of candidateRestaurantIds",
-    "Candidate Restaurant Verification - Batch Moderation & Concurrency Batch Execution & Ordering accumulates user incentives correctly across multiple approved candidates from same user",
-    "Candidate Restaurant Verification - Batch Moderation & Concurrency Batch Rollback on Partial Failures rolls back entire batch when one candidate restaurant does not exist",
-    "Candidate Restaurant Verification - Batch Moderation & Concurrency Batch Rollback on Partial Failures rolls back entire batch when one candidate is already approved",
-    "Candidate Restaurant Verification - Batch Moderation & Concurrency Batch Rollback on Partial Failures rolls back entire batch when one candidate is already rejected",
-    "Candidate Restaurant Verification - Batch Moderation & Concurrency Concurrency & Race Condition Serialization serializes concurrent reviews on the same candidate using row lock"
+    "Candidate Restaurant Verification - Lifecycle & Single Review Behavior Transactional Rollback on Failures rolls back approval when credential email sending fails"
   ],
   "p2p_node_ids": [
     "Candidate Item Controller Tests POST /candidate-item should create a candidate item and return 201",
