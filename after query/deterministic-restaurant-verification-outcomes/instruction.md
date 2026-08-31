@@ -1,13 +1,17 @@
-We need to make restaurant claim verification outcomes deterministic, stable, and resilient against concurrent reviews and retried actions.
+We need to introduce a reliable and stable solution for restaurant claim verification processes.
 
-Currently, approving or rejecting a restaurant claim request does not enforce terminal state guards, resulting in duplicate processing, inconsistent responses, and conflicting chain updates under concurrent requests.
+At this moment, it does not require moving requests to a terminal state which results in duplicate processing of claims and differences in responses.
 
-Update the restaurant claim verification workflow to satisfy the following requirements:
-- Ensure each restaurant claim request transitions through valid lifecycle states (Pending -> Approved or Pending -> Rejected). Once in a terminal state, subsequent approval or rejection attempts must be rejected with a 409 Conflict error.
-- When approving a claim with an associated restaurant chain (restaurant_chain_id present), synchronize and mark the chain as verified within the same transaction.
-- Create administrator notification records upon approval to alert super admins of the verified claim.
-- Provide a batch verification endpoint `POST /api/v1/restaurant-claim-request/batch-verify` accepting `{ claims: [{ claimId, action, rejectionReason? }] }` that processes mixed approvals and rejections atomically in the exact order specified.
-- Enforce strict validation on batch payloads: reject requests missing required fields, containing unknown actions, or containing duplicate claim IDs with 400 Bad Request.
-- If any individual claim in a batch fails validation, is not found, or is in an invalid state, roll back the entire batch transaction so no partial modifications persist.
+The approach to restaurant claim verification should be revised so that at least the following rules should be met:
+
+- On the way to the terminal states, only valid statuses should be assumed (Pending -> Approved or Pending -> Rejected) so that if any attempt at the approval or disapproval of the already verified claim is made, a 409 Conflict message is shown.
+
+- If restaurant chain (with restaurant_chain_id) is approval relevant, the restaurant chain should be validated in the same transaction together with the claim approval.
+
+- When the claim is approved, super admins should receive notifications about the newly-verified claim.
+
+- Provide a batch verification endpoint `POST /api/v1/restaurant-claim-request/batch-verify` which accepts `{ claims: [{ claimId, action, rejectionReason? }] }` and processes approvals and rejections in the order specified.
+- Batch payloads should be validated strictly: requests missing required fields, requests that contain actions we don't know, and those with claims that violate duplicate claim IDs will automatically be rejected with 400 Bad Request.
+- Must roll back the entire transaction batch if any claim fails validation, cannot be found or if its state is invalid.
 
 IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.
