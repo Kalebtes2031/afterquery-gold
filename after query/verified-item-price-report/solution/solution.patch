@@ -1,0 +1,723 @@
+diff --git a/rateeat_backend/src/controllers/restaurant_claim_request.controller.ts b/rateeat_backend/src/controllers/restaurant_claim_request.controller.ts
+index bb222e5..94cec4e 100644
+--- a/rateeat_backend/src/controllers/restaurant_claim_request.controller.ts
++++ b/rateeat_backend/src/controllers/restaurant_claim_request.controller.ts
+@@ -17,6 +17,8 @@ import sendNotification from "../utils/notification.utils";
+ import { NotificationCategory } from "../models/Feedback/Notification";
+ import { Op, WhereOptions, Transaction } from "sequelize";
+ import sequelize from "../config/db";
++import { RestaurantClaimVerificationService } from "../services/restaurant-claim-verification.service";
++import { validateBatchClaimPayload } from "../utils/restaurant-claim-verification.utils";
+ 
+ // @desc    Create a restaurant claiming request
+ // @route   POST /api/v1/restaurant-claim-request
+@@ -280,30 +282,30 @@ const getRestaurantClaimRequest = asyncAwaitHandler(
+ 
+ // @desc    Approve a restaurant claiming request
+ // @route   PUT /api/v1/restaurant-claim-request/:claimId/approve
+-
+ const approveRestaurantClaimRequest = asyncAwaitHandler(
+   async (req: Request, res: Response, next: NextFunction) => {
+     const user: any = req.user;
+     const { claimId } = req.params;
+ 
+-    const request = await RestaurantClaimRequest.findByPk(claimId!);
+-
+     if (!user) {
+       return next(new AuthorizationError());
+     }
+ 
+-    if (!request) {
+-      return next(new NotFoundError("Request not found"));
+-    }
+-
+-    request.status = Status.Approved;
+-    await request.save();
++    try {
++      const approvedRequest =
++        await RestaurantClaimVerificationService.approveClaimRequestWithLock(
++          claimId,
++          user.id
++        );
+ 
+-    res.status(200).json({
+-      success: true,
+-      message: "Request approved successfully",
+-      data: request,
+-    });
++      return res.status(200).json({
++        success: true,
++        message: "Request approved successfully",
++        data: approvedRequest,
++      });
++    } catch (error) {
++      return next(error);
++    }
+   }
+ );
+ 
+@@ -313,6 +315,7 @@ const rejectRestaurantClaimRequest = asyncAwaitHandler(
+   async (req: Request, res: Response, next: NextFunction) => {
+     let user: any = req.user;
+     const { claimId } = req.params;
++    const { reason } = req.body || {};
+ 
+     user = await AdminUser.findByPk(user?.id);
+ 
+@@ -320,20 +323,52 @@ const rejectRestaurantClaimRequest = asyncAwaitHandler(
+       return next(new AuthorizationError());
+     }
+ 
+-    const request = await RestaurantClaimRequest.findByPk(claimId);
++    try {
++      const rejectedRequest =
++        await RestaurantClaimVerificationService.rejectClaimRequestWithLock(
++          claimId,
++          user.id,
++          undefined,
++          reason
++        );
++
++      return res.status(200).json({
++        success: true,
++        message: "Request rejected successfully",
++        data: rejectedRequest,
++      });
++    } catch (error) {
++      return next(error);
++    }
++  }
++);
+ 
+-    if (!request) {
+-      return next(new NotFoundError("Request not found"));
++// @desc    Verify restaurant claim requests in batch
++// @route   PUT /api/v1/restaurant-claim-request/verify-batch
++const verifyRestaurantClaimBatch = asyncAwaitHandler(
++  async (req: Request, res: Response, next: NextFunction) => {
++    const user: any = req.user;
++
++    if (!user) {
++      return next(new AuthorizationError());
+     }
+ 
+-    request.status = Status.Rejected;
+-    await request.save();
++    const currentUser = await AdminUser.findByPk(user.id);
++    if (!currentUser) {
++      return next(new AuthorizationError());
++    }
+ 
+-    res.status(200).json({
+-      success: true,
+-      message: "Request rejected successfully",
+-      data: request,
+-    });
++    try {
++      const validatedClaims = validateBatchClaimPayload(req.body);
++      const result =
++        await RestaurantClaimVerificationService.processBatchClaimVerification(
++          validatedClaims,
++          currentUser.id
++        );
++      return res.status(200).json(result);
++    } catch (error) {
++      return next(error);
++    }
+   }
+ );
+ 
+@@ -342,4 +377,5 @@ export {
+   getRestaurantClaimRequest,
+   approveRestaurantClaimRequest,
+   rejectRestaurantClaimRequest,
++  verifyRestaurantClaimBatch,
+ };
+diff --git a/rateeat_backend/src/routes/restaurant_claim_request.route.ts b/rateeat_backend/src/routes/restaurant_claim_request.route.ts
+index 94fc6ee..e3373a5 100644
+--- a/rateeat_backend/src/routes/restaurant_claim_request.route.ts
++++ b/rateeat_backend/src/routes/restaurant_claim_request.route.ts
+@@ -6,6 +6,7 @@ import {
+   createRestaurantClaimRequest,
+   getRestaurantClaimRequest,
+   rejectRestaurantClaimRequest,
++  verifyRestaurantClaimBatch,
+ } from "../controllers/restaurant_claim_request.controller";
+ import { filterImage } from "../middlewares/multer";
+ import { uploadBusinessLicenseAndMenuFiles } from "../middlewares/upload-image";
+@@ -37,6 +38,12 @@ router.get(
+   getRestaurantClaimRequest
+ );
+ 
++router.put(
++  "/verify-batch",
++  protectRouteForAdmin,
++  verifyRestaurantClaimBatch
++);
++
+ router.put(
+   "/:claimId/approve",
+   protectRouteForAdmin,
+diff --git a/rateeat_backend/src/services/restaurant-claim-state.service.ts b/rateeat_backend/src/services/restaurant-claim-state.service.ts
+new file mode 100644
+index 0000000..7f675d2
+--- /dev/null
++++ b/rateeat_backend/src/services/restaurant-claim-state.service.ts
+@@ -0,0 +1,69 @@
++import {
++  VerificationConflictError as ConflictError,
++  VerificationNotFoundError as NotFoundError,
++} from "../utils/verification-errors";
++import { Status } from "../models/RestaurantClaim/RestaurantClaimRequest";
++
++export class RestaurantClaimStateService {
++  public static ensureClaimExists(claim: any): void {
++    if (!claim) {
++      throw new NotFoundError("Request not found");
++    }
++  }
++
++  public static validateClaimForApproval(claim: any): void {
++    this.ensureClaimExists(claim);
++
++    if (claim.status === Status.Approved) {
++      throw new ConflictError("Claim request already approved");
++    }
++
++    if (claim.status === Status.Rejected) {
++      throw new ConflictError("Claim request already rejected");
++    }
++  }
++
++  public static validateClaimForRejection(claim: any): void {
++    this.ensureClaimExists(claim);
++
++    if (claim.status === Status.Rejected) {
++      throw new ConflictError("Claim request already rejected");
++    }
++
++    if (claim.status === Status.Approved) {
++      throw new ConflictError("Claim request already approved");
++    }
++  }
++
++  public static isTerminalState(status: any): boolean {
++    return status === Status.Approved || status === Status.Rejected;
++  }
++
++  public static assertPendingState(claim: any): void {
++    this.ensureClaimExists(claim);
++    if (this.isTerminalState(claim.status)) {
++      if (claim.status === Status.Approved) {
++        throw new ConflictError("Claim request already approved");
++      }
++      throw new ConflictError("Claim request already rejected");
++    }
++  }
++
++  public static validateTransition(
++    currentStatus: Status,
++    targetAction: "approve" | "reject"
++  ): void {
++    if (currentStatus === Status.Approved) {
++      throw new ConflictError("Claim request already approved");
++    }
++    if (currentStatus === Status.Rejected) {
++      throw new ConflictError("Claim request already rejected");
++    }
++  }
++
++  public static getTerminalStateForAction(
++    action: "approve" | "reject"
++  ): Status {
++    return action === "approve" ? Status.Approved : Status.Rejected;
++  }
++}
+diff --git a/rateeat_backend/src/services/restaurant-claim-verification.service.ts b/rateeat_backend/src/services/restaurant-claim-verification.service.ts
+new file mode 100644
+index 0000000..60a1278
+--- /dev/null
++++ b/rateeat_backend/src/services/restaurant-claim-verification.service.ts
+@@ -0,0 +1,246 @@
++import { Transaction } from "sequelize";
++import sequelize from "../config/db";
++import RestaurantClaimRequest, {
++  Status,
++} from "../models/RestaurantClaim/RestaurantClaimRequest";
++import { AdminUser, Notification, RestaurantChain, Role } from "../models";
++import { NotificationCategory } from "../models/Feedback/Notification";
++import sendNotification from "../utils/notification.utils";
++import {
++  RestaurantClaimAuditRecord,
++  RestaurantClaimBatchItem,
++  RestaurantClaimBatchVerificationResult,
++  RestaurantClaimTransitionContext,
++} from "../types/restaurant-claim-verification.types";
++import { RestaurantClaimStateService } from "./restaurant-claim-state.service";
++import {
++  buildClaimNotificationMessage,
++  createClaimAuditRecord,
++  formatClaimResponse,
++} from "../utils/restaurant-claim-verification.utils";
++import { NotFoundError } from "../utils/error-response.utils";
++
++export class RestaurantClaimVerificationService {
++  public static async approveClaimRequestWithLock(
++    claimId: string,
++    adminUserId: string,
++    existingTransaction?: Transaction
++  ): Promise<any> {
++    const isOuterTransaction = !!existingTransaction;
++    const transaction = existingTransaction || (await sequelize.transaction());
++
++    try {
++      const claim = await RestaurantClaimRequest.findOne({
++        where: { id: claimId },
++        transaction,
++        lock: transaction.LOCK.UPDATE,
++      });
++
++      RestaurantClaimStateService.validateClaimForApproval(claim);
++
++      const previousStatus = claim.status;
++      claim.status = Status.Approved;
++      await claim.save({ transaction });
++
++      if (claim.restaurant_chain_id) {
++        const chain = await RestaurantChain.findOne({
++          where: { id: claim.restaurant_chain_id },
++          transaction,
++          lock: transaction.LOCK.UPDATE,
++        });
++
++        if (chain) {
++          await chain.save({ transaction });
++        }
++      }
++
++      const admins = await AdminUser.findAll({
++        transaction,
++        include: [
++          {
++            model: Role,
++            where: {
++              name: ["super_admin", "admin"],
++            },
++          },
++        ],
++      });
++
++      const message = buildClaimNotificationMessage(claim.restaurant_name, "approve");
++      for (const admin of admins) {
++        await Notification.create(
++          {
++            notifiable_type: "RestaurantClaimRequest",
++            notifiable_id: claim.id,
++            user_id: admin.id,
++            reactor_id: adminUserId || "00000000-0000-0000-0000-000000000000",
++            message,
++            notification_category: NotificationCategory.General,
++          },
++          { transaction }
++        );
++
++        const registrationToken = admin.fcm_token;
++        if (registrationToken) {
++          try {
++            await sendNotification(
++              registrationToken,
++              "Restaurant Claim Approved",
++              message,
++              "businessApp"
++            );
++          } catch (notifErr) {
++            // Notification delivery failure does not roll back verified decision
++          }
++        }
++      }
++
++      const auditContext: RestaurantClaimTransitionContext = {
++        claimId: claim.id,
++        initiatorAdminId: adminUserId,
++        action: "approve",
++        timestamp: new Date(),
++      };
++      const audit = createClaimAuditRecord(auditContext, previousStatus, Status.Approved);
++
++      if (!isOuterTransaction) {
++        await transaction.commit();
++      }
++
++      return claim;
++    } catch (error) {
++      if (!isOuterTransaction) {
++        try {
++          await transaction.rollback();
++        } catch (rbErr) {
++          // ignore
++        }
++      }
++      throw error;
++    }
++  }
++
++  public static async rejectClaimRequestWithLock(
++    claimId: string,
++    adminUserId: string,
++    existingTransaction?: Transaction,
++    reason?: string
++  ): Promise<any> {
++    const isOuterTransaction = !!existingTransaction;
++    const transaction = existingTransaction || (await sequelize.transaction());
++
++    try {
++      const claim = await RestaurantClaimRequest.findOne({
++        where: { id: claimId },
++        transaction,
++        lock: transaction.LOCK.UPDATE,
++      });
++
++      RestaurantClaimStateService.validateClaimForRejection(claim);
++
++      const previousStatus = claim.status;
++      claim.status = Status.Rejected;
++      await claim.save({ transaction });
++
++      const admins = await AdminUser.findAll({
++        transaction,
++        include: [
++          {
++            model: Role,
++            where: {
++              name: ["super_admin", "admin"],
++            },
++          },
++        ],
++      });
++
++      const rejectMessage = buildClaimNotificationMessage(
++        claim.restaurant_name,
++        "reject",
++        reason
++      );
++
++      for (const admin of admins) {
++        await Notification.create(
++          {
++            notifiable_type: "RestaurantClaimRequest",
++            notifiable_id: claim.id,
++            user_id: admin.id,
++            reactor_id: adminUserId || "00000000-0000-0000-0000-000000000000",
++            message: rejectMessage,
++            notification_category: NotificationCategory.General,
++          },
++          { transaction }
++        );
++      }
++
++      const auditContext: RestaurantClaimTransitionContext = {
++        claimId: claim.id,
++        initiatorAdminId: adminUserId,
++        action: "reject",
++        timestamp: new Date(),
++        reason,
++      };
++      const audit = createClaimAuditRecord(auditContext, previousStatus, Status.Rejected);
++
++      if (!isOuterTransaction) {
++        await transaction.commit();
++      }
++
++      return claim;
++    } catch (error) {
++      if (!isOuterTransaction) {
++        try {
++          await transaction.rollback();
++        } catch (rbErr) {
++          // ignore
++        }
++      }
++      throw error;
++    }
++  }
++
++  public static async processBatchClaimVerification(
++    claims: RestaurantClaimBatchItem[],
++    adminUserId: string
++  ): Promise<RestaurantClaimBatchVerificationResult> {
++    const transaction = await sequelize.transaction();
++    const results: any[] = [];
++
++    try {
++      for (const item of claims) {
++        if (item.action === "approve") {
++          const approved =
++            await RestaurantClaimVerificationService.approveClaimRequestWithLock(
++              item.claimId,
++              adminUserId,
++              transaction
++            );
++          results.push(approved);
++        } else if (item.action === "reject") {
++          const rejected =
++            await RestaurantClaimVerificationService.rejectClaimRequestWithLock(
++              item.claimId,
++              adminUserId,
++              transaction,
++              item.reason
++            );
++          results.push(rejected);
++        }
++      }
++
++      await transaction.commit();
++      return {
++        success: true,
++        data: results,
++      };
++    } catch (error) {
++      try {
++        await transaction.rollback();
++      } catch (rbErr) {
++        // ignore
++      }
++      throw error;
++    }
++  }
++}
+diff --git a/rateeat_backend/src/types/restaurant-claim-verification.types.ts b/rateeat_backend/src/types/restaurant-claim-verification.types.ts
+new file mode 100644
+index 0000000..1eadba9
+--- /dev/null
++++ b/rateeat_backend/src/types/restaurant-claim-verification.types.ts
+@@ -0,0 +1,52 @@
++export enum RestaurantClaimVerificationAction {
++  Approve = "approve",
++  Reject = "reject",
++}
++
++export enum RestaurantClaimTerminalState {
++  Approved = "Approved",
++  Rejected = "Rejected",
++  Pending = "Pending",
++}
++
++export interface RestaurantClaimBatchItem {
++  claimId: string;
++  action: "approve" | "reject";
++  reason?: string;
++}
++
++export interface RestaurantClaimBatchVerificationRequest {
++  claims: RestaurantClaimBatchItem[];
++}
++
++export interface RestaurantClaimVerificationResult {
++  claimId: string;
++  action: "approve" | "reject";
++  status: string;
++  success: boolean;
++  data: any;
++  message?: string;
++}
++
++export interface RestaurantClaimBatchVerificationResult {
++  success: boolean;
++  data: any[];
++}
++
++export interface RestaurantClaimAuditRecord {
++  claimId: string;
++  adminUserId: string;
++  decision: "approve" | "reject";
++  decidedAt: string;
++  reason?: string;
++  previousStatus: string;
++  targetStatus: string;
++}
++
++export interface RestaurantClaimTransitionContext {
++  claimId: string;
++  initiatorAdminId: string;
++  action: "approve" | "reject";
++  timestamp: Date;
++  reason?: string;
++}
+diff --git a/rateeat_backend/src/utils/restaurant-claim-verification.utils.ts b/rateeat_backend/src/utils/restaurant-claim-verification.utils.ts
+new file mode 100644
+index 0000000..7894566
+--- /dev/null
++++ b/rateeat_backend/src/utils/restaurant-claim-verification.utils.ts
+@@ -0,0 +1,131 @@
++import { VerificationValidationError as BadRequestError } from "./verification-errors";
++import {
++  RestaurantClaimAuditRecord,
++  RestaurantClaimBatchItem,
++  RestaurantClaimTransitionContext,
++  RestaurantClaimVerificationAction,
++} from "../types/restaurant-claim-verification.types";
++
++export const validateClaimAction = (action: any): "approve" | "reject" => {
++  if (!action || typeof action !== "string") {
++    throw new BadRequestError("Claim verification action must be a string");
++  }
++  const normalized = action.toLowerCase().trim();
++  if (
++    normalized !== RestaurantClaimVerificationAction.Approve &&
++    normalized !== RestaurantClaimVerificationAction.Reject
++  ) {
++    throw new BadRequestError(
++      "Invalid verification action: must be 'approve' or 'reject'"
++    );
++  }
++  return normalized as "approve" | "reject";
++};
++
++export const sanitizeClaimReason = (reason?: any): string | undefined => {
++  if (reason === undefined || reason === null) {
++    return undefined;
++  }
++  if (typeof reason !== "string") {
++    throw new BadRequestError("Reason must be a string when provided");
++  }
++  const trimmed = reason.trim();
++  return trimmed.length > 0 ? trimmed : undefined;
++};
++
++export const validateBatchClaimPayload = (
++  payload: any
++): RestaurantClaimBatchItem[] => {
++  if (!payload || typeof payload !== "object") {
++    throw new BadRequestError("Request body must be an object");
++  }
++
++  const { claims } = payload;
++  if (!Array.isArray(claims)) {
++    throw new BadRequestError("Field 'claims' must be a non-empty array");
++  }
++
++  if (claims.length === 0) {
++    throw new BadRequestError("Field 'claims' cannot be empty");
++  }
++
++  const seenIds = new Set<string>();
++  const validatedItems: RestaurantClaimBatchItem[] = [];
++
++  for (let i = 0; i < claims.length; i++) {
++    const item = claims[i];
++    if (!item || typeof item !== "object") {
++      throw new BadRequestError(`Batch claim item at index ${i} must be an object`);
++    }
++
++    const { claimId, action, reason } = item;
++    if (!claimId || typeof claimId !== "string") {
++      throw new BadRequestError(
++        `Batch claim item at index ${i} must contain a valid claimId string`
++      );
++    }
++
++    const trimmedId = claimId.trim();
++    if (!trimmedId) {
++      throw new BadRequestError(
++        `Batch claim item at index ${i} must contain a non-empty claimId`
++      );
++    }
++
++    if (seenIds.has(trimmedId)) {
++      throw new BadRequestError("Duplicate claim request id");
++    }
++    seenIds.add(trimmedId);
++
++    const validAction = validateClaimAction(action);
++    const sanitizedReason = sanitizeClaimReason(reason);
++
++    validatedItems.push({
++      claimId: trimmedId,
++      action: validAction,
++      reason: sanitizedReason,
++    });
++  }
++
++  return validatedItems;
++};
++
++export const formatClaimResponse = (claim: any, message?: string): any => {
++  return {
++    id: claim.id,
++    restaurant_name: claim.restaurant_name,
++    status: claim.status,
++    requester_name: claim.requester_name,
++    email: claim.email,
++    phone_number: claim.phone_number,
++    restaurant_chain_id: claim.restaurant_chain_id || null,
++    message: message || "Claim processed successfully",
++  };
++};
++
++export const buildClaimNotificationMessage = (
++  restaurantName: string,
++  action: "approve" | "reject",
++  reason?: string
++): string => {
++  if (action === "approve") {
++    return `Claim request for restaurant ${restaurantName} has been approved.`;
++  }
++  return `Claim request for restaurant ${restaurantName} has been rejected.${reason ? ` Reason: ${reason}` : ""}`;
++};
++
++export const createClaimAuditRecord = (
++  context: RestaurantClaimTransitionContext,
++  previousStatus: string,
++  targetStatus: string
++): RestaurantClaimAuditRecord => {
++  return {
++    claimId: context.claimId,
++    adminUserId: context.initiatorAdminId,
++    decision: context.action,
++    decidedAt: context.timestamp.toISOString(),
++    reason: context.reason,
++    previousStatus,
++    targetStatus,
++  };
++};
+diff --git a/rateeat_backend/src/utils/verification-errors.ts b/rateeat_backend/src/utils/verification-errors.ts
+new file mode 100644
+index 0000000..e309307
+--- /dev/null
++++ b/rateeat_backend/src/utils/verification-errors.ts
+@@ -0,0 +1,35 @@
++import {
++  BadRequestError,
++  ConflictError,
++  NotFoundError,
++} from "./error-response.utils";
++
++/**
++ * The shared error helpers in error-response.utils.ts decorate the text they
++ * are given ("<resource> not found", "<resource> already exists", a fixed
++ * "Bad request"). The verification workflows need to surface exact,
++ * caller-facing messages while still being recognisable as the same HTTP error
++ * families, so these thin subclasses keep the status codes and the instanceof
++ * relationships intact and replace the message with the literal string.
++ */
++
++export class VerificationNotFoundError extends NotFoundError {
++  constructor(message: string) {
++    super(message);
++    this.message = message;
++  }
++}
++
++export class VerificationConflictError extends ConflictError {
++  constructor(message: string) {
++    super(message);
++    this.message = message;
++  }
++}
++
++export class VerificationValidationError extends BadRequestError {
++  constructor(message: string) {
++    super(message);
++    this.message = message;
++  }
++}
