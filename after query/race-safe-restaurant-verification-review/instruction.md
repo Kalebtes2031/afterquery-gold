@@ -1,24 +1,22 @@
-Reliable Candidate Restaurant Verification Workflow
+Approving and rejecting candidate restaurants must be atomic and safe against concurrent admin actions on the same candidate.
 
-Update candidate restaurant verification to enforce race-safe review serialization, media synchronization, and atomic batch moderation.
+In one transaction, the approve endpoint (PUT /api/v1/candidate-restaurants/:candidateRestaurantId/approve) creates the live restaurant, finds or creates its chain from the name up to " | ", approves the candidate, and—if it has a submitter—adds 20 incentive points (create the row if absent) plus a General history entry. If a candidate admin is linked, create its admin account, email the credentials, set it as the chain's admin if none exists, and approve it; if it is already approved, fail with 409. reject works the same way, rejecting the candidate and any linked candidate admin.
 
-- State Transitions & Guards:
-  `PUT /api/v1/candidate-restaurants/:candidateRestaurantId/review` transitions a Pending candidate restaurant to Approved or Rejected (`{ "action": "approve" | "reject", "rejectionReason"?: string }`). Once in a terminal state, subsequent review attempts must return HTTP 409 Conflict with `{"success": false, "message": "..."}`.
+On any failure, roll everything back, leave the candidate pending, and answer with the failure's status (e.g. 500 when the credentials email throws). Lock the candidate row so concurrent reviews serialize. Unknown id → 404; already-finalized → 409, the message saying which (already approved or rejected). Each success writes one notification per admin that references the candidate and names the acting admin.
 
-- Side Effects on Approval:
-  When approving a candidate restaurant, automatically create and link the active `Restaurant` record and copy candidate media into `RestaurantMedia` within the same transaction.
-  Create a `Notification` for super admins (`AdminUser` with `is_super_admin: true`) alerting them of the newly activated restaurant.
+Both endpoints answer 200 with a data object; `restaurant_id` is the new restaurant on approval, `null` on rejection:
 
-- Batch Review Endpoint:
-  Add `PUT /api/v1/candidate-restaurants/batch-review` accepting `{ "reviews": [...] }`. Each item requires `candidateRestaurantId` and `action` (`"approve"` or `"reject"`), with optional `rejectionReason`.
-  Return HTTP 200 with `{ "success": true, "message": "...", "data": [...] }` containing verified candidate restaurant records in the exact order requested.
+    { "success": true,
+      "data": { "candidateRestaurantId": "<url id>", "action": "approve"|"reject",
+                "is_approved": <bool>, "is_rejected": <bool>, "restaurant_id": "<id>"|null } }
 
-- Strict Validation & Atomic Rollback:
-  Missing, non-array, or empty `reviews` returns HTTP 400.
-  Duplicate `candidateRestaurantId` values return HTTP 400 with `Duplicate candidate restaurant id`.
-  Unknown actions return HTTP 400.
-  If any candidate restaurant fails, is not found (HTTP 404), or is already reviewed (HTTP 409), roll back the entire batch.
+Also add PUT /api/v1/candidate-restaurants/review-batch, running the whole batch in one transaction that any failing item (unknown or already-finalized candidate) rolls back:
 
-Keep existing authorization conventions.
+    request:  { "items": [ { "candidateRestaurantId": "<id>", "action": "approve"|"reject" }, ... ] }
+    200 body: { "success": true, "data": [ <one entry per item, request order, shaped like the data object above> ] }
+
+Answer 400 for missing or empty `items`, an entry that is not an object or has no usable `candidateRestaurantId`, an `action` that is neither "approve" nor "reject", or a repeated id — exact message "Duplicate candidate restaurant id".
+
+Every error response is `{ "success": false, "message": "<text>" }` with the status above.
 
 IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.

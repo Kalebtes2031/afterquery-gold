@@ -1,626 +1,955 @@
-diff --git a/rateeat_backend/src/__tests__/unit/candidate_restaurant_batch_verification_behavior.test.ts b/rateeat_backend/src/__tests__/unit/candidate_restaurant_batch_verification_behavior.test.ts
+diff --git a/rateeat_backend/src/__tests__/db_setup.ts b/rateeat_backend/src/__tests__/db_setup.ts
+index e60a6e1..f57cdf8 100644
+--- a/rateeat_backend/src/__tests__/db_setup.ts
++++ b/rateeat_backend/src/__tests__/db_setup.ts
+@@ -17,6 +17,7 @@ import {
+   ItemVideo,
+   UserLocation,
+   RestaurantLocation,
++  Neighborhood,
+   ItemReviewImage,
+   ItemReviewVideo,
+   RestaurantReview,
+@@ -103,6 +104,11 @@ class Database {
+     if (!Database.instance) {
+       Database.instance = new Sequelize({
+         ...configFile,
++
++        // The repository test config forces SSL for hosted Postgres; the
++        // local Postgres used by these behavior suites does not offer SSL.
++        dialectOptions: {},
++
+         models: [
+           User,
+           AdminUser,
+@@ -116,6 +122,7 @@ class Database {
+           ItemVideo,
+           UserLocation,
+           RestaurantLocation,
++          Neighborhood,
+           ItemReviewImage,
+           ItemReviewVideo,
+           RestaurantReview,
+diff --git a/rateeat_backend/src/__tests__/unit/candidate_restaurant_review_auth.test.ts b/rateeat_backend/src/__tests__/unit/candidate_restaurant_review_auth.test.ts
 new file mode 100644
-index 0000000..1b9916b
+index 0000000..55f7455
 --- /dev/null
-+++ b/rateeat_backend/src/__tests__/unit/candidate_restaurant_batch_verification_behavior.test.ts
-@@ -0,0 +1,251 @@
++++ b/rateeat_backend/src/__tests__/unit/candidate_restaurant_review_auth.test.ts
+@@ -0,0 +1,64 @@
 +import express from "express";
 +import request from "supertest";
++
 +import candidateRestaurantRouter from "../../routes/candidate_restaurant.route";
-+import {
-+  CandidateRestaurant,
-+  Restaurant,
-+  RestaurantMedia,
-+} from "../../models";
++import { errorHandler } from "../../middlewares/error-handler";
 +
-+jest.mock("../../middlewares/auth", () => ({
-+  authenticateToken: (req: any, _res: any, next: any) => {
-+    req.user = { id: "admin-uuid-1", is_super_admin: true };
-+    next();
-+  },
-+  authorizeRole: (_roles: any) => (_req: any, _res: any, next: any) => next(),
-+}));
++/**
++ * These checks exercise the wiring of the review endpoints through the real
++ * router with the repository's real admin guard in place, so they confirm the
++ * routes exist and stay behind admin authorization.
++ */
++const app = express();
++app.use(express.json());
++app.use("/api/v1/candidate-restaurants", candidateRestaurantRouter);
++app.use(errorHandler);
 +
-+jest.mock("../../models", () => ({
-+  CandidateRestaurant: {
-+    findByPk: jest.fn(),
-+    count: jest.fn(),
-+    findAndCountAll: jest.fn(),
-+  },
-+  Restaurant: {
-+    create: jest.fn(),
-+  },
-+  RestaurantMedia: {
-+    create: jest.fn(),
-+  },
-+}));
++const UNKNOWN_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeee01";
 +
-+jest.mock("../../config/db", () => ({
-+  __esModule: true,
-+  default: {
-+    transaction: jest.fn().mockImplementation((cb) => {
-+      const mockTx = {
-+        LOCK: { UPDATE: "UPDATE" },
-+        commit: jest.fn().mockResolvedValue(undefined),
-+        rollback: jest.fn().mockResolvedValue(undefined),
-+      };
-+      return cb(mockTx);
-+    }),
-+  },
-+}));
-+
-+describe("Candidate Restaurant Verification - Batch Review Endpoint", () => {
-+  const app = express();
-+  app.use(express.json());
-+  app.use("/api/v1/candidate-restaurants", candidateRestaurantRouter);
-+  app.use((err: any, _req: any, res: any, _next: any) => {
-+    res.status(err.statusCode || 500).json({
-+      success: false,
-+      message: err.message || "Internal Server Error",
-+    });
-+  });
-+
-+  beforeEach(() => {
-+    jest.clearAllMocks();
-+  });
-+
-+  it("returns 400 when body does not contain reviews array", async () => {
-+    const res = await request(app)
-+      .put("/api/v1/candidate-restaurants/batch-review")
++describe("Candidate Restaurant Review - authorization", () => {
++  it("rejects an unauthenticated approve with 401", async () => {
++    const response = await request(app)
++      .put(`/api/v1/candidate-restaurants/${UNKNOWN_ID}/approve`)
 +      .send({});
 +
-+    expect(res.status).toBe(400);
-+  });
-+
-+  it("returns 400 when reviews array is empty", async () => {
-+    const res = await request(app)
-+      .put("/api/v1/candidate-restaurants/batch-review")
-+      .send({ reviews: [] });
-+
-+    expect(res.status).toBe(400);
-+  });
-+
-+  it("returns 400 when duplicate candidate restaurant IDs are detected in batch payload", async () => {
-+    const res = await request(app)
-+      .put("/api/v1/candidate-restaurants/batch-review")
-+      .send({
-+        reviews: [
-+          { candidateRestaurantId: "cand-dup-1", action: "approve" },
-+          { candidateRestaurantId: "cand-dup-1", action: "reject" },
-+        ],
-+      });
-+
-+    expect(res.status).toBe(400);
-+    expect(res.body.message).toContain("Duplicate candidate restaurant id");
-+  });
-+
-+  it("returns 400 when an invalid candidate review action is specified", async () => {
-+    const res = await request(app)
-+      .put("/api/v1/candidate-restaurants/batch-review")
-+      .send({
-+        reviews: [{ candidateRestaurantId: "cand-1", action: "unknown_action" }],
-+      });
-+
-+    expect(res.status).toBe(400);
-+  });
-+
-+  it("returns 400 when candidateRestaurantId is missing or whitespace only", async () => {
-+    const res = await request(app)
-+      .put("/api/v1/candidate-restaurants/batch-review")
-+      .send({
-+        reviews: [{ candidateRestaurantId: "   ", action: "approve" }],
-+      });
-+
-+    expect(res.status).toBe(400);
-+  });
-+
-+  it("successfully reviews mixed batch candidates in exact requested order", async () => {
-+    const mock1 = {
-+      id: "cand-b1",
-+      name: "Bakery A",
-+      is_approved: null,
-+      candidate_restaurant_images: [],
-+      save: jest.fn().mockResolvedValue(true),
-+    };
-+    const mock2 = {
-+      id: "cand-b2",
-+      name: "Bakery B",
-+      is_approved: null,
-+      save: jest.fn().mockResolvedValue(true),
-+    };
-+
-+    (CandidateRestaurant.findByPk as jest.Mock)
-+      .mockResolvedValueOnce(mock1)
-+      .mockResolvedValueOnce(mock2);
-+    (Restaurant.create as jest.Mock).mockResolvedValue({ id: "rest-b1" });
-+
-+    const res = await request(app)
-+      .put("/api/v1/candidate-restaurants/batch-review")
-+      .send({
-+        reviews: [
-+          { candidateRestaurantId: "cand-b1", action: "approve" },
-+          { candidateRestaurantId: "cand-b2", action: "reject", rejectionReason: "Incomplete menu" },
-+        ],
-+      });
-+
-+    expect(res.status).toBe(200);
-+    expect(res.body.success).toBe(true);
-+    expect(res.body.data).toHaveLength(2);
-+    expect(res.body.data[0].id).toBe("cand-b1");
-+    expect(res.body.data[0].is_approved).toBe(true);
-+    expect(res.body.data[1].id).toBe("cand-b2");
-+    expect(res.body.data[1].is_approved).toBe(false);
-+  });
-+
-+  it("rolls back batch when any candidate fails or is not found", async () => {
-+    (CandidateRestaurant.findByPk as jest.Mock).mockResolvedValue(null);
-+
-+    const res = await request(app)
-+      .put("/api/v1/candidate-restaurants/batch-review")
-+      .send({
-+        reviews: [{ candidateRestaurantId: "cand-missing", action: "approve" }],
-+      });
-+
-+    expect(res.status).toBe(404);
-+  });
-+
-+  it("rolls back batch when any candidate is already in a terminal state", async () => {
-+    const mockCandidate = {
-+      id: "cand-term",
-+      is_approved: true,
-+    };
-+    (CandidateRestaurant.findByPk as jest.Mock).mockResolvedValue(mockCandidate);
-+
-+    const res = await request(app)
-+      .put("/api/v1/candidate-restaurants/batch-review")
-+      .send({
-+        reviews: [{ candidateRestaurantId: "cand-term", action: "approve" }],
-+      });
-+
-+    expect(res.status).toBe(409);
-+  });
-+
-+  it("handles batch candidate reviews with mixed casing in action fields", async () => {
-+    const mock1 = { id: "c-case1", name: "C1", is_approved: null, save: jest.fn().mockResolvedValue(true) };
-+    const mock2 = { id: "c-case2", name: "C2", is_approved: null, save: jest.fn().mockResolvedValue(true) };
-+    (CandidateRestaurant.findByPk as jest.Mock)
-+      .mockResolvedValueOnce(mock1)
-+      .mockResolvedValueOnce(mock2);
-+    (Restaurant.create as jest.Mock).mockResolvedValue({ id: "rest-c1" });
-+
-+    const res = await request(app)
-+      .put("/api/v1/candidate-restaurants/batch-review")
-+      .send({
-+        reviews: [
-+          { candidateRestaurantId: "c-case1", action: "APPROVE" },
-+          { candidateRestaurantId: "c-case2", action: "ReJeCt" },
-+        ],
-+      });
-+
-+    expect(res.status).toBe(200);
-+    expect(res.body.data[0].is_approved).toBe(true);
-+    expect(res.body.data[1].is_approved).toBe(false);
-+  });
-+
-+  it("handles candidate batch with whitespace padding in candidate IDs", async () => {
-+    const mock = { id: "c-pad2", name: "Pad Rest", is_approved: null, save: jest.fn().mockResolvedValue(true) };
-+    (CandidateRestaurant.findByPk as jest.Mock).mockResolvedValue(mock);
-+    (Restaurant.create as jest.Mock).mockResolvedValue({ id: "rest-pad2" });
-+
-+    const res = await request(app)
-+      .put("/api/v1/candidate-restaurants/batch-review")
-+      .send({
-+        reviews: [{ candidateRestaurantId: "   c-pad2   ", action: "approve" }],
-+      });
-+
-+    expect(res.status).toBe(200);
-+    expect(res.body.data[0].id).toBe("c-pad2");
-+  });
-+
-+  it("ensures batch transaction rolls back when duplicate ID appears with whitespace", async () => {
-+    const res = await request(app)
-+      .put("/api/v1/candidate-restaurants/batch-review")
-+      .send({
-+        reviews: [
-+          { candidateRestaurantId: "c-dup-ws2", action: "approve" },
-+          { candidateRestaurantId: "   c-dup-ws2   ", action: "reject" },
-+        ],
-+      });
-+
-+    expect(res.status).toBe(400);
-+    expect(res.body.message).toContain("Duplicate candidate restaurant id");
-+  });
-+
-+  it("validates candidate restaurant batch processing with empty comments cleanly", async () => {
-+    const mock = { id: "c-comm", name: "Comm Rest", is_approved: null, save: jest.fn().mockResolvedValue(true) };
-+    (CandidateRestaurant.findByPk as jest.Mock).mockResolvedValue(mock);
-+
-+    const res = await request(app)
-+      .put("/api/v1/candidate-restaurants/batch-review")
-+      .send({
-+        reviews: [{ candidateRestaurantId: "c-comm", action: "reject", rejectionReason: "   " }],
-+      });
-+
-+    expect(res.status).toBe(200);
-+  });
-+
-+  it("rejects candidate restaurant batch when reviews array contains non-object items", async () => {
-+    const res = await request(app)
-+      .put("/api/v1/candidate-restaurants/batch-review")
-+      .send({
-+        reviews: ["invalid_string_item"],
-+      });
-+
-+    expect(res.status).toBe(400);
-+    expect(res.body.message).toContain("Candidate review item at index 0 must be an object");
-+  });
-+});
-diff --git a/rateeat_backend/src/__tests__/unit/candidate_restaurant_verification_audit.test.ts b/rateeat_backend/src/__tests__/unit/candidate_restaurant_verification_audit.test.ts
-new file mode 100644
-index 0000000..3f939e8
---- /dev/null
-+++ b/rateeat_backend/src/__tests__/unit/candidate_restaurant_verification_audit.test.ts
-@@ -0,0 +1,77 @@
-+import {
-+  formatCandidateReviewSummary,
-+  parseCandidateFilters,
-+  isValidCandidateIdentifier,
-+  formatCandidateAuditLog,
-+  isCandidateReviewable,
-+  isCandidateEligibleForPromotion,
-+  validateCandidateReviewAction,
-+  serializeCandidateReport,
-+  validateCandidateBatchBounds,
-+  buildRestaurantFromCandidate,
-+} from "../../utils/candidate-restaurant-workflow.utils";
-+
-+describe("Candidate Restaurant Verification - Utility & Filter Logic", () => {
-+  it("formats candidate review summary correctly for approved and rejected sets", () => {
-+    const summary = formatCandidateReviewSummary([
-+      { id: "c-1", is_approved: true, reviewed_at: new Date() },
-+      { id: "c-2", is_approved: false, reviewed_at: new Date() },
-+    ]);
-+
-+    expect(summary.total).toBe(2);
-+    expect(summary.approved).toBe(1);
-+    expect(summary.rejected).toBe(1);
-+  });
-+
-+  it("parses candidate filter parameters accurately", () => {
-+    const filters = parseCandidateFilters({
-+      status: "Approved",
-+      name: "Bistro",
-+      limit: "20",
-+      offset: "5",
++    expect(response.status).toBe(401);
++    expect(response.body).toEqual({
++      error: "Not authorized to access this route",
 +    });
-+
-+    expect(filters.status).toBe("Approved");
-+    expect(filters.name).toBe("Bistro");
-+    expect(filters.limit).toBe(20);
-+    expect(filters.offset).toBe(5);
 +  });
 +
-+  it("validates candidate identifier formats accurately", () => {
-+    expect(isValidCandidateIdentifier("cand-12345")).toBe(true);
-+    expect(isValidCandidateIdentifier("c-abcd-1234")).toBe(true);
-+    expect(isValidCandidateIdentifier("123e4567-e89b-12d3-a456-426614174000")).toBe(true);
-+    expect(isValidCandidateIdentifier("")).toBe(false);
++  it("rejects an unauthenticated reject with 401", async () => {
++    const response = await request(app)
++      .put(`/api/v1/candidate-restaurants/${UNKNOWN_ID}/reject`)
++      .send({});
++
++    expect(response.status).toBe(401);
++    expect(response.body).toEqual({
++      error: "Not authorized to access this route",
++    });
 +  });
 +
-+  it("formats candidate audit logs and validates reviewability", () => {
-+    const log = formatCandidateAuditLog({ id: "c-1", name: "R1" }, "approve", "u-1");
-+    expect(log.candidateId).toBe("c-1");
-+    expect(log.decision).toBe("Approved");
-+    expect(isCandidateReviewable(null)).toBe(true);
-+    expect(isCandidateReviewable(true)).toBe(false);
-+  });
-+
-+  it("validates candidate promotion eligibility and review action syntax", () => {
-+    expect(isCandidateEligibleForPromotion({ name: "Good", address: "123 St" })).toBe(true);
-+    expect(isCandidateEligibleForPromotion({ name: "No Info" })).toBe(false);
-+    expect(validateCandidateReviewAction("approve")).toBe(true);
-+    expect(validateCandidateReviewAction("REJECT")).toBe(true);
-+    expect(validateCandidateReviewAction("invalid")).toBe(false);
-+  });
-+
-+  it("serializes candidate reports, validates batch bounds, and builds restaurant models", () => {
-+    const report = serializeCandidateReport([
-+      { id: "c-1", name: "R1", is_approved: true, address: "123 St" },
-+    ]);
-+    expect(report[0].id).toBe("c-1");
-+    expect(report[0].isApproved).toBe("Approved");
-+
-+    const check = validateCandidateBatchBounds([{ candidateRestaurantId: "c-1", action: "approve" }]);
-+    expect(check.valid).toBe(true);
-+
-+    const model = buildRestaurantFromCandidate({ name: "R1", address: "123 St", phone_number: "555" });
-+    expect(model.name).toBe("R1");
-+    expect(model.is_active).toBe(true);
-+  });
-+});
-diff --git a/rateeat_backend/src/__tests__/unit/candidate_restaurant_verification_auth.test.ts b/rateeat_backend/src/__tests__/unit/candidate_restaurant_verification_auth.test.ts
-new file mode 100644
-index 0000000..6f811c1
---- /dev/null
-+++ b/rateeat_backend/src/__tests__/unit/candidate_restaurant_verification_auth.test.ts
-@@ -0,0 +1,32 @@
-+import express from "express";
-+import request from "supertest";
-+import candidateRestaurantRouter from "../../routes/candidate_restaurant.route";
-+
-+describe("Candidate Restaurant Verification - Route Authorization", () => {
-+  const app = express();
-+  app.use(express.json());
-+  app.use("/api/v1/candidate-restaurants", candidateRestaurantRouter);
-+
-+  it("returns 401 when batch-review is requested without authorization token", async () => {
-+    const res = await request(app)
-+      .put("/api/v1/candidate-restaurants/batch-review")
++  it("rejects an unauthenticated batch review with 401", async () => {
++    const response = await request(app)
++      .put("/api/v1/candidate-restaurants/review-batch")
 +      .send({
-+        reviews: [{ candidateRestaurantId: "cand-101", action: "approve" }],
++        items: [{ candidateRestaurantId: UNKNOWN_ID, action: "approve" }],
 +      });
-+    expect(res.status).toBe(401);
++
++    expect(response.status).toBe(401);
++    expect(response.body).toEqual({
++      error: "Not authorized to access this route",
++    });
 +  });
 +
-+  it("returns 401 when single candidate review is requested without authorization token", async () => {
-+    const res = await request(app)
-+      .put("/api/v1/candidate-restaurants/cand-101/review")
-+      .send({ action: "approve" });
-+    expect(res.status).toBe(401);
-+  });
-+
-+  it("returns 401 when metrics endpoint is requested without authorization token", async () => {
-+    const res = await request(app)
-+      .get("/api/v1/candidate-restaurants/metrics")
++  it("keeps the batch review route registered as a PUT endpoint", async () => {
++    const response = await request(app)
++      .get("/api/v1/candidate-restaurants/review-batch")
 +      .send();
-+    expect(res.status).toBe(401);
++
++    // GET is not defined for this path; the router should not treat
++    // "review-batch" as a candidate id and 404 instead of 200.
++    expect(response.status).not.toBe(200);
 +  });
 +});
-diff --git a/rateeat_backend/src/__tests__/unit/candidate_restaurant_verification_behavior.test.ts b/rateeat_backend/src/__tests__/unit/candidate_restaurant_verification_behavior.test.ts
+diff --git a/rateeat_backend/src/__tests__/unit/candidate_restaurant_review_behavior.test.ts b/rateeat_backend/src/__tests__/unit/candidate_restaurant_review_behavior.test.ts
 new file mode 100644
-index 0000000..3b46f47
+index 0000000..a3ea967
 --- /dev/null
-+++ b/rateeat_backend/src/__tests__/unit/candidate_restaurant_verification_behavior.test.ts
-@@ -0,0 +1,242 @@
++++ b/rateeat_backend/src/__tests__/unit/candidate_restaurant_review_behavior.test.ts
+@@ -0,0 +1,847 @@
 +import express from "express";
 +import request from "supertest";
++
++import Database from "../db_setup";
++import * as emailUtils from "../../utils/email_otp.utils";
 +import candidateRestaurantRouter from "../../routes/candidate_restaurant.route";
++import { errorHandler } from "../../middlewares/error-handler";
 +import {
++  AdminUser,
++  CandidateAdminUser,
 +  CandidateRestaurant,
++  Incentive,
++  ItemReviewIncentive,
++  Notification,
 +  Restaurant,
-+  RestaurantMedia,
++  RestaurantChain,
 +} from "../../models";
 +
++const ADMIN_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa01";
++const ROLE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa02";
++const SUBMITTER_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa03";
++const ADMIN2_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa04";
++
++const CAND_A = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbb01";
++const CAND_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbb02";
++const CAND_C = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbb03";
++const CADMIN_A = "cccccccc-cccc-4ccc-8ccc-cccccccccc01";
++
++const CAND_A_NAME = "RS Gold Alpha | Bole";
++const CAND_B_NAME = "RS Gold Beta | Piassa";
++const CAND_C_NAME = "RS Gold Gamma | Kazanchis";
++
 +jest.mock("../../middlewares/auth", () => ({
-+  authenticateToken: (req: any, _res: any, next: any) => {
-+    req.user = { id: "admin-uuid-1", is_super_admin: true };
++  protectRoute: (req: any, _res: any, next: any) => {
++    req.user = { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa01" };
 +    next();
 +  },
-+  authorizeRole: (_roles: any) => (_req: any, _res: any, next: any) => next(),
-+}));
-+
-+jest.mock("../../models", () => ({
-+  CandidateRestaurant: {
-+    findByPk: jest.fn(),
-+    count: jest.fn(),
-+    findAndCountAll: jest.fn(),
-+  },
-+  Restaurant: {
-+    create: jest.fn(),
-+  },
-+  RestaurantMedia: {
-+    create: jest.fn(),
++  protectRouteForAdmin: (req: any, _res: any, next: any) => {
++    req.user = { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa01" };
++    next();
 +  },
 +}));
 +
-+jest.mock("../../config/db", () => ({
-+  __esModule: true,
-+  default: {
-+    transaction: jest.fn().mockImplementation((cb) => {
-+      const mockTx = {
-+        LOCK: { UPDATE: "UPDATE" },
-+        commit: jest.fn().mockResolvedValue(undefined),
-+        rollback: jest.fn().mockResolvedValue(undefined),
-+      };
-+      return cb(mockTx);
-+    }),
-+  },
-+}));
++jest.mock("../../utils/email_otp.utils");
 +
-+describe("Candidate Restaurant Verification - Public HTTP Endpoint Behavior", () => {
-+  const app = express();
-+  app.use(express.json());
-+  app.use("/api/v1/candidate-restaurants", candidateRestaurantRouter);
-+  app.use((err: any, _req: any, res: any, _next: any) => {
-+    res.status(err.statusCode || 500).json({
-+      success: false,
-+      message: err.message || "Internal Server Error",
-+    });
++const app = express();
++app.use(express.json());
++app.use("/api/v1/candidate-restaurants", candidateRestaurantRouter);
++app.use(errorHandler);
++
++const approve = (id: string) =>
++  request(app).put(`/api/v1/candidate-restaurants/${id}/approve`).send({});
++
++const reject = (id: string) =>
++  request(app).put(`/api/v1/candidate-restaurants/${id}/reject`).send({});
++
++const reviewBatch = (body: any) =>
++  request(app).put("/api/v1/candidate-restaurants/review-batch").send(body);
++
++let sequelize: Awaited<ReturnType<typeof Database.getInstance>>;
++
++const run = (sql: string, replacements: any[] = []) =>
++  sequelize.query(sql, { replacements });
++
++const wipe = async () => {
++  await run(
++    `DELETE FROM notifications WHERE notifiable_id IN (?, ?, ?)`,
++    [CAND_A, CAND_B, CAND_C]
++  );
++  await run(
++    `DELETE FROM item_review_incentives WHERE user_id = ?`,
++    [SUBMITTER_ID]
++  );
++  await run(`DELETE FROM incentives WHERE user_id = ?`, [SUBMITTER_ID]);
++  await run(`DELETE FROM restaurants WHERE name LIKE 'RS Gold%'`);
++  await run(`DELETE FROM restaurant_chains WHERE name LIKE 'RS Gold%'`);
++  await run(`DELETE FROM admin_users WHERE email LIKE '%rs-gold-cadmin%'`);
++  await run(`DELETE FROM notifications WHERE reactor_id = ?`, [ADMIN2_ID]);
++  await run(`DELETE FROM admin_users WHERE id = ?`, [ADMIN2_ID]);
++  await run(`DELETE FROM candidate_restaurants WHERE id IN (?, ?, ?)`, [
++    CAND_A,
++    CAND_B,
++    CAND_C,
++  ]);
++  await run(`DELETE FROM candidate_admin_users WHERE id = ?`, [CADMIN_A]);
++};
++
++const seedCandidate = async (
++  id: string,
++  name: string,
++  overrides: {
++    is_approved?: boolean;
++    is_rejected?: boolean;
++    user_id?: string | null;
++    candidate_admin_user_id?: string | null;
++    description?: string;
++  } = {}
++) => {
++  const {
++    is_approved = false,
++    is_rejected = false,
++    user_id = SUBMITTER_ID,
++    candidate_admin_user_id = null,
++    description = "seeded candidate",
++  } = overrides;
++
++  await run(
++    `INSERT INTO candidate_restaurants
++       (id, name, description, opening_hour, closing_hour, is_open,
++        is_approved, is_rejected, user_id, candidate_admin_user_id,
++        "createdAt", "updatedAt")
++     VALUES (?, ?, ?, '09:00:00', '21:00:00', true, ?, ?, ?, ?, NOW(), NOW())`,
++    [
++      id,
++      name,
++      description,
++      is_approved,
++      is_rejected,
++      user_id,
++      candidate_admin_user_id,
++    ]
++  );
++};
++
++const seedCandidateAdmin = async (
++  id: string,
++  overrides: { is_approved?: boolean } = {}
++) => {
++  await run(
++    `INSERT INTO candidate_admin_users
++       (id, first_name, last_name, email, phone_number, role_id,
++        is_approved, is_rejected, "createdAt", "updatedAt")
++     VALUES (?, 'Chain', 'Manager', ?, ?, ?, ?, false, NOW(), NOW())`,
++    [
++      id,
++      `rs-gold-cadmin-${id.slice(0, 8)}@example.com`,
++      `+2519${id.replace(/\D/g, "").slice(0, 8)}`,
++      ROLE_ID,
++      overrides.is_approved ?? false,
++    ]
++  );
++};
++
++const seedIncentive = async (total: number) => {
++  await run(
++    `INSERT INTO incentives
++       (id, user_id, all_time_total, current_total, "createdAt", "updatedAt")
++     VALUES (gen_random_uuid(), ?, 0, ?, NOW(), NOW())`,
++    [SUBMITTER_ID, total]
++  );
++};
++
++const incentiveTotal = async () => {
++  const incentive = await Incentive.findOne({
++    where: { user_id: SUBMITTER_ID },
 +  });
++  return incentive ? Number(incentive.current_total) : null;
++};
 +
-+  beforeEach(() => {
-+    jest.clearAllMocks();
++const historyCount = async () => {
++  const rows = await ItemReviewIncentive.findAll({
++    where: { user_id: SUBMITTER_ID },
 +  });
++  return rows.length;
++};
 +
-+  describe("PUT /api/v1/candidate-restaurants/:candidateRestaurantId/review", () => {
-+    it("approves pending candidate restaurant, creates restaurant entity and media records", async () => {
-+      const mockCandidate = {
-+        id: "cand-101",
-+        name: "Gourmet Bistro",
-+        is_approved: null,
-+        candidate_restaurant_images: [{ url: "https://example.com/img1.jpg" }],
-+        candidate_restaurant_videos: [],
-+        save: jest.fn().mockResolvedValue(true),
-+      };
-+      (CandidateRestaurant.findByPk as jest.Mock).mockResolvedValue(mockCandidate);
-+      (Restaurant.create as jest.Mock).mockResolvedValue({ id: "rest-new-101", name: "Gourmet Bistro" });
-+      (RestaurantMedia.create as jest.Mock).mockResolvedValue({ id: "media-1" });
++const restaurantsFor = (name: string) =>
++  Restaurant.findAll({ where: { name } });
 +
-+      const res = await request(app)
-+        .put("/api/v1/candidate-restaurants/cand-101/review")
-+        .send({ action: "approve" });
++const notificationsFor = (candidateId: string) =>
++  Notification.findAll({ where: { notifiable_id: candidateId } });
 +
-+      expect(res.status).toBe(200);
-+      expect(res.body.success).toBe(true);
-+      expect(res.body.data.is_approved).toBe(true);
-+      expect(mockCandidate.is_approved).toBe(true);
-+      expect(Restaurant.create).toHaveBeenCalled();
-+      expect(RestaurantMedia.create).toHaveBeenCalledTimes(1);
-+    });
++const expectReviewShape = (
++  response: request.Response,
++  action: "approve" | "reject"
++) => {
++  expect(response.status).toBe(200);
++  expect(response.body.success).toBe(true);
++  expect(response.body.data).toMatchObject({
++    action,
++    candidateRestaurantId: expect.any(String),
++    is_approved: action === "approve",
++    is_rejected: action === "reject",
++  });
++};
 +
-+    it("rejects pending candidate restaurant with rejection reason and returns 200", async () => {
-+      const mockCandidate = {
-+        id: "cand-102",
-+        name: "Duplicate Diner",
-+        is_approved: null,
-+        save: jest.fn().mockResolvedValue(true),
-+      };
-+      (CandidateRestaurant.findByPk as jest.Mock).mockResolvedValue(mockCandidate);
++beforeAll(async () => {
++  sequelize = await Database.getInstance();
 +
-+      const res = await request(app)
-+        .put("/api/v1/candidate-restaurants/cand-102/review")
-+        .send({ action: "reject", rejectionReason: "Duplicate venue registration" });
++  await run(
++    `INSERT INTO roles (id, name, "createdAt", "updatedAt")
++     VALUES (?, 'rs-gold-role', NOW(), NOW())
++     ON CONFLICT (id) DO NOTHING`,
++    [ROLE_ID]
++  );
++  await run(
++    `INSERT INTO users (id, role_id, username, "createdAt", "updatedAt")
++     VALUES (?, ?, 'rs_gold_submitter', NOW(), NOW())
++     ON CONFLICT (id) DO NOTHING`,
++    [SUBMITTER_ID, ROLE_ID]
++  );
++  await run(
++    `INSERT INTO admin_users
++       (id, first_name, last_name, email, password, phone_number, role_id,
++        "createdAt", "updatedAt")
++     VALUES (?, 'Reviewer', 'Admin', 'rs-gold-reviewer@example.com', 'x',
++             '+251900000001', ?, NOW(), NOW())
++     ON CONFLICT (id) DO NOTHING`,
++    [ADMIN_ID, ROLE_ID]
++  );
++});
 +
-+      expect(res.status).toBe(200);
-+      expect(res.body.success).toBe(true);
-+      expect(res.body.data.is_approved).toBe(false);
-+      expect(res.body.data.rejection_reason).toBe("Duplicate venue registration");
-+    });
++afterAll(async () => {
++  await wipe();
++  await run(`DELETE FROM admin_users WHERE id = ?`, [ADMIN_ID]);
++  await run(`DELETE FROM users WHERE id = ?`, [SUBMITTER_ID]);
++  await run(`DELETE FROM roles WHERE id = ?`, [ROLE_ID]);
++  await Database.close();
++});
 +
-+    it("returns 409 when reviewing already approved candidate restaurant", async () => {
-+      const mockCandidate = {
-+        id: "cand-103",
-+        name: "Already Approved",
++beforeEach(async () => {
++  jest.clearAllMocks();
++  (emailUtils.sendAdminUserCredentialsEmail as jest.Mock).mockResolvedValue(
++    undefined
++  );
++  await wipe();
++});
++
++describe("Candidate Restaurant Review - single approve/reject behavior", () => {
++  describe("approving a pending candidate", () => {
++    it("provisions a restaurant and flips the candidate to approved", async () => {
++      await seedCandidate(CAND_A, CAND_A_NAME);
++      await seedIncentive(5);
++
++      const response = await approve(CAND_A);
++
++      expect(response.status).toBe(200);
++      expect(response.body.success).toBe(true);
++      expect(response.body.data).toMatchObject({
++        candidateRestaurantId: CAND_A,
++        action: "approve",
 +        is_approved: true,
-+      };
-+      (CandidateRestaurant.findByPk as jest.Mock).mockResolvedValue(mockCandidate);
++        is_rejected: false,
++      });
++      expect(response.body.data.restaurant_id).toEqual(expect.any(String));
 +
-+      const res = await request(app)
-+        .put("/api/v1/candidate-restaurants/cand-103/review")
-+        .send({ action: "approve" });
++      const candidate = await CandidateRestaurant.findByPk(CAND_A);
++      expect(candidate?.is_approved).toBe(true);
++      expect(candidate?.is_rejected).toBe(false);
 +
-+      expect(res.status).toBe(409);
++      const restaurants = await restaurantsFor(CAND_A_NAME);
++      expect(restaurants).toHaveLength(1);
++      expect(restaurants[0].id).toBe(response.body.data.restaurant_id);
 +    });
 +
-+    it("returns 409 when reviewing already rejected candidate restaurant", async () => {
-+      const mockCandidate = {
-+        id: "cand-104",
-+        name: "Already Rejected",
++    it("creates the restaurant chain from the name before the separator", async () => {
++      await seedCandidate(CAND_A, CAND_A_NAME);
++      await seedIncentive(0);
++
++      const response = await approve(CAND_A);
++      expectReviewShape(response, "approve");
++
++      const chain = await RestaurantChain.findOne({
++        where: { name: "RS Gold Alpha" },
++      });
++      expect(chain).not.toBeNull();
++
++      const restaurant = (await restaurantsFor(CAND_A_NAME))[0];
++      expect(restaurant.restaurant_chain_id).toBe(chain?.id);
++    });
++
++    it("reuses an existing chain instead of creating a duplicate", async () => {
++      await seedCandidate(CAND_A, CAND_A_NAME);
++      await seedIncentive(0);
++      await run(
++        `INSERT INTO restaurant_chains (id, name, "createdAt", "updatedAt")
++         VALUES (gen_random_uuid(), 'RS Gold Alpha', NOW(), NOW())`
++      );
++
++      const response = await approve(CAND_A);
++      expectReviewShape(response, "approve");
++
++      const chains = await RestaurantChain.findAll({
++        where: { name: "RS Gold Alpha" },
++      });
++      expect(chains).toHaveLength(1);
++    });
++
++    it("adds 20 points to the submitter incentive and records the history entry", async () => {
++      await seedCandidate(CAND_A, CAND_A_NAME);
++      await seedIncentive(30);
++
++      const response = await approve(CAND_A);
++      expectReviewShape(response, "approve");
++
++      expect(await incentiveTotal()).toBe(50);
++      expect(await historyCount()).toBe(1);
++      const [history] = await ItemReviewIncentive.findAll({
++        where: { user_id: SUBMITTER_ID },
++      });
++      expect(Number(history.points_earned)).toBe(20);
++    });
++
++    it("creates the incentive row when the submitter has none yet", async () => {
++      await seedCandidate(CAND_A, CAND_A_NAME);
++
++      const response = await approve(CAND_A);
++      expectReviewShape(response, "approve");
++
++      expect(await incentiveTotal()).toBe(20);
++    });
++
++    it("approves an ownerless candidate without touching incentives", async () => {
++      await seedCandidate(CAND_A, CAND_A_NAME, { user_id: null });
++
++      const response = await approve(CAND_A);
++
++      expectReviewShape(response, "approve");
++      const candidate = await CandidateRestaurant.findByPk(CAND_A);
++      expect(candidate?.is_approved).toBe(true);
++      expect(await incentiveTotal()).toBeNull();
++      expect(await historyCount()).toBe(0);
++    });
++  });
++
++  describe("approving with a linked candidate admin user", () => {
++    it("provisions the admin user, links the chain, and marks the candidate admin approved", async () => {
++      await seedCandidateAdmin(CADMIN_A);
++      await seedCandidate(CAND_A, CAND_A_NAME, {
++        candidate_admin_user_id: CADMIN_A,
++      });
++      await seedIncentive(0);
++
++      const response = await approve(CAND_A);
++      expectReviewShape(response, "approve");
++
++      const created = await CandidateAdminUser.findByPk(CADMIN_A);
++      expect(created?.is_approved).toBe(true);
++
++      const admin = await AdminUser.findOne({
++        where: { email: `rs-gold-cadmin-${CADMIN_A.slice(0, 8)}@example.com` },
++      });
++      expect(admin).not.toBeNull();
++
++      const chain = await RestaurantChain.findOne({
++        where: { name: "RS Gold Alpha" },
++      });
++      expect(chain?.admin_user_id).toBe(admin?.id);
++
++      expect(
++        emailUtils.sendAdminUserCredentialsEmail
++      ).toHaveBeenCalledTimes(1);
++    });
++
++    it("rolls the whole approval back when the candidate admin was already approved", async () => {
++      await seedCandidateAdmin(CADMIN_A, { is_approved: true });
++      await seedCandidate(CAND_A, CAND_A_NAME, {
++        candidate_admin_user_id: CADMIN_A,
++      });
++      await seedIncentive(12);
++
++      const response = await approve(CAND_A);
++
++      expect(response.status).toBe(409);
++      expect(response.body.message).toMatch(/already approved/i);
++
++      const candidate = await CandidateRestaurant.findByPk(CAND_A);
++      expect(candidate?.is_approved).toBe(false);
++      expect(await restaurantsFor(CAND_A_NAME)).toHaveLength(0);
++      expect(await incentiveTotal()).toBe(12);
++    });
++
++  });
++
++  describe("approval guards", () => {
++    it("returns 404 for an unknown candidate id", async () => {
++      const response = await approve(CAND_C);
++
++      expect(response.status).toBe(404);
++      expect(response.body.success).toBe(false);
++      expect(response.body.message).toMatch(/not found/i);
++      expect(response.body.statusCode).toBe(404);
++    });
++
++    it("returns 409 when the candidate is already approved", async () => {
++      await seedCandidate(CAND_A, CAND_A_NAME, { is_approved: true });
++
++      const response = await approve(CAND_A);
++
++      expect(response.status).toBe(409);
++      expect(response.body.message).toMatch(/already approved/i);
++      expect(await restaurantsFor(CAND_A_NAME)).toHaveLength(0);
++    });
++
++    it("returns 409 when the candidate is already rejected", async () => {
++      await seedCandidate(CAND_A, CAND_A_NAME, { is_rejected: true });
++
++      const response = await approve(CAND_A);
++
++      expect(response.status).toBe(409);
++      expect(response.body.message).toMatch(/already rejected/i);
++    });
++  });
++
++  describe("approval atomicity", () => {
++    it("rolls everything back when the credential email fails", async () => {
++      (emailUtils.sendAdminUserCredentialsEmail as jest.Mock).mockRejectedValue(
++        new Error("smtp down")
++      );
++      await seedCandidateAdmin(CADMIN_A);
++      await seedCandidate(CAND_A, CAND_A_NAME, {
++        candidate_admin_user_id: CADMIN_A,
++      });
++      await seedIncentive(7);
++
++      const response = await approve(CAND_A);
++
++      expect(response.status).toBe(500);
++      expect(response.body.success).toBe(false);
++
++      const candidate = await CandidateRestaurant.findByPk(CAND_A);
++      expect(candidate?.is_approved).toBe(false);
++      expect(await restaurantsFor(CAND_A_NAME)).toHaveLength(0);
++      expect(await incentiveTotal()).toBe(7);
++      expect(await historyCount()).toBe(0);
++
++      const candidateAdmin = await CandidateAdminUser.findByPk(CADMIN_A);
++      expect(candidateAdmin?.is_approved).toBe(false);
++      const admin = await AdminUser.findOne({
++        where: { email: `rs-gold-cadmin-${CADMIN_A.slice(0, 8)}@example.com` },
++      });
++      expect(admin).toBeNull();
++    });
++  });
++
++  describe("rejecting a pending candidate", () => {
++    it("flips the candidate to rejected and creates no restaurant", async () => {
++      await seedCandidate(CAND_A, CAND_A_NAME);
++
++      const response = await reject(CAND_A);
++
++      expect(response.status).toBe(200);
++      expect(response.body.data).toMatchObject({
++        candidateRestaurantId: CAND_A,
++        action: "reject",
 +        is_approved: false,
-+      };
-+      (CandidateRestaurant.findByPk as jest.Mock).mockResolvedValue(mockCandidate);
-+
-+      const res = await request(app)
-+        .put("/api/v1/candidate-restaurants/cand-104/review")
-+        .send({ action: "reject" });
-+
-+      expect(res.status).toBe(409);
-+    });
-+
-+    it("returns 404 when candidate restaurant is not found", async () => {
-+      (CandidateRestaurant.findByPk as jest.Mock).mockResolvedValue(null);
-+
-+      const res = await request(app)
-+        .put("/api/v1/candidate-restaurants/cand-missing/review")
-+        .send({ action: "approve" });
-+
-+      expect(res.status).toBe(404);
-+    });
-+
-+    it("handles candidate restaurant review when candidate has no media attachments", async () => {
-+      const mockCandidate = {
-+        id: "cand-nomedia",
-+        name: "No Media Restaurant",
-+        is_approved: null,
-+        candidate_restaurant_images: [],
-+        candidate_restaurant_videos: [],
-+        save: jest.fn().mockResolvedValue(true),
-+      };
-+      (CandidateRestaurant.findByPk as jest.Mock).mockResolvedValue(mockCandidate);
-+      (Restaurant.create as jest.Mock).mockResolvedValue({ id: "rest-nomedia" });
-+
-+      const res = await request(app)
-+        .put("/api/v1/candidate-restaurants/cand-nomedia/review")
-+        .send({ action: "approve" });
-+
-+      expect(res.status).toBe(200);
-+      expect(RestaurantMedia.create).not.toHaveBeenCalled();
-+    });
-+
-+    it("handles candidate restaurant review with videos and creates corresponding media entries", async () => {
-+      const mockCandidate = {
-+        id: "cand-video",
-+        name: "Video Restaurant",
-+        is_approved: null,
-+        candidate_restaurant_images: [],
-+        candidate_restaurant_videos: [{ url: "https://video.com/vid.mp4" }],
-+        save: jest.fn().mockResolvedValue(true),
-+      };
-+      (CandidateRestaurant.findByPk as jest.Mock).mockResolvedValue(mockCandidate);
-+      (Restaurant.create as jest.Mock).mockResolvedValue({ id: "rest-video" });
-+
-+      const res = await request(app)
-+        .put("/api/v1/candidate-restaurants/cand-video/review")
-+        .send({ action: "approve" });
-+
-+      expect(res.status).toBe(200);
-+      expect(RestaurantMedia.create).toHaveBeenCalledTimes(1);
-+    });
-+
-+    it("returns 400 when reviewing candidate with invalid action parameter", async () => {
-+      const res = await request(app)
-+        .put("/api/v1/candidate-restaurants/cand-inv/review")
-+        .send({ action: "unrecognized_action" });
-+
-+      expect(res.status).toBe(400);
-+    });
-+  });
-+
-+  describe("GET /api/v1/candidate-restaurants/metrics", () => {
-+    it("returns aggregated candidate status metrics with 200 status", async () => {
-+      (CandidateRestaurant.count as jest.Mock)
-+        .mockResolvedValueOnce(7)
-+        .mockResolvedValueOnce(15)
-+        .mockResolvedValueOnce(4);
-+
-+      const res = await request(app)
-+        .get("/api/v1/candidate-restaurants/metrics")
-+        .send();
-+
-+      expect(res.status).toBe(200);
-+      expect(res.body.success).toBe(true);
-+      expect(res.body.data.total).toBe(26);
-+      expect(res.body.data.pending).toBe(7);
-+      expect(res.body.data.approved).toBe(15);
-+      expect(res.body.data.rejected).toBe(4);
-+    });
-+  });
-+}
-+  it("handles batch review with whitespace-only rejectionReason gracefully", async () => {
-+    const mock = { id: "c-ws-rej", name: "WS Rej Rest", is_approved: null, save: jest.fn().mockResolvedValue(true) };
-+    (CandidateRestaurant.findByPk as jest.Mock).mockResolvedValue(mock);
-+
-+    const res = await request(app)
-+      .put("/api/v1/candidate-restaurants/batch-review")
-+      .send({
-+        reviews: [{ candidateRestaurantId: "c-ws-rej", action: "reject", rejectionReason: "    " }],
++        is_rejected: true,
++        restaurant_id: null,
 +      });
 +
-+    expect(res.status).toBe(200);
-+    expect(res.body.data[0].is_approved).toBe(false);
++      const candidate = await CandidateRestaurant.findByPk(CAND_A);
++      expect(candidate?.is_rejected).toBe(true);
++      expect(await restaurantsFor(CAND_A_NAME)).toHaveLength(0);
++    });
++
++    it("marks the linked candidate admin as rejected", async () => {
++      await seedCandidateAdmin(CADMIN_A);
++      await seedCandidate(CAND_A, CAND_A_NAME, {
++        candidate_admin_user_id: CADMIN_A,
++      });
++
++      const response = await reject(CAND_A);
++
++      expect(response.status).toBe(200);
++      expect(response.body.data).toMatchObject({
++        candidateRestaurantId: CAND_A,
++        action: "reject",
++        is_rejected: true,
++        restaurant_id: null,
++      });
++
++      const candidateAdmin = await CandidateAdminUser.findByPk(CADMIN_A);
++      expect(candidateAdmin?.is_rejected).toBe(true);
++      expect(candidateAdmin?.is_approved).toBe(false);
++    });
++
++    it("returns 404 for an unknown candidate id", async () => {
++      const response = await reject(CAND_C);
++      expect(response.status).toBe(404);
++      expect(response.body.message).toMatch(/not found/i);
++    });
++
++    it("returns 409 when the candidate is already rejected", async () => {
++      await seedCandidate(CAND_A, CAND_A_NAME, { is_rejected: true });
++      const response = await reject(CAND_A);
++      expect(response.status).toBe(409);
++      expect(response.body.message).toMatch(/already rejected/i);
++    });
++
++    it("returns 409 when the candidate is already approved", async () => {
++      await seedCandidate(CAND_A, CAND_A_NAME, { is_approved: true });
++      const response = await reject(CAND_A);
++      expect(response.status).toBe(409);
++      expect(response.body.message).toMatch(/already approved/i);
++    });
++  });
++});
++
++describe("Candidate Restaurant Review - batch moderation", () => {
++  describe("payload validation", () => {
++    // The message assertions below pin the failure to the batch payload
++    // validator: a route that never parses `items` (e.g. one that only
++    // validates the path segment) cannot produce them.
++    const BATCH_PAYLOAD_ERROR = /items|each item|candidateRestaurantId|action|approve or reject/i;
++
++    it("returns 400 when items is missing", async () => {
++      await seedCandidate(CAND_A, CAND_A_NAME);
++      const response = await reviewBatch({});
++      expect(response.status).toBe(400);
++      expect(response.body.success).toBe(false);
++      expect(response.body.message).toMatch(BATCH_PAYLOAD_ERROR);
++      const candidate = await CandidateRestaurant.findByPk(CAND_A);
++      expect(candidate?.is_approved).toBe(false);
++    });
++
++    it("returns 400 when items is empty", async () => {
++      const response = await reviewBatch({ items: [] });
++      expect(response.status).toBe(400);
++      expect(response.body.success).toBe(false);
++      expect(response.body.message).toMatch(BATCH_PAYLOAD_ERROR);
++    });
++
++    it("returns 400 when an item is not an object", async () => {
++      const response = await reviewBatch({ items: ["nope"] });
++      expect(response.status).toBe(400);
++      expect(response.body.success).toBe(false);
++      expect(response.body.message).toMatch(BATCH_PAYLOAD_ERROR);
++    });
++
++    it("returns 400 when an item has no candidateRestaurantId", async () => {
++      const response = await reviewBatch({ items: [{ action: "approve" }] });
++      expect(response.status).toBe(400);
++      expect(response.body.success).toBe(false);
++      expect(response.body.message).toMatch(BATCH_PAYLOAD_ERROR);
++    });
++
++    it("returns 400 when an action is not approve or reject", async () => {
++      const response = await reviewBatch({
++        items: [{ candidateRestaurantId: CAND_A, action: "delete" }],
++      });
++      expect(response.status).toBe(400);
++      expect(response.body.success).toBe(false);
++      expect(response.body.message).toMatch(/action|approve or reject/i);
++    });
++
++    it("returns 400 with 'Duplicate candidate restaurant id' for a repeated id", async () => {
++      const response = await reviewBatch({
++        items: [
++          { candidateRestaurantId: CAND_A, action: "approve" },
++          { candidateRestaurantId: CAND_A, action: "reject" },
++        ],
++      });
++      expect(response.status).toBe(400);
++      expect(response.body.message).toBe("Duplicate candidate restaurant id");
++    });
 +  });
 +
-+  it("handles single review approve when candidate record has null media collections", async () => {
-+    const mock = { id: "c-null-col", name: "Null Collections", is_approved: null, save: jest.fn().mockResolvedValue(true) };
-+    (CandidateRestaurant.findByPk as jest.Mock).mockResolvedValue(mock);
-+    (Restaurant.create as jest.Mock).mockResolvedValue({ id: "rest-null-col" });
++  describe("execution and ordering", () => {
++    it("applies a mixed approve/reject batch in one call", async () => {
++      await seedCandidate(CAND_A, CAND_A_NAME);
++      await seedCandidate(CAND_B, CAND_B_NAME);
++      await seedIncentive(0);
 +
-+    const res = await request(app)
-+      .put("/api/v1/candidate-restaurants/c-null-col/review")
-+      .send({ action: "approve" });
++      const response = await reviewBatch({
++        items: [
++          { candidateRestaurantId: CAND_A, action: "approve" },
++          { candidateRestaurantId: CAND_B, action: "reject" },
++        ],
++      });
 +
-+    expect(res.status).toBe(200);
-+    expect(Restaurant.create).toHaveBeenCalled();
++      expect(response.status).toBe(200);
++      expect(response.body.success).toBe(true);
++      expect(response.body.data).toHaveLength(2);
++      expect(response.body.data[0]).toMatchObject({
++        candidateRestaurantId: CAND_A,
++        action: "approve",
++        is_approved: true,
++      });
++      expect(response.body.data[1]).toMatchObject({
++        candidateRestaurantId: CAND_B,
++        action: "reject",
++        is_rejected: true,
++      });
++
++      expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(
++        true
++      );
++      expect((await CandidateRestaurant.findByPk(CAND_B))?.is_rejected).toBe(
++        true
++      );
++      expect(await restaurantsFor(CAND_A_NAME)).toHaveLength(1);
++      expect(await restaurantsFor(CAND_B_NAME)).toHaveLength(0);
++    });
++
++    it("returns results in the exact requested order", async () => {
++      await seedCandidate(CAND_A, CAND_A_NAME);
++      await seedCandidate(CAND_B, CAND_B_NAME);
++      await seedIncentive(0);
++
++      const response = await reviewBatch({
++        items: [
++          { candidateRestaurantId: CAND_B, action: "reject" },
++          { candidateRestaurantId: CAND_A, action: "approve" },
++        ],
++      });
++
++      expect(response.body.data.map((entry: any) => entry.candidateRestaurantId)).toEqual([
++        CAND_B,
++        CAND_A,
++      ]);
++    });
++
++    it("accumulates incentive points across two approvals from the same submitter", async () => {
++      await seedCandidate(CAND_A, CAND_A_NAME);
++      await seedCandidate(CAND_B, CAND_B_NAME);
++      await seedIncentive(10);
++
++      const response = await reviewBatch({
++        items: [
++          { candidateRestaurantId: CAND_A, action: "approve" },
++          { candidateRestaurantId: CAND_B, action: "approve" },
++        ],
++      });
++
++      expect(response.status).toBe(200);
++      expect(await incentiveTotal()).toBe(50);
++      expect(await historyCount()).toBe(2);
++    });
 +  });
 +
++  describe("batch rollback", () => {
++    it("rolls the batch back when one candidate id is unknown", async () => {
++      await seedCandidate(CAND_A, CAND_A_NAME);
++      await seedIncentive(0);
++
++      const response = await reviewBatch({
++        items: [
++          { candidateRestaurantId: CAND_A, action: "approve" },
++          { candidateRestaurantId: CAND_C, action: "approve" },
++        ],
++      });
++
++      expect(response.status).toBe(404);
++      expect(response.body.message).toMatch(/not found/i);
++      expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(
++        false
++      );
++      expect(await restaurantsFor(CAND_A_NAME)).toHaveLength(0);
++      expect(await incentiveTotal()).toBe(0);
++    });
++
++    it("rolls the batch back when one candidate is already approved", async () => {
++      await seedCandidate(CAND_A, CAND_A_NAME);
++      await seedCandidate(CAND_B, CAND_B_NAME, { is_approved: true });
++      await seedIncentive(0);
++
++      const response = await reviewBatch({
++        items: [
++          { candidateRestaurantId: CAND_A, action: "approve" },
++          { candidateRestaurantId: CAND_B, action: "reject" },
++        ],
++      });
++
++      expect(response.status).toBe(409);
++      expect(response.body.message).toMatch(/already approved/i);
++      expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(
++        false
++      );
++      expect(await restaurantsFor(CAND_A_NAME)).toHaveLength(0);
++    });
++
++    it("rolls the batch back when one candidate is already rejected", async () => {
++      await seedCandidate(CAND_A, CAND_A_NAME);
++      await seedCandidate(CAND_B, CAND_B_NAME, { is_rejected: true });
++      await seedIncentive(0);
++
++      const response = await reviewBatch({
++        items: [
++          { candidateRestaurantId: CAND_A, action: "approve" },
++          { candidateRestaurantId: CAND_B, action: "approve" },
++        ],
++      });
++
++      expect(response.status).toBe(409);
++      expect(response.body.message).toMatch(/already rejected/i);
++      expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(
++        false
++      );
++    });
++  });
++});
++
++describe("Candidate Restaurant Review - review notifications", () => {
++  it("notifies admins once when a candidate is approved", async () => {
++    await seedCandidate(CAND_A, CAND_A_NAME);
++    await seedIncentive(0);
++
++    await approve(CAND_A);
++
++    const notifications = await notificationsFor(CAND_A);
++    expect(notifications).toHaveLength(1);
++    expect(notifications[0].message).toEqual(expect.stringContaining(CAND_A_NAME));
++    expect(notifications[0].reactor_id).toBe(ADMIN_ID);
++  });
++
++  it("writes one notification for every admin, not just one", async () => {
++    await run(
++      `INSERT INTO admin_users
++         (id, first_name, last_name, email, password, phone_number, role_id,
++          "createdAt", "updatedAt")
++       VALUES (?, 'Second', 'Reviewer', 'rs-gold-admin2@example.com', 'x',
++               '+251900000002', ?, NOW(), NOW())
++       ON CONFLICT (id) DO NOTHING`,
++      [ADMIN2_ID, ROLE_ID]
++    );
++    await seedCandidate(CAND_A, CAND_A_NAME);
++    await seedIncentive(0);
++
++    await approve(CAND_A);
++
++    const notifications = await notificationsFor(CAND_A);
++    expect(notifications).toHaveLength(2);
++    expect(notifications.map((entry) => entry.user_id).sort()).toEqual(
++      [ADMIN_ID, ADMIN2_ID].sort()
++    );
++  });
++
++  it("rolls the rejection back entirely when writing the admin notifications fails", async () => {
++    await seedCandidate(CAND_A, CAND_A_NAME);
++
++    const spy = jest
++      .spyOn(Notification, "create")
++      .mockRejectedValue(new Error("notification store unavailable"));
++
++    const response = await reject(CAND_A);
++
++    spy.mockRestore();
++
++    expect(response.status).toBe(500);
++    expect(response.body.success).toBe(false);
++    expect((await CandidateRestaurant.findByPk(CAND_A))?.is_rejected).toBe(false);
++    expect(await notificationsFor(CAND_A)).toHaveLength(0);
++  });
++
++  it("notifies admins when a candidate is rejected", async () => {
++    await seedCandidate(CAND_A, CAND_A_NAME);
++
++    await reject(CAND_A);
++
++    const notifications = await notificationsFor(CAND_A);
++    expect(notifications).toHaveLength(1);
++    expect(notifications[0].message).toEqual(
++      expect.stringContaining(CAND_A_NAME)
++    );
++  });
++
++  it("writes no notification when the approval rolls back", async () => {
++    (emailUtils.sendAdminUserCredentialsEmail as jest.Mock).mockRejectedValue(
++      new Error("smtp down")
++    );
++    await seedCandidateAdmin(CADMIN_A);
++    await seedCandidate(CAND_A, CAND_A_NAME, {
++      candidate_admin_user_id: CADMIN_A,
++    });
++    await seedIncentive(0);
++
++    const response = await approve(CAND_A);
++
++    expect(response.status).toBe(500);
++    expect(await notificationsFor(CAND_A)).toHaveLength(0);
++    expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(
++      false
++    );
++    expect(await restaurantsFor(CAND_A_NAME)).toHaveLength(0);
++  });
++
++  it("writes one notification per candidate in a successful batch", async () => {
++    await seedCandidate(CAND_A, CAND_A_NAME);
++    await seedCandidate(CAND_B, CAND_B_NAME);
++    await seedIncentive(0);
++
++    await reviewBatch({
++      items: [
++        { candidateRestaurantId: CAND_A, action: "approve" },
++        { candidateRestaurantId: CAND_B, action: "reject" },
++      ],
++    });
++
++    expect(await notificationsFor(CAND_A)).toHaveLength(1);
++    expect(await notificationsFor(CAND_B)).toHaveLength(1);
++  });
++
++  it("writes no notifications when a batch rolls back", async () => {
++    await seedCandidate(CAND_A, CAND_A_NAME);
++    await seedIncentive(0);
++
++    const response = await reviewBatch({
++      items: [
++        { candidateRestaurantId: CAND_A, action: "approve" },
++        { candidateRestaurantId: CAND_C, action: "approve" },
++      ],
++    });
++
++    expect(response.status).toBe(404);
++    expect(await notificationsFor(CAND_A)).toHaveLength(0);
++    expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(
++      false
++    );
++  });
++});
++
++describe("Candidate Restaurant Review - concurrency", () => {
++  it("serializes a concurrent approve and reject so exactly one wins", async () => {
++    await seedCandidate(CAND_A, CAND_A_NAME);
++    await seedIncentive(0);
++
++    const [first, second] = await Promise.all([approve(CAND_A), reject(CAND_A)]);
++    const statuses = [first.status, second.status].sort();
++
++    expect(statuses).toEqual([200, 409]);
++
++    const candidate = await CandidateRestaurant.findByPk(CAND_A);
++    expect(candidate?.is_approved !== candidate?.is_rejected).toBe(true);
++
++    const restaurants = await restaurantsFor(CAND_A_NAME);
++    if (candidate?.is_approved) {
++      expect(restaurants).toHaveLength(1);
++    } else {
++      expect(restaurants).toHaveLength(0);
++    }
++  });
++
++  it("serializes two concurrent approvals so only one provisions a restaurant", async () => {
++    await seedCandidate(CAND_A, CAND_A_NAME);
++    await seedIncentive(0);
++
++    const [first, second] = await Promise.all([approve(CAND_A), approve(CAND_A)]);
++    const statuses = [first.status, second.status].sort();
++
++    expect(statuses).toEqual([200, 409]);
++    const loser = [first, second].find((r) => r.status === 409);
++    expect(loser?.body.message).toMatch(/already approved/i);
++
++    expect(await restaurantsFor(CAND_A_NAME)).toHaveLength(1);
++    expect(await incentiveTotal()).toBe(20);
++  });
 +});
