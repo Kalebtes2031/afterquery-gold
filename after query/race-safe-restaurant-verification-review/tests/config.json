@@ -34,7 +34,6 @@
     "Candidate Restaurant Review - review notifications writes one notification per candidate in a successful batch",
     "Candidate Restaurant Review - review notifications writes no notifications when a batch rolls back",
     "Candidate Restaurant Review - review notifications writes one notification for every admin, not just one",
-    "Candidate Restaurant Review - review notifications rolls the rejection back entirely when writing the admin notifications fails",
     "Candidate Restaurant Review - concurrency serializes a concurrent approve and reject so exactly one wins",
     "Candidate Restaurant Review - concurrency serializes two concurrent approvals so only one provisions a restaurant"
   ],

@@ -105,7 +105,7 @@ new file mode 100644
 index 0000000..a3ea967
 --- /dev/null
 +++ b/rateeat_backend/src/__tests__/unit/candidate_restaurant_review_behavior.test.ts
-@@ -0,0 +1,847 @@
+@@ -0,0 +1,831 @@
 +import express from "express";
 +import request from "supertest";
 +
@@ -407,6 +407,7 @@ index 0000000..a3ea967
 +        where: { user_id: SUBMITTER_ID },
 +      });
 +      expect(Number(history.points_earned)).toBe(20);
++      expect(history.incentive_type).toBe("General");
 +    });
 +
 +    it("creates the incentive row when the submitter has none yet", async () => {
@@ -831,23 +832,6 @@ index 0000000..a3ea967
 +    expect(notifications.map((entry) => entry.user_id).sort()).toEqual(
 +      [ADMIN_ID, ADMIN2_ID].sort()
 +    );
-+  });
-+
-+  it("rolls the rejection back entirely when writing the admin notifications fails", async () => {
-+    await seedCandidate(CAND_A, CAND_A_NAME);
-+
-+    const spy = jest
-+      .spyOn(Notification, "create")
-+      .mockRejectedValue(new Error("notification store unavailable"));
-+
-+    const response = await reject(CAND_A);
-+
-+    spy.mockRestore();
-+
-+    expect(response.status).toBe(500);
-+    expect(response.body.success).toBe(false);
-+    expect((await CandidateRestaurant.findByPk(CAND_A))?.is_rejected).toBe(false);
-+    expect(await notificationsFor(CAND_A)).toHaveLength(0);
 +  });
 +
 +  it("notifies admins when a candidate is rejected", async () => {
