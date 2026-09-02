@@ -1,17 +1,49 @@
 diff --git a/rateeat_backend/src/controllers/restaurant_claim_request.controller.ts b/rateeat_backend/src/controllers/restaurant_claim_request.controller.ts
-index bb222e5..5d3de10 100644
+index bb222e5..7e2a15f 100644
 --- a/rateeat_backend/src/controllers/restaurant_claim_request.controller.ts
 +++ b/rateeat_backend/src/controllers/restaurant_claim_request.controller.ts
-@@ -17,6 +17,8 @@ import sendNotification from "../utils/notification.utils";
+@@ -1,22 +1,28 @@
+ import { Request, Response, NextFunction } from "express";
+ import asyncAwaitHandler from "../middlewares/async-handler";
+ import { FileRequest } from "../middlewares/upload-image";
+-import RestaurantClaimRequest, {
+-  Status,
+-} from "../models/RestaurantClaim/RestaurantClaimRequest";
+-
++import {
++  RestaurantClaimRequest,
++  AdminUser,
++  Notification,
++  Role,
++} from "../models";
++import { Status } from "../models/RestaurantClaim/RestaurantClaimRequest";
+ import {
+   NotFoundError,
+   AuthorizationError,
+   BadRequestError,
+ } from "../utils/error-response.utils";
+-
+-import { AdminUser, Notification, Role } from "../models";
+ import MenuImage from "../models/Menu/MenuImage";
+ import sendNotification from "../utils/notification.utils";
  import { NotificationCategory } from "../models/Feedback/Notification";
  import { Op, WhereOptions, Transaction } from "sequelize";
  import sequelize from "../config/db";
 +import { RestaurantClaimOutcomeService } from "../services/restaurant-claim-outcome.service";
-+import { validateBatchClaimPayload, parseVerificationFilters } from "../utils/restaurant-claim-outcome.utils";
++import {
++  validateBatchClaimPayload,
++  parseVerificationFilters,
++} from "../utils/restaurant-claim-outcome.utils";
  
  // @desc    Create a restaurant claiming request
  // @route   POST /api/v1/restaurant-claim-request
-@@ -286,24 +288,26 @@ const approveRestaurantClaimRequest = asyncAwaitHandler(
+@@ -280,30 +286,31 @@ const getRestaurantClaimRequest = asyncAwaitHandler(
+ 
+ // @desc    Approve a restaurant claiming request
+ // @route   PUT /api/v1/restaurant-claim-request/:claimId/approve
+-
+ const approveRestaurantClaimRequest = asyncAwaitHandler(
+   async (req: Request, res: Response, next: NextFunction) => {
      const user: any = req.user;
      const { claimId } = req.params;
  
@@ -51,15 +83,206 @@ index bb222e5..5d3de10 100644
    }
  );
  
-@@ -342,4 +346,6 @@ export {
+@@ -311,29 +318,85 @@ const approveRestaurantClaimRequest = asyncAwaitHandler(
+ // @route   PUT /api/v1/restaurant-claim-request/:claimId/reject
+ const rejectRestaurantClaimRequest = asyncAwaitHandler(
+   async (req: Request, res: Response, next: NextFunction) => {
+-    let user: any = req.user;
++    const user: any = req.user;
+     const { claimId } = req.params;
++    const { rejectionReason } = req.body || {};
++
++    if (!user) {
++      return next(new AuthorizationError());
++    }
++
++    try {
++      const verified =
++        await RestaurantClaimOutcomeService.verifySingleClaimWithLock(
++          claimId!,
++          "reject",
++          user.id,
++          rejectionReason
++        );
++
++      return res.status(200).json({
++        success: true,
++        message: "Request rejected successfully",
++        data: verified,
++      });
++    } catch (error) {
++      return next(error);
++    }
++  }
++);
+ 
+-    user = await AdminUser.findByPk(user?.id);
++// @desc    Batch verify restaurant claim requests
++// @route   POST /api/v1/restaurant-claim-request/batch-verify
++const batchVerifyRestaurantClaims = asyncAwaitHandler(
++  async (req: Request, res: Response, next: NextFunction) => {
++    const user: any = req.user;
+ 
+     if (!user) {
+       return next(new AuthorizationError());
+     }
+ 
+-    const request = await RestaurantClaimRequest.findByPk(claimId);
++    try {
++      const { claims } = validateBatchClaimPayload(req.body);
++      const results =
++        await RestaurantClaimOutcomeService.executeBatchVerification(
++          claims,
++          user.id
++        );
++
++      return res.status(200).json({
++        success: true,
++        message: "Batch claim verification processed successfully",
++        data: results,
++      });
++    } catch (error) {
++      return next(error);
++    }
++  }
++);
++
++// @desc    Get claim verification aggregated metrics
++// @route   GET /api/v1/restaurant-claim-request/metrics
++const getVerificationMetrics = asyncAwaitHandler(
++  async (req: Request, res: Response, next: NextFunction) => {
++    const user: any = req.user;
+ 
+-    if (!request) {
+-      return next(new NotFoundError("Request not found"));
++    if (!user) {
++      return next(new AuthorizationError());
+     }
+ 
+-    request.status = Status.Rejected;
+-    await request.save();
++    try {
++      const metrics =
++        await RestaurantClaimOutcomeService.getClaimStatusMetrics();
+ 
+-    res.status(200).json({
+-      success: true,
+-      message: "Request rejected successfully",
+-      data: request,
+-    });
++      return res.status(200).json({
++        success: true,
++        message: "Claim verification metrics retrieved successfully",
++        data: metrics,
++      });
++    } catch (error) {
++      return next(error);
++    }
+   }
+ );
+ 
+@@ -342,4 +405,6 @@ export {
    getRestaurantClaimRequest,
    approveRestaurantClaimRequest,
    rejectRestaurantClaimRequest,
 +  batchVerifyRestaurantClaims,
 +  getVerificationMetrics,
  };
+diff --git a/rateeat_backend/src/models/Feedback/Notification.ts b/rateeat_backend/src/models/Feedback/Notification.ts
+index 77206ca..b7cf4cf 100644
+--- a/rateeat_backend/src/models/Feedback/Notification.ts
++++ b/rateeat_backend/src/models/Feedback/Notification.ts
+@@ -19,6 +19,7 @@ export enum NotificationCategory {
+   Order = "Order",
+   Bill = "Bill",
+   Flag = "Flag",
++  RestaurantClaim = "RestaurantClaim",
+ }
+ 
+ @Table({
+@@ -63,6 +64,11 @@ class Notification extends Model<Notification> {
+   })
+   reactor_id!: string;
+ 
++  @Column({
++    type: DataType.STRING(255),
++  })
++  title?: string;
++
+   @Column({
+     type: DataType.STRING(255),
+     allowNull: false,
+@@ -80,6 +86,11 @@ class Notification extends Model<Notification> {
+   })
+   notification_category!: NotificationCategory;
+ 
++  @Column({
++    type: DataType.STRING,
++  })
++  category?: NotificationCategory | string;
++
+   @CreatedAt
+   createdAt: Date;
+ 
+diff --git a/rateeat_backend/src/models/Restaurant/RestaurantChain.ts b/rateeat_backend/src/models/Restaurant/RestaurantChain.ts
+index f1a2217..3f29649 100644
+--- a/rateeat_backend/src/models/Restaurant/RestaurantChain.ts
++++ b/rateeat_backend/src/models/Restaurant/RestaurantChain.ts
+@@ -30,6 +30,12 @@ class RestaurantChain extends Model<RestaurantChain> {
+   })
+   name!: string;
+ 
++  @Column({
++    type: DataType.BOOLEAN,
++    defaultValue: false,
++  })
++  is_verified!: boolean;
++
+   @ForeignKey(() => AdminUser)
+   @Column({
+     type: DataType.UUID,
+diff --git a/rateeat_backend/src/models/RestaurantClaim/RestaurantClaimRequest.ts b/rateeat_backend/src/models/RestaurantClaim/RestaurantClaimRequest.ts
+index 557a8ba..e55d1e0 100644
+--- a/rateeat_backend/src/models/RestaurantClaim/RestaurantClaimRequest.ts
++++ b/rateeat_backend/src/models/RestaurantClaim/RestaurantClaimRequest.ts
+@@ -40,6 +40,18 @@ class RestaurantClaimRequest extends Model<RestaurantClaimRequest> {
+   })
+   restaurant_chain_id: string;
+ 
++  @Column({
++    type: DataType.UUID,
++    allowNull: true,
++  })
++  restaurant_id?: string;
++
++  @Column({
++    type: DataType.TEXT,
++    allowNull: true,
++  })
++  rejection_reason?: string;
++
+   @Column({
+     type: DataType.STRING(20),
+     allowNull: false,
+diff --git a/rateeat_backend/src/models/User/AdminUser.ts b/rateeat_backend/src/models/User/AdminUser.ts
+index 08d8dec..fe046b6 100644
+--- a/rateeat_backend/src/models/User/AdminUser.ts
++++ b/rateeat_backend/src/models/User/AdminUser.ts
+@@ -113,6 +113,12 @@ class AdminUser extends Model<AdminUser> {
+   })
+   is_active!: boolean;
+ 
++  @Column({
++    type: DataType.BOOLEAN,
++    defaultValue: false,
++  })
++  is_super_admin!: boolean;
++
+   @BelongsTo(() => Role)
+   role!: Role;
+ 
 diff --git a/rateeat_backend/src/routes/restaurant_claim_request.route.ts b/rateeat_backend/src/routes/restaurant_claim_request.route.ts
-index 94fc6ee..02ddd42 100644
+index 94fc6ee..afa09e3 100644
 --- a/rateeat_backend/src/routes/restaurant_claim_request.route.ts
 +++ b/rateeat_backend/src/routes/restaurant_claim_request.route.ts
 @@ -6,6 +6,8 @@ import {
@@ -71,12 +294,74 @@ index 94fc6ee..02ddd42 100644
  } from "../controllers/restaurant_claim_request.controller";
  import { filterImage } from "../middlewares/multer";
  import { uploadBusinessLicenseAndMenuFiles } from "../middlewares/upload-image";
+@@ -37,6 +39,18 @@ router.get(
+   getRestaurantClaimRequest
+ );
+ 
++router.post(
++  "/batch-verify",
++  protectRouteForAdmin,
++  batchVerifyRestaurantClaims
++);
++
++router.get(
++  "/metrics",
++  protectRouteForAdmin,
++  getVerificationMetrics
++);
++
+ router.put(
+   "/:claimId/approve",
+   protectRouteForAdmin,
+diff --git a/rateeat_backend/src/schemas/restaurant/restaurantClaimRequestSchema.ts b/rateeat_backend/src/schemas/restaurant/restaurantClaimRequestSchema.ts
+index 8c2957c..c24188c 100644
+--- a/rateeat_backend/src/schemas/restaurant/restaurantClaimRequestSchema.ts
++++ b/rateeat_backend/src/schemas/restaurant/restaurantClaimRequestSchema.ts
+@@ -16,7 +16,7 @@ export const createRestaurantClaimRequestBodySchema = z.object({
+   tin_number: z.string().min(1, "TIN number cannot be empty"),
+   menu_description: z.string().optional(),
+   email: z.string().email("Please provide a valid email address"),
+-  chainId: z.string().uuid("Chain ID must be a valid UUID").optional(),
++  chainId: z.string().optional(),
+ });
+ 
+ // Schema for GET Restaurant Claim Request
+@@ -29,10 +29,27 @@ export const getRestaurantClaimRequestQuerySchema = z.object({
+ 
+ // Schema for PUT Approve Restaurant Claim Request
+ export const approveRestaurantClaimRequestParamsSchema = z.object({
+-  claimId: z.string().uuid("Claim ID must be a valid UUID"),
++  claimId: z.string().min(1, "Claim ID cannot be empty"),
+ });
+ 
+ // Schema for PUT Reject Restaurant Claim Request
+ export const rejectRestaurantClaimRequestParamsSchema = z.object({
+-  claimId: z.string().uuid("Claim ID must be a valid UUID"),
++  claimId: z.string().min(1, "Claim ID cannot be empty"),
++});
++
++// Schema for POST Batch Verify Restaurant Claims
++export const batchVerifyRestaurantClaimsBodySchema = z.object({
++  claims: z.array(
++    z.object({
++      claimId: z.string().min(1, "Claim ID cannot be empty"),
++      action: z.enum(["approve", "reject", "APPROVE", "REJECT", "Approve", "Reject"]),
++      rejectionReason: z.string().optional(),
++    })
++  ).min(1, "Claims array cannot be empty"),
++});
++
++// Schema for GET Verification Metrics Query
++export const getVerificationMetricsQuerySchema = z.object({
++  startDate: z.string().optional(),
++  endDate: z.string().optional(),
+ });
 diff --git a/rateeat_backend/src/services/restaurant-claim-outcome.service.ts b/rateeat_backend/src/services/restaurant-claim-outcome.service.ts
 new file mode 100644
-index 0000000..02e4c4b
+index 0000000..62bcaca
 --- /dev/null
 +++ b/rateeat_backend/src/services/restaurant-claim-outcome.service.ts
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,199 @@
 +import { Transaction, Op } from "sequelize";
 +import sequelize from "../config/db";
 +import {
@@ -134,8 +419,9 @@ index 0000000..02e4c4b
 +      }
 +
 +      const now = new Date();
++      const isApprove = String(action).toLowerCase() === "approve";
 +
-+      if (action === ClaimVerificationAction.Approve || action === "approve") {
++      if (isApprove) {
 +        claim.status = Status.Approved;
 +        await claim.save({ transaction: tx });
 +
@@ -164,7 +450,7 @@ index 0000000..02e4c4b
 +              user_id: admin.id,
 +              category: NotificationCategory.RestaurantClaim,
 +              title: "Restaurant Claim Approved",
-+              message: `Restaurant claim request for restaurant ${claim.restaurant_id} has been verified and approved.`,
++              message: `Restaurant claim request for restaurant ${claim.restaurant_id || claim.restaurant_name} has been verified and approved.`,
 +            },
 +            { transaction: tx }
 +          );
@@ -172,7 +458,7 @@ index 0000000..02e4c4b
 +
 +        return {
 +          id: claim.id,
-+          restaurant_id: claim.restaurant_id,
++          restaurant_id: claim.restaurant_id || claim.restaurant_name,
 +          restaurant_chain_id: claim.restaurant_chain_id,
 +          status: ClaimVerificationStatus.Approved,
 +          rejection_reason: null,
@@ -182,13 +468,13 @@ index 0000000..02e4c4b
 +      } else {
 +        claim.status = Status.Rejected;
 +        if (rejectionReason) {
-+          (claim as any).rejection_reason = rejectionReason;
++          claim.rejection_reason = rejectionReason;
 +        }
 +        await claim.save({ transaction: tx });
 +
 +        return {
 +          id: claim.id,
-+          restaurant_id: claim.restaurant_id,
++          restaurant_id: claim.restaurant_id || claim.restaurant_name,
 +          restaurant_chain_id: claim.restaurant_chain_id,
 +          status: ClaimVerificationStatus.Rejected,
 +          rejection_reason: rejectionReason || null,
@@ -251,9 +537,15 @@ index 0000000..02e4c4b
 +   * Computes aggregated claim status counts for verification dashboards.
 +   */
 +  public static async getClaimStatusMetrics(): Promise<ClaimVerificationMetrics> {
-+    const pending = await RestaurantClaimRequest.count({ where: { status: Status.Pending } });
-+    const approved = await RestaurantClaimRequest.count({ where: { status: Status.Approved } });
-+    const rejected = await RestaurantClaimRequest.count({ where: { status: Status.Rejected } });
++    const pending = await RestaurantClaimRequest.count({
++      where: { status: Status.Pending },
++    });
++    const approved = await RestaurantClaimRequest.count({
++      where: { status: Status.Approved },
++    });
++    const rejected = await RestaurantClaimRequest.count({
++      where: { status: Status.Rejected },
++    });
 +    const chainLinked = await RestaurantClaimRequest.count({
 +      where: {
 +        restaurant_chain_id: { [Op.ne]: null },
@@ -368,10 +660,10 @@ index 0000000..186b238
 +}
 diff --git a/rateeat_backend/src/utils/restaurant-claim-outcome.utils.ts b/rateeat_backend/src/utils/restaurant-claim-outcome.utils.ts
 new file mode 100644
-index 0000000..01fdc87
+index 0000000..c09e5e8
 --- /dev/null
 +++ b/rateeat_backend/src/utils/restaurant-claim-outcome.utils.ts
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,231 @@
 +import { BadRequestError } from "../utils/error-response.utils";
 +import {
 +  BatchClaimVerificationItem,
@@ -516,7 +808,7 @@ index 0000000..01fdc87
 + * Formats a single claim verification record for export or audit logging.
 + */
 +export function formatClaimVerificationAuditRecord(
-+  claim: RestaurantClaimRequest | any,
++  claim: any,
 +  action: string,
 +  reviewerId: string
 +): Record<string, any> {
@@ -532,13 +824,17 @@ index 0000000..01fdc87
 +}
 +
 +/**
-+ * Validates whether an incoming claim ID string conforms to UUID format.
++ * Validates whether an incoming claim ID string conforms to a recognizable identifier format.
 + */
 +export function isValidClaimIdentifier(id: string): boolean {
 +  if (!id || typeof id !== "string") return false;
 +  const uuidRegex =
 +    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-+  return uuidRegex.test(id.trim()) || id.trim().startsWith("claim-") || id.trim().startsWith("c-");
++  return (
++    uuidRegex.test(id.trim()) ||
++    id.trim().startsWith("claim-") ||
++    id.trim().startsWith("c-")
++  );
 +}
 +
 +/**
@@ -554,4 +850,48 @@ index 0000000..01fdc87
 +    message,
 +    ...(details ? { errorDetails: details } : {}),
 +  };
++}
++
++/**
++ * Validates permissible state transitions for claim verification.
++ */
++export function isPermissibleStatusTransition(
++  currentStatus: string,
++  nextStatus: string
++): boolean {
++  if (currentStatus === "Pending") {
++    return nextStatus === "Approved" || nextStatus === "Rejected";
++  }
++  return false;
++}
++
++/**
++ * Serializes claim verification results for audit exports.
++ */
++export function serializeClaimVerificationReport(
++  claims: any[]
++): Array<{ id: string; status: string }> {
++  return claims.map((c) => ({
++    id: c.id,
++    status: c.status,
++  }));
++}
++
++/**
++ * Validates batch claim volume bounds.
++ */
++export function validateBatchClaimVolume(
++  claims: any[],
++  maxVolume: number = 100
++): { valid: boolean; message?: string } {
++  if (!Array.isArray(claims) || claims.length === 0) {
++    return { valid: false, message: "Claims array cannot be empty" };
++  }
++  if (claims.length > maxVolume) {
++    return {
++      valid: false,
++      message: `Batch volume exceeds maximum allowable size of ${maxVolume}`,
++    };
++  }
++  return { valid: true };
 +}

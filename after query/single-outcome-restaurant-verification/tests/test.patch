@@ -1,19 +1,26 @@
 diff --git a/rateeat_backend/src/__tests__/unit/restaurant_claim_batch_verification_behavior.test.ts b/rateeat_backend/src/__tests__/unit/restaurant_claim_batch_verification_behavior.test.ts
 new file mode 100644
-index 0000000..82b1320
+index 0000000..8c33a34
 --- /dev/null
 +++ b/rateeat_backend/src/__tests__/unit/restaurant_claim_batch_verification_behavior.test.ts
-@@ -0,0 +1,239 @@
+@@ -0,0 +1,252 @@
 +import express from "express";
 +import request from "supertest";
 +import restaurantClaimRouter from "../../routes/restaurant_claim_request.route";
 +import {
 +  AdminUser,
++  Notification,
++  RestaurantChain,
 +  RestaurantClaimRequest,
 +} from "../../models";
 +import { Status } from "../../models/RestaurantClaim/RestaurantClaimRequest";
++import sequelize from "../../config/db";
 +
 +jest.mock("../../middlewares/auth", () => ({
++  protectRouteForAdmin: (req: any, _res: any, next: any) => {
++    req.user = { id: "admin-uuid-1", is_super_admin: true };
++    next();
++  },
 +  authenticateToken: (req: any, _res: any, next: any) => {
 +    req.user = { id: "admin-uuid-1", is_super_admin: true };
 +    next();
@@ -24,13 +31,15 @@ index 0000000..82b1320
 +jest.mock("../../models", () => ({
 +  RestaurantClaimRequest: {
 +    findByPk: jest.fn(),
++    count: jest.fn(),
++    findAndCountAll: jest.fn(),
 +  },
 +  RestaurantChain: {
 +    findByPk: jest.fn(),
 +  },
 +  AdminUser: {
-+    findAll: jest.fn().mockResolvedValue([]),
-+    findByPk: jest.fn().mockResolvedValue({ id: "admin-uuid-1" }),
++    findAll: jest.fn(),
++    findByPk: jest.fn(),
 +  },
 +  Notification: {
 +    create: jest.fn(),
@@ -40,14 +49,7 @@ index 0000000..82b1320
 +jest.mock("../../config/db", () => ({
 +  __esModule: true,
 +  default: {
-+    transaction: jest.fn().mockImplementation((cb) => {
-+      const mockTx = {
-+        LOCK: { UPDATE: "UPDATE" },
-+        commit: jest.fn().mockResolvedValue(undefined),
-+        rollback: jest.fn().mockResolvedValue(undefined),
-+      };
-+      return cb(mockTx);
-+    }),
++    transaction: jest.fn(),
 +  },
 +}));
 +
@@ -58,12 +60,26 @@ index 0000000..82b1320
 +  app.use((err: any, _req: any, res: any, _next: any) => {
 +    res.status(err.statusCode || 500).json({
 +      success: false,
-+      message: err.message || "Internal Server Error",
++      message: err.details || err.message || "Internal Server Error",
 +    });
 +  });
 +
 +  beforeEach(() => {
 +    jest.clearAllMocks();
++    (sequelize.transaction as jest.Mock).mockImplementation(async (cb: any) => {
++      const mockTx = {
++        LOCK: { UPDATE: "UPDATE" },
++        commit: jest.fn().mockResolvedValue(undefined),
++        rollback: jest.fn().mockResolvedValue(undefined),
++      };
++      return cb(mockTx);
++    });
++    (AdminUser.findByPk as jest.Mock).mockResolvedValue({
++      id: "admin-uuid-1",
++      is_super_admin: true,
++    });
++    (AdminUser.findAll as jest.Mock).mockResolvedValue([]);
++    (Notification.create as jest.Mock).mockResolvedValue({});
 +  });
 +
 +  it("returns 400 when body does not contain claims array", async () => {
@@ -133,7 +149,6 @@ index 0000000..82b1320
 +    (RestaurantClaimRequest.findByPk as jest.Mock)
 +      .mockResolvedValueOnce(mockClaim1)
 +      .mockResolvedValueOnce(mockClaim2);
-+    (AdminUser.findAll as jest.Mock).mockResolvedValue([]);
 +
 +    const res = await request(app)
 +      .post("/api/v1/restaurant-claim-request/batch-verify")
@@ -187,7 +202,6 @@ index 0000000..82b1320
 +    (RestaurantClaimRequest.findByPk as jest.Mock)
 +      .mockResolvedValueOnce(mockClaim1)
 +      .mockResolvedValueOnce(mockClaim2);
-+    (AdminUser.findAll as jest.Mock).mockResolvedValue([]);
 +
 +    const res = await request(app)
 +      .post("/api/v1/restaurant-claim-request/batch-verify")
@@ -206,7 +220,6 @@ index 0000000..82b1320
 +  it("handles batch with whitespace padding in claim IDs seamlessly", async () => {
 +    const mockClaim = { id: "c-pad", restaurant_id: "r-pad", status: Status.Pending, save: jest.fn().mockResolvedValue(true) };
 +    (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(mockClaim);
-+    (AdminUser.findAll as jest.Mock).mockResolvedValue([]);
 +
 +    const res = await request(app)
 +      .post("/api/v1/restaurant-claim-request/batch-verify")
@@ -245,10 +258,10 @@ index 0000000..82b1320
 +});
 diff --git a/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_audit.test.ts b/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_audit.test.ts
 new file mode 100644
-index 0000000..a23ad8f
+index 0000000..4c91bf3
 --- /dev/null
 +++ b/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_audit.test.ts
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,128 @@
 +import {
 +  formatClaimVerificationSummary,
 +  parseVerificationFilters,
@@ -347,13 +360,42 @@ index 0000000..a23ad8f
 +    expect(isPermissibleStatusTransition("Approved", "Pending")).toBe(false);
 +    expect(isPermissibleStatusTransition("Rejected", "Approved")).toBe(false);
 +  });
++
++  it("handles edge-case filter criteria gracefully", () => {
++    const filters = parseVerificationFilters({
++      status: "Rejected",
++      chainId: "chain-55",
++      reviewerId: "admin-99",
++      limit: "invalid",
++      offset: "-5",
++    });
++    expect(filters.status).toBe(ClaimVerificationStatus.Rejected);
++    expect(filters.chainId).toBe("chain-55");
++    expect(filters.reviewerId).toBe("admin-99");
++    expect(filters.limit).toBeUndefined();
++    expect(filters.offset).toBeUndefined();
++  });
++
++  it("validates batch volume bounds with custom maximum thresholds", () => {
++    const items = [
++      { claimId: "c-1", action: "approve" },
++      { claimId: "c-2", action: "reject" },
++      { claimId: "c-3", action: "approve" },
++    ];
++    const checkValid = validateBatchClaimVolume(items, 5);
++    expect(checkValid.valid).toBe(true);
++
++    const checkExceeded = validateBatchClaimVolume(items, 2);
++    expect(checkExceeded.valid).toBe(false);
++    expect(checkExceeded.message).toContain("Batch volume exceeds maximum allowable size");
++  });
 +});
 diff --git a/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_auth.test.ts b/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_auth.test.ts
 new file mode 100644
-index 0000000..e7c0dd5
+index 0000000..ecb24f8
 --- /dev/null
 +++ b/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_auth.test.ts
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,39 @@
 +import express from "express";
 +import request from "supertest";
 +import restaurantClaimRouter from "../../routes/restaurant_claim_request.route";
@@ -379,6 +421,13 @@ index 0000000..e7c0dd5
 +    expect(res.status).toBe(401);
 +  });
 +
++  it("returns 401 when reject claim is requested without authorization token", async () => {
++    const res = await request(app)
++      .put("/api/v1/restaurant-claim-request/claim-101/reject")
++      .send({ rejectionReason: "No credentials" });
++    expect(res.status).toBe(401);
++  });
++
 +  it("returns 401 when metrics endpoint is requested without authorization token", async () => {
 +    const res = await request(app)
 +      .get("/api/v1/restaurant-claim-request/metrics")
@@ -388,10 +437,10 @@ index 0000000..e7c0dd5
 +});
 diff --git a/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_behavior.test.ts b/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_behavior.test.ts
 new file mode 100644
-index 0000000..5c361a4
+index 0000000..2caca06
 --- /dev/null
 +++ b/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_behavior.test.ts
-@@ -0,0 +1,275 @@
+@@ -0,0 +1,287 @@
 +import express from "express";
 +import request from "supertest";
 +import restaurantClaimRouter from "../../routes/restaurant_claim_request.route";
@@ -402,8 +451,13 @@ index 0000000..5c361a4
 +  RestaurantClaimRequest,
 +} from "../../models";
 +import { Status } from "../../models/RestaurantClaim/RestaurantClaimRequest";
++import sequelize from "../../config/db";
 +
 +jest.mock("../../middlewares/auth", () => ({
++  protectRouteForAdmin: (req: any, _res: any, next: any) => {
++    req.user = { id: "admin-uuid-1", is_super_admin: true };
++    next();
++  },
 +  authenticateToken: (req: any, _res: any, next: any) => {
 +    req.user = { id: "admin-uuid-1", is_super_admin: true };
 +    next();
@@ -416,13 +470,16 @@ index 0000000..5c361a4
 +    findByPk: jest.fn(),
 +    count: jest.fn(),
 +    findAndCountAll: jest.fn(),
++    findOne: jest.fn(),
++    findAll: jest.fn(),
++    create: jest.fn(),
 +  },
 +  RestaurantChain: {
 +    findByPk: jest.fn(),
 +  },
 +  AdminUser: {
 +    findAll: jest.fn(),
-+    findByPk: jest.fn().mockResolvedValue({ id: "admin-uuid-1" }),
++    findByPk: jest.fn(),
 +  },
 +  Notification: {
 +    create: jest.fn(),
@@ -432,14 +489,7 @@ index 0000000..5c361a4
 +jest.mock("../../config/db", () => ({
 +  __esModule: true,
 +  default: {
-+    transaction: jest.fn().mockImplementation((cb) => {
-+      const mockTx = {
-+        LOCK: { UPDATE: "UPDATE" },
-+        commit: jest.fn().mockResolvedValue(undefined),
-+        rollback: jest.fn().mockResolvedValue(undefined),
-+      };
-+      return cb(mockTx);
-+    }),
++    transaction: jest.fn(),
 +  },
 +}));
 +
@@ -450,12 +500,26 @@ index 0000000..5c361a4
 +  app.use((err: any, _req: any, res: any, _next: any) => {
 +    res.status(err.statusCode || 500).json({
 +      success: false,
-+      message: err.message || "Internal Server Error",
++      message: err.details || err.message || "Internal Server Error",
 +    });
 +  });
 +
 +  beforeEach(() => {
 +    jest.clearAllMocks();
++    (sequelize.transaction as jest.Mock).mockImplementation(async (cb: any) => {
++      const mockTx = {
++        LOCK: { UPDATE: "UPDATE" },
++        commit: jest.fn().mockResolvedValue(undefined),
++        rollback: jest.fn().mockResolvedValue(undefined),
++      };
++      return cb(mockTx);
++    });
++    (AdminUser.findByPk as jest.Mock).mockResolvedValue({
++      id: "admin-uuid-1",
++      is_super_admin: true,
++    });
++    (AdminUser.findAll as jest.Mock).mockResolvedValue([]);
++    (Notification.create as jest.Mock).mockResolvedValue({});
 +  });
 +
 +  describe("PUT /api/v1/restaurant-claim-request/:claimId/approve", () => {
@@ -468,7 +532,6 @@ index 0000000..5c361a4
 +        save: jest.fn().mockResolvedValue(true),
 +      };
 +      (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(mockClaim);
-+      (AdminUser.findAll as jest.Mock).mockResolvedValue([]);
 +
 +      const res = await request(app)
 +        .put("/api/v1/restaurant-claim-request/c-101/approve")
@@ -496,7 +559,6 @@ index 0000000..5c361a4
 +      };
 +      (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(mockClaim);
 +      (RestaurantChain.findByPk as jest.Mock).mockResolvedValue(mockChain);
-+      (AdminUser.findAll as jest.Mock).mockResolvedValue([]);
 +
 +      const res = await request(app)
 +        .put("/api/v1/restaurant-claim-request/c-102/approve")
@@ -577,7 +639,6 @@ index 0000000..5c361a4
 +        save: jest.fn().mockResolvedValue(true),
 +      };
 +      (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(mockClaim);
-+      (AdminUser.findAll as jest.Mock).mockResolvedValue([]);
 +
 +      const res = await request(app)
 +        .put("/api/v1/restaurant-claim-request/c-null-chain/approve")
