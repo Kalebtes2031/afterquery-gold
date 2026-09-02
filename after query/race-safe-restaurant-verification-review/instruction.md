@@ -13,18 +13,18 @@ Write-lock the candidate row so a second admin's call waits; run everything belo
 - create the live `Restaurant` (same name, description, opening/closing hours, opened);
 - chain name = text before the first ` | ` in the name; reuse or create that `RestaurantChain`, link the restaurant to it;
 - with a submitting user, add 20 to their incentive (creating the row if absent) plus one `General` incentive-history entry of 20; skip for an ownerless candidate;
-- with a linked candidate-admin, create their admin account, email the credentials, mark it approved, and make it chain admin only if the chain has none; if that candidate-admin is already approved the whole call fails 409 with "already approved" in the message;
-- mark the candidate approved and write one notification per admin user, each message containing the restaurant name and the acting admin.
+- with a linked candidate-admin, create their admin account, email the credentials, mark it approved, and make it chain admin only if the chain has none; an already-approved candidate-admin fails the call with 409 and "already approved" in the message;
+- mark the candidate approved and write one notification per admin user; each notification's message text contains the restaurant name, with the acting admin as its actor.
 
-If any step throws — the credentials email and the notification insert included — nothing commits; the candidate stays pending and the response status mirrors the error (a bare throw is 500).
+If any step throws — credentials email and notification insert included — nothing commits; the candidate stays pending and the status mirrors the error (a bare throw is 500).
 
 ## Reject
 
-Locking, transaction and guards match Approve. Flip the candidate and any linked candidate-admin to rejected and emit the same name-bearing per-admin notifications. Nothing else changes — no restaurant, chain, admin account or incentive.
+Locking, transaction and guards match Approve. Flip the candidate and any linked candidate-admin to rejected and emit the same per-admin notifications (message text again carries the restaurant name). Nothing else changes — no restaurant, chain, admin account or incentive.
 
 ## Batch
 
-Body `{ "items": [ { "candidateRestaurantId", "action" }, ... ] }`. Process the entries by the Approve/Reject rules under one shared transaction. If any entry can't be processed — not found, already decided, downstream error — abandon the whole batch and answer with that entry's status. Otherwise reply with one result per entry, in sent order.
+Body `{ "items": [ { "candidateRestaurantId", "action" }, ... ] }`. Apply the Approve/Reject rules to every entry under one shared transaction, in sent order. If any entry can't be processed — not found, already decided, downstream error — abandon the whole batch and answer with that entry's status; otherwise return one result per entry.
 
 Payload errors answer 400 up front:
 
@@ -36,7 +36,7 @@ Payload errors answer 400 up front:
 
 ## Guards and responses
 
-Keep the current admin guard ahead of all three handlers; anyone it turns away still receives its own 401.
+Keep the admin guard ahead of all three handlers; anyone it turns away still gets its 401.
 
     unknown candidate ............ 404, message "Candidate Restaurant not found"
     candidate already finalized .. 409, message says whether it was approved or rejected
