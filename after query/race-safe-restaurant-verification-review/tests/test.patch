@@ -102,10 +102,10 @@ index 0000000..55f7455
 +});
 diff --git a/rateeat_backend/src/__tests__/unit/candidate_restaurant_review_behavior.test.ts b/rateeat_backend/src/__tests__/unit/candidate_restaurant_review_behavior.test.ts
 new file mode 100644
-index 0000000..a3ea967
+index 0000000..243c271
 --- /dev/null
 +++ b/rateeat_backend/src/__tests__/unit/candidate_restaurant_review_behavior.test.ts
-@@ -0,0 +1,831 @@
+@@ -0,0 +1,916 @@
 +import express from "express";
 +import request from "supertest";
 +
@@ -461,6 +461,30 @@ index 0000000..a3ea967
 +      ).toHaveBeenCalledTimes(1);
 +    });
 +
++    it("preserves an existing chain admin when provisioning a candidate admin", async () => {
++      await run(
++        `INSERT INTO restaurant_chains
++           (id, name, admin_user_id, "createdAt", "updatedAt")
++         VALUES (gen_random_uuid(), 'RS Gold Alpha', ?, NOW(), NOW())`,
++        [ADMIN_ID]
++      );
++      await seedCandidateAdmin(CADMIN_A);
++      await seedCandidate(CAND_A, CAND_A_NAME, {
++        candidate_admin_user_id: CADMIN_A,
++      });
++
++      const response = await approve(CAND_A);
++
++      expect(response.status).toBe(200);
++      const chain = await RestaurantChain.findOne({
++        where: { name: "RS Gold Alpha" },
++      });
++      expect(chain?.admin_user_id).toBe(ADMIN_ID);
++      expect((await CandidateAdminUser.findByPk(CADMIN_A))?.is_approved).toBe(
++        true
++      );
++    });
++
 +    it("rolls the whole approval back when the candidate admin was already approved", async () => {
 +      await seedCandidateAdmin(CADMIN_A, { is_approved: true });
 +      await seedCandidate(CAND_A, CAND_A_NAME, {
@@ -643,6 +667,24 @@ index 0000000..a3ea967
 +      expect(response.body.message).toMatch(BATCH_PAYLOAD_ERROR);
 +    });
 +
++    it("returns 400 when candidateRestaurantId is blank", async () => {
++      const response = await reviewBatch({
++        items: [{ candidateRestaurantId: "   ", action: "approve" }],
++      });
++      expect(response.status).toBe(400);
++      expect(response.body.success).toBe(false);
++      expect(response.body.message).toMatch(BATCH_PAYLOAD_ERROR);
++    });
++
++    it("returns 400 when candidateRestaurantId is not a string", async () => {
++      const response = await reviewBatch({
++        items: [{ candidateRestaurantId: 123, action: "approve" }],
++      });
++      expect(response.status).toBe(400);
++      expect(response.body.success).toBe(false);
++      expect(response.body.message).toMatch(BATCH_PAYLOAD_ERROR);
++    });
++
 +    it("returns 400 when an action is not approve or reject", async () => {
 +      const response = await reviewBatch({
 +        items: [{ candidateRestaurantId: CAND_A, action: "delete" }],
@@ -684,11 +726,15 @@ index 0000000..a3ea967
 +        candidateRestaurantId: CAND_A,
 +        action: "approve",
 +        is_approved: true,
++        is_rejected: false,
++        restaurant_id: expect.any(String),
 +      });
 +      expect(response.body.data[1]).toMatchObject({
 +        candidateRestaurantId: CAND_B,
 +        action: "reject",
++        is_approved: false,
 +        is_rejected: true,
++        restaurant_id: null,
 +      });
 +
 +      expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(
@@ -898,6 +944,45 @@ index 0000000..a3ea967
 +    expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(
 +      false
 +    );
++  });
++
++  it("rolls the review back when the final notification write fails", async () => {
++    await seedCandidateAdmin(CADMIN_A);
++    await seedCandidate(CAND_A, CAND_A_NAME, {
++      candidate_admin_user_id: CADMIN_A,
++    });
++
++    await run(`
++      CREATE OR REPLACE FUNCTION fail_candidate_review_notification()
++      RETURNS trigger AS $$
++      BEGIN
++        RAISE EXCEPTION 'notification store unavailable';
++      END;
++      $$ LANGUAGE plpgsql;
++
++      CREATE TRIGGER fail_candidate_review_notification
++      BEFORE INSERT ON notifications
++      FOR EACH ROW EXECUTE FUNCTION fail_candidate_review_notification();
++    `);
++
++    try {
++      const response = await reject(CAND_A);
++
++      expect(response.status).toBe(500);
++      expect(response.body.success).toBe(false);
++      expect((await CandidateRestaurant.findByPk(CAND_A))?.is_rejected).toBe(
++        false
++      );
++      const candidateAdmin = await CandidateAdminUser.findByPk(CADMIN_A);
++      expect(candidateAdmin?.is_rejected).toBe(false);
++      expect(candidateAdmin?.is_approved).toBe(false);
++      expect(await notificationsFor(CAND_A)).toHaveLength(0);
++    } finally {
++      await run(
++        "DROP TRIGGER IF EXISTS fail_candidate_review_notification ON notifications"
++      );
++      await run("DROP FUNCTION IF EXISTS fail_candidate_review_notification()");
++    }
 +  });
 +});
 +

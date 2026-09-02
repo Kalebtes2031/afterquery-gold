@@ -1,22 +1,52 @@
-Approving and rejecting candidate restaurants must be atomic and safe against concurrent admin actions on the same candidate.
+Promoting Candidate Restaurants into the Live Catalogue
 
-In one transaction, the approve endpoint (PUT /api/v1/candidate-restaurants/:candidateRestaurantId/approve) creates the live restaurant, finds or creates its chain from the name up to " | ", approves the candidate, and—if it has a submitter—adds 20 incentive points (create the row if absent) plus a General history entry. If a candidate admin is linked, create its admin account, email the credentials, set it as the chain's admin if none exists, and approve it; if it is already approved, fail with 409. reject works the same way, rejecting the candidate and any linked candidate admin.
+Make the candidate-restaurant approve and reject actions transactional and safe under concurrent admin action, and add a bulk endpoint.
 
-On any failure, roll everything back, leave the candidate pending, and answer with the failure's status (e.g. 500 when the credentials email throws). Lock the candidate row so concurrent reviews serialize. Unknown id → 404 with message "Candidate Restaurant not found"; already-finalized → 409, the message saying which (already approved or rejected). Each success writes one notification per admin that records the candidate and the acting admin. Leave the existing admin guard on all three endpoints, so a caller it rejects still gets that guard's own 401.
+    approve: PUT /api/v1/candidate-restaurants/:candidateRestaurantId/approve
+    reject:  PUT /api/v1/candidate-restaurants/:candidateRestaurantId/reject
+    batch:   PUT /api/v1/candidate-restaurants/review-batch
 
-Both endpoints answer 200 with a data object; `restaurant_id` is the new restaurant on approval, `null` on rejection:
+## Approve
 
-    { "success": true,
-      "data": { "candidateRestaurantId": "<url id>", "action": "approve"|"reject",
-                "is_approved": <bool>, "is_rejected": <bool>, "restaurant_id": "<id>"|null } }
+Write-lock the candidate row so a second admin's call blocks until this one finishes; run everything below in a single transaction:
 
-Also add PUT /api/v1/candidate-restaurants/review-batch, running the whole batch in one transaction that any failing item (unknown or already-finalized candidate) rolls back:
+- create the live `Restaurant` (same name, description, opening/closing hours, opened);
+- chain name = text before the first ` | ` in the name; reuse or create that `RestaurantChain`, link the restaurant to it;
+- with a submitting user, add 20 to their incentive (creating the row if absent) plus one `General` incentive-history entry of 20; skip for an ownerless candidate;
+- with a linked candidate-admin, create that person's admin account, email the credentials, mark it approved, and set it as chain admin only if the chain has none; one already approved fails with 409;
+- mark the candidate approved and write one notification per admin user, naming the restaurant and the acting admin.
 
-    request:  { "items": [ { "candidateRestaurantId": "<id>", "action": "approve"|"reject" }, ... ] }
-    200 body: { "success": true, "data": [ <one entry per item, request order, shaped like the data object above> ] }
+If any step throws — the credentials email and the notification insert included — nothing commits; the candidate stays pending and the response status mirrors the error (a bare throw is 500).
 
-Answer 400 for missing or empty `items`, an entry that is not an object or has no usable `candidateRestaurantId`, an `action` that is neither "approve" nor "reject", or a repeated id — exact message "Duplicate candidate restaurant id".
+## Reject
 
-Every error these handlers raise responds `{ "success": false, "message": "<text>", "statusCode": <status> }` with the status above.
+Locking, transaction and guards match Approve. Flip the candidate and any linked candidate-admin to rejected and emit the same per-admin notifications. Nothing else changes — no restaurant, chain, admin account or incentive.
 
-IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.
+## Batch
+
+Body `{ "items": [ { "candidateRestaurantId", "action" }, ... ] }`. Process the entries by the Approve/Reject rules under one shared transaction. If any entry can't be processed — not found, already decided, downstream error — abandon the whole batch and answer with that entry's status. Otherwise reply with one result per entry, in sent order.
+
+Payload errors answer 400 up front:
+
+    - items missing or empty
+    - an item that is not an object
+    - an item with no usable string candidateRestaurantId
+    - action neither "approve" nor "reject"  (the message says "approve or reject")
+    - an id repeated: message exactly "Duplicate candidate restaurant id"
+
+## Guards and responses
+
+Keep the current admin guard ahead of all three handlers; anyone it turns away still receives its own 401.
+
+    unknown candidate ............ 404, message "Candidate Restaurant not found"
+    candidate already finalized .. 409, message says whether it was approved or rejected
+
+    single success: { "success": true,
+                      "data": { "candidateRestaurantId": "<url id>",
+                                "action": "approve" | "reject",
+                                "is_approved": <bool>, "is_rejected": <bool>,
+                                "restaurant_id": "<new restaurant id>" | null } }
+    batch success:  { "success": true, "data": [ <entry shaped like the data object above>, ... ] }
+    handler error:  { "success": false, "message": "<text>", "statusCode": <status> }
+
+`restaurant_id` is the new restaurant on approve, `null` on reject.

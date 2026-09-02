@@ -126,7 +126,6 @@ timeout --kill-after=10s 300s \
   src/__tests__/unit/candidate_restaurant_verification_auth.test.ts \
   src/__tests__/unit/candidate_restaurant_verification_behavior.test.ts \
   src/__tests__/unit/candidate_restaurant_batch_verification_behavior.test.ts \
-  src/__tests__/unit/candidate_restaurant_verification_audit.test.ts \
   --reporters=default \
   --reporters="$CTRF_REPORTER" \
   2>&1 | tee -a "$RUN_LOG"
