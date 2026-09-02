@@ -32,10 +32,10 @@ index e60a6e1..f57cdf8 100644
            RestaurantReview,
 diff --git a/rateeat_backend/src/__tests__/unit/candidate_restaurant_review_auth.test.ts b/rateeat_backend/src/__tests__/unit/candidate_restaurant_review_auth.test.ts
 new file mode 100644
-index 0000000..de841bf
+index 0000000..55f7455
 --- /dev/null
 +++ b/rateeat_backend/src/__tests__/unit/candidate_restaurant_review_auth.test.ts
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,64 @@
 +import express from "express";
 +import request from "supertest";
 +
@@ -43,9 +43,9 @@ index 0000000..de841bf
 +import { errorHandler } from "../../middlewares/error-handler";
 +
 +/**
-+ * These checks exercise the wiring of the approve and reject endpoints through
-+ * the real router with the repository's real admin guard in place, so they
-+ * confirm the routes exist and stay behind admin authorization.
++ * These checks exercise the wiring of the review endpoints through the real
++ * router with the repository's real admin guard in place, so they confirm the
++ * routes exist and stay behind admin authorization.
 + */
 +const app = express();
 +app.use(express.json());
@@ -76,13 +76,36 @@ index 0000000..de841bf
 +      error: "Not authorized to access this route",
 +    });
 +  });
++
++  it("rejects an unauthenticated batch review with 401", async () => {
++    const response = await request(app)
++      .put("/api/v1/candidate-restaurants/review-batch")
++      .send({
++        items: [{ candidateRestaurantId: UNKNOWN_ID, action: "approve" }],
++      });
++
++    expect(response.status).toBe(401);
++    expect(response.body).toEqual({
++      error: "Not authorized to access this route",
++    });
++  });
++
++  it("keeps the batch review route registered as a PUT endpoint", async () => {
++    const response = await request(app)
++      .get("/api/v1/candidate-restaurants/review-batch")
++      .send();
++
++    // GET is not defined for this path; the router should not treat
++    // "review-batch" as a candidate id and 404 instead of 200.
++    expect(response.status).not.toBe(200);
++  });
 +});
 diff --git a/rateeat_backend/src/__tests__/unit/candidate_restaurant_review_behavior.test.ts b/rateeat_backend/src/__tests__/unit/candidate_restaurant_review_behavior.test.ts
 new file mode 100644
-index 0000000..7d67c5f
+index 0000000..243c271
 --- /dev/null
 +++ b/rateeat_backend/src/__tests__/unit/candidate_restaurant_review_behavior.test.ts
-@@ -0,0 +1,682 @@
+@@ -0,0 +1,939 @@
 +import express from "express";
 +import request from "supertest";
 +
@@ -138,6 +161,9 @@ index 0000000..7d67c5f
 +
 +const reject = (id: string) =>
 +  request(app).put(`/api/v1/candidate-restaurants/${id}/reject`).send({});
++
++const reviewBatch = (body: any) =>
++  request(app).put("/api/v1/candidate-restaurants/review-batch").send(body);
 +
 +let sequelize: Awaited<ReturnType<typeof Database.getInstance>>;
 +
@@ -497,7 +523,7 @@ index 0000000..7d67c5f
 +      const response = await approve(CAND_C);
 +
 +      expect(response.status).toBe(404);
-+      expectErrorShape(response, 404, /candidate restaurant not found/i);
++      expectErrorShape(response, 404, "Candidate Restaurant not found");
 +    });
 +
 +    it("returns 409 when the candidate is already approved", async () => {
@@ -597,7 +623,7 @@ index 0000000..7d67c5f
 +    it("returns 404 for an unknown candidate id", async () => {
 +      const response = await reject(CAND_C);
 +      expect(response.status).toBe(404);
-+      expectErrorShape(response, 404, /candidate restaurant not found/i);
++      expectErrorShape(response, 404, "Candidate Restaurant not found");
 +    });
 +
 +    it("returns 409 when the candidate is already rejected", async () => {
@@ -614,6 +640,225 @@ index 0000000..7d67c5f
 +      expect(response.status).toBe(409);
 +      expectErrorShape(response, 409, /already approved/i);
 +      expect(response.body.message).toMatch(/already approved/i);
++    });
++  });
++});
++
++describe("Candidate Restaurant Review - batch moderation", () => {
++  describe("payload validation", () => {
++    // The message assertions below pin the failure to the batch payload
++    // validator: a route that never parses `items` (e.g. one that only
++    // validates the path segment) cannot produce them.
++    const BATCH_PAYLOAD_ERROR = /items|each item|candidateRestaurantId|action|approve or reject/i;
++
++    it("returns 400 when items is missing", async () => {
++      await seedCandidate(CAND_A, CAND_A_NAME);
++      const response = await reviewBatch({});
++      expect(response.status).toBe(400);
++      expectErrorShape(response, 400);
++      expect(response.body.message).toMatch(BATCH_PAYLOAD_ERROR);
++      const candidate = await CandidateRestaurant.findByPk(CAND_A);
++      expect(candidate?.is_approved).toBe(false);
++    });
++
++    it("returns 400 when items is empty", async () => {
++      const response = await reviewBatch({ items: [] });
++      expect(response.status).toBe(400);
++      expectErrorShape(response, 400);
++      expect(response.body.message).toMatch(BATCH_PAYLOAD_ERROR);
++    });
++
++    it("returns 400 when an item is not an object", async () => {
++      const response = await reviewBatch({ items: ["nope"] });
++      expect(response.status).toBe(400);
++      expectErrorShape(response, 400);
++      expect(response.body.message).toMatch(BATCH_PAYLOAD_ERROR);
++    });
++
++    it("returns 400 when an item has no candidateRestaurantId", async () => {
++      const response = await reviewBatch({ items: [{ action: "approve" }] });
++      expect(response.status).toBe(400);
++      expectErrorShape(response, 400);
++      expect(response.body.message).toMatch(BATCH_PAYLOAD_ERROR);
++    });
++
++    it("returns 400 when candidateRestaurantId is blank", async () => {
++      const response = await reviewBatch({
++        items: [{ candidateRestaurantId: "   ", action: "approve" }],
++      });
++      expect(response.status).toBe(400);
++      expectErrorShape(response, 400);
++      expect(response.body.message).toMatch(BATCH_PAYLOAD_ERROR);
++    });
++
++    it("returns 400 when candidateRestaurantId is not a string", async () => {
++      const response = await reviewBatch({
++        items: [{ candidateRestaurantId: 123, action: "approve" }],
++      });
++      expect(response.status).toBe(400);
++      expectErrorShape(response, 400);
++      expect(response.body.message).toMatch(BATCH_PAYLOAD_ERROR);
++    });
++
++    it("returns 400 when an action is not approve or reject", async () => {
++      const response = await reviewBatch({
++        items: [{ candidateRestaurantId: CAND_A, action: "delete" }],
++      });
++      expect(response.status).toBe(400);
++      expectErrorShape(response, 400, /approve or reject/i);
++      expect(response.body.message).toMatch(/action|approve or reject/i);
++    });
++
++    it("returns 400 with 'Duplicate candidate restaurant id' for a repeated id", async () => {
++      const response = await reviewBatch({
++        items: [
++          { candidateRestaurantId: CAND_A, action: "approve" },
++          { candidateRestaurantId: CAND_A, action: "reject" },
++        ],
++      });
++      expect(response.status).toBe(400);
++      expectErrorShape(response, 400, "Duplicate candidate restaurant id");
++      expect(response.body.message).toBe("Duplicate candidate restaurant id");
++    });
++  });
++
++  describe("execution and ordering", () => {
++    it("applies a mixed approve/reject batch in one call", async () => {
++      await seedCandidate(CAND_A, CAND_A_NAME);
++      await seedCandidate(CAND_B, CAND_B_NAME);
++      await seedIncentive(0);
++
++      const response = await reviewBatch({
++        items: [
++          { candidateRestaurantId: CAND_A, action: "approve" },
++          { candidateRestaurantId: CAND_B, action: "reject" },
++        ],
++      });
++
++      expect(response.status).toBe(200);
++      expect(response.body.success).toBe(true);
++      expect(response.body.data).toHaveLength(2);
++      expect(response.body.data[0]).toMatchObject({
++        candidateRestaurantId: CAND_A,
++        action: "approve",
++        is_approved: true,
++        is_rejected: false,
++        restaurant_id: expect.any(String),
++      });
++      expect(response.body.data[1]).toMatchObject({
++        candidateRestaurantId: CAND_B,
++        action: "reject",
++        is_approved: false,
++        is_rejected: true,
++        restaurant_id: null,
++      });
++
++      expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(
++        true
++      );
++      expect((await CandidateRestaurant.findByPk(CAND_B))?.is_rejected).toBe(
++        true
++      );
++      expect(await restaurantsFor(CAND_A_NAME)).toHaveLength(1);
++      expect(await restaurantsFor(CAND_B_NAME)).toHaveLength(0);
++    });
++
++    it("returns results in the exact requested order", async () => {
++      await seedCandidate(CAND_A, CAND_A_NAME);
++      await seedCandidate(CAND_B, CAND_B_NAME);
++      await seedIncentive(0);
++
++      const response = await reviewBatch({
++        items: [
++          { candidateRestaurantId: CAND_B, action: "reject" },
++          { candidateRestaurantId: CAND_A, action: "approve" },
++        ],
++      });
++
++      expect(response.body.data.map((entry: any) => entry.candidateRestaurantId)).toEqual([
++        CAND_B,
++        CAND_A,
++      ]);
++    });
++
++    it("accumulates incentive points across two approvals from the same submitter", async () => {
++      await seedCandidate(CAND_A, CAND_A_NAME);
++      await seedCandidate(CAND_B, CAND_B_NAME);
++      await seedIncentive(10);
++
++      const response = await reviewBatch({
++        items: [
++          { candidateRestaurantId: CAND_A, action: "approve" },
++          { candidateRestaurantId: CAND_B, action: "approve" },
++        ],
++      });
++
++      expect(response.status).toBe(200);
++      expect(await incentiveTotal()).toBe(50);
++      expect(await historyCount()).toBe(2);
++    });
++  });
++
++  describe("batch rollback", () => {
++    it("rolls the batch back when one candidate id is unknown", async () => {
++      await seedCandidate(CAND_A, CAND_A_NAME);
++      await seedIncentive(0);
++
++      const response = await reviewBatch({
++        items: [
++          { candidateRestaurantId: CAND_A, action: "approve" },
++          { candidateRestaurantId: CAND_C, action: "approve" },
++        ],
++      });
++
++      expect(response.status).toBe(404);
++      expectErrorShape(response, 404, "Candidate Restaurant not found");
++      expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(
++        false
++      );
++      expect(await restaurantsFor(CAND_A_NAME)).toHaveLength(0);
++      expect(await incentiveTotal()).toBe(0);
++    });
++
++    it("rolls the batch back when one candidate is already approved", async () => {
++      await seedCandidate(CAND_A, CAND_A_NAME);
++      await seedCandidate(CAND_B, CAND_B_NAME, { is_approved: true });
++      await seedIncentive(0);
++
++      const response = await reviewBatch({
++        items: [
++          { candidateRestaurantId: CAND_A, action: "approve" },
++          { candidateRestaurantId: CAND_B, action: "reject" },
++        ],
++      });
++
++      expect(response.status).toBe(409);
++      expectErrorShape(response, 409, /already approved/i);
++      expect(response.body.message).toMatch(/already approved/i);
++      expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(
++        false
++      );
++      expect(await restaurantsFor(CAND_A_NAME)).toHaveLength(0);
++    });
++
++    it("rolls the batch back when one candidate is already rejected", async () => {
++      await seedCandidate(CAND_A, CAND_A_NAME);
++      await seedCandidate(CAND_B, CAND_B_NAME, { is_rejected: true });
++      await seedIncentive(0);
++
++      const response = await reviewBatch({
++        items: [
++          { candidateRestaurantId: CAND_A, action: "approve" },
++          { candidateRestaurantId: CAND_B, action: "approve" },
++        ],
++      });
++
++      expect(response.status).toBe(409);
++      expectErrorShape(response, 409, /already rejected/i);
++      expect(response.body.message).toMatch(/already rejected/i);
++      expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(
++        false
++      );
 +    });
 +  });
 +});
@@ -684,6 +929,41 @@ index 0000000..7d67c5f
 +      false
 +    );
 +    expect(await restaurantsFor(CAND_A_NAME)).toHaveLength(0);
++  });
++
++  it("writes one notification per candidate in a successful batch", async () => {
++    await seedCandidate(CAND_A, CAND_A_NAME);
++    await seedCandidate(CAND_B, CAND_B_NAME);
++    await seedIncentive(0);
++
++    await reviewBatch({
++      items: [
++        { candidateRestaurantId: CAND_A, action: "approve" },
++        { candidateRestaurantId: CAND_B, action: "reject" },
++      ],
++    });
++
++    expect(await notificationsFor(CAND_A)).toHaveLength(1);
++    expect(await notificationsFor(CAND_B)).toHaveLength(1);
++  });
++
++  it("writes no notifications when a batch rolls back", async () => {
++    await seedCandidate(CAND_A, CAND_A_NAME);
++    await seedIncentive(0);
++
++    const response = await reviewBatch({
++      items: [
++        { candidateRestaurantId: CAND_A, action: "approve" },
++        { candidateRestaurantId: CAND_C, action: "approve" },
++      ],
++    });
++
++    expect(response.status).toBe(404);
++    expectErrorShape(response, 404, "Candidate Restaurant not found");
++    expect(await notificationsFor(CAND_A)).toHaveLength(0);
++    expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(
++      false
++    );
 +  });
 +
 +  it("rolls the review back when the final notification write fails", async () => {
