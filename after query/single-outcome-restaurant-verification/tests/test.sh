@@ -19,8 +19,6 @@ export RUN_LOG=/logs/verifier/run.log
 run_log() { echo "+ $*" >> "$RUN_LOG" 2>/dev/null; "$@" 2>&1 | tee -a "$RUN_LOG"; return "${PIPESTATUS[0]}"; }
 
 # >>> RUN TESTS (task-specific) <<<
-
-export NODE_PATH="/opt/ctrf/node_modules:/app/rateeat_backend/node_modules"
 set +e
 
 cd /app/rateeat_backend || exit 6
@@ -65,7 +63,7 @@ module.exports = {
     "json"
   ],
   transform: {
-    "^.+\\.tsx?$": [
+    "^.+\.tsx?$": [
       "ts-jest",
       {
         tsconfig: {
