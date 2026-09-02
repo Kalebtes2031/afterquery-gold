@@ -1,9 +1,9 @@
 diff --git a/rateeat_backend/src/constants/candidate-restaurant-review.constants.ts b/rateeat_backend/src/constants/candidate-restaurant-review.constants.ts
 new file mode 100644
-index 0000000..7e83ce6
+index 0000000..103f32f
 --- /dev/null
 +++ b/rateeat_backend/src/constants/candidate-restaurant-review.constants.ts
-@@ -0,0 +1,18 @@
+@@ -0,0 +1,14 @@
 +export const CANDIDATE_RESTAURANT_APPROVAL_REWARD = 20;
 +
 +export const CANDIDATE_RESTAURANT_CHAIN_NAME_SEPARATOR = " | ";
@@ -15,30 +15,22 @@ index 0000000..7e83ce6
 +  ADMIN_NOT_FOUND: "Candidate Admin User not found",
 +  ADMIN_ALREADY_APPROVED: "Candidate Admin User already approved",
 +  CREDENTIAL_EMAIL_FAILED: "Failed to send credentials email",
-+  BATCH_ITEMS_REQUIRED: "items must be a non-empty array",
-+  BATCH_ITEM_INVALID: "each item needs a candidateRestaurantId and an action",
-+  BATCH_ACTION_INVALID: "action must be approve or reject",
-+  BATCH_DUPLICATE_ID: "Duplicate candidate restaurant id",
 +} as const;
 +
 +export type CandidateRestaurantReviewAction = "approve" | "reject";
 diff --git a/rateeat_backend/src/controllers/candidate_restaurant.controller.ts b/rateeat_backend/src/controllers/candidate_restaurant.controller.ts
-index 6855d94..6008f6d 100644
+index 6855d94..0fdbf22 100644
 --- a/rateeat_backend/src/controllers/candidate_restaurant.controller.ts
 +++ b/rateeat_backend/src/controllers/candidate_restaurant.controller.ts
-@@ -34,6 +34,11 @@ import { Op } from "sequelize";
+@@ -34,6 +34,7 @@ import { Op } from "sequelize";
  // import sequelize from "../config/db";
  import { NotificationCategory } from "../models/Feedback/Notification";
  import sendNotification from "../utils/notification.utils";
-+import {
-+  reviewCandidateRestaurant,
-+  reviewCandidateRestaurantBatch,
-+} from "../services/candidate-restaurant-review.service";
-+import { parseBatchReviewPayload } from "../utils/candidate-restaurant-review.utils";
++import { reviewCandidateRestaurant } from "../services/candidate-restaurant-review.service";
  
  // @desc Create a candidate restaurant
  // @route POST /candidate-restaurants
-@@ -426,124 +431,13 @@ const approveCandidateRestaurant = asyncAwaitHandler(
+@@ -426,124 +427,13 @@ const approveCandidateRestaurant = asyncAwaitHandler(
        return next(new AuthorizationError());
      }
  
@@ -168,7 +160,7 @@ index 6855d94..6008f6d 100644
    }
  );
  
-@@ -551,7 +445,7 @@ const approveCandidateRestaurant = asyncAwaitHandler(
+@@ -551,7 +441,7 @@ const approveCandidateRestaurant = asyncAwaitHandler(
  // @route PUT /candidate-restaurants/:candidateRestaurantId/reject
  const rejectCandidateRestaurant = asyncAwaitHandler(
    async (req: Request, res: Response, next: NextFunction) => {
@@ -177,26 +169,18 @@ index 6855d94..6008f6d 100644
  
      const adminUser: any = req.user;
      const currentUser = await AdminUser.findByPk(adminUser?.id);
-@@ -560,31 +454,31 @@ const rejectCandidateRestaurant = asyncAwaitHandler(
+@@ -560,31 +450,13 @@ const rejectCandidateRestaurant = asyncAwaitHandler(
        return next(new AuthorizationError());
      }
  
 -    const candidateRestaurant = await CandidateRestaurant.findOne({
 -      where: { id: candidateRestaurantId },
 -    });
-+    const data = await reviewCandidateRestaurant(
-+      "reject",
-+      candidateRestaurantId,
-+      currentUser.id
-+    );
- 
+-
 -    if (!candidateRestaurant) {
 -      return next(new NotFoundError("Candidate Restaurant not found"));
 -    }
-+    return res.status(200).json({ success: true, data });
-+  }
-+);
- 
+-
 -    if (candidateRestaurant.candidate_admin_user_id) {
 -      const candidateAdminUser = await CandidateAdminUser.findOne({
 -        where: { id: candidateRestaurant.candidate_admin_user_id },
@@ -208,35 +192,21 @@ index 6855d94..6008f6d 100644
 -        { is_rejected: true, email: null },
 -        { where: { id: candidateRestaurant.candidate_admin_user_id } }
 -      );
-+// @desc Review candidate restaurants in a single batch
-+// @route PUT /candidate-restaurants/review-batch
-+const reviewCandidateRestaurantBatchHandler = asyncAwaitHandler(
-+  async (req: Request, res: Response, next: NextFunction) => {
-+    const adminUser: any = req.user;
-+    const currentUser = await AdminUser.findByPk(adminUser?.id);
-+
-+    if (!currentUser) {
-+      return next(new AuthorizationError());
-     }
- 
+-    }
+-
 -    await candidateRestaurant.update({ is_rejected: true });
 -    await candidateRestaurant.save();
-+    const items = parseBatchReviewPayload(req.body);
-+    const data = await reviewCandidateRestaurantBatch(items, currentUser.id);
++    const data = await reviewCandidateRestaurant(
++      "reject",
++      candidateRestaurantId,
++      currentUser.id
++    );
  
 -    return res.status(200).json({ success: true, data: candidateRestaurant });
 +    return res.status(200).json({ success: true, data });
    }
  );
  
-@@ -758,6 +652,7 @@ export {
-   getAllCandidateRestaurants,
-   approveCandidateRestaurant,
-   rejectCandidateRestaurant,
-+  reviewCandidateRestaurantBatchHandler,
-   registerPartnerRestaurant,
-   createAdminCandidateRestaurant,
-   modifyCandidateRestaurant,
 diff --git a/rateeat_backend/src/models/Restaurant/Restaurant.ts b/rateeat_backend/src/models/Restaurant/Restaurant.ts
 index db5e5ef..4b876fe 100644
 --- a/rateeat_backend/src/models/Restaurant/Restaurant.ts
@@ -282,35 +252,12 @@ index db5e5ef..4b876fe 100644
    }
  }
  
-diff --git a/rateeat_backend/src/routes/candidate_restaurant.route.ts b/rateeat_backend/src/routes/candidate_restaurant.route.ts
-index ec8c574..745111c 100644
---- a/rateeat_backend/src/routes/candidate_restaurant.route.ts
-+++ b/rateeat_backend/src/routes/candidate_restaurant.route.ts
-@@ -5,6 +5,7 @@ import {
-   createCandidateRestaurant,
-   approveCandidateRestaurant,
-   rejectCandidateRestaurant,
-+  reviewCandidateRestaurantBatchHandler,
-   registerPartnerRestaurant,
-   createAdminCandidateRestaurant,
-   modifyCandidateRestaurant,
-@@ -61,6 +62,10 @@ router.post(
-   registerPartnerRestaurant
- );
- 
-+router
-+  .route("/review-batch")
-+  .put(protectRouteForAdmin, reviewCandidateRestaurantBatchHandler);
-+
- router
-   .route("/:candidateRestaurantId")
-   .get(
 diff --git a/rateeat_backend/src/services/candidate-restaurant-review.service.ts b/rateeat_backend/src/services/candidate-restaurant-review.service.ts
 new file mode 100644
-index 0000000..1f8de09
+index 0000000..a5bd642
 --- /dev/null
 +++ b/rateeat_backend/src/services/candidate-restaurant-review.service.ts
-@@ -0,0 +1,354 @@
+@@ -0,0 +1,330 @@
 +import { Transaction } from "sequelize";
 +import {
 +  AdminUser,
@@ -331,10 +278,7 @@ index 0000000..1f8de09
 +  CANDIDATE_RESTAURANT_REVIEW_MESSAGES,
 +  CandidateRestaurantReviewAction,
 +} from "../constants/candidate-restaurant-review.constants";
-+import {
-+  CandidateRestaurantBatchItemInput,
-+  CandidateRestaurantReviewResult,
-+} from "../types/candidate-restaurant-review.types";
++import { CandidateRestaurantReviewResult } from "../types/candidate-restaurant-review.types";
 +import {
 +  conflictError,
 +  deriveChainName,
@@ -644,49 +588,18 @@ index 0000000..1f8de09
 +      transaction
 +    )
 +  );
-+
-+export const reviewCandidateRestaurantBatch = (
-+  items: CandidateRestaurantBatchItemInput[],
-+  reviewerAdminUserId: string
-+): Promise<CandidateRestaurantReviewResult[]> =>
-+  withTransaction(async (transaction) => {
-+    const results: CandidateRestaurantReviewResult[] = [];
-+
-+    for (const item of items) {
-+      results.push(
-+        await runWithinTransaction(
-+          item.action,
-+          item.candidateRestaurantId,
-+          reviewerAdminUserId,
-+          transaction
-+        )
-+      );
-+    }
-+
-+    return results;
-+  });
 diff --git a/rateeat_backend/src/types/candidate-restaurant-review.types.ts b/rateeat_backend/src/types/candidate-restaurant-review.types.ts
 new file mode 100644
-index 0000000..2b0b466
+index 0000000..22e9735
 --- /dev/null
 +++ b/rateeat_backend/src/types/candidate-restaurant-review.types.ts
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,15 @@
 +import { Transaction } from "sequelize";
 +import { CandidateRestaurantReviewAction } from "../constants/candidate-restaurant-review.constants";
 +
 +export interface CandidateRestaurantReviewContext {
 +  reviewerAdminUserId: string;
 +  transaction?: Transaction;
-+}
-+
-+export interface CandidateRestaurantBatchItemInput {
-+  candidateRestaurantId: string;
-+  action: CandidateRestaurantReviewAction;
-+}
-+
-+export interface CandidateRestaurantBatchInput {
-+  items: CandidateRestaurantBatchItemInput[];
-+  reviewerAdminUserId: string;
 +}
 +
 +export interface CandidateRestaurantReviewResult {
@@ -698,21 +611,19 @@ index 0000000..2b0b466
 +}
 diff --git a/rateeat_backend/src/utils/candidate-restaurant-review.utils.ts b/rateeat_backend/src/utils/candidate-restaurant-review.utils.ts
 new file mode 100644
-index 0000000..77cf30a
+index 0000000..67f3b1b
 --- /dev/null
 +++ b/rateeat_backend/src/utils/candidate-restaurant-review.utils.ts
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,37 @@
 +import { HttpError } from "./error-response.utils";
 +import {
 +  CANDIDATE_RESTAURANT_CHAIN_NAME_SEPARATOR,
-+  CANDIDATE_RESTAURANT_REVIEW_MESSAGES,
 +  CandidateRestaurantReviewAction,
 +} from "../constants/candidate-restaurant-review.constants";
-+import { CandidateRestaurantBatchItemInput } from "../types/candidate-restaurant-review.types";
 +
 +/**
 + * The generic helpers in error-response.utils.ts rewrite the text they are
-+ * handed. These review flows need to return the message verbatim, so build the
++ * handed. These review flows need to surface the message verbatim, so build the
 + * HttpError directly with the exact status/message pair.
 + */
 +export const reviewError = (message: string, statusCode: number): HttpError =>
@@ -723,9 +634,6 @@ index 0000000..77cf30a
 +
 +export const conflictError = (message: string): HttpError =>
 +  reviewError(message, 409);
-+
-+export const badRequestError = (message: string): HttpError =>
-+  reviewError(message, 400);
 +
 +export const serverError = (message: string): HttpError =>
 +  reviewError(message, 500);
@@ -743,59 +651,4 @@ index 0000000..77cf30a
 +    CANDIDATE_RESTAURANT_CHAIN_NAME_SEPARATOR
 +  );
 +  return (head || "").trim() || String(candidateRestaurantName || "").trim();
-+};
-+
-+const isReviewAction = (value: unknown): value is CandidateRestaurantReviewAction =>
-+  value === "approve" || value === "reject";
-+
-+export const parseBatchReviewPayload = (
-+  body: unknown
-+): CandidateRestaurantBatchItemInput[] => {
-+  const items = (body as { items?: unknown })?.items;
-+
-+  if (!Array.isArray(items) || items.length === 0) {
-+    throw badRequestError(
-+      CANDIDATE_RESTAURANT_REVIEW_MESSAGES.BATCH_ITEMS_REQUIRED
-+    );
-+  }
-+
-+  const seen = new Set<string>();
-+
-+  return items.map((raw) => {
-+    if (!raw || typeof raw !== "object") {
-+      throw badRequestError(
-+        CANDIDATE_RESTAURANT_REVIEW_MESSAGES.BATCH_ITEM_INVALID
-+      );
-+    }
-+
-+    const candidateRestaurantId = (raw as Record<string, unknown>)
-+      .candidateRestaurantId;
-+    const action = (raw as Record<string, unknown>).action;
-+
-+    if (
-+      typeof candidateRestaurantId !== "string" ||
-+      candidateRestaurantId.trim().length === 0
-+    ) {
-+      throw badRequestError(
-+        CANDIDATE_RESTAURANT_REVIEW_MESSAGES.BATCH_ITEM_INVALID
-+      );
-+    }
-+
-+    if (!isReviewAction(action)) {
-+      throw badRequestError(
-+        CANDIDATE_RESTAURANT_REVIEW_MESSAGES.BATCH_ACTION_INVALID
-+      );
-+    }
-+
-+    const normalizedId = candidateRestaurantId.trim();
-+
-+    if (seen.has(normalizedId)) {
-+      throw badRequestError(
-+        CANDIDATE_RESTAURANT_REVIEW_MESSAGES.BATCH_DUPLICATE_ID
-+      );
-+    }
-+    seen.add(normalizedId);
-+
-+    return { candidateRestaurantId: normalizedId, action };
-+  });
 +};
