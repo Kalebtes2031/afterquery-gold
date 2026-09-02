@@ -1,21 +1,34 @@
 Reliable Candidate Restaurant Verification Workflow
 
-Add three admin-protected endpoints without changing the existing approve and reject routes:
+Add three admin-guarded endpoints; leave the existing approve and reject routes untouched.
 
-- `PUT /api/v1/candidate-restaurants/:candidateRestaurantId/review`
-- `PUT /api/v1/candidate-restaurants/batch-review`
-- `GET /api/v1/candidate-restaurants/metrics`
+Single review — `PUT /api/v1/candidate-restaurants/:candidateRestaurantId/review`, body `{ "action": "approve" | "reject", "rejectionReason"?: string }`. Trim `action`, match case-insensitively; anything else is 400 mentioning "approve or reject". Run it in one transaction that row-locks the candidate, so concurrent reviewers serialize. Unknown candidate: 404. Already approved or rejected: 409 whose message states which.
 
-Single review accepts `{ "action": "approve" | "reject", "rejectionReason"?: string }`. Trim and case-normalize `action`; other values return 400 mentioning "approve or reject". Lock the candidate row and complete the review in one transaction.
+Approving marks it approved and creates the live `Restaurant` from the candidate's name, description and opening/closing hours, always open. Each candidate menu image url becomes a restaurant image row on it. Write one notification per admin user naming the restaurant, with the reviewer as actor.
 
-Approval marks the candidate approved and creates an always-open Restaurant with its name, description, and hours. Copy every candidate menu image URL into a RestaurantImage linked to it. Notify every admin, naming the restaurant and recording the reviewer as actor.
+Rejecting marks the candidate rejected and stores the trimmed `rejectionReason` (missing or whitespace-only becomes `null`); it creates no restaurant, images or notifications.
 
-Rejection marks the candidate rejected and stores the trimmed reason; missing or whitespace-only reasons become null. It creates no restaurant, images, or notifications. Any failure rolls back everything. Unknown candidates return 404; finalized candidates return 409 with approved or rejected in the message.
+Any failure rolls everything back, leaves the candidate pending, and answers with that failure's status; a throwing side effect (e.g. the notification write) is 500.
 
-Batch review accepts `{ "reviews": [...] }`, trims IDs, applies the same rules in one shared transaction, and preserves request order. Any failed entry rolls back the batch and returns no data. Reject missing, non-array, empty, non-object, invalid-action, or missing-ID input with 400. Duplicate trimmed IDs must return exactly "Duplicate candidate restaurant id".
+Batch review — `PUT /api/v1/candidate-restaurants/batch-review`, body `{ "reviews": [entry, ...] }` where each entry is a single-review body plus its `candidateRestaurantId`. Trim each id, apply the single-review rules to every entry in one shared transaction, and return results in request order, each carrying the reviewer id. If any entry is not found, already reviewed, or fails, roll the whole batch back and answer with that entry's status and no `data`. Up front, return 400 for a missing, non-array or empty `reviews`; a non-object entry; an entry lacking a string `candidateRestaurantId`; a bad action; or a repeated (trimmed) id.
 
-Metrics returns nonnegative pending, approved, rejected, and total counts.
+Metrics — `GET /api/v1/candidate-restaurants/metrics` returns candidate-restaurant counts by state; `pending` is `total − approved − rejected` floored at 0.
 
-Each review result uses `candidate_restaurant_id`, `name`, `status`, `rejection_reason`, `restaurant_id`, and `reviewed_by`. Successful responses contain `success`, `message`, and `data`; errors contain `success: false`, `message`, and `statusCode`.
+    Fixed 400 messages
+      missing / non-array / empty reviews  ->  "The reviews field must be a non-empty array"
+      duplicate id after trimming          ->  "Duplicate candidate restaurant id"
+    The non-object and missing-id 400s only need to name "object" / "candidateRestaurantId".
 
-Work on a new branch from main and commit your changes.
+    review object (snake_case keys):
+    { "candidate_restaurant_id": string, "name": string,
+      "status": "approved" | "rejected", "rejection_reason": string | null,
+      "restaurant_id": string | null,   // new restaurant on approve, else null
+      "reviewed_by": string }           // acting admin id
+
+    single 200:  { "success": true, "message": string, "data": <review object> }
+    batch 200:   { "success": true, "message": string, "data": [ <review object>, ... ] }
+    metrics 200: { "success": true, "message": string,
+                   "data": { "pending": n, "approved": n, "rejected": n, "total": n } }
+    any error:   { "success": false, "message": string, "statusCode": number }
+
+Work on a new branch and commit your changes.

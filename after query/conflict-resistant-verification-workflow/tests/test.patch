@@ -30,12 +30,59 @@ index e60a6e1..f57cdf8 100644
            ItemReviewImage,
            ItemReviewVideo,
            RestaurantReview,
+diff --git a/rateeat_backend/src/__tests__/unit/candidate_restaurant_verification_auth.test.ts b/rateeat_backend/src/__tests__/unit/candidate_restaurant_verification_auth.test.ts
+new file mode 100644
+index 0000000..34fc675
+--- /dev/null
++++ b/rateeat_backend/src/__tests__/unit/candidate_restaurant_verification_auth.test.ts
+@@ -0,0 +1,41 @@
++import express from "express";
++import request from "supertest";
++
++import candidateRestaurantRouter from "../../routes/candidate_restaurant.route";
++
++/**
++ * Drives the new verification endpoints through the real router with the
++ * repository's real admin guard in place, confirming the routes exist and stay
++ * behind admin authorization.
++ */
++const app = express();
++app.use(express.json());
++app.use("/api/v1/candidate-restaurants", candidateRestaurantRouter);
++
++const CANDIDATE_ID = "11111111-1111-4111-8111-111111111111";
++
++describe("Candidate Restaurant Verification - Route Authorization", () => {
++  it("rejects an unauthenticated single candidate review with 401", async () => {
++    const res = await request(app)
++      .put(`/api/v1/candidate-restaurants/${CANDIDATE_ID}/review`)
++      .send({ action: "approve" });
++
++    expect(res.status).toBe(401);
++  });
++
++  it("rejects an unauthenticated batch review with 401", async () => {
++    const res = await request(app)
++      .put("/api/v1/candidate-restaurants/batch-review")
++      .send({ reviews: [{ candidateRestaurantId: CANDIDATE_ID, action: "approve" }] });
++
++    expect(res.status).toBe(401);
++  });
++
++  it("rejects an unauthenticated metrics request with 401", async () => {
++    const res = await request(app)
++      .get("/api/v1/candidate-restaurants/metrics")
++      .send();
++
++    expect(res.status).toBe(401);
++  });
++});
 diff --git a/rateeat_backend/src/__tests__/unit/candidate_restaurant_verification_behavior.test.ts b/rateeat_backend/src/__tests__/unit/candidate_restaurant_verification_behavior.test.ts
 new file mode 100644
-index 0000000..3bb1cdc
+index 0000000..3f03480
 --- /dev/null
 +++ b/rateeat_backend/src/__tests__/unit/candidate_restaurant_verification_behavior.test.ts
-@@ -0,0 +1,668 @@
+@@ -0,0 +1,705 @@
 +import express from "express";
 +import request from "supertest";
 +
@@ -228,6 +275,39 @@ index 0000000..3bb1cdc
 +    expect(images).toHaveLength(2);
 +  });
 +
++  it("creates the restaurant open and copies the candidate description and hours", async () => {
++    await seedCandidate(CAND_A, NAME_A);
++
++    const res = await review(CAND_A, { action: "approve" });
++
++    expect(res.status).toBe(200);
++    const restaurant = await Restaurant.findByPk(res.body.data.restaurant_id);
++    expect(restaurant?.description).toBe("seeded description");
++    expect(restaurant?.is_open).toBe(true);
++    expect(String(restaurant?.opening_hour)).toBe("07:30:00");
++    expect(String(restaurant?.closing_hour)).toBe("22:15:00");
++  });
++
++  it("serializes two concurrent reviews of the same candidate so one wins", async () => {
++    await seedCandidate(CAND_A, NAME_A);
++
++    const [first, second] = await Promise.all([
++      review(CAND_A, { action: "approve" }),
++      review(CAND_A, { action: "reject" }),
++    ]);
++    expect([first.status, second.status].sort()).toEqual([200, 409]);
++
++    const loser = [first, second].find((r) => r.status === 409)!;
++    expect(loser.body.success).toBe(false);
++    expect(loser.body.statusCode).toBe(409);
++
++    const candidate = await CandidateRestaurant.findByPk(CAND_A);
++    expect(candidate?.is_approved !== candidate?.is_rejected).toBe(true);
++    expect(await Restaurant.count({ where: { name: NAME_A } })).toBe(
++      candidate?.is_approved ? 1 : 0
++    );
++  });
++
 +  it("writes one notification per admin user on approval", async () => {
 +    await seedAdmins([ADMIN_2, ADMIN_3]);
 +    await seedCandidate(CAND_A, NAME_A);
@@ -279,6 +359,7 @@ index 0000000..3bb1cdc
 +
 +    expect(res.status).toBe(404);
 +    expect(res.body.success).toBe(false);
++    expect(res.body.statusCode).toBe(404);
 +    expect(await Restaurant.count({ where: { name: NAME_A } })).toBe(0);
 +  });
 +
@@ -289,6 +370,7 @@ index 0000000..3bb1cdc
 +
 +    expect(res.status).toBe(409);
 +    expect(res.body.success).toBe(false);
++    expect(res.body.statusCode).toBe(409);
 +    expect(res.body.message).toMatch(/approved/i);
 +  });
 +
@@ -308,6 +390,7 @@ index 0000000..3bb1cdc
 +    const res = await review(CAND_A, { action: "delete" });
 +
 +    expect(res.status).toBe(400);
++    expect(res.body.statusCode).toBe(400);
 +    expect(res.body.message).toMatch(/approve or reject/i);
 +    expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(false);
 +  });
@@ -511,6 +594,7 @@ index 0000000..3bb1cdc
 +
 +    expect(res.status).toBe(400);
 +    expect(res.body.success).toBe(false);
++    expect(res.body.statusCode).toBe(400);
 +    expect(res.body.message).toMatch(/reviews field must be a non-empty array/i);
 +    expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(false);
 +  });
@@ -702,52 +786,5 @@ index 0000000..3bb1cdc
 +
 +    expect(res.status).toBe(400);
 +    expect(res.body.message).toMatch(/approve or reject/i);
-+  });
-+});
-diff --git a/rateeat_backend/src/__tests__/unit/candidate_restaurant_verification_auth.test.ts b/rateeat_backend/src/__tests__/unit/candidate_restaurant_verification_auth.test.ts
-new file mode 100644
-index 0000000..34fc675
---- /dev/null
-+++ b/rateeat_backend/src/__tests__/unit/candidate_restaurant_verification_auth.test.ts
-@@ -0,0 +1,41 @@
-+import express from "express";
-+import request from "supertest";
-+
-+import candidateRestaurantRouter from "../../routes/candidate_restaurant.route";
-+
-+/**
-+ * Drives the new verification endpoints through the real router with the
-+ * repository's real admin guard in place, confirming the routes exist and stay
-+ * behind admin authorization.
-+ */
-+const app = express();
-+app.use(express.json());
-+app.use("/api/v1/candidate-restaurants", candidateRestaurantRouter);
-+
-+const CANDIDATE_ID = "11111111-1111-4111-8111-111111111111";
-+
-+describe("Candidate Restaurant Verification - Route Authorization", () => {
-+  it("rejects an unauthenticated single candidate review with 401", async () => {
-+    const res = await request(app)
-+      .put(`/api/v1/candidate-restaurants/${CANDIDATE_ID}/review`)
-+      .send({ action: "approve" });
-+
-+    expect(res.status).toBe(401);
-+  });
-+
-+  it("rejects an unauthenticated batch review with 401", async () => {
-+    const res = await request(app)
-+      .put("/api/v1/candidate-restaurants/batch-review")
-+      .send({ reviews: [{ candidateRestaurantId: CANDIDATE_ID, action: "approve" }] });
-+
-+    expect(res.status).toBe(401);
-+  });
-+
-+  it("rejects an unauthenticated metrics request with 401", async () => {
-+    const res = await request(app)
-+      .get("/api/v1/candidate-restaurants/metrics")
-+      .send();
-+
-+    expect(res.status).toBe(401);
 +  });
 +});

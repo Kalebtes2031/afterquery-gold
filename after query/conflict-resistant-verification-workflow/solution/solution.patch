@@ -1,5 +1,25 @@
+diff --git a/rateeat_backend/migrations/20260901000000-add-rejection-reason-to-candidate-restaurants.js b/rateeat_backend/migrations/20260901000000-add-rejection-reason-to-candidate-restaurants.js
+new file mode 100644
+index 0000000..eabf9cb
+--- /dev/null
++++ b/rateeat_backend/migrations/20260901000000-add-rejection-reason-to-candidate-restaurants.js
+@@ -0,0 +1,14 @@
++"use strict";
++
++module.exports = {
++  async up(queryInterface, Sequelize) {
++    await queryInterface.addColumn("candidate_restaurants", "rejection_reason", {
++      type: Sequelize.TEXT,
++      allowNull: true,
++    });
++  },
++
++  async down(queryInterface) {
++    await queryInterface.removeColumn("candidate_restaurants", "rejection_reason");
++  },
++};
 diff --git a/rateeat_backend/src/controllers/candidate_restaurant.controller.ts b/rateeat_backend/src/controllers/candidate_restaurant.controller.ts
-index babeead..c5d1a69 100644
+index 6855d94..3dd9f5f 100644
 --- a/rateeat_backend/src/controllers/candidate_restaurant.controller.ts
 +++ b/rateeat_backend/src/controllers/candidate_restaurant.controller.ts
 @@ -27,6 +27,13 @@ import {
@@ -110,26 +130,24 @@ index babeead..c5d1a69 100644
 +  getCandidateRestaurantMetrics,
  };
 diff --git a/rateeat_backend/src/models/Incentive/CandidateRestaurant.ts b/rateeat_backend/src/models/Incentive/CandidateRestaurant.ts
-index eac757f..4204a09 100644
+index f8d6bfd..9109504 100644
 --- a/rateeat_backend/src/models/Incentive/CandidateRestaurant.ts
 +++ b/rateeat_backend/src/models/Incentive/CandidateRestaurant.ts
-@@ -69,7 +69,13 @@ class CandidateRestaurant extends Model<CandidateRestaurant> {
-     type: DataType.BOOLEAN,
-     defaultValue: false,
+@@ -71,6 +71,12 @@ class CandidateRestaurant extends Model<CandidateRestaurant> {
    })
--  is_rejected!: boolean;
-+  is_rejected!: boolean;
-+
+   is_rejected!: boolean;
+ 
 +  @Column({
 +    type: DataType.TEXT,
 +    allowNull: true,
 +  })
 +  rejection_reason!: string | null;
- 
++
    @ForeignKey(() => User)
    @Column({
+     type: DataType.UUID,
 diff --git a/rateeat_backend/src/models/Restaurant/Restaurant.ts b/rateeat_backend/src/models/Restaurant/Restaurant.ts
-index 92bdc9c..75d4b22 100644
+index db5e5ef..4b876fe 100644
 --- a/rateeat_backend/src/models/Restaurant/Restaurant.ts
 +++ b/rateeat_backend/src/models/Restaurant/Restaurant.ts
 @@ -273,25 +273,31 @@ class Restaurant extends Model<Restaurant> {
@@ -174,7 +192,7 @@ index 92bdc9c..75d4b22 100644
  }
  
 diff --git a/rateeat_backend/src/routes/candidate_restaurant.route.ts b/rateeat_backend/src/routes/candidate_restaurant.route.ts
-index 821b420..3c8bc64 100644
+index ec8c574..9905009 100644
 --- a/rateeat_backend/src/routes/candidate_restaurant.route.ts
 +++ b/rateeat_backend/src/routes/candidate_restaurant.route.ts
 @@ -8,6 +8,9 @@ import {
@@ -211,7 +229,7 @@ index 821b420..3c8bc64 100644
    .get(
 diff --git a/rateeat_backend/src/services/candidate-restaurant-verification.service.ts b/rateeat_backend/src/services/candidate-restaurant-verification.service.ts
 new file mode 100644
-index 0000000..2334413
+index 0000000..e3d07df
 --- /dev/null
 +++ b/rateeat_backend/src/services/candidate-restaurant-verification.service.ts
 @@ -0,0 +1,197 @@
@@ -414,7 +432,7 @@ index 0000000..2334413
 +}
 diff --git a/rateeat_backend/src/types/candidate-restaurant-verification.types.ts b/rateeat_backend/src/types/candidate-restaurant-verification.types.ts
 new file mode 100644
-index 0000000..2dd8dcb
+index 0000000..dc372b3
 --- /dev/null
 +++ b/rateeat_backend/src/types/candidate-restaurant-verification.types.ts
 @@ -0,0 +1,40 @@
@@ -460,7 +478,7 @@ index 0000000..2dd8dcb
 +}
 diff --git a/rateeat_backend/src/utils/candidate-restaurant-verification.errors.ts b/rateeat_backend/src/utils/candidate-restaurant-verification.errors.ts
 new file mode 100644
-index 0000000..2f5974a
+index 0000000..c82e614
 --- /dev/null
 +++ b/rateeat_backend/src/utils/candidate-restaurant-verification.errors.ts
 @@ -0,0 +1,35 @@
@@ -501,7 +519,7 @@ index 0000000..2f5974a
 +}
 diff --git a/rateeat_backend/src/utils/candidate-restaurant-verification.utils.ts b/rateeat_backend/src/utils/candidate-restaurant-verification.utils.ts
 new file mode 100644
-index 0000000..1b79161
+index 0000000..c5f4018
 --- /dev/null
 +++ b/rateeat_backend/src/utils/candidate-restaurant-verification.utils.ts
 @@ -0,0 +1,126 @@
@@ -631,23 +649,3 @@ index 0000000..1b79161
 +    is_open: true,
 +  };
 +}
-diff --git a/rateeat_backend/migrations/20260901000000-add-rejection-reason-to-candidate-restaurants.js b/rateeat_backend/migrations/20260901000000-add-rejection-reason-to-candidate-restaurants.js
-new file mode 100644
-index 0000000..eabf9cb
---- /dev/null
-+++ b/rateeat_backend/migrations/20260901000000-add-rejection-reason-to-candidate-restaurants.js
-@@ -0,0 +1,14 @@
-+"use strict";
-+
-+module.exports = {
-+  async up(queryInterface, Sequelize) {
-+    await queryInterface.addColumn("candidate_restaurants", "rejection_reason", {
-+      type: Sequelize.TEXT,
-+      allowNull: true,
-+    });
-+  },
-+
-+  async down(queryInterface) {
-+    await queryInterface.removeColumn("candidate_restaurants", "rejection_reason");
-+  },
-+};

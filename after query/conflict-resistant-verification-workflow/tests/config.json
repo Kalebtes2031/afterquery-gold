@@ -3,6 +3,8 @@
   "f2p_node_ids": [
     "Candidate Restaurant Verification - Single Review Endpoint approves a pending candidate, creates the restaurant and copies media",
     "Candidate Restaurant Verification - Single Review Endpoint writes one notification per admin user on approval",
+    "Candidate Restaurant Verification - Single Review Endpoint creates the restaurant open and copies the candidate description and hours",
+    "Candidate Restaurant Verification - Single Review Endpoint serializes two concurrent reviews of the same candidate so one wins",
     "Candidate Restaurant Verification - Single Review Endpoint rejects a pending candidate and stores the trimmed rejection reason",
     "Candidate Restaurant Verification - Single Review Endpoint does not create restaurant images when the candidate has no media",
     "Candidate Restaurant Verification - Single Review Endpoint returns 404 when the candidate restaurant does not exist",
