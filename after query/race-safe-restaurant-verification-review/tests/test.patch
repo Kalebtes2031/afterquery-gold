@@ -105,7 +105,7 @@ new file mode 100644
 index 0000000..243c271
 --- /dev/null
 +++ b/rateeat_backend/src/__tests__/unit/candidate_restaurant_review_behavior.test.ts
-@@ -0,0 +1,916 @@
+@@ -0,0 +1,939 @@
 +import express from "express";
 +import request from "supertest";
 +
@@ -277,6 +277,18 @@ index 0000000..243c271
 +
 +const notificationsFor = (candidateId: string) =>
 +  Notification.findAll({ where: { notifiable_id: candidateId } });
++
++const expectErrorShape = (
++  response: request.Response,
++  statusCode: number,
++  message?: string | RegExp
++) => {
++  expect(response.status).toBe(statusCode);
++  expect(response.body.success).toBe(false);
++  expect(response.body.statusCode).toBe(statusCode);
++  if (typeof message === "string") expect(response.body.message).toBe(message);
++  if (message instanceof RegExp) expect(response.body.message).toMatch(message);
++};
 +
 +const expectReviewShape = (
 +  response: request.Response,
@@ -495,6 +507,7 @@ index 0000000..243c271
 +      const response = await approve(CAND_A);
 +
 +      expect(response.status).toBe(409);
++      expectErrorShape(response, 409, /already approved/i);
 +      expect(response.body.message).toMatch(/already approved/i);
 +
 +      const candidate = await CandidateRestaurant.findByPk(CAND_A);
@@ -510,9 +523,7 @@ index 0000000..243c271
 +      const response = await approve(CAND_C);
 +
 +      expect(response.status).toBe(404);
-+      expect(response.body.success).toBe(false);
-+      expect(response.body.message).toMatch(/not found/i);
-+      expect(response.body.statusCode).toBe(404);
++      expectErrorShape(response, 404, "Candidate Restaurant not found");
 +    });
 +
 +    it("returns 409 when the candidate is already approved", async () => {
@@ -521,6 +532,7 @@ index 0000000..243c271
 +      const response = await approve(CAND_A);
 +
 +      expect(response.status).toBe(409);
++      expectErrorShape(response, 409, /already approved/i);
 +      expect(response.body.message).toMatch(/already approved/i);
 +      expect(await restaurantsFor(CAND_A_NAME)).toHaveLength(0);
 +    });
@@ -531,6 +543,7 @@ index 0000000..243c271
 +      const response = await approve(CAND_A);
 +
 +      expect(response.status).toBe(409);
++      expectErrorShape(response, 409, /already rejected/i);
 +      expect(response.body.message).toMatch(/already rejected/i);
 +    });
 +  });
@@ -549,7 +562,7 @@ index 0000000..243c271
 +      const response = await approve(CAND_A);
 +
 +      expect(response.status).toBe(500);
-+      expect(response.body.success).toBe(false);
++      expectErrorShape(response, 500);
 +
 +      const candidate = await CandidateRestaurant.findByPk(CAND_A);
 +      expect(candidate?.is_approved).toBe(false);
@@ -610,13 +623,14 @@ index 0000000..243c271
 +    it("returns 404 for an unknown candidate id", async () => {
 +      const response = await reject(CAND_C);
 +      expect(response.status).toBe(404);
-+      expect(response.body.message).toMatch(/not found/i);
++      expectErrorShape(response, 404, "Candidate Restaurant not found");
 +    });
 +
 +    it("returns 409 when the candidate is already rejected", async () => {
 +      await seedCandidate(CAND_A, CAND_A_NAME, { is_rejected: true });
 +      const response = await reject(CAND_A);
 +      expect(response.status).toBe(409);
++      expectErrorShape(response, 409, /already rejected/i);
 +      expect(response.body.message).toMatch(/already rejected/i);
 +    });
 +
@@ -624,6 +638,7 @@ index 0000000..243c271
 +      await seedCandidate(CAND_A, CAND_A_NAME, { is_approved: true });
 +      const response = await reject(CAND_A);
 +      expect(response.status).toBe(409);
++      expectErrorShape(response, 409, /already approved/i);
 +      expect(response.body.message).toMatch(/already approved/i);
 +    });
 +  });
@@ -640,7 +655,7 @@ index 0000000..243c271
 +      await seedCandidate(CAND_A, CAND_A_NAME);
 +      const response = await reviewBatch({});
 +      expect(response.status).toBe(400);
-+      expect(response.body.success).toBe(false);
++      expectErrorShape(response, 400);
 +      expect(response.body.message).toMatch(BATCH_PAYLOAD_ERROR);
 +      const candidate = await CandidateRestaurant.findByPk(CAND_A);
 +      expect(candidate?.is_approved).toBe(false);
@@ -649,21 +664,21 @@ index 0000000..243c271
 +    it("returns 400 when items is empty", async () => {
 +      const response = await reviewBatch({ items: [] });
 +      expect(response.status).toBe(400);
-+      expect(response.body.success).toBe(false);
++      expectErrorShape(response, 400);
 +      expect(response.body.message).toMatch(BATCH_PAYLOAD_ERROR);
 +    });
 +
 +    it("returns 400 when an item is not an object", async () => {
 +      const response = await reviewBatch({ items: ["nope"] });
 +      expect(response.status).toBe(400);
-+      expect(response.body.success).toBe(false);
++      expectErrorShape(response, 400);
 +      expect(response.body.message).toMatch(BATCH_PAYLOAD_ERROR);
 +    });
 +
 +    it("returns 400 when an item has no candidateRestaurantId", async () => {
 +      const response = await reviewBatch({ items: [{ action: "approve" }] });
 +      expect(response.status).toBe(400);
-+      expect(response.body.success).toBe(false);
++      expectErrorShape(response, 400);
 +      expect(response.body.message).toMatch(BATCH_PAYLOAD_ERROR);
 +    });
 +
@@ -672,7 +687,7 @@ index 0000000..243c271
 +        items: [{ candidateRestaurantId: "   ", action: "approve" }],
 +      });
 +      expect(response.status).toBe(400);
-+      expect(response.body.success).toBe(false);
++      expectErrorShape(response, 400);
 +      expect(response.body.message).toMatch(BATCH_PAYLOAD_ERROR);
 +    });
 +
@@ -681,7 +696,7 @@ index 0000000..243c271
 +        items: [{ candidateRestaurantId: 123, action: "approve" }],
 +      });
 +      expect(response.status).toBe(400);
-+      expect(response.body.success).toBe(false);
++      expectErrorShape(response, 400);
 +      expect(response.body.message).toMatch(BATCH_PAYLOAD_ERROR);
 +    });
 +
@@ -690,7 +705,7 @@ index 0000000..243c271
 +        items: [{ candidateRestaurantId: CAND_A, action: "delete" }],
 +      });
 +      expect(response.status).toBe(400);
-+      expect(response.body.success).toBe(false);
++      expectErrorShape(response, 400, /approve or reject/i);
 +      expect(response.body.message).toMatch(/action|approve or reject/i);
 +    });
 +
@@ -702,6 +717,7 @@ index 0000000..243c271
 +        ],
 +      });
 +      expect(response.status).toBe(400);
++      expectErrorShape(response, 400, "Duplicate candidate restaurant id");
 +      expect(response.body.message).toBe("Duplicate candidate restaurant id");
 +    });
 +  });
@@ -796,7 +812,7 @@ index 0000000..243c271
 +      });
 +
 +      expect(response.status).toBe(404);
-+      expect(response.body.message).toMatch(/not found/i);
++      expectErrorShape(response, 404, "Candidate Restaurant not found");
 +      expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(
 +        false
 +      );
@@ -817,6 +833,7 @@ index 0000000..243c271
 +      });
 +
 +      expect(response.status).toBe(409);
++      expectErrorShape(response, 409, /already approved/i);
 +      expect(response.body.message).toMatch(/already approved/i);
 +      expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(
 +        false
@@ -837,6 +854,7 @@ index 0000000..243c271
 +      });
 +
 +      expect(response.status).toBe(409);
++      expectErrorShape(response, 409, /already rejected/i);
 +      expect(response.body.message).toMatch(/already rejected/i);
 +      expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(
 +        false
@@ -905,6 +923,7 @@ index 0000000..243c271
 +    const response = await approve(CAND_A);
 +
 +    expect(response.status).toBe(500);
++    expectErrorShape(response, 500);
 +    expect(await notificationsFor(CAND_A)).toHaveLength(0);
 +    expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(
 +      false
@@ -940,6 +959,7 @@ index 0000000..243c271
 +    });
 +
 +    expect(response.status).toBe(404);
++    expectErrorShape(response, 404, "Candidate Restaurant not found");
 +    expect(await notificationsFor(CAND_A)).toHaveLength(0);
 +    expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(
 +      false
@@ -969,7 +989,7 @@ index 0000000..243c271
 +      const response = await reject(CAND_A);
 +
 +      expect(response.status).toBe(500);
-+      expect(response.body.success).toBe(false);
++      expectErrorShape(response, 500);
 +      expect((await CandidateRestaurant.findByPk(CAND_A))?.is_rejected).toBe(
 +        false
 +      );
@@ -995,6 +1015,8 @@ index 0000000..243c271
 +    const statuses = [first.status, second.status].sort();
 +
 +    expect(statuses).toEqual([200, 409]);
++    const loser = [first, second].find((r) => r.status === 409)!;
++    expectErrorShape(loser, 409, /already (approved|rejected)/i);
 +
 +    const candidate = await CandidateRestaurant.findByPk(CAND_A);
 +    expect(candidate?.is_approved !== candidate?.is_rejected).toBe(true);
@@ -1016,6 +1038,7 @@ index 0000000..243c271
 +
 +    expect(statuses).toEqual([200, 409]);
 +    const loser = [first, second].find((r) => r.status === 409);
++    expectErrorShape(loser!, 409, /already approved/i);
 +    expect(loser?.body.message).toMatch(/already approved/i);
 +
 +    expect(await restaurantsFor(CAND_A_NAME)).toHaveLength(1);
