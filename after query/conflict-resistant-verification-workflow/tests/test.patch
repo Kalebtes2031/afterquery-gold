@@ -1,129 +1,530 @@
-diff --git a/rateeat_backend/src/__tests__/unit/candidate_restaurant_batch_verification_behavior.test.ts b/rateeat_backend/src/__tests__/unit/candidate_restaurant_batch_verification_behavior.test.ts
+diff --git a/rateeat_backend/src/__tests__/db_setup.ts b/rateeat_backend/src/__tests__/db_setup.ts
+index e60a6e1..f57cdf8 100644
+--- a/rateeat_backend/src/__tests__/db_setup.ts
++++ b/rateeat_backend/src/__tests__/db_setup.ts
+@@ -17,6 +17,7 @@ import {
+   ItemVideo,
+   UserLocation,
+   RestaurantLocation,
++  Neighborhood,
+   ItemReviewImage,
+   ItemReviewVideo,
+   RestaurantReview,
+@@ -103,6 +104,11 @@ class Database {
+     if (!Database.instance) {
+       Database.instance = new Sequelize({
+         ...configFile,
++
++        // The repository test config forces SSL for hosted Postgres; the
++        // local Postgres used by these behavior suites does not offer SSL.
++        dialectOptions: {},
++
+         models: [
+           User,
+           AdminUser,
+@@ -116,6 +122,7 @@ class Database {
+           ItemVideo,
+           UserLocation,
+           RestaurantLocation,
++          Neighborhood,
+           ItemReviewImage,
+           ItemReviewVideo,
+           RestaurantReview,
+diff --git a/rateeat_backend/src/__tests__/unit/candidate_restaurant_verification_behavior.test.ts b/rateeat_backend/src/__tests__/unit/candidate_restaurant_verification_behavior.test.ts
 new file mode 100644
-index 0000000..29d4b12
+index 0000000..3bb1cdc
 --- /dev/null
-+++ b/rateeat_backend/src/__tests__/unit/candidate_restaurant_batch_verification_behavior.test.ts
-@@ -0,0 +1,296 @@
++++ b/rateeat_backend/src/__tests__/unit/candidate_restaurant_verification_behavior.test.ts
+@@ -0,0 +1,668 @@
 +import express from "express";
 +import request from "supertest";
 +
++import Database from "../db_setup";
 +import candidateRestaurantRouter from "../../routes/candidate_restaurant.route";
-+import sequelize from "../../config/db";
++import { errorHandler } from "../../middlewares/error-handler";
 +import {
-+  AdminUser,
 +  CandidateRestaurant,
-+  CandidateRestaurantMenuImage,
 +  Notification,
 +  Restaurant,
 +  RestaurantImage,
 +} from "../../models";
 +
++/**
++ * Behavioural coverage for the candidate-restaurant verification workflow —
++ * the single `/review` endpoint, the atomic `/batch-review` endpoint and the
++ * `/metrics` endpoint. Everything is exercised over the real router against a
++ * real PostgreSQL database: requests go in as HTTP and the expectations are the
++ * HTTP response plus the rows that actually landed in the database.
++ */
++
++const REVIEWER_ID = "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a101";
++const ROLE_ID = "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a102";
++const ADMIN_1 = "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a111";
++const ADMIN_2 = "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a112";
++const ADMIN_3 = "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a113";
++const ALL_ADMINS = [ADMIN_1, ADMIN_2, ADMIN_3];
++
++const CAND_A = "b1b1b1b1-b1b1-4b1b-8b1b-b1b1b1b1b101";
++const CAND_B = "b1b1b1b1-b1b1-4b1b-8b1b-b1b1b1b1b102";
++const MISSING = "b1b1b1b1-b1b1-4b1b-8b1b-b1b1b1b1b199";
++
++const NAME_PREFIX = "CRVW Verify";
++const NAME_A = `${NAME_PREFIX} Alpha`;
++const NAME_B = `${NAME_PREFIX} Bravo`;
++
 +jest.mock("../../middlewares/auth", () => ({
 +  protectRoute: (req: any, _res: any, next: any) => {
-+    req.user = { id: "reviewer-9" };
++    req.user = { id: "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a101" };
 +    next();
 +  },
 +  protectRouteForAdmin: (req: any, _res: any, next: any) => {
-+    req.user = { id: "reviewer-9" };
++    req.user = { id: "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a101" };
 +    next();
 +  },
 +  optionalAuth: (_req: any, _res: any, next: any) => next(),
 +}));
 +
-+jest.mock("../../models", () => ({
-+  CandidateRestaurant: { findByPk: jest.fn(), count: jest.fn() },
-+  Restaurant: { create: jest.fn() },
-+  RestaurantImage: { create: jest.fn() },
-+  CandidateRestaurantMenuImage: { findAll: jest.fn() },
-+  AdminUser: { findAll: jest.fn() },
-+  Notification: { create: jest.fn() },
-+}));
-+
-+jest.mock("../../config/db", () => ({
-+  __esModule: true,
-+  default: { transaction: jest.fn() },
-+}));
-+
 +const app = express();
 +app.use(express.json());
 +app.use("/api/v1/candidate-restaurants", candidateRestaurantRouter);
-+app.use((err: any, _req: any, res: any, _next: any) => {
-+  res
-+    .status(err.statusCode || 500)
-+    .json({ success: false, message: err.message || "Internal Server Error" });
-+});
++app.use(errorHandler);
 +
-+const transaction = (sequelize as unknown as { transaction: jest.Mock }).transaction;
-+const findByPk = CandidateRestaurant.findByPk as jest.Mock;
-+const createRestaurant = Restaurant.create as jest.Mock;
-+const findCandidateMedia = CandidateRestaurantMenuImage.findAll as jest.Mock;
-+const findAdmins = AdminUser.findAll as jest.Mock;
-+
-+const pendingCandidate = (id: string, name: string) => ({
-+  id,
-+  name,
-+  description: `${name} description`,
-+  is_approved: false,
-+  is_rejected: false,
-+  save: jest.fn().mockResolvedValue(true),
-+});
-+
-+beforeEach(() => {
-+  jest.clearAllMocks();
-+  transaction.mockImplementation(async (cb: any) => cb({ LOCK: { UPDATE: "UPDATE" } }));
-+  findCandidateMedia.mockResolvedValue([]);
-+  findAdmins.mockResolvedValue([{ id: "admin-1" }]);
-+  createRestaurant.mockResolvedValue({ id: "rest-x" });
-+  (RestaurantImage.create as jest.Mock).mockResolvedValue({ id: "img" });
-+  (Notification.create as jest.Mock).mockResolvedValue({ id: "note" });
-+});
++const review = (id: string, body: any) =>
++  request(app).put(`/api/v1/candidate-restaurants/${id}/review`).send(body);
 +
 +const batch = (body: any) =>
 +  request(app).put("/api/v1/candidate-restaurants/batch-review").send(body);
 +
-+describe("Candidate Restaurant Verification - Batch Review Endpoint", () => {
-+  it("reviews a mixed batch and returns results in the exact requested order", async () => {
-+    findByPk.mockImplementation((id: string) =>
-+      Promise.resolve(
-+        id === "cand-a"
-+          ? pendingCandidate("cand-a", "Alpha")
-+          : pendingCandidate("cand-b", "Bravo")
-+      )
++const metrics = () =>
++  request(app).get("/api/v1/candidate-restaurants/metrics").send();
++
++let sequelize: Awaited<ReturnType<typeof Database.getInstance>>;
++
++const run = (sql: string, replacements: any[] = []) =>
++  sequelize.query(sql, { replacements });
++
++const wipe = async () => {
++  await run(`DELETE FROM notifications WHERE reactor_id = ?`, [REVIEWER_ID]);
++  await run(
++    `DELETE FROM restaurant_images WHERE restaurant_id IN
++       (SELECT id FROM restaurants WHERE name LIKE '${NAME_PREFIX}%')`
++  );
++  await run(`DELETE FROM restaurants WHERE name LIKE '${NAME_PREFIX}%'`);
++  await run(
++    `DELETE FROM candidate_restaurant_menu_images WHERE candidate_restaurant_id IN
++       (SELECT id FROM candidate_restaurants WHERE name LIKE '${NAME_PREFIX}%')`
++  );
++  await run(`DELETE FROM candidate_restaurants WHERE name LIKE '${NAME_PREFIX}%'`);
++};
++
++const seedAdmins = async (ids: string[]) => {
++  for (const id of ids) {
++    const tail = id.replace(/-/g, "").slice(-12);
++    const digits = id.replace(/\D/g, "").slice(-11);
++    await run(
++      `INSERT INTO admin_users
++         (id, first_name, last_name, email, password, phone_number, role_id,
++          "createdAt", "updatedAt")
++       VALUES (?, 'CRVW', 'Admin', ?, 'x', ?, ?, NOW(), NOW())
++       ON CONFLICT (id) DO NOTHING`,
++      [id, `crvw-${tail}@ex.co`, `+9${digits}`, ROLE_ID]
 +    );
++  }
++};
++
++const removeAdmins = async (ids: string[]) => {
++  for (const id of ids) {
++    await run(`DELETE FROM admin_users WHERE id = ?`, [id]);
++  }
++};
++
++const seedCandidate = async (
++  id: string,
++  name: string,
++  overrides: { is_approved?: boolean; is_rejected?: boolean } = {}
++) => {
++  const { is_approved = false, is_rejected = false } = overrides;
++  await run(
++    `INSERT INTO candidate_restaurants
++       (id, name, description, opening_hour, closing_hour, is_open,
++        is_approved, is_rejected, user_id, candidate_admin_user_id,
++        "createdAt", "updatedAt")
++     VALUES (?, ?, 'seeded description', '07:30:00', '22:15:00', false,
++             ?, ?, NULL, NULL, NOW(), NOW())`,
++    [id, name, is_approved, is_rejected]
++  );
++};
++
++const addMenuImage = async (candidateId: string, url: string) => {
++  await run(
++    `INSERT INTO candidate_restaurant_menu_images
++       (id, candidate_restaurant_id, url, "createdAt", "updatedAt")
++     VALUES (gen_random_uuid(), ?, ?, NOW(), NOW())`,
++    [candidateId, url]
++  );
++};
++
++const notificationsByReviewer = () =>
++  Notification.findAll({ where: { reactor_id: REVIEWER_ID } });
++
++const rejectionReasonRow = async (id: string) => {
++  const [rows]: any = await run(
++    `SELECT is_rejected, rejection_reason FROM candidate_restaurants WHERE id = ?`,
++    [id]
++  );
++  return rows[0];
++};
++
++beforeAll(async () => {
++  sequelize = await Database.getInstance();
++  await run(
++    `INSERT INTO roles (id, name, "createdAt", "updatedAt")
++     VALUES (?, 'crvw-verify-role', NOW(), NOW()) ON CONFLICT (id) DO NOTHING`,
++    [ROLE_ID]
++  );
++});
++
++afterAll(async () => {
++  await wipe();
++  await removeAdmins([REVIEWER_ID, ...ALL_ADMINS]);
++  await run(`DELETE FROM roles WHERE id = ?`, [ROLE_ID]);
++  await Database.close();
++});
++
++beforeEach(async () => {
++  jest.clearAllMocks();
++  await wipe();
++  await removeAdmins(ALL_ADMINS);
++  await seedAdmins([ADMIN_1]);
++});
++
++describe("Candidate Restaurant Verification - Single Review Endpoint", () => {
++  it("approves a pending candidate, creates the restaurant and copies media", async () => {
++    await seedCandidate(CAND_A, NAME_A);
++    await addMenuImage(CAND_A, "https://cdn.example/a.jpg");
++    await addMenuImage(CAND_A, "https://cdn.example/b.jpg");
++
++    const res = await review(CAND_A, { action: "approve" });
++
++    expect(res.status).toBe(200);
++    expect(res.body.success).toBe(true);
++    expect(res.body.data).toMatchObject({
++      candidate_restaurant_id: CAND_A,
++      status: "approved",
++      rejection_reason: null,
++      reviewed_by: REVIEWER_ID,
++    });
++    expect(res.body.data.restaurant_id).toEqual(expect.any(String));
++
++    const candidate = await CandidateRestaurant.findByPk(CAND_A);
++    expect(candidate?.is_approved).toBe(true);
++
++    const restaurant = await Restaurant.findByPk(res.body.data.restaurant_id);
++    expect(restaurant?.name).toBe(NAME_A);
++
++    const images = await RestaurantImage.findAll({
++      where: { restaurant_id: res.body.data.restaurant_id },
++    });
++    expect(images).toHaveLength(2);
++  });
++
++  it("writes one notification per admin user on approval", async () => {
++    await seedAdmins([ADMIN_2, ADMIN_3]);
++    await seedCandidate(CAND_A, NAME_A);
++
++    const res = await review(CAND_A, { action: "approve" });
++
++    expect(res.status).toBe(200);
++    const notes = await notificationsByReviewer();
++    expect(notes).toHaveLength(3);
++    expect(notes.map((n) => n.user_id).sort()).toEqual([...ALL_ADMINS].sort());
++  });
++
++  it("rejects a pending candidate and stores the trimmed rejection reason", async () => {
++    await seedCandidate(CAND_A, NAME_A);
++
++    const res = await review(CAND_A, {
++      action: "reject",
++      rejectionReason: "  incomplete menu photos  ",
++    });
++
++    expect(res.status).toBe(200);
++    expect(res.body.data).toMatchObject({
++      status: "rejected",
++      rejection_reason: "incomplete menu photos",
++      restaurant_id: null,
++    });
++
++    const row = await rejectionReasonRow(CAND_A);
++    expect(row.is_rejected).toBe(true);
++    expect(row.rejection_reason).toBe("incomplete menu photos");
++    expect(await Restaurant.count({ where: { name: NAME_A } })).toBe(0);
++  });
++
++  it("does not create restaurant images when the candidate has no media", async () => {
++    await seedCandidate(CAND_A, NAME_A);
++
++    const res = await review(CAND_A, { action: "approve" });
++
++    expect(res.status).toBe(200);
++    expect(
++      await RestaurantImage.count({
++        where: { restaurant_id: res.body.data.restaurant_id },
++      })
++    ).toBe(0);
++  });
++
++  it("returns 404 when the candidate restaurant does not exist", async () => {
++    const res = await review(MISSING, { action: "approve" });
++
++    expect(res.status).toBe(404);
++    expect(res.body.success).toBe(false);
++    expect(await Restaurant.count({ where: { name: NAME_A } })).toBe(0);
++  });
++
++  it("returns 409 when the candidate was already approved", async () => {
++    await seedCandidate(CAND_A, NAME_A, { is_approved: true });
++
++    const res = await review(CAND_A, { action: "approve" });
++
++    expect(res.status).toBe(409);
++    expect(res.body.success).toBe(false);
++    expect(res.body.message).toMatch(/approved/i);
++  });
++
++  it("returns 409 when the candidate was already rejected", async () => {
++    await seedCandidate(CAND_A, NAME_A, { is_rejected: true });
++
++    const res = await review(CAND_A, { action: "reject" });
++
++    expect(res.status).toBe(409);
++    expect(res.body.success).toBe(false);
++    expect(res.body.message).toMatch(/rejected/i);
++  });
++
++  it("returns 400 when the action is not approve or reject", async () => {
++    await seedCandidate(CAND_A, NAME_A);
++
++    const res = await review(CAND_A, { action: "delete" });
++
++    expect(res.status).toBe(400);
++    expect(res.body.message).toMatch(/approve or reject/i);
++    expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(false);
++  });
++
++  it("normalizes a mixed-case, padded action", async () => {
++    await seedCandidate(CAND_A, NAME_A);
++
++    const res = await review(CAND_A, { action: "  ApPrOvE  " });
++
++    expect(res.status).toBe(200);
++    expect(res.body.data.status).toBe("approved");
++  });
++
++  it("surfaces a 500 and does not resolve when notifying admins fails", async () => {
++    await seedCandidate(CAND_A, NAME_A);
++    await run(`
++      CREATE OR REPLACE FUNCTION crvw_fail_notification() RETURNS trigger AS $$
++      BEGIN RAISE EXCEPTION 'notification store unavailable'; END;
++      $$ LANGUAGE plpgsql;
++      CREATE TRIGGER crvw_fail_notification BEFORE INSERT ON notifications
++      FOR EACH ROW EXECUTE FUNCTION crvw_fail_notification();
++    `);
++
++    try {
++      const res = await review(CAND_A, { action: "approve" });
++
++      expect(res.status).toBe(500);
++      expect(res.body.success).toBe(false);
++      expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(
++        false
++      );
++      expect(await Restaurant.count({ where: { name: NAME_A } })).toBe(0);
++    } finally {
++      await run(
++        `DROP TRIGGER IF EXISTS crvw_fail_notification ON notifications`
++      );
++      await run(`DROP FUNCTION IF EXISTS crvw_fail_notification()`);
++    }
++  });
++
++  it("returns the review envelope with a message and the candidate name", async () => {
++    await seedCandidate(CAND_A, NAME_A);
++
++    const res = await review(CAND_A, { action: "approve" });
++
++    expect(res.status).toBe(200);
++    expect(typeof res.body.message).toBe("string");
++    expect(res.body.message.length).toBeGreaterThan(0);
++    expect(res.body.data.name).toBe(NAME_A);
++    expect(res.body.data.reviewed_by).toBe(REVIEWER_ID);
++  });
++
++  it("notifies each admin with the reviewer id and a message naming the restaurant", async () => {
++    await seedCandidate(CAND_A, NAME_A);
++
++    const res = await review(CAND_A, { action: "approve" });
++
++    expect(res.status).toBe(200);
++    const notes = await notificationsByReviewer();
++    expect(notes).toHaveLength(1);
++    expect(notes[0].reactor_id).toBe(REVIEWER_ID);
++    expect(notes[0].message).toEqual(expect.stringContaining(NAME_A));
++  });
++
++  it("copies each candidate menu image url into a restaurant image row", async () => {
++    await seedCandidate(CAND_A, NAME_A);
++    await addMenuImage(CAND_A, "https://cdn.example/one.jpg");
++    await addMenuImage(CAND_A, "https://cdn.example/two.jpg");
++
++    const res = await review(CAND_A, { action: "approve" });
++
++    expect(res.status).toBe(200);
++    const images = await RestaurantImage.findAll({
++      where: { restaurant_id: res.body.data.restaurant_id },
++      order: [["url", "ASC"]],
++    });
++    expect(images.map((i) => i.url)).toEqual([
++      "https://cdn.example/one.jpg",
++      "https://cdn.example/two.jpg",
++    ]);
++    for (const image of images) {
++      expect(image.restaurant_id).toBe(res.body.data.restaurant_id);
++    }
++  });
++
++  it("does not create a restaurant, media or notifications when rejecting", async () => {
++    await seedCandidate(CAND_A, NAME_A);
++    await addMenuImage(CAND_A, "https://cdn.example/skip.jpg");
++
++    const res = await review(CAND_A, { action: "reject" });
++
++    expect(res.status).toBe(200);
++    expect(await Restaurant.count({ where: { name: NAME_A } })).toBe(0);
++    expect(await notificationsByReviewer()).toHaveLength(0);
++  });
++
++  it("stores a null rejection reason when the reason is whitespace only", async () => {
++    await seedCandidate(CAND_A, NAME_A);
++
++    const res = await review(CAND_A, { action: "reject", rejectionReason: "   " });
++
++    expect(res.status).toBe(200);
++    expect(res.body.data.rejection_reason).toBeNull();
++    expect((await rejectionReasonRow(CAND_A)).rejection_reason).toBeNull();
++  });
++});
++
++describe("Candidate Restaurant Verification - Metrics Endpoint", () => {
++  const seedMany = async (
++    count: number,
++    state: "pending" | "approved" | "rejected"
++  ) => {
++    for (let i = 0; i < count; i += 1) {
++      await run(
++        `INSERT INTO candidate_restaurants
++           (id, name, description, opening_hour, closing_hour, is_open,
++            is_approved, is_rejected, "createdAt", "updatedAt")
++         VALUES (gen_random_uuid(), ?, 'metrics', '08:00:00', '20:00:00', false,
++                 ?, ?, NOW(), NOW())`,
++        [
++          `${NAME_PREFIX} Metrics ${state} ${i}`,
++          state === "approved",
++          state === "rejected",
++        ]
++      );
++    }
++  };
++
++  beforeEach(async () => {
++    await run(`DELETE FROM candidate_restaurant_menu_images`);
++    await run(`DELETE FROM candidate_restaurants`);
++  });
++
++  it("returns aggregated pending/approved/rejected/total counts", async () => {
++    await seedMany(5, "pending");
++    await seedMany(4, "approved");
++    await seedMany(3, "rejected");
++
++    const res = await metrics();
++
++    expect(res.status).toBe(200);
++    expect(res.body.data).toEqual({
++      pending: 5,
++      approved: 4,
++      rejected: 3,
++      total: 12,
++    });
++  });
++
++  it("never reports a negative pending count", async () => {
++    await seedMany(6, "approved");
++    await seedMany(6, "rejected");
++
++    const res = await metrics();
++
++    expect(res.status).toBe(200);
++    expect(res.body.data.pending).toBe(0);
++    expect(res.body.data.total).toBe(12);
++  });
++});
++
++describe("Candidate Restaurant Verification - Batch Review Endpoint", () => {
++  const restaurantCount = () =>
++    Restaurant.count({ where: { name: [NAME_A, NAME_B] } });
++
++  it("reviews a mixed batch and returns results in the exact requested order", async () => {
++    await seedCandidate(CAND_A, NAME_A);
++    await seedCandidate(CAND_B, NAME_B);
 +
 +    const res = await batch({
 +      reviews: [
-+        { candidateRestaurantId: "cand-b", action: "reject", rejectionReason: "duplicate" },
-+        { candidateRestaurantId: "cand-a", action: "approve" },
++        { candidateRestaurantId: CAND_B, action: "reject", rejectionReason: "duplicate" },
++        { candidateRestaurantId: CAND_A, action: "approve" },
 +      ],
 +    });
 +
 +    expect(res.status).toBe(200);
 +    expect(res.body.success).toBe(true);
 +    expect(res.body.data.map((r: any) => r.candidate_restaurant_id)).toEqual([
-+      "cand-b",
-+      "cand-a",
++      CAND_B,
++      CAND_A,
 +    ]);
-+    expect(res.body.data[0]).toMatchObject({ status: "rejected", rejection_reason: "duplicate" });
-+    expect(res.body.data[1]).toMatchObject({ status: "approved", restaurant_id: "rest-x" });
++    expect(res.body.data[0]).toMatchObject({
++      status: "rejected",
++      rejection_reason: "duplicate",
++      restaurant_id: null,
++    });
++    expect(res.body.data[1]).toMatchObject({ status: "approved" });
++    expect(res.body.data[1].restaurant_id).toEqual(expect.any(String));
++
++    expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(true);
++    expect((await CandidateRestaurant.findByPk(CAND_B))?.is_rejected).toBe(true);
++    expect(await Restaurant.count({ where: { name: NAME_A } })).toBe(1);
++    expect(await Restaurant.count({ where: { name: NAME_B } })).toBe(0);
 +  });
 +
 +  it("returns 400 when the reviews field is missing", async () => {
++    await seedCandidate(CAND_A, NAME_A);
++
 +    const res = await batch({});
++
 +    expect(res.status).toBe(400);
 +    expect(res.body.success).toBe(false);
 +    expect(res.body.message).toMatch(/reviews field must be a non-empty array/i);
-+    expect(findByPk).not.toHaveBeenCalled();
++    expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(false);
 +  });
 +
 +  it("returns 400 when the reviews array is empty", async () => {
 +    const res = await batch({ reviews: [] });
++
 +    expect(res.status).toBe(400);
 +    expect(res.body.message).toMatch(/reviews field must be a non-empty array/i);
 +  });
 +
 +  it("returns 400 when a review entry is not an object", async () => {
 +    const res = await batch({ reviews: ["approve cand-a"] });
++
 +    expect(res.status).toBe(400);
 +    expect(res.body.success).toBe(false);
 +    expect(res.body.message).toMatch(/object/i);
@@ -131,6 +532,7 @@ index 0000000..29d4b12
 +
 +  it("returns 400 when a review entry has no candidateRestaurantId", async () => {
 +    const res = await batch({ reviews: [{ action: "approve" }] });
++
 +    expect(res.status).toBe(400);
 +    expect(res.body.success).toBe(false);
 +    expect(res.body.message).toMatch(/candidateRestaurantId/i);
@@ -138,8 +540,9 @@ index 0000000..29d4b12
 +
 +  it("returns 400 when a review entry has an unknown action", async () => {
 +    const res = await batch({
-+      reviews: [{ candidateRestaurantId: "cand-a", action: "archive" }],
++      reviews: [{ candidateRestaurantId: CAND_A, action: "archive" }],
 +    });
++
 +    expect(res.status).toBe(400);
 +    expect(res.body.message).toMatch(/approve or reject/i);
 +  });
@@ -147,10 +550,11 @@ index 0000000..29d4b12
 +  it("returns 400 with 'Duplicate candidate restaurant id' for a repeated id", async () => {
 +    const res = await batch({
 +      reviews: [
-+        { candidateRestaurantId: "cand-a", action: "approve" },
-+        { candidateRestaurantId: "cand-a", action: "reject" },
++        { candidateRestaurantId: CAND_A, action: "approve" },
++        { candidateRestaurantId: CAND_A, action: "reject" },
 +      ],
 +    });
++
 +    expect(res.status).toBe(400);
 +    expect(res.body.message).toBe("Duplicate candidate restaurant id");
 +  });
@@ -158,82 +562,83 @@ index 0000000..29d4b12
 +  it("detects duplicate ids that differ only by surrounding whitespace", async () => {
 +    const res = await batch({
 +      reviews: [
-+        { candidateRestaurantId: "cand-a", action: "approve" },
-+        { candidateRestaurantId: "  cand-a  ", action: "reject" },
++        { candidateRestaurantId: CAND_A, action: "approve" },
++        { candidateRestaurantId: `  ${CAND_A}  `, action: "reject" },
 +      ],
 +    });
++
 +    expect(res.status).toBe(400);
 +    expect(res.body.message).toBe("Duplicate candidate restaurant id");
 +  });
 +
 +  it("accepts mixed-case actions inside the batch", async () => {
-+    findByPk.mockImplementation((id: string) =>
-+      Promise.resolve(pendingCandidate(id, "Case Test"))
-+    );
++    await seedCandidate(CAND_A, NAME_A);
++    await seedCandidate(CAND_B, NAME_B);
 +
 +    const res = await batch({
 +      reviews: [
-+        { candidateRestaurantId: "cand-a", action: "APPROVE" },
-+        { candidateRestaurantId: "cand-b", action: "ReJeCt" },
++        { candidateRestaurantId: CAND_A, action: "APPROVE" },
++        { candidateRestaurantId: CAND_B, action: "ReJeCt" },
 +      ],
 +    });
 +
 +    expect(res.status).toBe(200);
-+    expect(res.body.data.map((r: any) => r.status)).toEqual(["approved", "rejected"]);
++    expect(res.body.data.map((r: any) => r.status)).toEqual([
++      "approved",
++      "rejected",
++    ]);
 +  });
 +
 +  it("trims whitespace-padded candidate ids before lookup", async () => {
-+    findByPk.mockResolvedValue(pendingCandidate("cand-a", "Padded"));
++    await seedCandidate(CAND_A, NAME_A);
 +
 +    const res = await batch({
-+      reviews: [{ candidateRestaurantId: "   cand-a   ", action: "approve" }],
++      reviews: [{ candidateRestaurantId: `   ${CAND_A}   `, action: "approve" }],
 +    });
 +
 +    expect(res.status).toBe(200);
-+    expect(findByPk).toHaveBeenCalledWith("cand-a", expect.anything());
++    expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(true);
 +  });
 +
 +  it("fails the whole batch with 404 when any candidate is missing", async () => {
-+    findByPk.mockImplementation((id: string) =>
-+      Promise.resolve(id === "cand-a" ? pendingCandidate("cand-a", "Alpha") : null)
-+    );
++    await seedCandidate(CAND_A, NAME_A);
 +
 +    const res = await batch({
 +      reviews: [
-+        { candidateRestaurantId: "cand-a", action: "approve" },
-+        { candidateRestaurantId: "cand-missing", action: "approve" },
++        { candidateRestaurantId: CAND_A, action: "approve" },
++        { candidateRestaurantId: MISSING, action: "approve" },
 +      ],
 +    });
 +
 +    expect(res.status).toBe(404);
 +    expect(res.body).not.toHaveProperty("data");
++    expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(false);
++    expect(await restaurantCount()).toBe(0);
 +  });
 +
 +  it("fails the whole batch with 409 when any candidate is already reviewed", async () => {
-+    findByPk.mockImplementation((id: string) =>
-+      Promise.resolve(
-+        id === "cand-a"
-+          ? pendingCandidate("cand-a", "Alpha")
-+          : { id: "cand-b", name: "Bravo", is_approved: true, is_rejected: false }
-+      )
-+    );
++    await seedCandidate(CAND_A, NAME_A);
++    await seedCandidate(CAND_B, NAME_B, { is_approved: true });
 +
 +    const res = await batch({
 +      reviews: [
-+        { candidateRestaurantId: "cand-a", action: "approve" },
-+        { candidateRestaurantId: "cand-b", action: "approve" },
++        { candidateRestaurantId: CAND_A, action: "approve" },
++        { candidateRestaurantId: CAND_B, action: "approve" },
 +      ],
 +    });
 +
 +    expect(res.status).toBe(409);
 +    expect(res.body).not.toHaveProperty("data");
++    expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(false);
 +  });
 +
 +  it("keeps a whitespace-only rejectionReason out of the stored reason", async () => {
-+    findByPk.mockResolvedValue(pendingCandidate("cand-a", "Blank Reason"));
++    await seedCandidate(CAND_A, NAME_A);
 +
 +    const res = await batch({
-+      reviews: [{ candidateRestaurantId: "cand-a", action: "reject", rejectionReason: "    " }],
++      reviews: [
++        { candidateRestaurantId: CAND_A, action: "reject", rejectionReason: "    " },
++      ],
 +    });
 +
 +    expect(res.status).toBe(200);
@@ -241,10 +646,10 @@ index 0000000..29d4b12
 +  });
 +
 +  it("returns success, a message and one result for a single-item batch", async () => {
-+    findByPk.mockResolvedValue(pendingCandidate("cand-a", "Solo"));
++    await seedCandidate(CAND_A, NAME_A);
 +
 +    const res = await batch({
-+      reviews: [{ candidateRestaurantId: "cand-a", action: "approve" }],
++      reviews: [{ candidateRestaurantId: CAND_A, action: "approve" }],
 +    });
 +
 +    expect(res.status).toBe(200);
@@ -252,48 +657,47 @@ index 0000000..29d4b12
 +    expect(typeof res.body.message).toBe("string");
 +    expect(res.body.data).toHaveLength(1);
 +    expect(res.body.data[0]).toMatchObject({
-+      candidate_restaurant_id: "cand-a",
++      candidate_restaurant_id: CAND_A,
 +      status: "approved",
-+      reviewed_by: "reviewer-9",
++      reviewed_by: REVIEWER_ID,
 +    });
 +  });
 +
 +  it("stamps the reviewer id on every entry of the batch", async () => {
-+    findByPk.mockImplementation((id: string) =>
-+      Promise.resolve(pendingCandidate(id, "Batch"))
-+    );
++    await seedCandidate(CAND_A, NAME_A);
++    await seedCandidate(CAND_B, NAME_B);
 +
 +    const res = await batch({
 +      reviews: [
-+        { candidateRestaurantId: "cand-a", action: "approve" },
-+        { candidateRestaurantId: "cand-b", action: "reject" },
++        { candidateRestaurantId: CAND_A, action: "approve" },
++        { candidateRestaurantId: CAND_B, action: "reject" },
 +      ],
 +    });
 +
 +    expect(res.status).toBe(200);
 +    expect(res.body.data.map((r: any) => r.reviewed_by)).toEqual([
-+      "reviewer-9",
-+      "reviewer-9",
++      REVIEWER_ID,
++      REVIEWER_ID,
 +    ]);
 +  });
 +
 +  it("does not create any restaurant when the batch rolls back on the first entry", async () => {
-+    findByPk.mockResolvedValue(null);
++    await seedCandidate(CAND_A, NAME_A);
 +
 +    const res = await batch({
 +      reviews: [
-+        { candidateRestaurantId: "cand-missing", action: "approve" },
-+        { candidateRestaurantId: "cand-a", action: "approve" },
++        { candidateRestaurantId: MISSING, action: "approve" },
++        { candidateRestaurantId: CAND_A, action: "approve" },
 +      ],
 +    });
 +
 +    expect(res.status).toBe(404);
-+    expect(createRestaurant).not.toHaveBeenCalled();
++    expect(await restaurantCount()).toBe(0);
 +  });
 +
 +  it("rejects a review entry whose action is not a string", async () => {
 +    const res = await batch({
-+      reviews: [{ candidateRestaurantId: "cand-a", action: 1 }],
++      reviews: [{ candidateRestaurantId: CAND_A, action: 1 }],
 +    });
 +
 +    expect(res.status).toBe(400);
@@ -345,321 +749,5 @@ index 0000000..34fc675
 +      .send();
 +
 +    expect(res.status).toBe(401);
-+  });
-+});
-diff --git a/rateeat_backend/src/__tests__/unit/candidate_restaurant_verification_behavior.test.ts b/rateeat_backend/src/__tests__/unit/candidate_restaurant_verification_behavior.test.ts
-new file mode 100644
-index 0000000..7588755
---- /dev/null
-+++ b/rateeat_backend/src/__tests__/unit/candidate_restaurant_verification_behavior.test.ts
-@@ -0,0 +1,310 @@
-+import express from "express";
-+import request from "supertest";
-+
-+import candidateRestaurantRouter from "../../routes/candidate_restaurant.route";
-+import sequelize from "../../config/db";
-+import {
-+  AdminUser,
-+  CandidateRestaurant,
-+  CandidateRestaurantMenuImage,
-+  Notification,
-+  Restaurant,
-+  RestaurantImage,
-+} from "../../models";
-+
-+jest.mock("../../middlewares/auth", () => ({
-+  protectRoute: (req: any, _res: any, next: any) => {
-+    req.user = { id: "reviewer-1" };
-+    next();
-+  },
-+  protectRouteForAdmin: (req: any, _res: any, next: any) => {
-+    req.user = { id: "reviewer-1" };
-+    next();
-+  },
-+  optionalAuth: (_req: any, _res: any, next: any) => next(),
-+}));
-+
-+jest.mock("../../models", () => ({
-+  CandidateRestaurant: { findByPk: jest.fn(), count: jest.fn() },
-+  Restaurant: { create: jest.fn() },
-+  RestaurantImage: { create: jest.fn() },
-+  CandidateRestaurantMenuImage: { findAll: jest.fn() },
-+  AdminUser: { findAll: jest.fn() },
-+  Notification: { create: jest.fn() },
-+}));
-+
-+jest.mock("../../config/db", () => ({
-+  __esModule: true,
-+  default: { transaction: jest.fn() },
-+}));
-+
-+const app = express();
-+app.use(express.json());
-+app.use("/api/v1/candidate-restaurants", candidateRestaurantRouter);
-+app.use((err: any, _req: any, res: any, _next: any) => {
-+  res
-+    .status(err.statusCode || 500)
-+    .json({ success: false, message: err.message || "Internal Server Error" });
-+});
-+
-+const transaction = (sequelize as unknown as { transaction: jest.Mock }).transaction;
-+const findByPk = CandidateRestaurant.findByPk as jest.Mock;
-+const countCandidates = CandidateRestaurant.count as jest.Mock;
-+const createRestaurant = Restaurant.create as jest.Mock;
-+const createRestaurantImage = RestaurantImage.create as jest.Mock;
-+const findCandidateMedia = CandidateRestaurantMenuImage.findAll as jest.Mock;
-+const findAdmins = AdminUser.findAll as jest.Mock;
-+const createNotification = Notification.create as jest.Mock;
-+
-+const pendingCandidate = (overrides: Record<string, any> = {}) => ({
-+  id: "cand-1",
-+  name: "Blue Nile Kitchen",
-+  description: "Injera and tibs",
-+  is_approved: false,
-+  is_rejected: false,
-+  save: jest.fn().mockResolvedValue(true),
-+  ...overrides,
-+});
-+
-+beforeEach(() => {
-+  jest.clearAllMocks();
-+  transaction.mockImplementation(async (cb: any) => cb({ LOCK: { UPDATE: "UPDATE" } }));
-+  findCandidateMedia.mockResolvedValue([]);
-+  findAdmins.mockResolvedValue([{ id: "admin-1" }]);
-+  createRestaurant.mockResolvedValue({ id: "rest-1", name: "Blue Nile Kitchen" });
-+  createRestaurantImage.mockResolvedValue({ id: "img-1" });
-+  createNotification.mockResolvedValue({ id: "note-1" });
-+});
-+
-+const review = (id: string, body: any) =>
-+  request(app).put(`/api/v1/candidate-restaurants/${id}/review`).send(body);
-+
-+describe("Candidate Restaurant Verification - Single Review Endpoint", () => {
-+  it("approves a pending candidate, creates the restaurant and copies media", async () => {
-+    const candidate = pendingCandidate();
-+    findByPk.mockResolvedValue(candidate);
-+    findCandidateMedia.mockResolvedValue([
-+      { url: "https://cdn.example/a.jpg" },
-+      { url: "https://cdn.example/b.jpg" },
-+    ]);
-+
-+    const res = await review("cand-1", { action: "approve" });
-+
-+    expect(res.status).toBe(200);
-+    expect(res.body.success).toBe(true);
-+    expect(res.body.data).toMatchObject({
-+      candidate_restaurant_id: "cand-1",
-+      status: "approved",
-+      restaurant_id: "rest-1",
-+      rejection_reason: null,
-+      reviewed_by: "reviewer-1",
-+    });
-+    expect(candidate.is_approved).toBe(true);
-+    expect(candidate.save).toHaveBeenCalledTimes(1);
-+    expect(createRestaurant).toHaveBeenCalledTimes(1);
-+    expect(createRestaurantImage).toHaveBeenCalledTimes(2);
-+    expect(transaction).toHaveBeenCalledTimes(1);
-+    expect(findByPk).toHaveBeenCalledWith(
-+      "cand-1",
-+      expect.objectContaining({ lock: expect.anything() })
-+    );
-+  });
-+
-+  it("writes one notification per admin user on approval", async () => {
-+    findByPk.mockResolvedValue(pendingCandidate());
-+    findAdmins.mockResolvedValue([{ id: "admin-1" }, { id: "admin-2" }, { id: "admin-3" }]);
-+
-+    const res = await review("cand-1", { action: "approve" });
-+
-+    expect(res.status).toBe(200);
-+    expect(createNotification).toHaveBeenCalledTimes(3);
-+    const recipients = createNotification.mock.calls.map(([payload]) => payload.user_id);
-+    expect(recipients).toEqual(["admin-1", "admin-2", "admin-3"]);
-+  });
-+
-+  it("rejects a pending candidate and stores the trimmed rejection reason", async () => {
-+    const candidate = pendingCandidate();
-+    findByPk.mockResolvedValue(candidate);
-+
-+    const res = await review("cand-1", {
-+      action: "reject",
-+      rejectionReason: "  incomplete menu photos  ",
-+    });
-+
-+    expect(res.status).toBe(200);
-+    expect(res.body.data).toMatchObject({
-+      status: "rejected",
-+      rejection_reason: "incomplete menu photos",
-+      restaurant_id: null,
-+    });
-+    expect(candidate.is_rejected).toBe(true);
-+    expect(createRestaurant).not.toHaveBeenCalled();
-+  });
-+
-+  it("does not create restaurant images when the candidate has no media", async () => {
-+    findByPk.mockResolvedValue(pendingCandidate());
-+    findCandidateMedia.mockResolvedValue([]);
-+
-+    const res = await review("cand-1", { action: "approve" });
-+
-+    expect(res.status).toBe(200);
-+    expect(createRestaurantImage).not.toHaveBeenCalled();
-+  });
-+
-+  it("returns 404 when the candidate restaurant does not exist", async () => {
-+    findByPk.mockResolvedValue(null);
-+
-+    const res = await review("missing", { action: "approve" });
-+
-+    expect(res.status).toBe(404);
-+    expect(res.body.success).toBe(false);
-+    expect(createRestaurant).not.toHaveBeenCalled();
-+  });
-+
-+  it("returns 409 when the candidate was already approved", async () => {
-+    findByPk.mockResolvedValue(pendingCandidate({ is_approved: true }));
-+
-+    const res = await review("cand-1", { action: "approve" });
-+
-+    expect(res.status).toBe(409);
-+    expect(res.body.success).toBe(false);
-+    expect(res.body.message).toMatch(/approved/i);
-+  });
-+
-+  it("returns 409 when the candidate was already rejected", async () => {
-+    findByPk.mockResolvedValue(pendingCandidate({ is_rejected: true }));
-+
-+    const res = await review("cand-1", { action: "reject" });
-+
-+    expect(res.status).toBe(409);
-+    expect(res.body.success).toBe(false);
-+    expect(res.body.message).toMatch(/rejected/i);
-+  });
-+
-+  it("returns 400 when the action is not approve or reject", async () => {
-+    const res = await review("cand-1", { action: "delete" });
-+
-+    expect(res.status).toBe(400);
-+    expect(res.body.message).toMatch(/approve or reject/i);
-+    expect(findByPk).not.toHaveBeenCalled();
-+  });
-+
-+  it("normalizes a mixed-case, padded action", async () => {
-+    const candidate = pendingCandidate();
-+    findByPk.mockResolvedValue(candidate);
-+
-+    const res = await review("cand-1", { action: "  ApPrOvE  " });
-+
-+    expect(res.status).toBe(200);
-+    expect(res.body.data.status).toBe("approved");
-+  });
-+
-+  it("surfaces a 500 and does not resolve when notifying admins fails", async () => {
-+    findByPk.mockResolvedValue(pendingCandidate());
-+    createNotification.mockRejectedValue(new Error("notification store offline"));
-+
-+    const res = await review("cand-1", { action: "approve" });
-+
-+    expect(res.status).toBe(500);
-+    expect(res.body.success).toBe(false);
-+  });
-+
-+  it("returns the review envelope with a message and the candidate name", async () => {
-+    findByPk.mockResolvedValue(pendingCandidate({ name: "Habesha Grill" }));
-+
-+    const res = await review("cand-1", { action: "approve" });
-+
-+    expect(res.status).toBe(200);
-+    expect(typeof res.body.message).toBe("string");
-+    expect(res.body.message.length).toBeGreaterThan(0);
-+    expect(res.body.data.name).toBe("Habesha Grill");
-+    expect(res.body.data.reviewed_by).toBe("reviewer-1");
-+  });
-+
-+  it("notifies each admin with the reviewer id and a message naming the restaurant", async () => {
-+    findByPk.mockResolvedValue(pendingCandidate({ name: "Lucy Lounge" }));
-+
-+    const res = await review("cand-1", { action: "approve" });
-+
-+    expect(res.status).toBe(200);
-+    const [payload] = createNotification.mock.calls[0];
-+    expect(payload.reactor_id).toBe("reviewer-1");
-+    expect(payload.message).toEqual(expect.stringContaining("Lucy Lounge"));
-+  });
-+
-+  it("copies each candidate menu image url into a restaurant image row", async () => {
-+    findByPk.mockResolvedValue(pendingCandidate());
-+    findCandidateMedia.mockResolvedValue([
-+      { url: "https://cdn.example/one.jpg" },
-+      { url: "https://cdn.example/two.jpg" },
-+    ]);
-+
-+    const res = await review("cand-1", { action: "approve" });
-+
-+    expect(res.status).toBe(200);
-+    const urls = createRestaurantImage.mock.calls.map(([row]) => row.url);
-+    expect(urls).toEqual([
-+      "https://cdn.example/one.jpg",
-+      "https://cdn.example/two.jpg",
-+    ]);
-+    for (const [row] of createRestaurantImage.mock.calls) {
-+      expect(row.restaurant_id).toBe("rest-1");
-+    }
-+  });
-+
-+  it("does not create a restaurant, media or notifications when rejecting", async () => {
-+    findByPk.mockResolvedValue(pendingCandidate());
-+
-+    const res = await review("cand-1", { action: "reject" });
-+
-+    expect(res.status).toBe(200);
-+    expect(createRestaurant).not.toHaveBeenCalled();
-+    expect(createRestaurantImage).not.toHaveBeenCalled();
-+    expect(createNotification).not.toHaveBeenCalled();
-+  });
-+
-+  it("stores a null rejection reason when the reason is whitespace only", async () => {
-+    findByPk.mockResolvedValue(pendingCandidate());
-+
-+    const res = await review("cand-1", { action: "reject", rejectionReason: "   " });
-+
-+    expect(res.status).toBe(200);
-+    expect(res.body.data.rejection_reason).toBeNull();
-+  });
-+});
-+
-+describe("Candidate Restaurant Verification - Metrics Endpoint", () => {
-+  it("returns aggregated pending/approved/rejected/total counts", async () => {
-+    countCandidates
-+      .mockResolvedValueOnce(4) // approved
-+      .mockResolvedValueOnce(3) // rejected
-+      .mockResolvedValueOnce(12); // total
-+
-+    const res = await request(app)
-+      .get("/api/v1/candidate-restaurants/metrics")
-+      .send();
-+
-+    expect(res.status).toBe(200);
-+    expect(res.body.data).toEqual({
-+      pending: 5,
-+      approved: 4,
-+      rejected: 3,
-+      total: 12,
-+    });
-+  });
-+
-+  it("never reports a negative pending count", async () => {
-+    countCandidates
-+      .mockResolvedValueOnce(6) // approved
-+      .mockResolvedValueOnce(6) // rejected
-+      .mockResolvedValueOnce(10); // total
-+
-+    const res = await request(app)
-+      .get("/api/v1/candidate-restaurants/metrics")
-+      .send();
-+
-+    expect(res.status).toBe(200);
-+    expect(res.body.data.pending).toBe(0);
-+    expect(res.body.data.total).toBe(10);
 +  });
 +});
