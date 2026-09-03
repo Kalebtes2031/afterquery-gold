@@ -936,6 +936,41 @@ index 0000000..243c271
 +    expect(await restaurantsFor(CAND_A_NAME)).toHaveLength(0);
 +  });
 +
++  it("rolls approval back when the final notification write fails", async () => {
++    await seedCandidate(CAND_A, CAND_A_NAME);
++    await seedIncentive(0);
++
++    await run(`
++      CREATE OR REPLACE FUNCTION fail_candidate_approval_notification()
++      RETURNS trigger AS $$
++      BEGIN
++        RAISE EXCEPTION 'notification store unavailable';
++      END;
++      $$ LANGUAGE plpgsql;
++
++      CREATE TRIGGER fail_candidate_approval_notification
++      BEFORE INSERT ON notifications
++      FOR EACH ROW EXECUTE FUNCTION fail_candidate_approval_notification();
++    `);
++
++    try {
++      const response = await approve(CAND_A);
++
++      expect(response.status).toBe(500);
++      expectErrorShape(response, 500);
++      expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(
++        false
++      );
++      expect(await restaurantsFor(CAND_A_NAME)).toHaveLength(0);
++      expect(await notificationsFor(CAND_A)).toHaveLength(0);
++    } finally {
++      await run(
++        "DROP TRIGGER IF EXISTS fail_candidate_approval_notification ON notifications"
++      );
++      await run("DROP FUNCTION IF EXISTS fail_candidate_approval_notification()");
++    }
++  });
++
 +  it("writes one notification per candidate in a successful batch", async () => {
 +    await seedCandidate(CAND_A, CAND_A_NAME);
 +    await seedCandidate(CAND_B, CAND_B_NAME);
