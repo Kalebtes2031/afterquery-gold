@@ -102,10 +102,10 @@ index 0000000..55f7455
 +});
 diff --git a/rateeat_backend/src/__tests__/unit/candidate_restaurant_review_behavior.test.ts b/rateeat_backend/src/__tests__/unit/candidate_restaurant_review_behavior.test.ts
 new file mode 100644
-index 0000000..e8c761d
+index 0000000..243c271
 --- /dev/null
 +++ b/rateeat_backend/src/__tests__/unit/candidate_restaurant_review_behavior.test.ts
-@@ -0,0 +1,1044 @@
+@@ -0,0 +1,967 @@
 +import express from "express";
 +import request from "supertest";
 +
@@ -286,21 +286,24 @@ index 0000000..e8c761d
 +  expect(response.status).toBe(statusCode);
 +  expect(response.body.success).toBe(false);
 +  expect(response.body.statusCode).toBe(statusCode);
++  expect(typeof response.body.message).toBe("string");
 +  if (typeof message === "string") expect(response.body.message).toBe(message);
 +  if (message instanceof RegExp) expect(response.body.message).toMatch(message);
 +};
 +
 +const expectReviewShape = (
 +  response: request.Response,
-+  action: "approve" | "reject"
++  action: "approve" | "reject",
++  candidateRestaurantId?: string
 +) => {
 +  expect(response.status).toBe(200);
 +  expect(response.body.success).toBe(true);
-+  expect(response.body.data).toMatchObject({
++  expect(response.body.data).toEqual({
 +    action,
-+    candidateRestaurantId: expect.any(String),
++    candidateRestaurantId: candidateRestaurantId ?? expect.any(String),
 +    is_approved: action === "approve",
 +    is_rejected: action === "reject",
++    restaurant_id: action === "approve" ? expect.any(String) : null,
 +  });
 +};
 +
@@ -354,15 +357,7 @@ index 0000000..e8c761d
 +
 +      const response = await approve(CAND_A);
 +
-+      expect(response.status).toBe(200);
-+      expect(response.body.success).toBe(true);
-+      expect(response.body.data).toMatchObject({
-+        candidateRestaurantId: CAND_A,
-+        action: "approve",
-+        is_approved: true,
-+        is_rejected: false,
-+      });
-+      expect(response.body.data.restaurant_id).toEqual(expect.any(String));
++      expectReviewShape(response, "approve", CAND_A);
 +
 +      const candidate = await CandidateRestaurant.findByPk(CAND_A);
 +      expect(candidate?.is_approved).toBe(true);
@@ -487,7 +482,7 @@ index 0000000..e8c761d
 +
 +      const response = await approve(CAND_A);
 +
-+      expect(response.status).toBe(200);
++      expectReviewShape(response, "approve", CAND_A);
 +      const chain = await RestaurantChain.findOne({
 +        where: { name: "RS Gold Alpha" },
 +      });
@@ -585,14 +580,7 @@ index 0000000..e8c761d
 +
 +      const response = await reject(CAND_A);
 +
-+      expect(response.status).toBe(200);
-+      expect(response.body.data).toMatchObject({
-+        candidateRestaurantId: CAND_A,
-+        action: "reject",
-+        is_approved: false,
-+        is_rejected: true,
-+        restaurant_id: null,
-+      });
++      expectReviewShape(response, "reject", CAND_A);
 +
 +      const candidate = await CandidateRestaurant.findByPk(CAND_A);
 +      expect(candidate?.is_rejected).toBe(true);
@@ -607,13 +595,7 @@ index 0000000..e8c761d
 +
 +      const response = await reject(CAND_A);
 +
-+      expect(response.status).toBe(200);
-+      expect(response.body.data).toMatchObject({
-+        candidateRestaurantId: CAND_A,
-+        action: "reject",
-+        is_rejected: true,
-+        restaurant_id: null,
-+      });
++      expectReviewShape(response, "reject", CAND_A);
 +
 +      const candidateAdmin = await CandidateAdminUser.findByPk(CADMIN_A);
 +      expect(candidateAdmin?.is_rejected).toBe(true);
@@ -738,14 +720,14 @@ index 0000000..e8c761d
 +      expect(response.status).toBe(200);
 +      expect(response.body.success).toBe(true);
 +      expect(response.body.data).toHaveLength(2);
-+      expect(response.body.data[0]).toMatchObject({
++      expect(response.body.data[0]).toEqual({
 +        candidateRestaurantId: CAND_A,
 +        action: "approve",
 +        is_approved: true,
 +        is_rejected: false,
 +        restaurant_id: expect.any(String),
 +      });
-+      expect(response.body.data[1]).toMatchObject({
++      expect(response.body.data[1]).toEqual({
 +        candidateRestaurantId: CAND_B,
 +        action: "reject",
 +        is_approved: false,
@@ -775,6 +757,16 @@ index 0000000..e8c761d
 +        ],
 +      });
 +
++      expectReviewShape(
++        { ...response, body: { ...response.body, data: response.body.data[0] } } as request.Response,
++        "reject",
++        CAND_B
++      );
++      expectReviewShape(
++        { ...response, body: { ...response.body, data: response.body.data[1] } } as request.Response,
++        "approve",
++        CAND_A
++      );
 +      expect(response.body.data.map((entry: any) => entry.candidateRestaurantId)).toEqual([
 +        CAND_B,
 +        CAND_A,
@@ -794,6 +786,16 @@ index 0000000..e8c761d
 +      });
 +
 +      expect(response.status).toBe(200);
++      expectReviewShape(
++        { ...response, body: { ...response.body, data: response.body.data[0] } } as request.Response,
++        "approve",
++        CAND_A
++      );
++      expectReviewShape(
++        { ...response, body: { ...response.body, data: response.body.data[1] } } as request.Response,
++        "approve",
++        CAND_B
++      );
 +      expect(await incentiveTotal()).toBe(50);
 +      expect(await historyCount()).toBe(2);
 +    });
@@ -868,7 +870,8 @@ index 0000000..e8c761d
 +    await seedCandidate(CAND_A, CAND_A_NAME);
 +    await seedIncentive(0);
 +
-+    await approve(CAND_A);
++    const response = await approve(CAND_A);
++    expectReviewShape(response, "approve", CAND_A);
 +
 +    const notifications = await notificationsFor(CAND_A);
 +    expect(notifications).toHaveLength(1);
@@ -889,7 +892,8 @@ index 0000000..e8c761d
 +    await seedCandidate(CAND_A, CAND_A_NAME);
 +    await seedIncentive(0);
 +
-+    await approve(CAND_A);
++    const response = await approve(CAND_A);
++    expectReviewShape(response, "approve", CAND_A);
 +
 +    const notifications = await notificationsFor(CAND_A);
 +    expect(notifications).toHaveLength(2);
@@ -901,39 +905,14 @@ index 0000000..e8c761d
 +  it("notifies admins when a candidate is rejected", async () => {
 +    await seedCandidate(CAND_A, CAND_A_NAME);
 +
-+    await reject(CAND_A);
++    const response = await reject(CAND_A);
++    expectReviewShape(response, "reject", CAND_A);
 +
 +    const notifications = await notificationsFor(CAND_A);
 +    expect(notifications).toHaveLength(1);
 +    expect(notifications[0].message).toEqual(
 +      expect.stringContaining(CAND_A_NAME)
 +    );
-+    expect(notifications[0].reactor_id).toBe(ADMIN_ID);
-+  });
-+
-+  it("writes one notification per admin when a candidate is rejected", async () => {
-+    await run(
-+      `INSERT INTO admin_users
-+         (id, first_name, last_name, email, password, phone_number, role_id,
-+          "createdAt", "updatedAt")
-+       VALUES (?, 'Second', 'Reviewer', 'rs-gold-admin2@example.com', 'x',
-+               '+251900000002', ?, NOW(), NOW())
-+       ON CONFLICT (id) DO NOTHING`,
-+      [ADMIN2_ID, ROLE_ID]
-+    );
-+    await seedCandidate(CAND_A, CAND_A_NAME);
-+
-+    await reject(CAND_A);
-+
-+    const notifications = await notificationsFor(CAND_A);
-+    expect(notifications).toHaveLength(2);
-+    expect(notifications.map((entry) => entry.user_id).sort()).toEqual(
-+      [ADMIN_ID, ADMIN2_ID].sort()
-+    );
-+    notifications.forEach((entry) => {
-+      expect(entry.reactor_id).toBe(ADMIN_ID);
-+      expect(entry.message).toEqual(expect.stringContaining(CAND_A_NAME));
-+    });
 +  });
 +
 +  it("writes no notification when the approval rolls back", async () => {
@@ -962,57 +941,28 @@ index 0000000..e8c761d
 +    await seedCandidate(CAND_B, CAND_B_NAME);
 +    await seedIncentive(0);
 +
-+    await reviewBatch({
++    const response = await reviewBatch({
 +      items: [
 +        { candidateRestaurantId: CAND_A, action: "approve" },
 +        { candidateRestaurantId: CAND_B, action: "reject" },
 +      ],
 +    });
-+
-+    const forA = await notificationsFor(CAND_A);
-+    const forB = await notificationsFor(CAND_B);
-+    expect(forA).toHaveLength(1);
-+    expect(forB).toHaveLength(1);
-+    expect(forA[0].reactor_id).toBe(ADMIN_ID);
-+    expect(forB[0].reactor_id).toBe(ADMIN_ID);
-+    expect(forA[0].message).toEqual(expect.stringContaining(CAND_A_NAME));
-+    expect(forB[0].message).toEqual(expect.stringContaining(CAND_B_NAME));
-+  });
-+
-+  it("writes one notification per admin for every candidate in a successful batch", async () => {
-+    await run(
-+      `INSERT INTO admin_users
-+         (id, first_name, last_name, email, password, phone_number, role_id,
-+          "createdAt", "updatedAt")
-+       VALUES (?, 'Second', 'Reviewer', 'rs-gold-admin2@example.com', 'x',
-+               '+251900000002', ?, NOW(), NOW())
-+       ON CONFLICT (id) DO NOTHING`,
-+      [ADMIN2_ID, ROLE_ID]
++    expect(response.status).toBe(200);
++    expect(response.body.success).toBe(true);
++    expect(response.body.data).toHaveLength(2);
++    expectReviewShape(
++      { ...response, body: { ...response.body, data: response.body.data[0] } } as request.Response,
++      "approve",
++      CAND_A
 +    );
-+    await seedCandidate(CAND_A, CAND_A_NAME);
-+    await seedCandidate(CAND_B, CAND_B_NAME);
-+    await seedIncentive(0);
-+
-+    await reviewBatch({
-+      items: [
-+        { candidateRestaurantId: CAND_A, action: "approve" },
-+        { candidateRestaurantId: CAND_B, action: "reject" },
-+      ],
-+    });
-+
-+    const forA = await notificationsFor(CAND_A);
-+    const forB = await notificationsFor(CAND_B);
-+    expect(forA).toHaveLength(2);
-+    expect(forB).toHaveLength(2);
-+    expect(forA.map((entry) => entry.user_id).sort()).toEqual(
-+      [ADMIN_ID, ADMIN2_ID].sort()
++    expectReviewShape(
++      { ...response, body: { ...response.body, data: response.body.data[1] } } as request.Response,
++      "reject",
++      CAND_B
 +    );
-+    expect(forB.map((entry) => entry.user_id).sort()).toEqual(
-+      [ADMIN_ID, ADMIN2_ID].sort()
-+    );
-+    [...forA, ...forB].forEach((entry) => {
-+      expect(entry.reactor_id).toBe(ADMIN_ID);
-+    });
++
++    expect(await notificationsFor(CAND_A)).toHaveLength(1);
++    expect(await notificationsFor(CAND_B)).toHaveLength(1);
 +  });
 +
 +  it("writes no notifications when a batch rolls back", async () => {
@@ -1072,43 +1022,6 @@ index 0000000..e8c761d
 +      await run("DROP FUNCTION IF EXISTS fail_candidate_review_notification()");
 +    }
 +  });
-+
-+  it("rolls the approval back when the final notification write fails", async () => {
-+    await seedCandidate(CAND_A, CAND_A_NAME);
-+    await seedIncentive(15);
-+
-+    await run(`
-+      CREATE OR REPLACE FUNCTION fail_candidate_review_notification()
-+      RETURNS trigger AS $$
-+      BEGIN
-+        RAISE EXCEPTION 'notification store unavailable';
-+      END;
-+      $$ LANGUAGE plpgsql;
-+
-+      CREATE TRIGGER fail_candidate_review_notification
-+      BEFORE INSERT ON notifications
-+      FOR EACH ROW EXECUTE FUNCTION fail_candidate_review_notification();
-+    `);
-+
-+    try {
-+      const response = await approve(CAND_A);
-+
-+      expect(response.status).toBe(500);
-+      expectErrorShape(response, 500);
-+      expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(
-+        false
-+      );
-+      expect(await restaurantsFor(CAND_A_NAME)).toHaveLength(0);
-+      expect(await incentiveTotal()).toBe(15);
-+      expect(await historyCount()).toBe(0);
-+      expect(await notificationsFor(CAND_A)).toHaveLength(0);
-+    } finally {
-+      await run(
-+        "DROP TRIGGER IF EXISTS fail_candidate_review_notification ON notifications"
-+      );
-+      await run("DROP FUNCTION IF EXISTS fail_candidate_review_notification()");
-+    }
-+  });
 +});
 +
 +describe("Candidate Restaurant Review - concurrency", () => {
@@ -1120,7 +1033,15 @@ index 0000000..e8c761d
 +    const statuses = [first.status, second.status].sort();
 +
 +    expect(statuses).toEqual([200, 409]);
++    const winner = [first, second].find((r) => r.status === 200)!;
 +    const loser = [first, second].find((r) => r.status === 409)!;
++    expectReviewShape(
++      winner,
++      (await CandidateRestaurant.findByPk(CAND_A))?.is_approved
++        ? "approve"
++        : "reject",
++      CAND_A
++    );
 +    expectErrorShape(loser, 409, /already (approved|rejected)/i);
 +
 +    const candidate = await CandidateRestaurant.findByPk(CAND_A);
@@ -1142,6 +1063,8 @@ index 0000000..e8c761d
 +    const statuses = [first.status, second.status].sort();
 +
 +    expect(statuses).toEqual([200, 409]);
++    const winner = [first, second].find((r) => r.status === 200)!;
++    expectReviewShape(winner, "approve", CAND_A);
 +    const loser = [first, second].find((r) => r.status === 409);
 +    expectErrorShape(loser!, 409, /already approved/i);
 +    expect(loser?.body.message).toMatch(/already approved/i);

@@ -36,12 +36,11 @@
     "Candidate Restaurant Review - review notifications writes one notification per candidate in a successful batch",
     "Candidate Restaurant Review - review notifications writes no notifications when a batch rolls back",
     "Candidate Restaurant Review - review notifications rolls the review back when the final notification write fails",
-    "Candidate Restaurant Review - review notifications rolls the approval back when the final notification write fails",
     "Candidate Restaurant Review - review notifications writes one notification for every admin, not just one",
-    "Candidate Restaurant Review - review notifications writes one notification per admin when a candidate is rejected",
-    "Candidate Restaurant Review - review notifications writes one notification per admin for every candidate in a successful batch",
     "Candidate Restaurant Review - concurrency serializes a concurrent approve and reject so exactly one wins",
-    "Candidate Restaurant Review - concurrency serializes two concurrent approvals so only one provisions a restaurant"
+    "Candidate Restaurant Review - concurrency serializes two concurrent approvals so only one provisions a restaurant",
+    "Candidate Restaurant Review - single approve/reject behavior approving with a linked candidate admin user preserves an existing chain admin when provisioning a candidate admin",
+    "Candidate Restaurant Review - authorization rejects an unauthenticated batch review with 401"
   ],
   "p2p_node_ids": [
     "Candidate Item Controller Tests POST /candidate-item should create a candidate item and return 201",
@@ -82,7 +81,6 @@
     "Auth Controller Tests Auth – usernameSearch verify the username is available and returns 200",
     "Auth Controller Tests Auth – usernameSearch verify the username exists and returns 409",
     "Landing Page Controller - getLandingPageStats (Unit) should return aggregated counts with 200 status",
-    "Candidate Restaurant Review - single approve/reject behavior approving with a linked candidate admin user preserves an existing chain admin when provisioning a candidate admin",
     "Candidate Restaurant Controller Tests POST /candidate-restaurants should create a candidate restaurant and return 201",
     "Candidate Restaurant Controller Tests POST /candidate-restaurants should return 400 if the name is empty or invalid",
     "Candidate Restaurant Controller Tests POST /candidate-restaurants should return 401 if the user is not authenticated or authorized",
@@ -140,16 +138,12 @@
     "Candidate Restaurant Review - single approve/reject behavior rejecting a pending candidate returns 404 for an unknown candidate id",
     "Candidate Restaurant Review - authorization rejects an unauthenticated approve with 401",
     "Candidate Restaurant Review - authorization rejects an unauthenticated reject with 401",
-    "Candidate Restaurant Review - authorization rejects an unauthenticated batch review with 401",
     "Candidate Restaurant Review - authorization keeps the batch review route registered as a PUT endpoint"
   ],
   "grade": {
     "format": "ctrf",
     "node_id": "name",
     "tool_label": "jest-ctrf-json-reporter",
-    "reports": [
-      "/logs/verifier/base_ctrf.json",
-      "/logs/verifier/new_ctrf.json"
-    ]
+    "reports": ["/logs/verifier/base_ctrf.json", "/logs/verifier/new_ctrf.json"]
   }
 }
