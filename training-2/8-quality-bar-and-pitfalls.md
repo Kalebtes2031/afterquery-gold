@@ -1,0 +1,8 @@
+Quality bar & pitfalls
+Write the solution fresh. The reference solution must be authored for this task. Picking a base commit just before a change you already shipped and submitting that existing change is checked for and rejected — the solution must not be derivable from your repository's history.
+Self-contained instruction. No references to hidden tests, issue or PR links, or anything the solver can't see. If the tests check it, the instruction must specify it.
+Deterministic tests. The verifier runs repeatedly during validation; variance across identical runs reads as flaky and fails. No timing assumptions, no network, no ordering dependence.
+Green base for P2P. Every test you list as pass-to-pass must actually pass at the base commit in your environment, and a red base fails reference verification. Tests you add to reach the floor must cover behavior that already works, so they pass with and without your solution.
+Disjoint paths. Your test patch and solution patch must not touch the same files, and the test patch should only add test files.
+No internal names. Bundle content is scanned for blocked terms — nothing in it may reference this program, platform, or evaluation vocabulary. Write the task as if it were a normal ticket in your repository.
+Aim past the floors. The strongest tasks specify a coherent feature with real edge cases, 20+ fail-to-pass tests, and an instruction an engineer could implement from cold.

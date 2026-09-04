@@ -1,0 +1,178 @@
+Automated checks
+
+Required files, configuration values, patch scope, instruction bounds
+
+Sep 3, 8:42 PM PDT
+passed
+
+AI check
+
+The instruction must be written by you — not generated
+
+Sep 3, 8:42 PM PDT
+passed
+
+Originality
+
+Compared against previously submitted tasks; near-duplicates are rejected
+
+Sep 3, 8:42 PM PDT
+passed
+
+Reference verification
+
+Your reference solution must pass every run; the unchanged repository must fail every run
+
+Sep 3, 8:42 PM PDT
+passed
+
+Quality review
+
+Automated review of the full bundle — instruction/test alignment, verifier integrity
+
+Sep 3, 8:51 PM PDT
+failed
+5 blocking criteria failed.
+behavior in task description
+fail
+Every behavior the tests check must be stated in your instructions.
+
+Most tested behavior is stated clearly, but the concurrent approval test requires the exact error text "Recommendation is already rejected" for the losing no-op PUT. The instruction specifies only a 400 for repeated state and does not document that exact new string.
+
+behavior in tests
+fail
+Every behavior your instructions promise must actually be verified by the tests.
+
+The F2P tests cover nearly all requested endpoint, race, filtering, persistence, and ordering behavior. However, the instruction explicitly requires totalPages as well as count to exclude inactive users; the inactive-user tests assert count but never totalPages, and use a limit for which an inflated total would still yield the same page count.
+
+f2p p2p consistency
+fail
+The fail-to-pass and pass-to-pass lists must match the tests, the reports, and the solution.
+
+The F2P list is nonempty, disjoint from P2P, exactly matches the 34 added test names, and those files are run. However, 'the follow notification tracks the followings row writes exactly one notification for a successful follow' is vacuous as F2P: the base context already awaits Notification.create for every ordinary successful follow, and the solution does not change that behavior.
+
+implementation acceptance breadth
+fail
+The tests should accept any correct implementation, not just the reference one.
+
+Most tests permit alternative internal designs and black-box equivalent behavior. The concurrent PUT test nevertheless rejects otherwise compliant implementations by asserting the exact incidental no-op error string "Recommendation is already rejected", although the instruction promises only status 400 for that case.
+
+instruction self containedness
+fail
+Your instructions must fully specify the tested behavior with no external or hidden references.
+
+The request otherwise stands alone and relies only on the available repository, but successful grading requires the newly introduced exact no-op text "Recommendation is already rejected", which appears only in hidden tests/reference code and is not specified for the repeated-state 400 response.
+
+anti cheating measures
+pass
+Honest implementation work must be the only realistic way to pass.
+
+behavioral test surface
+pass
+Tests should assert observable behavior through public interfaces, not implementation internals.
+
+git time travel hygiene
+pass
+Repository history must end at the base commit, with nothing recoverable beyond it.
+
+hardcoded solution
+pass
+The reference solution must implement the behavior, not hardcode expected outputs.
+
+instruction behavior focused
+pass
+instruction concise
+pass
+instruction reads naturally
+pass
+report integrity
+pass
+Every graded test must appear by name in the reports, so a silenced test reads as a failure.
+
+separate verifier integrity
+pass
+Grading must happen entirely in the separate verifier and read only committed work.
+
+test deps in image
+pass
+Everything the tests need at run time must be pre-installed in the image, not installed by test.sh.
+
+tests or solution in image
+pass
+The environment the agent works in must not contain your tests or solution.
+
+environment cleanliness
+pass
+The base-commit environment should be a clean, working starting point.
+
+file reference mentioned
+pass
+Files the tests expect should be named in your instructions and actually exist.
+
+informative test structure
+pass
+The test entrypoint and suites should be readable and clearly organized.
+
+pinned dependencies
+pass
+Components that affect grading should be version-pinned.
+
+solution originality
+pass
+The reference solution must be written for this task, not recovered from repository history.
+
+structured data schema
+pass
+If the task requires structured output, the exact schema belongs in your instructions.
+
+typos
+pass
+Typos in names, paths, commands, or ids can cause avoidable failures.
+
+This check ran 15 times. Viewing:
+Attempt 15 · latest
+Attempt 14
+Attempt 13
+Attempt 12
+Attempt 11
+Attempt 10
+Attempt 9
+Attempt 8
+Attempt 7
+Attempt 6
+Attempt 5
+Attempt 4
+Attempt 3
+Attempt 2
+Attempt 1
+Quality review
+
+completed
+bLfKcfCZ18uW0V79P4fZ
+
+Duration
+
+6m
+
+Browse job directory
+
+Calibration I
+
+Automated trials confirm the task is not too easy
+
+pending
+
+Calibration II
+
+Automated trials confirm the task sits inside the target difficulty range
+
+pending
+
+Run audit
+
+Unsuccessful calibration runs are audited — environment defects fail, genuine difficulty passes
+
+pending
+Validation failed
+
+Task quality checks failed: behavior in task description, behavior in tests, f2p p2p consistency, implementation acceptance breadth, instruction self containedness.
