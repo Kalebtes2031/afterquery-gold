@@ -2,7 +2,7 @@
 
 Task: `afterquery/race-safe-restaurant-verification-review`  
 Base commit: `220d10014c0bac8a924aa5ed50a989b1bab19a94`  
-Last updated: Sep 4, 2026
+Last updated: Sep 4, 2026 (instruction trimmed to **248 words**)
 
 ---
 
@@ -68,8 +68,8 @@ Held-out tests live in:
 
 ## Fixes applied (Sep 4, 2026)
 
-### `instruction.md`
-Rewrote to a dense, self-contained contract (**296 words**, within 100–300 limit) that now explicitly states:
+### Pass 1 — align instruction, tests, and config
+Rewrote to a dense, self-contained contract that explicitly states:
 
 - Single-transaction approve/reject with full rollback on any failure (email, notifications, etc.)
 - Chain creation/reuse from name before `" | "`
@@ -80,21 +80,13 @@ Rewrote to a dense, self-contained contract (**296 words**, within 100–300 lim
 - Success shape `{"success":true,"data":{...}}` and error shape `{"success":false,"message":"...","statusCode":N}`
 - One notification per admin on success; batch endpoint validation, ordering, reward accumulation, atomic rollback
 
-### `tests/config.json`
-Realigned F2P/P2P to cover **all 47** held-out tests with zero overlap:
+Realigned `tests/config.json` F2P/P2P to cover **all 47** held-out tests (42 F2P + 5 P2P review guards + 91 existing suite).
 
-| List | Before | After |
-|---|---|---|
-| F2P | 21 | **42** |
-| P2P (existing suite + review guards) | 96 | **96** |
-| Held-out tests unaccounted for | 26 | **0** |
+### Pass 2 — word-count trim (same day)
+Restored tight developer prose and compressed `instruction.md` to **248 words** (target: under 250, max 300). Replaced an over-long / unnatural draft that had drifted above the limit.
 
-**F2P (42):** all new behavior — atomic approve/reject, batch moderation, notifications, concurrency, batch auth 401.
-
-**P2P (5 review guards + 91 existing suite):**
-- Unauthenticated approve/reject → 401
-- Unknown candidate → 404
-- Batch route registered as PUT (not GET)
+### `error.txt`
+Cleared after Pass 2 — ready to paste output from the next pipeline run.
 
 ### Unchanged (already passing)
 - `solution/solution.patch` — 485 added lines, 7 files
@@ -108,7 +100,7 @@ Realigned F2P/P2P to cover **all 47** held-out tests with zero overlap:
 | Solution lines | 485 | ≥ 459 |
 | Solution files | 7 | ≥ 4 |
 | Test lines | 922 | ≥ 596 |
-| Instruction words | 296 | 100–300 |
+| Instruction words | **248** | 100–300 (aim ≤250) |
 | F2P tests | 42 | ≥ 8 |
 | P2P tests | 96 | ≥ 50 |
 
@@ -121,7 +113,7 @@ Realigned F2P/P2P to cover **all 47** held-out tests with zero overlap:
 - [x] All 47 held-out test names pinned in F2P or P2P (disjoint)
 - [x] No vacuous F2P tests (base-already-green behavior moved to P2P)
 - [x] No hidden-only error strings — all documented in instruction
-- [x] Instruction word count within bounds
+- [x] Instruction word count within bounds (**248 words**, under 250 target)
 - [ ] Resubmit on platform and confirm quality review passes
 - [ ] Watch reference verification after F2P expansion (21 → 42); move any base-green tests to P2P if needed
 
@@ -146,3 +138,4 @@ Realigned F2P/P2P to cover **all 47** held-out tests with zero overlap:
 3. **F2P = fail at base, pass with solution.** If base already satisfies a test, it belongs in P2P.
 4. **Keep instruction and tests on one coherent feature** — do not mix unrelated endpoints in one task.
 5. **Use `readme.md`** presubmission checklist at repo root before every submit.
+6. **Aim under 250 words** — platform max is 300; dense prose near 250 reads best and avoids automated bounds issues.

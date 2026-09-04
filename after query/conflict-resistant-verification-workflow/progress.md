@@ -2,7 +2,7 @@
 
 Task: `afterquery/conflict-resistant-verification-workflow`  
 Base commit: `220d10014c0bac8a924aa5ed50a989b1bab19a94`  
-Last updated: Sep 4, 2026
+Last updated: Sep 4, 2026 (instruction trimmed to **233 words**)
 
 ---
 
@@ -72,7 +72,7 @@ Held-out tests live in:
 
 ## Fixes applied (Sep 4, 2026)
 
-### `instruction.md`
+### Pass 1 — align instruction with tests/solution
 Full rewrite to a self-contained contract aligned with tests and solution:
 
 - Three endpoints with exact paths: `/review`, `/batch-review`, `/metrics`
@@ -85,6 +85,12 @@ Full rewrite to a self-contained contract aligned with tests and solution:
 - Rejection: no restaurant/media/notifications
 - Batch validation messages including `reviews field must be a non-empty array` and `Duplicate candidate restaurant id`
 - Metrics: `pending = max(total - approved - rejected, 0)`
+
+### Pass 2 — word-count trim (same day)
+Compressed `instruction.md` to **233 words** (target: under 250, max 300) while keeping every tested contract. Removed redundant phrasing; kept exact paths, schemas, and error strings.
+
+### `error.txt`
+Cleared after Pass 2 — ready to paste output from the next pipeline run.
 
 ### `tests/config.json`
 No structural change needed — already lists all **41 F2P** tests matching the held-out suite; **91 P2P** existing-suite pins. `f2p p2p consistency` had already passed.
@@ -100,7 +106,7 @@ No structural change needed — already lists all **41 F2P** tests matching the 
 |---|---|---|
 | Solution lines | 496 | ≥ 459 |
 | Test lines | 659 | ≥ 596 |
-| Instruction words | ~280 | 100–300 |
+| Instruction words | **233** | 100–300 (aim ≤250) |
 | F2P tests | 41 | ≥ 8 |
 | P2P tests | 91 | ≥ 50 |
 
@@ -115,7 +121,7 @@ No structural change needed — already lists all **41 F2P** tests matching the 
 - [x] Solution implements the instruction contract (not a different hidden API)
 - [x] All 41 held-out tests pinned in F2P; no overlap with P2P
 - [x] Natural developer prose (no broken template sentences)
-- [x] Word count within 100–300
+- [x] Word count within bounds (**233 words**, under 250 target)
 - [ ] Resubmit on platform and confirm quality review passes
 - [ ] Proceed through calibration I/II
 
@@ -142,3 +148,4 @@ No structural change needed — already lists all **41 F2P** tests matching the 
 4. **Define schemas in the instruction** — never point to unspecified "documentation" for response shapes.
 5. **Use exact path names everywhere** — `batch-review` vs `review-batch` typos fail honest implementations.
 6. **Write natural prose** — broken template text fails `instruction reads naturally` even when requirements are complete.
+7. **Aim under 250 words** — platform max is 300; dense prose near 250 reads best and avoids automated bounds issues.
