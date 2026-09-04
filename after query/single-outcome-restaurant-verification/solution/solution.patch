@@ -359,7 +359,7 @@ new file mode 100644
 index 0000000..3baca49
 --- /dev/null
 +++ b/rateeat_backend/src/services/restaurant-claim-outcome.service.ts
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,189 @@
 +import { Op, Transaction } from "sequelize";
 +import sequelize from "../config/db";
 +import {
@@ -419,6 +419,7 @@ index 0000000..3baca49
 +    claim.status = Status.Approved;
 +    await claim.save({ transaction: tx });
 +
++    let chainVerified = false;
 +    if (claim.restaurant_chain_id) {
 +      const chain: any = await RestaurantChain.findByPk(
 +        claim.restaurant_chain_id,
@@ -427,6 +428,7 @@ index 0000000..3baca49
 +      if (chain) {
 +        chain.is_verified = true;
 +        await chain.save({ transaction: tx });
++        chainVerified = true;
 +      }
 +    }
 +
@@ -457,6 +459,8 @@ index 0000000..3baca49
 +      rejection_reason: null,
 +      reviewed_at: reviewedAt,
 +      reviewed_by: reviewerId,
++      chain_verified: chainVerified,
++      notifications_created: superAdmins.length,
 +    };
 +  }
 +
@@ -474,6 +478,8 @@ index 0000000..3baca49
 +    rejection_reason: rejectionReason ?? null,
 +    reviewed_at: reviewedAt,
 +    reviewed_by: reviewerId,
++    chain_verified: false,
++    notifications_created: 0,
 +  };
 +};
 +
@@ -548,7 +554,7 @@ new file mode 100644
 index 0000000..88a18a3
 --- /dev/null
 +++ b/rateeat_backend/src/types/restaurant-claim-outcome.types.ts
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,55 @@
 +/**
 + * Lifecycle states a restaurant claim request can be in.
 + */
@@ -578,6 +584,8 @@ index 0000000..88a18a3
 +  rejection_reason?: string | null;
 +  reviewed_at: Date;
 +  reviewed_by: string;
++  chain_verified?: boolean;
++  notifications_created?: number;
 +}
 +
 +/**

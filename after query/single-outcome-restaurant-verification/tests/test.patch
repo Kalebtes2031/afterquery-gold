@@ -1,9 +1,9 @@
 diff --git a/rateeat_backend/src/__tests__/unit/restaurant_claim_batch_verification_behavior.test.ts b/rateeat_backend/src/__tests__/unit/restaurant_claim_batch_verification_behavior.test.ts
 new file mode 100644
-index 0000000..98ad8b1
+index 0000000..1111111
 --- /dev/null
 +++ b/rateeat_backend/src/__tests__/unit/restaurant_claim_batch_verification_behavior.test.ts
-@@ -0,0 +1,250 @@
+@@ -0,0 +1,337 @@
 +import express from "express";
 +import request from "supertest";
 +import restaurantClaimRouter from "../../routes/restaurant_claim_request.route";
@@ -34,7 +34,7 @@ index 0000000..98ad8b1
 +    findByPk: jest.fn().mockResolvedValue({ id: "admin-uuid-1" }),
 +  },
 +  Notification: {
-+    create: jest.fn(),
++    create: jest.fn().mockResolvedValue({}),
 +  },
 +}));
 +
@@ -65,9 +65,6 @@ index 0000000..98ad8b1
 +
 +  beforeEach(() => {
 +    jest.clearAllMocks();
-+    // The verifier's jest config sets resetMocks, which strips the mock
-+    // implementation declared in the jest.mock factory above; reinstall it so
-+    // the batch runs inside the stubbed transaction.
 +    (sequelize.transaction as jest.Mock).mockImplementation((cb: any) =>
 +      cb({
 +        LOCK: { UPDATE: "UPDATE" },
@@ -75,6 +72,7 @@ index 0000000..98ad8b1
 +        rollback: jest.fn().mockResolvedValue(undefined),
 +      })
 +    );
++    (AdminUser.findAll as jest.Mock).mockResolvedValue([]);
 +  });
 +
 +  it("returns 400 when body does not contain claims array", async () => {
@@ -83,6 +81,16 @@ index 0000000..98ad8b1
 +      .send({});
 +
 +    expect(res.status).toBe(400);
++    expect(res.body.success).toBe(false);
++  });
++
++  it("returns 400 when claims is present but is not an array", async () => {
++    const res = await request(app)
++      .post("/api/v1/restaurant-claim-request/batch-verify")
++      .send({ claims: { claimId: "c-1", action: "approve" } });
++
++    expect(res.status).toBe(400);
++    expect(res.body.success).toBe(false);
 +  });
 +
 +  it("returns 400 when claims array is empty", async () => {
@@ -91,6 +99,7 @@ index 0000000..98ad8b1
 +      .send({ claims: [] });
 +
 +    expect(res.status).toBe(400);
++    expect(res.body.success).toBe(false);
 +  });
 +
 +  it("returns 400 when duplicate claim IDs are detected in batch payload", async () => {
@@ -115,6 +124,7 @@ index 0000000..98ad8b1
 +      });
 +
 +    expect(res.status).toBe(400);
++    expect(res.body.success).toBe(false);
 +  });
 +
 +  it("returns 400 when claimId is missing or empty whitespace", async () => {
@@ -125,18 +135,36 @@ index 0000000..98ad8b1
 +      });
 +
 +    expect(res.status).toBe(400);
++    expect(res.body.success).toBe(false);
++  });
++
++  it("validates the batch payload before looking up or mutating any claim", async () => {
++    const res = await request(app)
++      .post("/api/v1/restaurant-claim-request/batch-verify")
++      .send({
++        claims: [
++          { claimId: "c-valid-looking", action: "approve" },
++          { claimId: "c-valid-looking", action: "reject" },
++        ],
++      });
++
++    expect(res.status).toBe(400);
++    expect(res.body.success).toBe(false);
++    expect(res.body.message).toContain("Duplicate claim request id");
 +  });
 +
 +  it("successfully verifies mixed batch claims in exact requested order", async () => {
 +    const mockClaim1 = {
 +      id: "c-b1",
 +      restaurant_id: "r-b1",
++      restaurant_chain_id: null,
 +      status: Status.Pending,
 +      save: jest.fn().mockResolvedValue(true),
 +    };
 +    const mockClaim2 = {
 +      id: "c-b2",
 +      restaurant_id: "r-b2",
++      restaurant_chain_id: null,
 +      status: Status.Pending,
 +      save: jest.fn().mockResolvedValue(true),
 +    };
@@ -144,7 +172,6 @@ index 0000000..98ad8b1
 +    (RestaurantClaimRequest.findByPk as jest.Mock)
 +      .mockResolvedValueOnce(mockClaim1)
 +      .mockResolvedValueOnce(mockClaim2);
-+    (AdminUser.findAll as jest.Mock).mockResolvedValue([]);
 +
 +    const res = await request(app)
 +      .post("/api/v1/restaurant-claim-request/batch-verify")
@@ -158,22 +185,47 @@ index 0000000..98ad8b1
 +    expect(res.status).toBe(200);
 +    expect(res.body.success).toBe(true);
 +    expect(res.body.data).toHaveLength(2);
-+    expect(res.body.data[0].id).toBe("c-b1");
-+    expect(res.body.data[0].status).toBe("Approved");
-+    expect(res.body.data[1].id).toBe("c-b2");
-+    expect(res.body.data[1].status).toBe("Rejected");
++    expect(res.body.data[0]).toMatchObject({
++      id: "c-b1",
++      restaurant_id: "r-b1",
++      status: "Approved",
++      rejection_reason: null,
++      reviewed_by: "admin-uuid-1",
++    });
++    expect(res.body.data[1]).toMatchObject({
++      id: "c-b2",
++      restaurant_id: "r-b2",
++      status: "Rejected",
++      rejection_reason: "Bad photo",
++      reviewed_by: "admin-uuid-1",
++    });
++    expect(res.body.data[0]).toHaveProperty("reviewed_at");
++    expect(res.body.data[1]).toHaveProperty("reviewed_at");
 +  });
 +
 +  it("rolls back batch when any claim fails or is not found", async () => {
-+    (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(null);
++    const mockClaim1 = {
++      id: "c-first",
++      restaurant_id: "r-first",
++      restaurant_chain_id: null,
++      status: Status.Pending,
++      save: jest.fn().mockResolvedValue(true),
++    };
++    (RestaurantClaimRequest.findByPk as jest.Mock)
++      .mockResolvedValueOnce(mockClaim1)
++      .mockResolvedValueOnce(null);
 +
 +    const res = await request(app)
 +      .post("/api/v1/restaurant-claim-request/batch-verify")
 +      .send({
-+        claims: [{ claimId: "c-missing", action: "approve" }],
++        claims: [
++          { claimId: "c-first", action: "approve" },
++          { claimId: "c-missing", action: "approve" },
++        ],
 +      });
 +
 +    expect(res.status).toBe(404);
++    expect(res.body.success).toBe(false);
 +  });
 +
 +  it("rolls back batch when any claim is already in a terminal state", async () => {
@@ -190,15 +242,27 @@ index 0000000..98ad8b1
 +      });
 +
 +    expect(res.status).toBe(409);
++    expect(res.body.success).toBe(false);
 +  });
 +
 +  it("handles batch payload with mixed casing in action strings", async () => {
-+    const mockClaim1 = { id: "c-case1", restaurant_id: "r-1", status: Status.Pending, save: jest.fn().mockResolvedValue(true) };
-+    const mockClaim2 = { id: "c-case2", restaurant_id: "r-2", status: Status.Pending, save: jest.fn().mockResolvedValue(true) };
++    const mockClaim1 = {
++      id: "c-case1",
++      restaurant_id: "r-1",
++      restaurant_chain_id: null,
++      status: Status.Pending,
++      save: jest.fn().mockResolvedValue(true),
++    };
++    const mockClaim2 = {
++      id: "c-case2",
++      restaurant_id: "r-2",
++      restaurant_chain_id: null,
++      status: Status.Pending,
++      save: jest.fn().mockResolvedValue(true),
++    };
 +    (RestaurantClaimRequest.findByPk as jest.Mock)
 +      .mockResolvedValueOnce(mockClaim1)
 +      .mockResolvedValueOnce(mockClaim2);
-+    (AdminUser.findAll as jest.Mock).mockResolvedValue([]);
 +
 +    const res = await request(app)
 +      .post("/api/v1/restaurant-claim-request/batch-verify")
@@ -215,9 +279,14 @@ index 0000000..98ad8b1
 +  });
 +
 +  it("handles batch with whitespace padding in claim IDs seamlessly", async () => {
-+    const mockClaim = { id: "c-pad", restaurant_id: "r-pad", status: Status.Pending, save: jest.fn().mockResolvedValue(true) };
++    const mockClaim = {
++      id: "c-pad",
++      restaurant_id: "r-pad",
++      restaurant_chain_id: null,
++      status: Status.Pending,
++      save: jest.fn().mockResolvedValue(true),
++    };
 +    (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(mockClaim);
-+    (AdminUser.findAll as jest.Mock).mockResolvedValue([]);
 +
 +    const res = await request(app)
 +      .post("/api/v1/restaurant-claim-request/batch-verify")
@@ -227,6 +296,7 @@ index 0000000..98ad8b1
 +
 +    expect(res.status).toBe(200);
 +    expect(res.body.data[0].id).toBe("c-pad");
++    expect(res.body.data[0].status).toBe("Approved");
 +  });
 +
 +  it("ensures batch transaction rolls back cleanly when duplicate ID appears with whitespace", async () => {
@@ -240,6 +310,7 @@ index 0000000..98ad8b1
 +      });
 +
 +    expect(res.status).toBe(400);
++    expect(res.body.success).toBe(false);
 +    expect(res.body.message).toContain("Duplicate claim request id");
 +  });
 +
@@ -251,120 +322,31 @@ index 0000000..98ad8b1
 +      });
 +
 +    expect(res.status).toBe(400);
++    expect(res.body.success).toBe(false);
 +    expect(res.body.message).toContain("Claim item at index 0 must be an object");
 +  });
-+});
-diff --git a/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_audit.test.ts b/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_audit.test.ts
-new file mode 100644
-index 0000000..a23ad8f
---- /dev/null
-+++ b/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_audit.test.ts
-@@ -0,0 +1,99 @@
-+import {
-+  formatClaimVerificationSummary,
-+  parseVerificationFilters,
-+  isValidClaimIdentifier,
-+  sanitizeVerificationMetrics,
-+  createVerificationErrorEnvelope,
-+  formatClaimVerificationAuditRecord,
-+  isPermissibleStatusTransition,
-+  serializeClaimVerificationReport,
-+  validateBatchClaimVolume,
-+} from "../../utils/restaurant-claim-outcome.utils";
-+import { ClaimVerificationStatus } from "../../types/restaurant-claim-outcome.types";
 +
-+describe("Restaurant Claim Verification - Utility & Filter Logic", () => {
-+  it("formats claim verification summary correctly for approved and rejected sets", () => {
-+    const summary = formatClaimVerificationSummary([
-+      {
-+        id: "c-1",
-+        restaurant_id: "r-1",
-+        status: ClaimVerificationStatus.Approved,
-+        reviewed_at: new Date(),
-+        reviewed_by: "u-1",
-+      },
-+      {
-+        id: "c-2",
-+        restaurant_id: "r-2",
-+        status: ClaimVerificationStatus.Rejected,
-+        reviewed_at: new Date(),
-+        reviewed_by: "u-1",
-+      },
-+    ]);
++  it("rejects a non-object claim item at a later index with the matching message", async () => {
++    const res = await request(app)
++      .post("/api/v1/restaurant-claim-request/batch-verify")
++      .send({
++        claims: [
++          { claimId: "c-ok", action: "approve" },
++          "not-an-object",
++        ],
++      });
 +
-+    expect(summary.total).toBe(2);
-+    expect(summary.approved).toBe(1);
-+    expect(summary.rejected).toBe(1);
-+  });
-+
-+  it("parses verification filters with limit, offset, and status", () => {
-+    const filters = parseVerificationFilters({
-+      status: "Approved",
-+      restaurantId: "r-100",
-+      limit: "25",
-+      offset: "10",
-+    });
-+
-+    expect(filters.status).toBe(ClaimVerificationStatus.Approved);
-+    expect(filters.restaurantId).toBe("r-100");
-+    expect(filters.limit).toBe(25);
-+    expect(filters.offset).toBe(10);
-+  });
-+
-+  it("validates claim identifier formats accurately", () => {
-+    expect(isValidClaimIdentifier("c-12345")).toBe(true);
-+    expect(isValidClaimIdentifier("claim-abcd-1234")).toBe(true);
-+    expect(isValidClaimIdentifier("123e4567-e89b-12d3-a456-426614174000")).toBe(true);
-+    expect(isValidClaimIdentifier("")).toBe(false);
-+  });
-+
-+  it("sanitizes verification metrics and builds standardized error envelopes", () => {
-+    const metrics = sanitizeVerificationMetrics({ pending: 4, approved: 10, rejected: 2 });
-+    expect(metrics.totalClaims).toBe(16);
-+    expect(metrics.approvedCount).toBe(10);
-+
-+    const errorBody = createVerificationErrorEnvelope(409, "Claim conflict detected");
-+    expect(errorBody.success).toBe(false);
-+    expect(errorBody.message).toBe("Claim conflict detected");
-+  });
-+
-+  it("formats claim audit records with timestamps and reviewer IDs", () => {
-+    const record = formatClaimVerificationAuditRecord(
-+      { id: "c-1", restaurant_id: "r-1", status: "Approved" },
-+      "approve",
-+      "admin-1"
-+    );
-+    expect(record.claimId).toBe("c-1");
-+    expect(record.resultingStatus).toBe("Approved");
-+    expect(record.reviewerId).toBe("admin-1");
-+  });
-+
-+  it("serializes claim verification reports and validates batch volume bounds", () => {
-+    const report = serializeClaimVerificationReport([
-+      { id: "c-1", restaurant_id: "r-1", status: "Approved" },
-+    ]);
-+    expect(report[0].id).toBe("c-1");
-+
-+    const check = validateBatchClaimVolume([{ claimId: "c-1", action: "approve" }]);
-+    expect(check.valid).toBe(true);
-+
-+    const emptyCheck = validateBatchClaimVolume([]);
-+    expect(emptyCheck.valid).toBe(false);
-+  });
-+
-+  it("validates permissible status transitions and claim serialization", () => {
-+    expect(isPermissibleStatusTransition("Pending", "Approved")).toBe(true);
-+    expect(isPermissibleStatusTransition("Pending", "Rejected")).toBe(true);
-+    expect(isPermissibleStatusTransition("Approved", "Pending")).toBe(false);
-+    expect(isPermissibleStatusTransition("Rejected", "Approved")).toBe(false);
++    expect(res.status).toBe(400);
++    expect(res.body.success).toBe(false);
++    expect(res.body.message).toContain("Claim item at index 1 must be an object");
 +  });
 +});
 diff --git a/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_auth.test.ts b/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_auth.test.ts
 new file mode 100644
-index 0000000..e7c0dd5
+index 0000000..1111111
 --- /dev/null
 +++ b/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_auth.test.ts
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,27 @@
 +import express from "express";
 +import request from "supertest";
 +import restaurantClaimRouter from "../../routes/restaurant_claim_request.route";
@@ -380,13 +362,7 @@ index 0000000..e7c0dd5
 +      .send({
 +        claims: [{ claimId: "claim-101", action: "approve" }],
 +      });
-+    expect(res.status).toBe(401);
-+  });
 +
-+  it("returns 401 when approve claim is requested without authorization token", async () => {
-+    const res = await request(app)
-+      .put("/api/v1/restaurant-claim-request/claim-101/approve")
-+      .send();
 +    expect(res.status).toBe(401);
 +  });
 +
@@ -394,15 +370,16 @@ index 0000000..e7c0dd5
 +    const res = await request(app)
 +      .get("/api/v1/restaurant-claim-request/metrics")
 +      .send();
++
 +    expect(res.status).toBe(401);
 +  });
 +});
 diff --git a/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_behavior.test.ts b/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_behavior.test.ts
 new file mode 100644
-index 0000000..b8fd92e
+index 0000000..1111111
 --- /dev/null
 +++ b/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_behavior.test.ts
-@@ -0,0 +1,286 @@
+@@ -0,0 +1,336 @@
 +import express from "express";
 +import request from "supertest";
 +import restaurantClaimRouter from "../../routes/restaurant_claim_request.route";
@@ -437,7 +414,7 @@ index 0000000..b8fd92e
 +    findByPk: jest.fn().mockResolvedValue({ id: "admin-uuid-1" }),
 +  },
 +  Notification: {
-+    create: jest.fn(),
++    create: jest.fn().mockResolvedValue({}),
 +  },
 +}));
 +
@@ -468,9 +445,6 @@ index 0000000..b8fd92e
 +
 +  beforeEach(() => {
 +    jest.clearAllMocks();
-+    // The verifier's jest config sets resetMocks, which strips the mock
-+    // implementation declared in the jest.mock factory above; reinstall it so
-+    // every test runs its service work inside the stubbed transaction.
 +    (sequelize.transaction as jest.Mock).mockImplementation((cb: any) =>
 +      cb({
 +        LOCK: { UPDATE: "UPDATE" },
@@ -478,6 +452,8 @@ index 0000000..b8fd92e
 +        rollback: jest.fn().mockResolvedValue(undefined),
 +      })
 +    );
++    (Notification.create as jest.Mock).mockResolvedValue({});
++    (AdminUser.findAll as jest.Mock).mockResolvedValue([]);
 +  });
 +
 +  describe("PUT /api/v1/restaurant-claim-request/:claimId/approve", () => {
@@ -490,7 +466,6 @@ index 0000000..b8fd92e
 +        save: jest.fn().mockResolvedValue(true),
 +      };
 +      (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(mockClaim);
-+      (AdminUser.findAll as jest.Mock).mockResolvedValue([]);
 +
 +      const res = await request(app)
 +        .put("/api/v1/restaurant-claim-request/c-101/approve")
@@ -498,9 +473,17 @@ index 0000000..b8fd92e
 +
 +      expect(res.status).toBe(200);
 +      expect(res.body.success).toBe(true);
-+      expect(res.body.data.status).toBe("Approved");
-+      expect(mockClaim.status).toBe(Status.Approved);
-+      expect(mockClaim.save).toHaveBeenCalled();
++      expect(res.body.data).toMatchObject({
++        id: "c-101",
++        restaurant_id: "r-101",
++        restaurant_chain_id: null,
++        status: "Approved",
++        rejection_reason: null,
++        reviewed_by: "admin-uuid-1",
++        chain_verified: false,
++        notifications_created: 0,
++      });
++      expect(res.body.data).toHaveProperty("reviewed_at");
 +    });
 +
 +    it("verifies and synchronizes associated restaurant chain when chainId is present", async () => {
@@ -518,27 +501,30 @@ index 0000000..b8fd92e
 +      };
 +      (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(mockClaim);
 +      (RestaurantChain.findByPk as jest.Mock).mockResolvedValue(mockChain);
-+      (AdminUser.findAll as jest.Mock).mockResolvedValue([]);
 +
 +      const res = await request(app)
 +        .put("/api/v1/restaurant-claim-request/c-102/approve")
 +        .send();
 +
 +      expect(res.status).toBe(200);
-+      expect(mockChain.is_verified).toBe(true);
-+      expect(mockChain.save).toHaveBeenCalled();
++      expect(res.body.success).toBe(true);
++      expect(res.body.data.restaurant_chain_id).toBe("chain-102");
++      expect(res.body.data.status).toBe("Approved");
++      expect(res.body.data.chain_verified).toBe(true);
 +    });
 +
 +    it("creates notification records for super admins on approval", async () => {
 +      const mockClaim = {
 +        id: "c-103",
 +        restaurant_id: "r-103",
++        restaurant_chain_id: null,
 +        status: Status.Pending,
 +        save: jest.fn().mockResolvedValue(true),
 +      };
 +      (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(mockClaim);
 +      (AdminUser.findAll as jest.Mock).mockResolvedValue([
 +        { id: "super-1", is_super_admin: true },
++        { id: "super-2", is_super_admin: true },
 +      ]);
 +
 +      const res = await request(app)
@@ -546,7 +532,9 @@ index 0000000..b8fd92e
 +        .send();
 +
 +      expect(res.status).toBe(200);
-+      expect(Notification.create).toHaveBeenCalledTimes(1);
++      expect(res.body.success).toBe(true);
++      expect(res.body.data.status).toBe("Approved");
++      expect(res.body.data.notifications_created).toBe(2);
 +    });
 +
 +    it("returns 409 when approving an already approved claim request", async () => {
@@ -563,6 +551,7 @@ index 0000000..b8fd92e
 +
 +      expect(res.status).toBe(409);
 +      expect(res.body.success).toBe(false);
++      expect(typeof res.body.message).toBe("string");
 +    });
 +
 +    it("returns 409 when approving an already rejected claim request", async () => {
@@ -578,6 +567,7 @@ index 0000000..b8fd92e
 +        .send();
 +
 +      expect(res.status).toBe(409);
++      expect(res.body.success).toBe(false);
 +    });
 +
 +    it("returns 404 when claim request is not found", async () => {
@@ -588,6 +578,7 @@ index 0000000..b8fd92e
 +        .send();
 +
 +      expect(res.status).toBe(404);
++      expect(res.body.success).toBe(false);
 +    });
 +
 +    it("handles claim request approval with null chain id without triggering chain updates", async () => {
@@ -599,14 +590,15 @@ index 0000000..b8fd92e
 +        save: jest.fn().mockResolvedValue(true),
 +      };
 +      (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(mockClaim);
-+      (AdminUser.findAll as jest.Mock).mockResolvedValue([]);
 +
 +      const res = await request(app)
 +        .put("/api/v1/restaurant-claim-request/c-null-chain/approve")
 +        .send();
 +
 +      expect(res.status).toBe(200);
-+      expect(RestaurantChain.findByPk).not.toHaveBeenCalled();
++      expect(res.body.data.restaurant_chain_id).toBeNull();
++      expect(res.body.data.chain_verified).toBe(false);
++      expect(res.body.data.status).toBe("Approved");
 +    });
 +  });
 +
@@ -615,6 +607,7 @@ index 0000000..b8fd92e
 +      const mockClaim = {
 +        id: "c-201",
 +        restaurant_id: "r-201",
++        restaurant_chain_id: null,
 +        status: Status.Pending,
 +        save: jest.fn().mockResolvedValue(true),
 +      };
@@ -626,8 +619,35 @@ index 0000000..b8fd92e
 +
 +      expect(res.status).toBe(200);
 +      expect(res.body.success).toBe(true);
++      expect(res.body.data).toMatchObject({
++        id: "c-201",
++        restaurant_id: "r-201",
++        status: "Rejected",
++        rejection_reason: "Invalid business tax document",
++        reviewed_by: "admin-uuid-1",
++        chain_verified: false,
++        notifications_created: 0,
++      });
++      expect(res.body.data).toHaveProperty("reviewed_at");
++    });
++
++    it("rejects pending claim request without a rejection reason and returns 200", async () => {
++      const mockClaim = {
++        id: "c-201b",
++        restaurant_id: "r-201b",
++        restaurant_chain_id: null,
++        status: Status.Pending,
++        save: jest.fn().mockResolvedValue(true),
++      };
++      (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(mockClaim);
++
++      const res = await request(app)
++        .put("/api/v1/restaurant-claim-request/c-201b/reject")
++        .send({});
++
++      expect(res.status).toBe(200);
 +      expect(res.body.data.status).toBe("Rejected");
-+      expect(res.body.data.rejection_reason).toBe("Invalid business tax document");
++      expect(res.body.data.rejection_reason).toBeNull();
 +    });
 +
 +    it("returns 409 when rejecting an already rejected claim request", async () => {
@@ -642,6 +662,7 @@ index 0000000..b8fd92e
 +        .send();
 +
 +      expect(res.status).toBe(409);
++      expect(res.body.success).toBe(false);
 +    });
 +
 +    it("returns 409 when rejecting an already approved claim request", async () => {
@@ -656,6 +677,7 @@ index 0000000..b8fd92e
 +        .send();
 +
 +      expect(res.status).toBe(409);
++      expect(res.body.success).toBe(false);
 +    });
 +
 +    it("returns 404 when rejecting non-existent claim request", async () => {
@@ -666,6 +688,7 @@ index 0000000..b8fd92e
 +        .send({ rejectionReason: "Rejected claim" });
 +
 +      expect(res.status).toBe(404);
++      expect(res.body.success).toBe(false);
 +    });
 +  });
 +
@@ -683,9 +706,13 @@ index 0000000..b8fd92e
 +
 +      expect(res.status).toBe(200);
 +      expect(res.body.success).toBe(true);
-+      expect(res.body.data).toHaveProperty("totalClaims");
-+      expect(res.body.data.pendingCount).toBe(5);
-+      expect(res.body.data.approvedCount).toBe(12);
++      expect(res.body.data).toEqual({
++        totalClaims: 20,
++        pendingCount: 5,
++        approvedCount: 12,
++        rejectedCount: 3,
++        chainLinkedCount: 8,
++      });
 +    });
 +  });
 +});

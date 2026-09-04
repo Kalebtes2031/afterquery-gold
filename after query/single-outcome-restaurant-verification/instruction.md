@@ -1,33 +1,13 @@
-Reliable Restaurant Claim Verification Workflow
+Tighten restaurant claim verification so Pending claims reach one terminal outcome, stay aligned with linked chains, and support atomic batch review.
 
-Update restaurant claim verification to enforce strict terminal state transitions, chain synchronization, and atomic batch moderation.
+`PUT /api/v1/restaurant-claim-request/:claimId/approve` and `PUT /api/v1/restaurant-claim-request/:claimId/reject` return HTTP 200 `{ "success": true, "message": "...", "data": { "id", "restaurant_id", "restaurant_chain_id", "status", "rejection_reason", "reviewed_at", "reviewed_by" } }` with `status` exactly `"Approved"` or `"Rejected"`. Unknown ids return 404. Already Approved or Rejected claims return 409 `{ "success": false, "message": "..." }`. Reject may send optional `rejectionReason`, echoed on `data.rejection_reason`. Each single transition uses one transaction and rolls back on failure.
 
-- State Transitions & Guards:
-  `PUT /api/v1/restaurant-claim-request/:claimId/approve` and `PUT /api/v1/restaurant-claim-request/:claimId/reject` transition a Pending claim to Approved or Rejected and respond with HTTP 200 `{ "success": true, "message": "...", "data": { ... } }`, where `data` reports the claim's `id`, `restaurant_id`, `restaurant_chain_id`, resulting `status` (`"Approved"` / `"Rejected"`), `rejection_reason`, and the reviewer.
-  An unknown `claimId` returns HTTP 404.
-  Once in a terminal state, subsequent approval or rejection attempts must return HTTP 409 Conflict with `{ "success": false, "message": "..." }`.
-  Rejecting accepts an optional `rejectionReason` in the request body; when supplied it is echoed back on `data.rejection_reason`.
-  Each single transition runs in its own transaction and rolls back completely on any failure.
+On approve, when `restaurant_chain_id` is set, set that chain's `is_verified` to true in the same transaction; a null chain id skips chain work. Write a `Notification` with category `RestaurantClaim` for every super-admin `AdminUser`. Approve `data` also includes `chain_verified` (true when a linked chain was verified, else false) and `notifications_created` (count of those notifications).
 
-- Side Effects on Approval:
-  When approving a claim with a `restaurant_chain_id`, set the associated `RestaurantChain.is_verified = true` in the same transaction. A claim with no `restaurant_chain_id` triggers no chain lookup or update.
-  Create a `Notification` for every super admin user (`AdminUser` with `is_super_admin: true`) with category `RestaurantClaim`.
+Add `POST /api/v1/restaurant-claim-request/batch-verify` accepting `{ "claims": [ { "claimId", "action", "rejectionReason?" } ] }`. Actions are `"approve"` or `"reject"` (case-insensitive); trim `claimId` values. Success is 200 `{ "success": true, "message": "...", "data": [ ... ] }` with the same per-claim `data` shape as the single routes, in request order. Missing, non-array, or empty `claims` returns 400. A non-object entry returns 400 whose message contains `Claim item at index <n> must be an object`. Blank `claimId` or unknown `action` returns 400. Duplicate trimmed ids return 400 with message containing `Duplicate claim request id`. Validate the payload before any mutation, then run the batch in one transaction so any 404 or 409 rolls earlier changes back.
 
-- Batch Verification Endpoint:
-  Add `POST /api/v1/restaurant-claim-request/batch-verify` accepting `{ "claims": [...] }`. Each item requires `claimId` and `action` (`"approve"` or `"reject"`, case-insensitive), with an optional `rejectionReason`.
-  `claimId` values are trimmed before use.
-  Return HTTP 200 with `{ "success": true, "message": "...", "data": [...] }` containing the verified claim records in the exact order requested.
+Add `GET /api/v1/restaurant-claim-request/metrics` returning 200 with `data` fields `totalClaims`, `pendingCount`, `approvedCount`, `rejectedCount`, and `chainLinkedCount`.
 
-- Strict Validation & Atomic Rollback:
-  Missing, non-array, or empty `claims` returns HTTP 400.
-  A non-object entry returns HTTP 400 with a message of the form `Claim item at index <n> must be an object`.
-  A missing or blank `claimId`, or an unknown `action`, returns HTTP 400.
-  Duplicate `claimId` values in a batch (compared after trimming) return HTTP 400 with a message containing `Duplicate claim request id`.
-  Process the whole batch in one transaction: if any claim fails, is not found (HTTP 404), or conflicts with an existing terminal state (HTTP 409), roll the entire batch back.
-
-- Verification Metrics:
-  Add `GET /api/v1/restaurant-claim-request/metrics` returning HTTP 200 `{ "success": true, "message": "...", "data": { ... } }` with aggregated counts: `totalClaims`, `pendingCount`, `approvedCount`, `rejectedCount`, and `chainLinkedCount`.
-
-Keep existing authorization and error-handling conventions: the approve, reject, batch-verify, and metrics routes stay behind admin authorization and return HTTP 401 when the caller is unauthenticated.
+Approve, reject, batch-verify, and metrics require admin auth and return 401 when unauthenticated.
 
 IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.
