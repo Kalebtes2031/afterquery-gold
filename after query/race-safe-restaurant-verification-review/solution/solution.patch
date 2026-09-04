@@ -701,7 +701,7 @@ new file mode 100644
 index 0000000..77cf30a
 --- /dev/null
 +++ b/rateeat_backend/src/utils/candidate-restaurant-review.utils.ts
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,109 @@
 +import { HttpError } from "./error-response.utils";
 +import {
 +  CANDIDATE_RESTAURANT_CHAIN_NAME_SEPARATOR,
@@ -781,13 +781,25 @@ index 0000000..77cf30a
 +      );
 +    }
 +
++    const normalizedId = candidateRestaurantId.trim();
++
++    // Reject nonempty but unusable ids up front so Postgres never sees a
++    // malformed UUID and turns the request into a 500.
++    if (
++      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
++        normalizedId
++      )
++    ) {
++      throw badRequestError(
++        CANDIDATE_RESTAURANT_REVIEW_MESSAGES.BATCH_ITEM_INVALID
++      );
++    }
++
 +    if (!isReviewAction(action)) {
 +      throw badRequestError(
 +        CANDIDATE_RESTAURANT_REVIEW_MESSAGES.BATCH_ACTION_INVALID
 +      );
 +    }
-+
-+    const normalizedId = candidateRestaurantId.trim();
 +
 +    if (seen.has(normalizedId)) {
 +      throw badRequestError(

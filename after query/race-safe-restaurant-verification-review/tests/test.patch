@@ -105,7 +105,7 @@ new file mode 100644
 index 0000000..243c271
 --- /dev/null
 +++ b/rateeat_backend/src/__tests__/unit/candidate_restaurant_review_behavior.test.ts
-@@ -0,0 +1,967 @@
+@@ -0,0 +1,1016 @@
 +import express from "express";
 +import request from "supertest";
 +
@@ -680,6 +680,20 @@ index 0000000..243c271
 +      expect(response.status).toBe(400);
 +      expectErrorShape(response, 400);
 +      expect(response.body.message).toMatch(BATCH_PAYLOAD_ERROR);
++    });
++
++    it("returns 400 when candidateRestaurantId is a malformed nonempty string", async () => {
++      await seedCandidate(CAND_A, CAND_A_NAME);
++      const response = await reviewBatch({
++        items: [{ candidateRestaurantId: "not-a-uuid", action: "approve" }],
++      });
++      expect(response.status).toBe(400);
++      expectErrorShape(response, 400);
++      expect(response.body.message).toMatch(BATCH_PAYLOAD_ERROR);
++      // Must not reach the database with an unusable id (which can surface as 500).
++      expect((await CandidateRestaurant.findByPk(CAND_A))?.is_approved).toBe(
++        false
++      );
 +    });
 +
 +    it("returns 400 when an action is not approve or reject", async () => {

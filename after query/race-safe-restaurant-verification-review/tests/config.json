@@ -15,7 +15,8 @@
     "Candidate Restaurant Review - concurrency serializes a concurrent approve and reject so exactly one wins",
     "Candidate Restaurant Review - concurrency serializes two concurrent approvals so only one provisions a restaurant",
     "Candidate Restaurant Review - authorization rejects an unauthenticated batch review with 401",
-    "Candidate Restaurant Review - authorization keeps the batch review route registered as a PUT endpoint"
+    "Candidate Restaurant Review - authorization keeps the batch review route registered as a PUT endpoint",
+    "Candidate Restaurant Review - batch moderation payload validation returns 400 when candidateRestaurantId is a malformed nonempty string"
   ],
   "p2p_node_ids": [
     "Candidate Item Controller Tests POST /candidate-item should create a candidate item and return 201",
