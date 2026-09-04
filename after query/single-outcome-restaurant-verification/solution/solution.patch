@@ -204,21 +204,6 @@ index bb222e5..ca0c45e 100644
 +  batchVerifyRestaurantClaimRequests,
 +  getRestaurantClaimVerificationMetrics,
  };
-diff --git a/rateeat_backend/src/middlewares/auth.ts b/rateeat_backend/src/middlewares/auth.ts
-index ebf5ff5..221696f 100644
---- a/rateeat_backend/src/middlewares/auth.ts
-+++ b/rateeat_backend/src/middlewares/auth.ts
-@@ -97,4 +97,9 @@ const optionalAuth = async (
-   }
- };
- 
--export { protectRoute, protectRouteForAdmin, optionalAuth };
-+// Admin-guarded authentication for restaurant claim verification routes.
-+// Kept as an alias so these routes follow the same convention as the rest of
-+// the admin surface.
-+const authenticateToken = protectRouteForAdmin;
-+
-+export { protectRoute, protectRouteForAdmin, optionalAuth, authenticateToken };
 diff --git a/rateeat_backend/src/models/Feedback/Notification.ts b/rateeat_backend/src/models/Feedback/Notification.ts
 index 77206ca..746a38f 100644
 --- a/rateeat_backend/src/models/Feedback/Notification.ts
@@ -290,8 +275,7 @@ index 94fc6ee..643ac6e 100644
 +++ b/rateeat_backend/src/routes/restaurant_claim_request.route.ts
 @@ -1,11 +1,13 @@
  import express from "express";
--import { protectRouteForAdmin } from "../middlewares/auth";
-+import { authenticateToken } from "../middlewares/auth";
+ import { protectRouteForAdmin } from "../middlewares/auth";
  
  import {
    approveRestaurantClaimRequest,
@@ -315,13 +299,13 @@ index 94fc6ee..643ac6e 100644
  
 +router.post(
 +  "/batch-verify",
-+  authenticateToken,
++  protectRouteForAdmin,
 +  batchVerifyRestaurantClaimRequests
 +);
 +
 +router.get(
 +  "/metrics",
-+  authenticateToken,
++  protectRouteForAdmin,
 +  getRestaurantClaimVerificationMetrics
 +);
 +
@@ -332,8 +316,7 @@ index 94fc6ee..643ac6e 100644
  
  router.get(
    "/",
--  protectRouteForAdmin,
-+  authenticateToken,
+   protectRouteForAdmin,
    validateRequest(getRestaurantClaimRequestQuerySchema, "query"),
    getRestaurantClaimRequest
  );
@@ -342,7 +325,7 @@ index 94fc6ee..643ac6e 100644
    "/:claimId/approve",
 -  protectRouteForAdmin,
 -  validateRequest(approveRestaurantClaimRequestParamsSchema, "params"),
-+  authenticateToken,
++  protectRouteForAdmin,
    approveRestaurantClaimRequest
  );
  
@@ -350,7 +333,7 @@ index 94fc6ee..643ac6e 100644
    "/:claimId/reject",
 -  protectRouteForAdmin,
 -  validateRequest(rejectRestaurantClaimRequestParamsSchema, "params"),
-+  authenticateToken,
++  protectRouteForAdmin,
    rejectRestaurantClaimRequest
  );
  

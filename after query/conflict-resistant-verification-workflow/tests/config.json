@@ -25,6 +25,8 @@
     "Candidate Restaurant Verification - Batch Review Endpoint returns 400 when the reviews array is empty",
     "Candidate Restaurant Verification - Batch Review Endpoint returns 400 when a review entry is not an object",
     "Candidate Restaurant Verification - Batch Review Endpoint returns 400 when a review entry has no candidateRestaurantId",
+    "Candidate Restaurant Verification - Batch Review Endpoint returns 400 when candidateRestaurantId is not a string",
+    "Candidate Restaurant Verification - Batch Review Endpoint returns 400 when candidateRestaurantId is whitespace only",
     "Candidate Restaurant Verification - Batch Review Endpoint returns 400 when a review entry has an unknown action",
     "Candidate Restaurant Verification - Batch Review Endpoint returns 400 with 'Duplicate candidate restaurant id' for a repeated id",
     "Candidate Restaurant Verification - Batch Review Endpoint detects duplicate ids that differ only by surrounding whitespace",

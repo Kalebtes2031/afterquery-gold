@@ -1,6 +1,8 @@
 {
   "base_commit": "220d10014c0bac8a924aa5ed50a989b1bab19a94",
   "f2p_node_ids": [
+    "Restaurant Claim Verification - Route Authorization returns 401 when approve is requested without authorization token",
+    "Restaurant Claim Verification - Route Authorization returns 401 when reject is requested without authorization token",
     "Restaurant Claim Verification - Route Authorization returns 401 when batch-verify is requested without authorization token",
     "Restaurant Claim Verification - Route Authorization returns 401 when metrics endpoint is requested without authorization token",
     "Restaurant Claim Verification - Public HTTP Endpoint Behavior PUT /api/v1/restaurant-claim-request/:claimId/approve approves pending claim request and returns 200 with approved data",
@@ -10,6 +12,7 @@
     "Restaurant Claim Verification - Public HTTP Endpoint Behavior PUT /api/v1/restaurant-claim-request/:claimId/approve returns 409 when approving an already rejected claim request",
     "Restaurant Claim Verification - Public HTTP Endpoint Behavior PUT /api/v1/restaurant-claim-request/:claimId/approve returns 404 when claim request is not found",
     "Restaurant Claim Verification - Public HTTP Endpoint Behavior PUT /api/v1/restaurant-claim-request/:claimId/approve handles claim request approval with null chain id without triggering chain updates",
+    "Restaurant Claim Verification - Public HTTP Endpoint Behavior PUT /api/v1/restaurant-claim-request/:claimId/approve rolls the approval back when notifying super-admins fails",
     "Restaurant Claim Verification - Public HTTP Endpoint Behavior PUT /api/v1/restaurant-claim-request/:claimId/reject rejects pending claim request with rejection reason and returns 200",
     "Restaurant Claim Verification - Public HTTP Endpoint Behavior PUT /api/v1/restaurant-claim-request/:claimId/reject rejects pending claim request without a rejection reason and returns 200",
     "Restaurant Claim Verification - Public HTTP Endpoint Behavior PUT /api/v1/restaurant-claim-request/:claimId/reject returns 409 when rejecting an already rejected claim request",
@@ -28,7 +31,7 @@
     "Restaurant Claim Verification - Batch Verification Endpoint rolls back batch when any claim is already in a terminal state",
     "Restaurant Claim Verification - Batch Verification Endpoint handles batch payload with mixed casing in action strings",
     "Restaurant Claim Verification - Batch Verification Endpoint handles batch with whitespace padding in claim IDs seamlessly",
-    "Restaurant Claim Verification - Batch Verification Endpoint ensures batch transaction rolls back cleanly when duplicate ID appears with whitespace",
+    "Restaurant Claim Verification - Batch Verification Endpoint returns 400 when duplicate claim IDs differ only by whitespace",
     "Restaurant Claim Verification - Batch Verification Endpoint rejects batch verification when claim array contains null elements",
     "Restaurant Claim Verification - Batch Verification Endpoint rejects a non-object claim item at a later index with the matching message"
   ],

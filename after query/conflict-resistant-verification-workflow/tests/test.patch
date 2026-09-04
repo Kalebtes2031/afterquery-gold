@@ -82,7 +82,7 @@ new file mode 100644
 index 0000000..3f03480
 --- /dev/null
 +++ b/rateeat_backend/src/__tests__/unit/candidate_restaurant_verification_behavior.test.ts
-@@ -0,0 +1,735 @@
+@@ -0,0 +1,757 @@
 +import express from "express";
 +import request from "supertest";
 +
@@ -639,6 +639,28 @@ index 0000000..3f03480
 +
 +  it("returns 400 when a review entry has no candidateRestaurantId", async () => {
 +    const res = await batch({ reviews: [{ action: "approve" }] });
++
++    expect(res.status).toBe(400);
++    expect(res.body.success).toBe(false);
++    expect(res.body.statusCode).toBe(400);
++    expect(res.body.message).toMatch(/candidateRestaurantId/i);
++  });
++
++  it("returns 400 when candidateRestaurantId is not a string", async () => {
++    const res = await batch({
++      reviews: [{ candidateRestaurantId: 123, action: "approve" }],
++    });
++
++    expect(res.status).toBe(400);
++    expect(res.body.success).toBe(false);
++    expect(res.body.statusCode).toBe(400);
++    expect(res.body.message).toMatch(/candidateRestaurantId/i);
++  });
++
++  it("returns 400 when candidateRestaurantId is whitespace only", async () => {
++    const res = await batch({
++      reviews: [{ candidateRestaurantId: "   ", action: "approve" }],
++    });
 +
 +    expect(res.status).toBe(400);
 +    expect(res.body.success).toBe(false);

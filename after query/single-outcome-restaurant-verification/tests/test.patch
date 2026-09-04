@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000..1111111
 --- /dev/null
 +++ b/rateeat_backend/src/__tests__/unit/restaurant_claim_batch_verification_behavior.test.ts
-@@ -0,0 +1,337 @@
+@@ -0,0 +1,370 @@
 +import express from "express";
 +import request from "supertest";
 +import restaurantClaimRouter from "../../routes/restaurant_claim_request.route";
@@ -15,11 +15,14 @@ index 0000000..1111111
 +import sequelize from "../../config/db";
 +
 +jest.mock("../../middlewares/auth", () => ({
-+  authenticateToken: (req: any, _res: any, next: any) => {
++  protectRoute: (req: any, _res: any, next: any) => {
 +    req.user = { id: "admin-uuid-1", is_super_admin: true };
 +    next();
 +  },
-+  authorizeRole: (_roles: any) => (_req: any, _res: any, next: any) => next(),
++  protectRouteForAdmin: (req: any, _res: any, next: any) => {
++    req.user = { id: "admin-uuid-1", is_super_admin: true };
++    next();
++  },
 +}));
 +
 +jest.mock("../../models", () => ({
@@ -41,13 +44,20 @@ index 0000000..1111111
 +jest.mock("../../config/db", () => ({
 +  __esModule: true,
 +  default: {
-+    transaction: jest.fn().mockImplementation((cb) => {
++    transaction: jest.fn().mockImplementation(async (cb: any) => {
 +      const mockTx = {
 +        LOCK: { UPDATE: "UPDATE" },
 +        commit: jest.fn().mockResolvedValue(undefined),
 +        rollback: jest.fn().mockResolvedValue(undefined),
 +      };
-+      return cb(mockTx);
++      try {
++        const result = await cb(mockTx);
++        await mockTx.commit();
++        return result;
++      } catch (error) {
++        await mockTx.rollback();
++        throw error;
++      }
 +    }),
 +  },
 +}));
@@ -63,15 +73,29 @@ index 0000000..1111111
 +    });
 +  });
 +
++  let lastTx: {
++    LOCK: { UPDATE: string };
++    commit: jest.Mock;
++    rollback: jest.Mock;
++  };
++
 +  beforeEach(() => {
 +    jest.clearAllMocks();
-+    (sequelize.transaction as jest.Mock).mockImplementation((cb: any) =>
-+      cb({
++    (sequelize.transaction as jest.Mock).mockImplementation(async (cb: any) => {
++      lastTx = {
 +        LOCK: { UPDATE: "UPDATE" },
 +        commit: jest.fn().mockResolvedValue(undefined),
 +        rollback: jest.fn().mockResolvedValue(undefined),
-+      })
-+    );
++      };
++      try {
++        const result = await cb(lastTx);
++        await lastTx.commit();
++        return result;
++      } catch (error) {
++        await lastTx.rollback();
++        throw error;
++      }
++    });
 +    (AdminUser.findAll as jest.Mock).mockResolvedValue([]);
 +  });
 +
@@ -151,6 +175,7 @@ index 0000000..1111111
 +    expect(res.status).toBe(400);
 +    expect(res.body.success).toBe(false);
 +    expect(res.body.message).toContain("Duplicate claim request id");
++    expect(RestaurantClaimRequest.findByPk).not.toHaveBeenCalled();
 +  });
 +
 +  it("successfully verifies mixed batch claims in exact requested order", async () => {
@@ -226,12 +251,16 @@ index 0000000..1111111
 +
 +    expect(res.status).toBe(404);
 +    expect(res.body.success).toBe(false);
++    expect(mockClaim1.save).toHaveBeenCalled();
++    expect(lastTx.rollback).toHaveBeenCalled();
++    expect(lastTx.commit).not.toHaveBeenCalled();
 +  });
 +
 +  it("rolls back batch when any claim is already in a terminal state", async () => {
 +    const mockClaim = {
 +      id: "c-term",
 +      status: Status.Approved,
++      save: jest.fn(),
 +    };
 +    (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(mockClaim);
 +
@@ -243,6 +272,9 @@ index 0000000..1111111
 +
 +    expect(res.status).toBe(409);
 +    expect(res.body.success).toBe(false);
++    expect(mockClaim.save).not.toHaveBeenCalled();
++    expect(lastTx.rollback).toHaveBeenCalled();
++    expect(lastTx.commit).not.toHaveBeenCalled();
 +  });
 +
 +  it("handles batch payload with mixed casing in action strings", async () => {
@@ -299,7 +331,7 @@ index 0000000..1111111
 +    expect(res.body.data[0].status).toBe("Approved");
 +  });
 +
-+  it("ensures batch transaction rolls back cleanly when duplicate ID appears with whitespace", async () => {
++  it("returns 400 when duplicate claim IDs differ only by whitespace", async () => {
 +    const res = await request(app)
 +      .post("/api/v1/restaurant-claim-request/batch-verify")
 +      .send({
@@ -312,6 +344,7 @@ index 0000000..1111111
 +    expect(res.status).toBe(400);
 +    expect(res.body.success).toBe(false);
 +    expect(res.body.message).toContain("Duplicate claim request id");
++    expect(RestaurantClaimRequest.findByPk).not.toHaveBeenCalled();
 +  });
 +
 +  it("rejects batch verification when claim array contains null elements", async () => {
@@ -346,7 +379,7 @@ new file mode 100644
 index 0000000..1111111
 --- /dev/null
 +++ b/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_auth.test.ts
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,43 @@
 +import express from "express";
 +import request from "supertest";
 +import restaurantClaimRouter from "../../routes/restaurant_claim_request.route";
@@ -355,6 +388,22 @@ index 0000000..1111111
 +  const app = express();
 +  app.use(express.json());
 +  app.use("/api/v1/restaurant-claim-request", restaurantClaimRouter);
++
++  it("returns 401 when approve is requested without authorization token", async () => {
++    const res = await request(app)
++      .put("/api/v1/restaurant-claim-request/claim-101/approve")
++      .send();
++
++    expect(res.status).toBe(401);
++  });
++
++  it("returns 401 when reject is requested without authorization token", async () => {
++    const res = await request(app)
++      .put("/api/v1/restaurant-claim-request/claim-101/reject")
++      .send({ rejectionReason: "incomplete docs" });
++
++    expect(res.status).toBe(401);
++  });
 +
 +  it("returns 401 when batch-verify is requested without authorization token", async () => {
 +    const res = await request(app)
@@ -379,7 +428,7 @@ new file mode 100644
 index 0000000..1111111
 --- /dev/null
 +++ b/rateeat_backend/src/__tests__/unit/restaurant_claim_verification_behavior.test.ts
-@@ -0,0 +1,336 @@
+@@ -0,0 +1,395 @@
 +import express from "express";
 +import request from "supertest";
 +import restaurantClaimRouter from "../../routes/restaurant_claim_request.route";
@@ -393,11 +442,14 @@ index 0000000..1111111
 +import sequelize from "../../config/db";
 +
 +jest.mock("../../middlewares/auth", () => ({
-+  authenticateToken: (req: any, _res: any, next: any) => {
++  protectRoute: (req: any, _res: any, next: any) => {
 +    req.user = { id: "admin-uuid-1", is_super_admin: true };
 +    next();
 +  },
-+  authorizeRole: (_roles: any) => (_req: any, _res: any, next: any) => next(),
++  protectRouteForAdmin: (req: any, _res: any, next: any) => {
++    req.user = { id: "admin-uuid-1", is_super_admin: true };
++    next();
++  },
 +}));
 +
 +jest.mock("../../models", () => ({
@@ -421,13 +473,20 @@ index 0000000..1111111
 +jest.mock("../../config/db", () => ({
 +  __esModule: true,
 +  default: {
-+    transaction: jest.fn().mockImplementation((cb) => {
++    transaction: jest.fn().mockImplementation(async (cb: any) => {
 +      const mockTx = {
 +        LOCK: { UPDATE: "UPDATE" },
 +        commit: jest.fn().mockResolvedValue(undefined),
 +        rollback: jest.fn().mockResolvedValue(undefined),
 +      };
-+      return cb(mockTx);
++      try {
++        const result = await cb(mockTx);
++        await mockTx.commit();
++        return result;
++      } catch (error) {
++        await mockTx.rollback();
++        throw error;
++      }
 +    }),
 +  },
 +}));
@@ -443,15 +502,29 @@ index 0000000..1111111
 +    });
 +  });
 +
++  let lastTx: {
++    LOCK: { UPDATE: string };
++    commit: jest.Mock;
++    rollback: jest.Mock;
++  };
++
 +  beforeEach(() => {
 +    jest.clearAllMocks();
-+    (sequelize.transaction as jest.Mock).mockImplementation((cb: any) =>
-+      cb({
++    (sequelize.transaction as jest.Mock).mockImplementation(async (cb: any) => {
++      lastTx = {
 +        LOCK: { UPDATE: "UPDATE" },
 +        commit: jest.fn().mockResolvedValue(undefined),
 +        rollback: jest.fn().mockResolvedValue(undefined),
-+      })
-+    );
++      };
++      try {
++        const result = await cb(lastTx);
++        await lastTx.commit();
++        return result;
++      } catch (error) {
++        await lastTx.rollback();
++        throw error;
++      }
++    });
 +    (Notification.create as jest.Mock).mockResolvedValue({});
 +    (AdminUser.findAll as jest.Mock).mockResolvedValue([]);
 +  });
@@ -535,6 +608,13 @@ index 0000000..1111111
 +      expect(res.body.success).toBe(true);
 +      expect(res.body.data.status).toBe("Approved");
 +      expect(res.body.data.notifications_created).toBe(2);
++      expect(Notification.create).toHaveBeenCalledTimes(2);
++      expect(Notification.create).toHaveBeenCalledWith(
++        expect.objectContaining({
++          category: "RestaurantClaim",
++        }),
++        expect.anything()
++      );
 +    });
 +
 +    it("returns 409 when approving an already approved claim request", async () => {
@@ -599,6 +679,34 @@ index 0000000..1111111
 +      expect(res.body.data.restaurant_chain_id).toBeNull();
 +      expect(res.body.data.chain_verified).toBe(false);
 +      expect(res.body.data.status).toBe("Approved");
++      expect(RestaurantChain.findByPk).not.toHaveBeenCalled();
++    });
++
++    it("rolls the approval back when notifying super-admins fails", async () => {
++      const mockClaim = {
++        id: "c-notify-fail",
++        restaurant_id: "r-notify-fail",
++        restaurant_chain_id: null,
++        status: Status.Pending,
++        save: jest.fn().mockResolvedValue(true),
++      };
++      (RestaurantClaimRequest.findByPk as jest.Mock).mockResolvedValue(mockClaim);
++      (AdminUser.findAll as jest.Mock).mockResolvedValue([
++        { id: "super-1", is_super_admin: true },
++      ]);
++      (Notification.create as jest.Mock).mockRejectedValue(
++        new Error("notification write failed")
++      );
++
++      const res = await request(app)
++        .put("/api/v1/restaurant-claim-request/c-notify-fail/approve")
++        .send();
++
++      expect(res.status).toBeGreaterThanOrEqual(400);
++      expect(res.body.success).toBe(false);
++      expect(mockClaim.save).toHaveBeenCalled();
++      expect(lastTx.rollback).toHaveBeenCalled();
++      expect(lastTx.commit).not.toHaveBeenCalled();
 +    });
 +  });
 +
