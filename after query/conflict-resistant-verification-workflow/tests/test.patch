@@ -82,7 +82,7 @@ new file mode 100644
 index 0000000..3f03480
 --- /dev/null
 +++ b/rateeat_backend/src/__tests__/unit/candidate_restaurant_verification_behavior.test.ts
-@@ -0,0 +1,705 @@
+@@ -0,0 +1,735 @@
 +import express from "express";
 +import request from "supertest";
 +
@@ -520,8 +520,16 @@ index 0000000..3f03480
 +  };
 +
 +  beforeEach(async () => {
-+    await run(`DELETE FROM candidate_restaurant_menu_images`);
-+    await run(`DELETE FROM candidate_restaurants`);
++    await run(
++      `TRUNCATE TABLE
++         candidate_restaurant_menu_images,
++         candidate_restaurant_license_images,
++         candidate_restaurant_locations,
++         candidate_restaurant_tags,
++         candidate_restaurant_phone_numbers,
++         candidate_restaurants
++       RESTART IDENTITY CASCADE`
++    );
 +  });
 +
 +  it("returns aggregated pending/approved/rejected/total counts", async () => {

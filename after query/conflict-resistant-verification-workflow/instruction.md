@@ -10,4 +10,4 @@ Batch: `PUT /api/v1/candidate-restaurants/batch-review` accepts `{reviews:[{cand
 
 Metrics: `GET /api/v1/candidate-restaurants/metrics` returns `{pending, approved, rejected, total}`; `pending = max(total - approved - rejected, 0)`.
 
-Work on a new branch from main and commit changes.
+IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.
