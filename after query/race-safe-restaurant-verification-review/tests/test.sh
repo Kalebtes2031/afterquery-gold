@@ -22,10 +22,14 @@ run_log() { echo "+ $*" >> "$RUN_LOG" 2>/dev/null; "$@" 2>&1 | tee -a "$RUN_LOG"
 
 set +e
 
-install -d -o root -g root -m 0755 /logs/verifier
+mkdir -p /logs/verifier
+chown root:root /logs/verifier || exit 6
+chmod 700 /logs/verifier || exit 6
 rm -f \
   /logs/verifier/base_ctrf.json \
-  /logs/verifier/new_ctrf.json
+  /logs/verifier/new_ctrf.json \
+  /logs/verifier/base_ctrf.json.capturing \
+  /logs/verifier/new_ctrf.json.capturing
 
 JEST_BIN="/app/rateeat_backend/node_modules/.bin/jest"
 
@@ -92,6 +96,64 @@ kill_user_processes() {
   echo "Processes belonging to $username survived cleanup" \
     | tee -a "$RUN_LOG"
   return 1
+}
+
+# Seal CTRF capture: the reporter's default path (./ctrf/ctrf-report.json
+# relative to CWD) is pre-created as a root-owned FIFO. A root reader drains
+# that single write into /logs/verifier before anything user-writable can be
+# rewritten by an import-time process.exit hook.
+CTRF_READER_PID=""
+
+start_ctrf_capture() {
+  local runner_dir="$1"
+  local final_path="$2"
+  local capture_dir="$runner_dir/ctrf"
+  local capture_pipe="$capture_dir/ctrf-report.json"
+
+  rm -rf "$capture_dir"
+  mkdir -p "$capture_dir" || exit 6
+  chown root:root "$capture_dir" || exit 6
+  chmod 711 "$capture_dir" || exit 6
+
+  mkfifo "$capture_pipe" || exit 6
+  chown root:root "$capture_pipe" || exit 6
+  chmod 622 "$capture_pipe" || exit 6
+
+  rm -f "$final_path" "$final_path.capturing"
+  (
+    if timeout 300 cat "$capture_pipe" > "$final_path.capturing" 2>/dev/null
+    then
+      mv -f "$final_path.capturing" "$final_path"
+    fi
+  ) &
+  CTRF_READER_PID=$!
+}
+
+finish_ctrf_capture() {
+  local final_path="$1"
+  local label="$2"
+
+  wait "$CTRF_READER_PID" 2>/dev/null
+  CTRF_READER_PID=""
+
+  if [ ! -f "$final_path" ]; then
+    echo "$label CTRF report was not produced" | tee -a "$RUN_LOG"
+    exit 6
+  fi
+
+  chown root:root "$final_path" || exit 6
+  chmod 0444 "$final_path" || exit 6
+}
+
+require_normal_jest_exit() {
+  local exit_code="$1"
+  local label="$2"
+
+  if [ "$exit_code" != "0" ] && [ "$exit_code" != "1" ]; then
+    echo "$label Jest run exited abnormally ($exit_code) - not grading a run that didn't finish on its own" \
+      | tee -a "$RUN_LOG"
+    exit 6
+  fi
 }
 
 MIGRATE_USER=rateeat_rsrv_migrate
@@ -243,49 +305,39 @@ BASE_DB=rateeat_gold_rsrv_base_test
 prepare_database "$BASE_DB"
 run_migrations "$BASE_DB"
 
-cd "$BASE_RUNNER" || exit 6
-rm -rf ctrf
+start_ctrf_capture "$BASE_RUNNER" /logs/verifier/base_ctrf.json
 
-timeout --signal=TERM --kill-after=10s 360 \
-  runuser -u "$BASE_TEST_USER" -- env \
-    HOME="$BASE_RUNNER" \
-    PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-    NODE_PATH="/app/rateeat_backend/node_modules" \
-    NODE_ENV=test \
-    TEST_PG_USER="$DB_USER" \
-    TEST_PG_PASSWORD="$DB_PASSWORD" \
-    TEST_PG_DATABASE="$BASE_DB" \
-    TEST_PG_HOST=127.0.0.1 \
-    TEST_PG_PORT=5432 \
-    JWT_SECRET=gold-rsrv-test-secret \
-    SLACK_WEBHOOK_URL=https://hooks.slack.com/services/test/test/test \
-    "$JEST_BIN" \
-      --config /tmp/rateeat-rsrv-verifier-jest.config.cjs \
-      --no-cache \
-      --runInBand \
-      --forceExit \
-      --testPathIgnorePatterns='candidate_restaurant_review_(behavior|auth)\.test\.ts$' \
-      --reporters=default \
-      --reporters="$CTRF_REPORTER" \
-  2>&1 | tee -a "$RUN_LOG"
+(
+  cd "$BASE_RUNNER" || exit 6
+
+  timeout --signal=TERM --kill-after=10s 360 \
+    runuser -u "$BASE_TEST_USER" -- env \
+      HOME="$BASE_RUNNER" \
+      PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+      NODE_PATH="/app/rateeat_backend/node_modules" \
+      NODE_ENV=test \
+      TEST_PG_USER="$DB_USER" \
+      TEST_PG_PASSWORD="$DB_PASSWORD" \
+      TEST_PG_DATABASE="$BASE_DB" \
+      TEST_PG_HOST=127.0.0.1 \
+      TEST_PG_PORT=5432 \
+      JWT_SECRET=gold-rsrv-test-secret \
+      SLACK_WEBHOOK_URL=https://hooks.slack.com/services/test/test/test \
+      "$JEST_BIN" \
+        --config /tmp/rateeat-rsrv-verifier-jest.config.cjs \
+        --no-cache \
+        --runInBand \
+        --forceExit \
+        --testPathIgnorePatterns='candidate_restaurant_review_(behavior|auth)\.test\.ts$' \
+        --reporters=default \
+        --reporters="$CTRF_REPORTER"
+) 2>&1 | tee -a "$RUN_LOG"
 
 BASE_JEST_EXIT=${PIPESTATUS[0]}
 
+require_normal_jest_exit "$BASE_JEST_EXIT" "Existing-suite"
 kill_user_processes "$BASE_TEST_USER" || exit 6
-
-BASE_SOURCE="$BASE_RUNNER/ctrf/ctrf-report.json"
-
-if [ ! -f "$BASE_SOURCE" ]; then
-  echo "Existing-suite CTRF report was not produced" \
-    | tee -a "$RUN_LOG"
-else
-  install \
-    -o root \
-    -g root \
-    -m 0444 \
-    "$BASE_SOURCE" \
-    /logs/verifier/base_ctrf.json
-fi
+finish_ctrf_capture /logs/verifier/base_ctrf.json "Existing-suite"
 
 rm -rf "$BASE_RUNNER/ctrf"
 
@@ -301,51 +353,41 @@ NEW_DB=rateeat_gold_rsrv_new_test
 prepare_database "$NEW_DB"
 run_migrations "$NEW_DB"
 
-cd "$NEW_RUNNER" || exit 6
-rm -rf ctrf
+start_ctrf_capture "$NEW_RUNNER" /logs/verifier/new_ctrf.json
 
-timeout --signal=TERM --kill-after=10s 300 \
-  runuser -u "$NEW_TEST_USER" -- env \
-    HOME="$NEW_RUNNER" \
-    PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-    NODE_PATH="/app/rateeat_backend/node_modules" \
-    NODE_ENV=test \
-    TEST_PG_USER="$DB_USER" \
-    TEST_PG_PASSWORD="$DB_PASSWORD" \
-    TEST_PG_DATABASE="$NEW_DB" \
-    TEST_PG_HOST=127.0.0.1 \
-    TEST_PG_PORT=5432 \
-    JWT_SECRET=gold-rsrv-test-secret \
-    SLACK_WEBHOOK_URL=https://hooks.slack.com/services/test/test/test \
-    "$JEST_BIN" \
-      --config /tmp/rateeat-rsrv-verifier-jest.config.cjs \
-      --no-cache \
-      --runInBand \
-      --forceExit \
-      --runTestsByPath \
-        /app/rateeat_backend/src/__tests__/unit/candidate_restaurant_review_behavior.test.ts \
-        /app/rateeat_backend/src/__tests__/unit/candidate_restaurant_review_auth.test.ts \
-      --reporters=default \
-      --reporters="$CTRF_REPORTER" \
-  2>&1 | tee -a "$RUN_LOG"
+(
+  cd "$NEW_RUNNER" || exit 6
+
+  timeout --signal=TERM --kill-after=10s 300 \
+    runuser -u "$NEW_TEST_USER" -- env \
+      HOME="$NEW_RUNNER" \
+      PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+      NODE_PATH="/app/rateeat_backend/node_modules" \
+      NODE_ENV=test \
+      TEST_PG_USER="$DB_USER" \
+      TEST_PG_PASSWORD="$DB_PASSWORD" \
+      TEST_PG_DATABASE="$NEW_DB" \
+      TEST_PG_HOST=127.0.0.1 \
+      TEST_PG_PORT=5432 \
+      JWT_SECRET=gold-rsrv-test-secret \
+      SLACK_WEBHOOK_URL=https://hooks.slack.com/services/test/test/test \
+      "$JEST_BIN" \
+        --config /tmp/rateeat-rsrv-verifier-jest.config.cjs \
+        --no-cache \
+        --runInBand \
+        --forceExit \
+        --runTestsByPath \
+          /app/rateeat_backend/src/__tests__/unit/candidate_restaurant_review_behavior.test.ts \
+          /app/rateeat_backend/src/__tests__/unit/candidate_restaurant_review_auth.test.ts \
+        --reporters=default \
+        --reporters="$CTRF_REPORTER"
+) 2>&1 | tee -a "$RUN_LOG"
 
 NEW_JEST_EXIT=${PIPESTATUS[0]}
 
+require_normal_jest_exit "$NEW_JEST_EXIT" "Held-out-suite"
 kill_user_processes "$NEW_TEST_USER" || exit 6
-
-NEW_SOURCE="$NEW_RUNNER/ctrf/ctrf-report.json"
-
-if [ ! -f "$NEW_SOURCE" ]; then
-  echo "Held-out CTRF report was not produced" \
-    | tee -a "$RUN_LOG"
-else
-  install \
-    -o root \
-    -g root \
-    -m 0444 \
-    "$NEW_SOURCE" \
-    /logs/verifier/new_ctrf.json
-fi
+finish_ctrf_capture /logs/verifier/new_ctrf.json "Held-out-suite"
 
 rm -rf "$NEW_RUNNER/ctrf"
 
@@ -364,16 +406,6 @@ if [ "$CTRF_DIGEST_BEFORE" != "$CTRF_DIGEST_AFTER" ]; then
   echo "Trusted CTRF reporter changed while tests were running" \
     | tee -a "$RUN_LOG"
   exit 6
-fi
-
-if [ -f /logs/verifier/base_ctrf.json ]; then
-  chown root:root /logs/verifier/base_ctrf.json
-  chmod 0444 /logs/verifier/base_ctrf.json
-fi
-
-if [ -f /logs/verifier/new_ctrf.json ]; then
-  chown root:root /logs/verifier/new_ctrf.json
-  chmod 0444 /logs/verifier/new_ctrf.json
 fi
 
 echo "existing suite exit: $BASE_JEST_EXIT" | tee -a "$RUN_LOG"
