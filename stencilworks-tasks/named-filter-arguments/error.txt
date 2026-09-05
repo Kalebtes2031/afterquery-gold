@@ -1,16 +1,100 @@
-READY — first submit for named-filter-arguments
+named-filter-arguments
+Enhancement
+Validation Failed
+Report a problem
+stencilworks-render-core · environment v2 · base 3f4470fff4 · submitted Sep 5, 3:58 AM PDT
 
-Bundle built Sep 5 with lessons from loop-cycle-controls:
-  - solution.patch parser import rewritten for pre-macro (no MacroParam)
-  - P2P = 617 (all tests/macros.rs ids removed)
-  - test.sh has no --test macros
-  - test.patch = 2 test files only; nextest.toml created in test.sh
+Validation failed — review the results below, then revise your files and resubmit.
 
-Metrics:
-  Solution: 730 +lines, 17 files
-  Tests: 1104 +lines, 2 files, 69 F2P
-  Instruction: 221 words
-  P2P: 617
+Fix and resubmit
+Pipeline
+Files
+Edit & resubmit
 
-Before pasting, run:
-  python stencilworks-tasks/named-filter-arguments/verify_bundle.py
+Automated checks
+
+Required files, configuration values, patch scope, instruction bounds
+
+Sep 5, 3:58 AM PDT
+passed
+
+AI check
+
+The instruction must be written by you — not generated
+
+Sep 5, 3:58 AM PDT
+passed
+
+Originality
+
+Compared against previously submitted tasks; near-duplicates are rejected
+
+Sep 5, 3:58 AM PDT
+passed
+
+Reference verification
+
+Your reference solution must pass every run; the unchanged repository must fail every run
+
+Sep 5, 3:59 AM PDT
+failed
+Reference solution
+
+Every run must pass (reward 1)
+
+fail
+#1
+#2
+#3
+No-change baseline
+
+Every run must fail (reward 0)
+
+pass
+#1
+#2
+#3
+Reference verification
+
+completed
+iqoivaionmiVSUgncn4P
+
+Duration
+
+2m 12s
+
+Trial	Status	Reward	Runtime
+#1	completed	0	0s
+#2	completed	0	0s
+#3	completed	0	0s
+#4	completed	0	1s
+#5	completed	0	1s
+#6	completed	0	1s
+Browse job directory
+
+Quality review
+
+Automated review of the full bundle — instruction/test alignment, verifier integrity
+
+pending
+
+Calibration I
+
+Automated trials confirm the task is not too easy
+
+pending
+
+Calibration II
+
+Automated trials confirm the task sits inside the target difficulty range
+
+pending
+
+Run audit
+
+Unsuccessful calibration runs are audited — environment defects fail, genuine difficulty passes
+
+pending
+Validation failed
+
+Reference verification failed: reference-solution runs scored [0, 0, 0] — every run must score 1
