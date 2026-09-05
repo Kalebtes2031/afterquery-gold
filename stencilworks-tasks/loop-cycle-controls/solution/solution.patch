@@ -434,7 +434,7 @@ index c837f7e..3123fda 100644
          /// Byte offset in the template.
          offset: usize,
      },
-+    /// `loop.cycle(args╬ô├ç┬¬)` ΓÇö picks a value by iteration index.
++    /// loop.cycle(args...) - picks a value by iteration index.
 +    LoopCycle {
 +        /// The argument expressions.
 +        args: Vec<Expr>,
@@ -482,7 +482,7 @@ index c837f7e..3123fda 100644
          /// Byte offset in the template.
          offset: usize,
      },
-+    /// `{% cycle [name] value, ╬ô├ç┬¬ %}`
++    /// `{% cycle [name] value, ... %}`
 +    Cycle {
 +        /// The named group, when present.
 +        group: Option<String>,

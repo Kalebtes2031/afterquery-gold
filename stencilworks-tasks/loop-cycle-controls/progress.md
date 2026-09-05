@@ -32,6 +32,8 @@ Last updated: Sep 5, 2026
 | 8 | **solution.patch built against wrong base** (post-macro `52713c9`) | **Reference verification** | Platform base `3f4470f` is **pre-macro**; always generate patches from `_patchwork/b8f85fd` |
 | 9 | **P2P config had 3 extra macros.rs tests** without macro/caller/import/call_block in name | **Reference verification** | Filter ALL 30 `tests/macros.rs` functions, not just name-matched ones |
 | 10 | **test.sh referenced `--test macros`** binary | **Reference verification** | Pre-macro base has no `tests/macros.rs`; remove from both `INTEGRATION_BINS` and `cargo nextest run` |
+| 11 | **Windows CRLF line endings (`\r\n`) in patch and script files** | **Reference verification** | `git apply` fails context matching on Linux LF files; strictly enforce Unix LF on all files |
+| 12 | **Non-canonical instruction ending** | Automated / Quality | Must end with exact generated line: `IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.` |
 
 ---
 
@@ -51,38 +53,40 @@ Last updated: Sep 5, 2026
 ### Attempt 4 — Reference verification failed
 - Automated checks PASSED (fixed test.patch paths)
 - Reference solution scored [0, 0, 0] in 0 seconds
-- Root cause: solution.patch was generated against LOCAL base `52713c9` which has macros module
-- Platform base `3f4470f` is PRE-MACRO (no macros in ast/parser/render/mod.rs)
-- Context lines mismatch → `git apply` fails → immediate reward 0
+- Root causes:
+  1. `solution.patch` had Windows CRLF line endings (`\r\n`), causing `git apply` to fail against Linux LF files in `grader.py prepare`.
+  2. Mojibake in `ast.rs` comment lines (`╬ô├ç┬¬` and `ΓÇö`).
+  3. `instruction.md` ended with non-standard phrase instead of exact frozen line.
 
-### Attempt 5 — Fixes ready (correct base)
-| File | Fix |
-|---|---|
-| `solution/solution.patch` | **Rebuilt from pre-macro base** (`_patchwork/b8f85fd`); 563 +lines, 6 files |
-| `tests/test.patch` | Same 2 test files (608 lines); no `.config/` |
-| `tests/test.sh` | Creates nextest.toml inside RUN TESTS; fixed `normalize_junit`; removed `--test macros` |
-| `tests/config.json` | Platform base; 62 F2P + 617 P2P; no BOM; junit grade; all 30 macros.rs tests removed |
-| `instruction.md` | 203 words; no test-title mirroring |
-| `verify_bundle.py` | Pre-submit gate — catches non-test paths |
-
----
-
-## Local verification (proxy base `52713c9`)
-
-```
-git reset --hard 52713c9 && git clean -fd
-git apply --whitespace=nowarn tests/test.patch        # F2P fail ✓
-git apply --whitespace=nowarn solution/solution.patch # all pass ✓
-```
+### Attempt 5 — Fixes ready (all verified)
+| File | Fix | Status |
+|---|---|---|
+| `solution/solution.patch` | Rebuilt from pre-macro base (`_patchwork/b8f85fd`); 563 +lines, 6 files; clean ASCII comments; strictly Unix LF (`\n`) | ✅ Verified (`git apply --check` exits 0) |
+| `tests/test.patch` | 2 test files only (608 lines); no `.config/`; strictly Unix LF (`\n`) | ✅ Verified (`git apply` exits 0) |
+| `tests/test.sh` | Creates nextest.toml inside RUN TESTS; fixed `normalize_junit`; removed `--test macros`; strictly Unix LF (`\n`) | ✅ Verified |
+| `tests/config.json` | Platform base; 62 F2P + 617 P2P; no BOM; junit grade; all 30 macros.rs tests removed; strictly Unix LF (`\n`) | ✅ Verified |
+| `instruction.md` | 242 words; ends with exact mandatory line; strictly Unix LF (`\n`) | ✅ Verified |
+| `verify_bundle.py` | Enhanced pre-submit gate: checks CRLF, BOM, non-ascii mojibake, mandatory line, word count, line count floors | ✅ Passes all checks |
 
 ---
 
-## Resubmit checklist (Attempt 4)
+## Local verification (proxy base `_patchwork`)
 
-- [x] Remove `.config/nextest.toml` from test.patch
-- [x] Write nextest profile in test.sh RUN TESTS only
-- [x] Keep JUnit normalize fix + clean config ids
-- [x] Rewrite instruction (no test mirroring)
+```
+git apply --check --whitespace=nowarn solution/solution.patch  # exits 0 ✓
+git apply --check --whitespace=nowarn tests/test.patch         # exits 0 ✓
+python stencilworks-tasks/loop-cycle-controls/verify_bundle.py # all checks pass ✓
+```
+
+---
+
+## Resubmit checklist (Attempt 5)
+
+- [x] Strictly Unix LF (`\n`) on all task files (`solution.patch`, `test.patch`, `test.sh`, `config.json`, `instruction.md`)
+- [x] Zero UTF-8 BOMs
+- [x] Replaced mojibake comments with clean ASCII
+- [x] Mandatory instruction line verified
+- [x] Run `verify_bundle.py` gate
 - [ ] Paste all updated files on platform
 - [ ] Pass automated checks → reference verification → quality → calibration
 

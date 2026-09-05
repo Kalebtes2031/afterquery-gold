@@ -6,4 +6,4 @@ Two approaches to perform the task must be implemented in an active 'for' loop. 
 
 Stencil check and stencil outline must accept valid cycle syntax. The parsing mechanism will fail to recognize cycle tags with an empty value. The group names must be precise.
 
-IMPORTANT: Please work on this in a new branch from the `main` branch and commit everything afterward.
+IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.

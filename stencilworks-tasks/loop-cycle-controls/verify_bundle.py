@@ -21,11 +21,32 @@ def ok(msg: str) -> None:
 
 
 def main() -> None:
+    # Binary checks: ensure NO Windows CRLF and NO UTF-8 BOM
+    critical_files = [
+        ROOT / "solution" / "solution.patch",
+        ROOT / "tests" / "test.patch",
+        ROOT / "tests" / "test.sh",
+        ROOT / "tests" / "config.json",
+        ROOT / "instruction.md",
+    ]
+    for cf in critical_files:
+        raw = cf.read_bytes()
+        if b"\r\n" in raw:
+            fail(f"{cf.name} contains Windows CRLF (\\r\\n) line endings — must be strictly Unix LF")
+        if raw.startswith(b"\xef\xbb\xbf"):
+            fail(f"{cf.name} starts with a UTF-8 BOM — must be clean UTF-8")
+    ok("all critical files use Unix LF (\\n) and have no BOM")
+
     test_patch = (ROOT / "tests" / "test.patch").read_text(encoding="utf-8")
-    solution_patch = (ROOT / "tests" / "solution.patch") if False else (ROOT / "solution" / "solution.patch")
     solution_patch = (ROOT / "solution" / "solution.patch").read_text(encoding="utf-8")
     instruction = (ROOT / "instruction.md").read_text(encoding="utf-8")
-    config = json.loads((ROOT / "tests" / "config.json").read_text(encoding="utf-8-sig"))
+    config = json.loads((ROOT / "tests" / "config.json").read_text(encoding="utf-8"))
+
+    # Check for mojibake / corrupt non-ascii characters in patches
+    non_ascii_sol = [line for line in solution_patch.splitlines() if any(ord(c) > 127 for c in line)]
+    if non_ascii_sol:
+        fail(f"solution.patch contains non-ascii/mojibake characters: {non_ascii_sol}")
+    ok("solution.patch has no non-ascii/mojibake characters")
 
     paths = re.findall(r"^diff --git a/(.+?) b/", test_patch, re.M)
     bad = [p for p in paths if not p.startswith("tests/") or not p.endswith(".rs")]
@@ -51,6 +72,12 @@ def main() -> None:
     if words < 100 or words > 300:
         fail(f"instruction word count {words} (need 100-300)")
     ok(f"instruction words = {words}")
+
+    # Check mandatory load-bearing ending
+    mandatory_ending = "IMPORTANT: Please work on this in a new branch from main and commit everything when you are done."
+    if not instruction.strip().endswith(mandatory_ending):
+        fail(f"instruction.md must end with exact generated line: {mandatory_ending}")
+    ok("instruction ends with exact mandatory line")
 
     f2p = config.get("f2p_node_ids", [])
     p2p = config.get("p2p_node_ids", [])
@@ -81,7 +108,7 @@ def main() -> None:
     bad_p2p = [t for t in p2p if any(kw in t for kw in macro_keywords)]
     if bad_p2p:
         fail(f"P2P still has macro-related tests: {bad_p2p}")
-    ok(f"no macro-related P2P tests remain")
+    ok("no macro-related P2P tests remain")
 
     mirror_phrases = [
         "loop cycle error mentions for loop",
