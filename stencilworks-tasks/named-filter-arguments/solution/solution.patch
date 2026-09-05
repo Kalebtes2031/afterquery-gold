@@ -1,0 +1,1919 @@
+diff --git a/src/cli/commands/inspect.rs b/src/cli/commands/inspect.rs
+index d6f51bd..8daad0c 100644
+--- a/src/cli/commands/inspect.rs
++++ b/src/cli/commands/inspect.rs
+@@ -85,7 +85,15 @@ pub fn list_filters(verbose: bool) -> Report {
+             continue;
+         }
+         let filter = set.get(name).expect("name came from the set");
+-        report.push_line(format!("{name}: {}", filter.arity_description()));
++        if filter.keywords.is_empty() {
++            report.push_line(format!("{name}: {}", filter.arity_description()));
++        } else {
++            report.push_line(format!(
++                "{name}: {} ({})",
++                filter.arity_description(),
++                filter.keywords.join(", ")
++            ));
++        }
+     }
+     report
+ }
+diff --git a/src/environment.rs b/src/environment.rs
+index 8335135..dc75147 100644
+--- a/src/environment.rs
++++ b/src/environment.rs
+@@ -231,7 +231,7 @@ mod tests {
+ 
+     #[test]
+     fn custom_filters_are_visible_to_templates() {
+-        fn shout(value: &Value, _args: &[Value]) -> Result<Value> {
++        fn shout(value: &Value, _args: &crate::filters::FilterArgs) -> Result<Value> {
+             Ok(Value::text(format!("{value}!")))
+         }
+         let mut env = Environment::new();
+@@ -245,7 +245,7 @@ mod tests {
+ 
+     #[test]
+     fn custom_filters_can_replace_standard_ones() {
+-        fn always(_value: &Value, _args: &[Value]) -> Result<Value> {
++        fn always(_value: &Value, _args: &crate::filters::FilterArgs) -> Result<Value> {
+             Ok(Value::text("X"))
+         }
+         let mut env = Environment::new();
+diff --git a/src/filters/args.rs b/src/filters/args.rs
+index b460f05..af28b35 100644
+--- a/src/filters/args.rs
++++ b/src/filters/args.rs
+@@ -7,6 +7,42 @@
+ use crate::error::{Error, ErrorKind, Result};
+ use crate::value::{number, Value, ValueMap};
+ 
++/// Bound filter arguments: a dense slot table filled by position or keyword.
++#[derive(Debug, Clone)]
++pub struct FilterArgs {
++    slots: Vec<Option<Value>>,
++}
++
++impl FilterArgs {
++    /// The value at `index`, when that slot was filled.
++    pub fn get(&self, index: usize) -> Option<&Value> {
++        self.slots.get(index).and_then(|slot| slot.as_ref())
++    }
++
++    /// Number of slots in the table.
++    pub fn len(&self) -> usize {
++        self.slots.len()
++    }
++
++    /// True when no slots were allocated.
++    pub fn is_empty(&self) -> bool {
++        self.slots.is_empty()
++    }
++
++    /// Builds a table from a purely positional argument list (for tests and
++    /// the legacy [`super::FilterSet::apply`] path).
++    pub fn from_positional(args: Vec<Value>) -> FilterArgs {
++        FilterArgs {
++            slots: args.into_iter().map(Some).collect(),
++        }
++    }
++
++    /// Builds a table from pre-sized slots.
++    pub(crate) fn from_slots(slots: Vec<Option<Value>>) -> FilterArgs {
++        FilterArgs { slots }
++    }
++}
++
+ /// Renders any value as text, the way `{{ … }}` would.
+ pub fn to_text(value: &Value) -> String {
+     value.to_string()
+@@ -79,12 +115,12 @@ pub fn to_string_strict(value: &Value) -> Result<String> {
+ }
+ 
+ /// The positional argument at `index`, or null when absent.
+-pub fn arg(args: &[Value], index: usize) -> Value {
++pub fn arg(args: &FilterArgs, index: usize) -> Value {
+     args.get(index).cloned().unwrap_or(Value::Null)
+ }
+ 
+ /// The argument at `index` as text, or `fallback` when absent.
+-pub fn arg_text(args: &[Value], index: usize, fallback: &str) -> String {
++pub fn arg_text(args: &FilterArgs, index: usize, fallback: &str) -> String {
+     match args.get(index) {
+         Some(value) => to_text(value),
+         None => fallback.to_string(),
+@@ -92,7 +128,7 @@ pub fn arg_text(args: &[Value], index: usize, fallback: &str) -> String {
+ }
+ 
+ /// The argument at `index` as a number, or `fallback` when absent.
+-pub fn arg_number(args: &[Value], index: usize, fallback: f64) -> Result<f64> {
++pub fn arg_number(args: &FilterArgs, index: usize, fallback: f64) -> Result<f64> {
+     match args.get(index) {
+         Some(value) => to_number(value),
+         None => Ok(fallback),
+@@ -100,7 +136,7 @@ pub fn arg_number(args: &[Value], index: usize, fallback: f64) -> Result<f64> {
+ }
+ 
+ /// The argument at `index` as an integer, or `fallback` when absent.
+-pub fn arg_integer(args: &[Value], index: usize, fallback: i64) -> Result<i64> {
++pub fn arg_integer(args: &FilterArgs, index: usize, fallback: i64) -> Result<i64> {
+     match args.get(index) {
+         Some(value) => to_integer(value),
+         None => Ok(fallback),
+@@ -108,7 +144,7 @@ pub fn arg_integer(args: &[Value], index: usize, fallback: i64) -> Result<i64> {
+ }
+ 
+ /// The argument at `index` as a size, or `fallback` when absent.
+-pub fn arg_size(args: &[Value], index: usize, fallback: usize) -> Result<usize> {
++pub fn arg_size(args: &FilterArgs, index: usize, fallback: usize) -> Result<usize> {
+     match args.get(index) {
+         Some(value) => to_size(value),
+         None => Ok(fallback),
+@@ -116,7 +152,7 @@ pub fn arg_size(args: &[Value], index: usize, fallback: usize) -> Result<usize>
+ }
+ 
+ /// The argument at `index` as a truthiness, or `fallback` when absent.
+-pub fn arg_flag(args: &[Value], index: usize, fallback: bool) -> bool {
++pub fn arg_flag(args: &FilterArgs, index: usize, fallback: bool) -> bool {
+     match args.get(index) {
+         Some(value) => crate::value::truthy(value),
+         None => fallback,
+@@ -127,7 +163,7 @@ pub fn arg_flag(args: &[Value], index: usize, fallback: bool) -> bool {
+ ///
+ /// A multi-character argument is a value error: a fill character that silently
+ /// used only its first character would misalign every padded column.
+-pub fn arg_char(args: &[Value], index: usize, fallback: char) -> Result<char> {
++pub fn arg_char(args: &FilterArgs, index: usize, fallback: char) -> Result<char> {
+     let Some(value) = args.get(index) else {
+         return Ok(fallback);
+     };
+@@ -212,7 +248,7 @@ mod tests {
+ 
+     #[test]
+     fn missing_arguments_fall_back() {
+-        let args: Vec<Value> = Vec::new();
++        let args = FilterArgs::from_positional(Vec::new());
+         assert_eq!(arg(&args, 0), Value::Null);
+         assert_eq!(arg_text(&args, 0, "x"), "x");
+         assert_eq!(arg_number(&args, 0, 1.5).unwrap(), 1.5);
+@@ -224,7 +260,7 @@ mod tests {
+ 
+     #[test]
+     fn present_arguments_are_coerced() {
+-        let args = vec![Value::from("2"), Value::Bool(false)];
++        let args = FilterArgs::from_positional(vec![Value::from("2"), Value::Bool(false)]);
+         assert_eq!(arg_text(&args, 0, "x"), "2");
+         assert_eq!(arg_number(&args, 0, 0.0).unwrap(), 2.0);
+         assert!(!arg_flag(&args, 1, true));
+@@ -232,7 +268,7 @@ mod tests {
+ 
+     #[test]
+     fn multi_character_fills_are_rejected() {
+-        let args = vec![Value::from("ab")];
++        let args = FilterArgs::from_positional(vec![Value::from("ab")]);
+         let err = arg_char(&args, 0, ' ').unwrap_err();
+         assert_eq!(err.kind, ErrorKind::Value);
+         assert!(err.message.contains("single character"));
+diff --git a/src/filters/encode.rs b/src/filters/encode.rs
+index b8f6d9f..7f0aa7f 100644
+--- a/src/filters/encode.rs
++++ b/src/filters/encode.rs
+@@ -1,7 +1,7 @@
+ //! Filters that encode values for another language.
+ 
+ use super::args::{arg_char, arg_size, to_list, to_text};
+-use super::{Filter, FilterSet};
++use super::{Filter, FilterArgs, FilterSet};
+ use crate::error::Result;
+ use crate::format::escape;
+ use crate::value::Value;
+@@ -11,33 +11,33 @@ pub fn register(set: &mut FilterSet) {
+     set.insert(Filter::new("html", 0, Some(0), html));
+     set.insert(Filter::new("unhtml", 0, Some(0), unhtml));
+     set.insert(Filter::new("url", 0, Some(0), url));
+-    set.insert(Filter::new("json", 0, Some(1), json));
+-    set.insert(Filter::new("csv", 0, Some(1), csv));
++    set.insert(Filter::with_keywords("json", 0, Some(1), json, &["indent"]));
++    set.insert(Filter::with_keywords("csv", 0, Some(1), csv, &["delimiter"]));
+     set.insert(Filter::new("shell", 0, Some(0), shell));
+     set.insert(Filter::new("xml", 0, Some(0), xml));
+     set.insert(Filter::new("strip_tags", 0, Some(0), strip_tags));
+ }
+ 
+-fn html(value: &Value, _args: &[Value]) -> Result<Value> {
++fn html(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(Value::text(escape::html(&to_text(value))))
+ }
+ 
+-fn unhtml(value: &Value, _args: &[Value]) -> Result<Value> {
++fn unhtml(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(Value::text(escape::unhtml(&to_text(value))))
+ }
+ 
+-fn url(value: &Value, _args: &[Value]) -> Result<Value> {
++fn url(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(Value::text(escape::url(&to_text(value))))
+ }
+ 
+ /// Serializes to JSON. An argument sets the indent width; zero is compact.
+-fn json(value: &Value, args: &[Value]) -> Result<Value> {
++fn json(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let indent = arg_size(args, 0, 0)?;
+     Ok(Value::text(to_json(value, indent)))
+ }
+ 
+ /// Renders a list as one comma separated row.
+-fn csv(value: &Value, args: &[Value]) -> Result<Value> {
++fn csv(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let delimiter = arg_char(args, 0, ',')?;
+     let items = to_list(value)?;
+     let fields: Vec<String> = items
+@@ -47,15 +47,15 @@ fn csv(value: &Value, args: &[Value]) -> Result<Value> {
+     Ok(Value::text(fields.join(&delimiter.to_string())))
+ }
+ 
+-fn shell(value: &Value, _args: &[Value]) -> Result<Value> {
++fn shell(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(Value::text(escape::shell_word(&to_text(value))))
+ }
+ 
+-fn xml(value: &Value, _args: &[Value]) -> Result<Value> {
++fn xml(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(Value::text(escape::xml_attribute(&to_text(value))))
+ }
+ 
+-fn strip_tags(value: &Value, _args: &[Value]) -> Result<Value> {
++fn strip_tags(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(Value::text(escape::strip_tags(&to_text(value))))
+ }
+ 
+diff --git a/src/filters/list.rs b/src/filters/list.rs
+index 2f09987..55f8e92 100644
+--- a/src/filters/list.rs
++++ b/src/filters/list.rs
+@@ -1,7 +1,7 @@
+ //! Filters over lists.
+ 
+ use super::args::{arg_text, to_list, to_number, to_size, to_text};
+-use super::{Filter, FilterSet};
++use super::{Filter, FilterArgs, FilterSet};
+ use crate::error::{Error, Result};
+ use crate::value::{compare, equal, natural_compare, number, Value};
+ 
+@@ -10,8 +10,14 @@ pub fn register(set: &mut FilterSet) {
+     set.insert(Filter::new("length", 0, Some(0), length));
+     set.insert(Filter::new("first", 0, Some(0), first));
+     set.insert(Filter::new("last", 0, Some(0), last));
+-    set.insert(Filter::new("join", 0, Some(2), join));
+-    set.insert(Filter::new("sort", 0, Some(1), sort));
++    set.insert(Filter::with_keywords(
++        "join",
++        0,
++        Some(2),
++        join,
++        &["sep", "final_sep"],
++    ));
++    set.insert(Filter::with_keywords("sort", 0, Some(1), sort, &["field"]));
+     set.insert(Filter::new("sort_natural", 0, Some(0), sort_natural));
+     set.insert(Filter::new("reverse", 0, Some(0), reverse));
+     set.insert(Filter::new("unique", 0, Some(0), unique));
+@@ -32,7 +38,7 @@ pub fn register(set: &mut FilterSet) {
+ }
+ 
+ /// Counts characters for text and elements for a collection.
+-fn length(value: &Value, _args: &[Value]) -> Result<Value> {
++fn length(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     match value.len() {
+         Some(count) => Ok(Value::from(count)),
+         None => Err(super::args::type_error(
+@@ -42,16 +48,16 @@ fn length(value: &Value, _args: &[Value]) -> Result<Value> {
+     }
+ }
+ 
+-fn first(value: &Value, _args: &[Value]) -> Result<Value> {
++fn first(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(value.index(0).cloned().unwrap_or(Value::Null))
+ }
+ 
+-fn last(value: &Value, _args: &[Value]) -> Result<Value> {
++fn last(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(value.index(-1).cloned().unwrap_or(Value::Null))
+ }
+ 
+ /// Joins with a separator; a second argument is used before the final element.
+-fn join(value: &Value, args: &[Value]) -> Result<Value> {
++fn join(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let items = to_list(value)?;
+     let separator = arg_text(args, 0, "");
+     let rendered: Vec<String> = items.iter().map(to_text).collect();
+@@ -70,9 +76,9 @@ fn join(value: &Value, args: &[Value]) -> Result<Value> {
+ }
+ 
+ /// Sorts by the natural value order, or by a field when one is named.
+-fn sort(value: &Value, args: &[Value]) -> Result<Value> {
++fn sort(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let mut items = to_list(value)?;
+-    match args.first() {
++    match args.get(0) {
+         None => items.sort_by(compare),
+         Some(field) => {
+             let field = to_text(field);
+@@ -87,14 +93,14 @@ fn sort(value: &Value, args: &[Value]) -> Result<Value> {
+ }
+ 
+ /// Sorts strings so embedded numbers order by value.
+-fn sort_natural(value: &Value, _args: &[Value]) -> Result<Value> {
++fn sort_natural(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     let mut items = to_list(value)?;
+     items.sort_by(|left, right| natural_compare(&to_text(left), &to_text(right)));
+     Ok(Value::List(items))
+ }
+ 
+ /// Reverses a list, or the characters of a string.
+-fn reverse(value: &Value, _args: &[Value]) -> Result<Value> {
++fn reverse(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     match value {
+         Value::List(items) => {
+             let mut reversed = items.clone();
+@@ -110,7 +116,7 @@ fn reverse(value: &Value, _args: &[Value]) -> Result<Value> {
+ }
+ 
+ /// Removes later duplicates, keeping the first occurrence's position.
+-fn unique(value: &Value, _args: &[Value]) -> Result<Value> {
++fn unique(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     let items = to_list(value)?;
+     let mut out: Vec<Value> = Vec::with_capacity(items.len());
+     for item in items {
+@@ -122,7 +128,7 @@ fn unique(value: &Value, _args: &[Value]) -> Result<Value> {
+ }
+ 
+ /// Flattens one level of nesting.
+-fn flatten(value: &Value, _args: &[Value]) -> Result<Value> {
++fn flatten(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     let items = to_list(value)?;
+     let mut out = Vec::new();
+     for item in items {
+@@ -135,7 +141,7 @@ fn flatten(value: &Value, _args: &[Value]) -> Result<Value> {
+ }
+ 
+ /// Drops null elements.
+-fn compact(value: &Value, _args: &[Value]) -> Result<Value> {
++fn compact(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     let items = to_list(value)?;
+     Ok(Value::List(
+         items.into_iter().filter(|item| !item.is_null()).collect(),
+@@ -143,7 +149,7 @@ fn compact(value: &Value, _args: &[Value]) -> Result<Value> {
+ }
+ 
+ /// Adds every element, skipping nulls.
+-fn sum(value: &Value, _args: &[Value]) -> Result<Value> {
++fn sum(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     let items = to_list(value)?;
+     let mut total = 0.0;
+     for item in &items {
+@@ -156,7 +162,7 @@ fn sum(value: &Value, _args: &[Value]) -> Result<Value> {
+ }
+ 
+ /// The mean of the non-null elements; null for an empty list.
+-fn average(value: &Value, _args: &[Value]) -> Result<Value> {
++fn average(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     let items = to_list(value)?;
+     let mut total = 0.0;
+     let mut count = 0usize;
+@@ -173,7 +179,7 @@ fn average(value: &Value, _args: &[Value]) -> Result<Value> {
+     Ok(Value::number(total / count as f64))
+ }
+ 
+-fn minimum(value: &Value, _args: &[Value]) -> Result<Value> {
++fn minimum(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     let items = to_list(value)?;
+     Ok(items
+         .into_iter()
+@@ -181,7 +187,7 @@ fn minimum(value: &Value, _args: &[Value]) -> Result<Value> {
+         .unwrap_or(Value::Null))
+ }
+ 
+-fn maximum(value: &Value, _args: &[Value]) -> Result<Value> {
++fn maximum(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     let items = to_list(value)?;
+     Ok(items
+         .into_iter()
+@@ -190,23 +196,23 @@ fn maximum(value: &Value, _args: &[Value]) -> Result<Value> {
+ }
+ 
+ /// The first `n` elements, or all of them when the list is shorter.
+-fn take(value: &Value, args: &[Value]) -> Result<Value> {
++fn take(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let items = to_list(value)?;
+-    let count = to_size(&args[0])?;
++    let count = to_size(args.get(0).unwrap())?;
+     Ok(Value::List(items.into_iter().take(count).collect()))
+ }
+ 
+ /// Everything after the first `n` elements.
+-fn drop_items(value: &Value, args: &[Value]) -> Result<Value> {
++fn drop_items(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let items = to_list(value)?;
+-    let count = to_size(&args[0])?;
++    let count = to_size(args.get(0).unwrap())?;
+     Ok(Value::List(items.into_iter().skip(count).collect()))
+ }
+ 
+ /// Splits into chunks of at most `n` elements; the last chunk may be shorter.
+-fn batch(value: &Value, args: &[Value]) -> Result<Value> {
++fn batch(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let items = to_list(value)?;
+-    let size = to_size(&args[0])?;
++    let size = to_size(args.get(0).unwrap())?;
+     if size == 0 {
+         return Err(Error::value("batch size must be at least 1"));
+     }
+@@ -215,40 +221,40 @@ fn batch(value: &Value, args: &[Value]) -> Result<Value> {
+ }
+ 
+ /// The position of the first equal element, or `-1`.
+-fn index_of(value: &Value, args: &[Value]) -> Result<Value> {
++fn index_of(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let items = to_list(value)?;
+-    let position = items.iter().position(|item| equal(item, &args[0]));
++    let position = items.iter().position(|item| equal(item, args.get(0).unwrap()));
+     Ok(Value::from(
+         position.map(|index| index as i64).unwrap_or(-1),
+     ))
+ }
+ 
+ /// Reads one field from every element, dropping the elements that lack it.
+-fn pluck(value: &Value, args: &[Value]) -> Result<Value> {
++fn pluck(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let items = to_list(value)?;
+-    let field = to_text(&args[0]);
++    let field = to_text(args.get(0).unwrap());
+     let picked = items.iter().filter_map(|item| item.member(&field).cloned());
+     Ok(Value::list(picked))
+ }
+ 
+ /// Keeps the elements whose named field equals the given value.
+-fn select(value: &Value, args: &[Value]) -> Result<Value> {
++fn select(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let items = to_list(value)?;
+-    let field = to_text(&args[0]);
++    let field = to_text(args.get(0).unwrap());
+     let kept = items.into_iter().filter(|item| match item.member(&field) {
+-        Some(found) => equal(found, &args[1]),
++        Some(found) => equal(found, args.get(1).unwrap()),
+         None => false,
+     });
+     Ok(Value::list(kept))
+ }
+ 
+ /// Drops the elements whose named field equals the given value.
+-fn reject(value: &Value, args: &[Value]) -> Result<Value> {
++fn reject(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let items = to_list(value)?;
+     let kept = items.into_iter().filter(|item| {
+-        let field = to_text(&args[0]);
++        let field = to_text(args.get(0).unwrap());
+         match item.member(&field) {
+-            Some(found) => !equal(found, &args[1]),
++            Some(found) => !equal(found, args.get(1).unwrap()),
+             None => true,
+         }
+     });
+@@ -256,11 +262,11 @@ fn reject(value: &Value, args: &[Value]) -> Result<Value> {
+ }
+ 
+ /// Membership: elements for a list, keys for a map, substrings for text.
+-fn contains(value: &Value, args: &[Value]) -> Result<Value> {
++fn contains(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let found = match value {
+-        Value::List(items) => items.iter().any(|item| equal(item, &args[0])),
+-        Value::Map(map) => map.contains_key(&to_text(&args[0])),
+-        Value::Text(text) => text.contains(&to_text(&args[0])),
++        Value::List(items) => items.iter().any(|item| equal(item, args.get(0).unwrap())),
++        Value::Map(map) => map.contains_key(&to_text(args.get(0).unwrap())),
++        Value::Text(text) => text.contains(&to_text(args.get(0).unwrap())),
+         other => {
+             return Err(super::args::type_error(
+                 "a list, map or string",
+diff --git a/src/filters/logic.rs b/src/filters/logic.rs
+index 64dc2bf..27f1f00 100644
+--- a/src/filters/logic.rs
++++ b/src/filters/logic.rs
+@@ -1,16 +1,28 @@
+ //! Filters that convert, test and choose between values.
+ 
+ use super::args::{to_number, to_text};
+-use super::{Filter, FilterSet};
++use super::{Filter, FilterArgs, FilterSet};
+ use crate::error::Result;
+ use crate::value::{equal, truthy, Value};
+ 
+ /// Registers every conversion and control filter.
+ pub fn register(set: &mut FilterSet) {
+-    set.insert(Filter::new("default", 1, Some(2), default));
++    set.insert(Filter::with_keywords(
++        "default",
++        1,
++        Some(2),
++        default,
++        &["fallback", "falsy"],
++    ));
+     set.insert(Filter::new("safe", 0, Some(0), safe));
+     set.insert(Filter::new("string", 0, Some(0), string));
+-    set.insert(Filter::new("number", 0, Some(1), number));
++    set.insert(Filter::with_keywords(
++        "number",
++        0,
++        Some(1),
++        number,
++        &["fallback"],
++    ));
+     set.insert(Filter::new("bool", 0, Some(0), boolean));
+     set.insert(Filter::new("type", 0, Some(0), type_of));
+     set.insert(Filter::new("list", 0, Some(0), listify));
+@@ -25,7 +37,7 @@ pub fn register(set: &mut FilterSet) {
+ /// With a truthy second argument the fallback also replaces any falsy value —
+ /// zero, the empty string, an empty list — which is what a template usually
+ /// means by "if there is nothing here".
+-fn default(value: &Value, args: &[Value]) -> Result<Value> {
++fn default(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let replace_falsy = super::args::arg_flag(args, 1, false);
+     let needs_fallback = if replace_falsy {
+         !truthy(value)
+@@ -33,7 +45,7 @@ fn default(value: &Value, args: &[Value]) -> Result<Value> {
+         value.is_null()
+     };
+     Ok(if needs_fallback {
+-        args[0].clone()
++        args.get(0).unwrap().clone()
+     } else {
+         value.clone()
+     })
+@@ -43,30 +55,30 @@ fn default(value: &Value, args: &[Value]) -> Result<Value> {
+ ///
+ /// The filter itself is the identity; the renderer looks for it at the top of
+ /// an output expression and skips escaping when it is there.
+-fn safe(value: &Value, _args: &[Value]) -> Result<Value> {
++fn safe(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(value.clone())
+ }
+ 
+-fn string(value: &Value, _args: &[Value]) -> Result<Value> {
++fn string(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(Value::text(to_text(value)))
+ }
+ 
+ /// Coerces to a number, falling back to the argument when it cannot.
+-fn number(value: &Value, args: &[Value]) -> Result<Value> {
++fn number(value: &Value, args: &FilterArgs) -> Result<Value> {
+     match to_number(value) {
+         Ok(parsed) => Ok(Value::number(parsed)),
+-        Err(err) => match args.first() {
++        Err(err) => match args.get(0) {
+             Some(fallback) => Ok(fallback.clone()),
+             None => Err(err),
+         },
+     }
+ }
+ 
+-fn boolean(value: &Value, _args: &[Value]) -> Result<Value> {
++fn boolean(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(Value::Bool(truthy(value)))
+ }
+ 
+-fn type_of(value: &Value, _args: &[Value]) -> Result<Value> {
++fn type_of(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(Value::text(value.kind().name()))
+ }
+ 
+@@ -74,7 +86,7 @@ fn type_of(value: &Value, _args: &[Value]) -> Result<Value> {
+ ///
+ /// Null becomes the empty list, so `{% for x in maybe | list %}` renders
+ /// nothing rather than one blank row.
+-fn listify(value: &Value, _args: &[Value]) -> Result<Value> {
++fn listify(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(match value {
+         Value::List(_) => value.clone(),
+         Value::Null => Value::list([]),
+@@ -84,24 +96,24 @@ fn listify(value: &Value, _args: &[Value]) -> Result<Value> {
+ }
+ 
+ /// Picks the first argument when the value is truthy, the second when not.
+-fn choose(value: &Value, args: &[Value]) -> Result<Value> {
++fn choose(value: &Value, args: &FilterArgs) -> Result<Value> {
+     Ok(if truthy(value) {
+-        args[0].clone()
++        args.get(0).unwrap().clone()
+     } else {
+-        args[1].clone()
++        args.get(1).unwrap().clone()
+     })
+ }
+ 
+-fn eq(value: &Value, args: &[Value]) -> Result<Value> {
+-    Ok(Value::Bool(equal(value, &args[0])))
++fn eq(value: &Value, args: &FilterArgs) -> Result<Value> {
++    Ok(Value::Bool(equal(value, args.get(0).unwrap())))
+ }
+ 
+-fn is_null(value: &Value, _args: &[Value]) -> Result<Value> {
++fn is_null(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(Value::Bool(value.is_null()))
+ }
+ 
+ /// True for null and for any sized value with nothing in it.
+-fn is_empty(value: &Value, _args: &[Value]) -> Result<Value> {
++fn is_empty(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(Value::Bool(match value {
+         Value::Null => true,
+         other => other.len().map(|count| count == 0).unwrap_or(false),
+diff --git a/src/filters/mod.rs b/src/filters/mod.rs
+index 48dfd1c..b548bcb 100644
+--- a/src/filters/mod.rs
++++ b/src/filters/mod.rs
+@@ -8,15 +8,17 @@ pub mod number;
+ pub mod structure;
+ pub mod text;
+ 
++pub use args::FilterArgs;
++
+ use crate::error::{Error, ErrorKind, Result};
+ use crate::value::Value;
+ use std::collections::BTreeMap;
+ 
+ /// The signature every filter implements.
+ ///
+-/// The first argument is the value flowing through the pipe; the slice holds
+-/// the parenthesized arguments, already evaluated.
+-pub type FilterFn = fn(&Value, &[Value]) -> Result<Value>;
++/// The first argument is the value flowing through the pipe; the second holds
++/// the parenthesized arguments, already evaluated and bound to slots.
++pub type FilterFn = fn(&Value, &FilterArgs) -> Result<Value>;
+ 
+ /// A registered filter with its arity.
+ #[derive(Clone, Copy)]
+@@ -29,10 +31,12 @@ pub struct Filter {
+     pub max_args: Option<usize>,
+     /// The implementation.
+     pub run: FilterFn,
++    /// Keyword names for each slot index; empty when keywords are not accepted.
++    pub keywords: &'static [&'static str],
+ }
+ 
+ impl Filter {
+-    /// Builds a filter descriptor.
++    /// Builds a filter descriptor with no keyword names.
+     pub const fn new(
+         name: &'static str,
+         min_args: usize,
+@@ -44,6 +48,24 @@ impl Filter {
+             min_args,
+             max_args,
+             run,
++            keywords: &[],
++        }
++    }
++
++    /// Builds a filter descriptor with named slots for keyword arguments.
++    pub const fn with_keywords(
++        name: &'static str,
++        min_args: usize,
++        max_args: Option<usize>,
++        run: FilterFn,
++        keywords: &'static [&'static str],
++    ) -> Filter {
++        Filter {
++            name,
++            min_args,
++            max_args,
++            run,
++            keywords,
+         }
+     }
+ 
+@@ -68,6 +90,7 @@ impl std::fmt::Debug for Filter {
+             .field("name", &self.name)
+             .field("min_args", &self.min_args)
+             .field("max_args", &self.max_args)
++            .field("keywords", &self.keywords)
+             .finish()
+     }
+ }
+@@ -128,7 +151,111 @@ impl FilterSet {
+         self.entries.keys().map(String::as_str).collect()
+     }
+ 
+-    /// Applies a filter by name, checking its arity first.
++    /// Binds evaluated positional and keyword arguments onto a filter's slots.
++    ///
++    /// `evaluated` entries are `(None, value)` for positionals and
++    /// `(Some(name), value)` for keywords, in source order.
++    pub fn bind_args(
++        &self,
++        filter_name: &str,
++        filter: &Filter,
++        evaluated: &[(Option<String>, Value)],
++    ) -> Result<FilterArgs> {
++        let slot_count = filter
++            .keywords
++            .len()
++            .max(evaluated.len())
++            .max(filter.max_args.unwrap_or(0))
++            .max(filter.min_args);
++        let mut slots: Vec<Option<Value>> = vec![None; slot_count];
++        let mut next_positional = 0usize;
++        let mut seen_keywords: Vec<&str> = Vec::new();
++
++        for (name, value) in evaluated {
++            match name {
++                None => {
++                    if next_positional >= slots.len() {
++                        slots.resize(next_positional + 1, None);
++                    }
++                    slots[next_positional] = Some(value.clone());
++                    next_positional += 1;
++                }
++                Some(keyword) => {
++                    if seen_keywords.iter().any(|seen| *seen == keyword.as_str()) {
++                        return Err(Error::new(
++                            ErrorKind::Arity,
++                            format!("`{filter_name}` got duplicate keyword `{keyword}`"),
++                        ));
++                    }
++                    let Some(index) = filter
++                        .keywords
++                        .iter()
++                        .position(|candidate| *candidate == keyword.as_str())
++                    else {
++                        return Err(Error::new(
++                            ErrorKind::Arity,
++                            format!("`{filter_name}` got unknown keyword `{keyword}`"),
++                        ));
++                    };
++                    if index >= slots.len() {
++                        slots.resize(index + 1, None);
++                    }
++                    slots[index] = Some(value.clone());
++                    seen_keywords.push(keyword.as_str());
++                }
++            }
++        }
++
++        for index in 0..filter.min_args {
++            if slots.get(index).and_then(|slot| slot.as_ref()).is_none() {
++                let filled = slots.iter().filter(|slot| slot.is_some()).count();
++                return Err(Error::new(
++                    ErrorKind::Arity,
++                    format!(
++                        "`{filter_name}` takes {}, found {filled}",
++                        filter.arity_description()
++                    ),
++                ));
++            }
++        }
++
++        if let Some(max) = filter.max_args {
++            let highest = slots
++                .iter()
++                .enumerate()
++                .rev()
++                .find(|(_, slot)| slot.is_some())
++                .map(|(index, _)| index);
++            if let Some(index) = highest {
++                if index >= max {
++                    let filled = slots.iter().filter(|slot| slot.is_some()).count();
++                    return Err(Error::new(
++                        ErrorKind::Arity,
++                        format!(
++                            "`{filter_name}` takes {}, found {filled}",
++                            filter.arity_description()
++                        ),
++                    ));
++                }
++            }
++            // Too many purely positional arguments beyond max, even if some
++            // trailing slots happen to be within range after resize.
++            let positional_count = evaluated.iter().filter(|(name, _)| name.is_none()).count();
++            if positional_count > max {
++                return Err(Error::new(
++                    ErrorKind::Arity,
++                    format!(
++                        "`{filter_name}` takes {}, found {positional_count}",
++                        filter.arity_description()
++                    ),
++                ));
++            }
++        }
++
++        Ok(FilterArgs::from_slots(slots))
++    }
++
++    /// Applies a filter by name with positional arguments only.
+     pub fn apply(&self, name: &str, value: &Value, arguments: &[Value]) -> Result<Value> {
+         let Some(filter) = self.get(name) else {
+             return Err(Error::new(
+@@ -146,7 +273,19 @@ impl FilterSet {
+                 ),
+             ));
+         }
+-        (filter.run)(value, arguments)
++        let args = FilterArgs::from_positional(arguments.to_vec());
++        (filter.run)(value, &args)
++    }
++
++    /// Applies a filter whose arguments have already been bound.
++    pub fn apply_bound(&self, name: &str, value: &Value, args: &FilterArgs) -> Result<Value> {
++        let Some(filter) = self.get(name) else {
++            return Err(Error::new(
++                ErrorKind::UnknownFilter,
++                format!("`{name}` is not a filter"),
++            ));
++        };
++        (filter.run)(value, args)
+     }
+ 
+     /// The registered names closest to `name`, for "did you mean" hints.
+@@ -190,7 +329,7 @@ pub fn edit_distance(left: &str, right: &str) -> usize {
+ mod tests {
+     use super::*;
+ 
+-    fn echo(value: &Value, _args: &[Value]) -> Result<Value> {
++    fn echo(value: &Value, _args: &FilterArgs) -> Result<Value> {
+         Ok(value.clone())
+     }
+ 
+@@ -280,4 +419,70 @@ mod tests {
+         );
+         assert!(set.suggestions("zzzzz").is_empty());
+     }
++
++    #[test]
++    fn keyword_binding_fills_named_slots() {
++        let filter = Filter::with_keywords("echo", 1, Some(2), echo, &["width", "end"]);
++        let set = FilterSet::empty();
++        let bound = set
++            .bind_args(
++                "echo",
++                &filter,
++                &[
++                    (None, Value::from(12.0)),
++                    (Some("end".into()), Value::text("…")),
++                ],
++            )
++            .unwrap();
++        assert_eq!(bound.get(0), Some(&Value::from(12.0)));
++        assert_eq!(bound.get(1), Some(&Value::text("…")));
++    }
++
++    #[test]
++    fn unknown_keywords_are_rejected_by_name() {
++        let filter = Filter::with_keywords("echo", 0, Some(1), echo, &["width"]);
++        let set = FilterSet::empty();
++        let err = set
++            .bind_args(
++                "echo",
++                &filter,
++                &[(Some("nope".into()), Value::Null)],
++            )
++            .unwrap_err();
++        assert_eq!(err.kind, ErrorKind::Arity);
++        assert!(err.message.contains("`echo`"));
++        assert!(err.message.contains("unknown keyword `nope`"));
++    }
++
++    #[test]
++    fn duplicate_keywords_are_rejected() {
++        let filter = Filter::with_keywords("echo", 0, Some(1), echo, &["width"]);
++        let set = FilterSet::empty();
++        let err = set
++            .bind_args(
++                "echo",
++                &filter,
++                &[
++                    (Some("width".into()), Value::from(1.0)),
++                    (Some("width".into()), Value::from(2.0)),
++                ],
++            )
++            .unwrap_err();
++        assert!(err.message.contains("duplicate keyword `width`"));
++        assert!(err.message.contains("`echo`"));
++    }
++
++    #[test]
++    fn filters_without_keywords_reject_keyword_calls() {
++        let filter = Filter::new("echo", 0, Some(0), echo);
++        let set = FilterSet::empty();
++        let err = set
++            .bind_args(
++                "echo",
++                &filter,
++                &[(Some("x".into()), Value::Null)],
++            )
++            .unwrap_err();
++        assert!(err.message.contains("unknown keyword `x`"));
++    }
+ }
+diff --git a/src/filters/number.rs b/src/filters/number.rs
+index e76e673..bf54fdb 100644
+--- a/src/filters/number.rs
++++ b/src/filters/number.rs
+@@ -1,31 +1,55 @@
+ //! Filters that shape numbers.
+ 
+ use super::args::{arg_number, arg_size, arg_text, to_number};
+-use super::{Filter, FilterSet};
++use super::{Filter, FilterArgs, FilterSet};
+ use crate::error::{Error, Result};
+ use crate::format::number as render;
+ use crate::value::{number, Value};
+ 
+ /// Registers every numeric filter.
+ pub fn register(set: &mut FilterSet) {
+-    set.insert(Filter::new("round", 0, Some(1), round));
+-    set.insert(Filter::new("ceil", 0, Some(1), ceil));
+-    set.insert(Filter::new("floor", 0, Some(1), floor));
++    set.insert(Filter::with_keywords("round", 0, Some(1), round, &["digits"]));
++    set.insert(Filter::with_keywords("ceil", 0, Some(1), ceil, &["digits"]));
++    set.insert(Filter::with_keywords("floor", 0, Some(1), floor, &["digits"]));
+     set.insert(Filter::new("abs", 0, Some(0), absolute));
+     set.insert(Filter::new("sign", 0, Some(0), sign));
+     set.insert(Filter::new("int", 0, Some(0), integer));
+-    set.insert(Filter::new("fixed", 1, Some(1), fixed));
+-    set.insert(Filter::new("percent", 0, Some(1), percent));
+-    set.insert(Filter::new("group", 0, Some(2), group));
++    set.insert(Filter::with_keywords(
++        "fixed",
++        1,
++        Some(1),
++        fixed,
++        &["decimals"],
++    ));
++    set.insert(Filter::with_keywords(
++        "percent",
++        0,
++        Some(1),
++        percent,
++        &["decimals"],
++    ));
++    set.insert(Filter::with_keywords(
++        "group",
++        0,
++        Some(2),
++        group,
++        &["sep", "point"],
++    ));
+     set.insert(Filter::new("bytes", 0, Some(0), bytes));
+     set.insert(Filter::new("roman", 0, Some(0), roman));
+-    set.insert(Filter::new("clamp", 2, Some(2), clamp));
++    set.insert(Filter::with_keywords(
++        "clamp",
++        2,
++        Some(2),
++        clamp,
++        &["low", "high"],
++    ));
+     set.insert(Filter::new("modulo", 1, Some(1), modulo));
+     set.insert(Filter::new("ordinal", 0, Some(0), ordinal));
+ }
+ 
+ /// Rounds half away from zero, to an optional number of decimals.
+-fn round(value: &Value, args: &[Value]) -> Result<Value> {
++fn round(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let digits = super::args::arg_integer(args, 0, 0)?;
+     Ok(Value::number(number::round_half_away(
+         to_number(value)?,
+@@ -33,26 +57,26 @@ fn round(value: &Value, args: &[Value]) -> Result<Value> {
+     )))
+ }
+ 
+-fn ceil(value: &Value, args: &[Value]) -> Result<Value> {
++fn ceil(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let digits = super::args::arg_integer(args, 0, 0)?;
+     let raw = to_number(value)?;
+     let factor = number::pow10(digits as i32);
+     Ok(Value::number(number::snap((raw * factor).ceil() / factor)))
+ }
+ 
+-fn floor(value: &Value, args: &[Value]) -> Result<Value> {
++fn floor(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let digits = super::args::arg_integer(args, 0, 0)?;
+     let raw = to_number(value)?;
+     let factor = number::pow10(digits as i32);
+     Ok(Value::number(number::snap((raw * factor).floor() / factor)))
+ }
+ 
+-fn absolute(value: &Value, _args: &[Value]) -> Result<Value> {
++fn absolute(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(Value::number(to_number(value)?.abs()))
+ }
+ 
+ /// `-1`, `0` or `1`.
+-fn sign(value: &Value, _args: &[Value]) -> Result<Value> {
++fn sign(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     let raw = to_number(value)?;
+     let out = if raw > 0.0 {
+         1.0
+@@ -65,7 +89,7 @@ fn sign(value: &Value, _args: &[Value]) -> Result<Value> {
+ }
+ 
+ /// Truncates toward zero.
+-fn integer(value: &Value, _args: &[Value]) -> Result<Value> {
++fn integer(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(Value::number(number::round_toward_zero(
+         to_number(value)?,
+         0,
+@@ -73,20 +97,20 @@ fn integer(value: &Value, _args: &[Value]) -> Result<Value> {
+ }
+ 
+ /// Renders with exactly the requested number of decimals.
+-fn fixed(value: &Value, args: &[Value]) -> Result<Value> {
++fn fixed(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let decimals = arg_size(args, 0, 0)?;
+     Ok(Value::text(render::fixed(to_number(value)?, decimals)))
+ }
+ 
+ /// Scales by a hundred and appends a percent sign.
+-fn percent(value: &Value, args: &[Value]) -> Result<Value> {
++fn percent(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let decimals = arg_size(args, 0, 0)?;
+     Ok(Value::text(render::percent(to_number(value)?, decimals)))
+ }
+ 
+ /// Renders with grouped thousands. The arguments are the group separator and
+ /// the decimal point, in that order.
+-fn group(value: &Value, args: &[Value]) -> Result<Value> {
++fn group(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let raw = to_number(value)?;
+     let separator = arg_text(args, 0, ",");
+     let point = arg_text(args, 1, ".");
+@@ -96,12 +120,12 @@ fn group(value: &Value, args: &[Value]) -> Result<Value> {
+     )))
+ }
+ 
+-fn bytes(value: &Value, _args: &[Value]) -> Result<Value> {
++fn bytes(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(Value::text(render::byte_size(to_number(value)?)))
+ }
+ 
+ /// Renders `1..=3999` as a Roman numeral; anything else is a value error.
+-fn roman(value: &Value, _args: &[Value]) -> Result<Value> {
++fn roman(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     let raw = super::args::to_integer(value)?;
+     let rendered = render::roman(raw);
+     if rendered.is_empty() {
+@@ -113,7 +137,7 @@ fn roman(value: &Value, _args: &[Value]) -> Result<Value> {
+ }
+ 
+ /// Constrains a number to a range. The bounds may be given in either order.
+-fn clamp(value: &Value, args: &[Value]) -> Result<Value> {
++fn clamp(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let raw = to_number(value)?;
+     let first = arg_number(args, 0, 0.0)?;
+     let second = arg_number(args, 1, 0.0)?;
+@@ -126,8 +150,8 @@ fn clamp(value: &Value, args: &[Value]) -> Result<Value> {
+ }
+ 
+ /// The modulus with the sign of the divisor.
+-fn modulo(value: &Value, args: &[Value]) -> Result<Value> {
+-    let divisor = to_number(&args[0])?;
++fn modulo(value: &Value, args: &FilterArgs) -> Result<Value> {
++    let divisor = to_number(args.get(0).unwrap())?;
+     match number::floor_mod(to_number(value)?, divisor) {
+         Some(result) => Ok(Value::number(result)),
+         None => Err(Error::value("cannot take a modulus by zero")),
+@@ -135,7 +159,7 @@ fn modulo(value: &Value, args: &[Value]) -> Result<Value> {
+ }
+ 
+ /// Appends the English ordinal suffix: `1st`, `2nd`, `11th`, `21st`.
+-fn ordinal(value: &Value, _args: &[Value]) -> Result<Value> {
++fn ordinal(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     let raw = super::args::to_integer(value)?;
+     let magnitude = raw.unsigned_abs();
+     let suffix = match (magnitude % 100, magnitude % 10) {
+diff --git a/src/filters/structure.rs b/src/filters/structure.rs
+index c41dbe8..861e357 100644
+--- a/src/filters/structure.rs
++++ b/src/filters/structure.rs
+@@ -1,7 +1,7 @@
+ //! Filters over maps.
+ 
+ use super::args::{to_list, to_map, to_text};
+-use super::{Filter, FilterSet};
++use super::{Filter, FilterArgs, FilterSet};
+ use crate::error::Result;
+ use crate::value::{Value, ValueMap};
+ 
+@@ -10,7 +10,13 @@ pub fn register(set: &mut FilterSet) {
+     set.insert(Filter::new("keys", 0, Some(0), keys));
+     set.insert(Filter::new("values", 0, Some(0), values));
+     set.insert(Filter::new("items", 0, Some(0), items));
+-    set.insert(Filter::new("get", 1, Some(2), get));
++    set.insert(Filter::with_keywords(
++        "get",
++        1,
++        Some(2),
++        get,
++        &["key", "default"],
++    ));
+     set.insert(Filter::new("merge", 1, Some(1), merge));
+     set.insert(Filter::new("pick", 1, Some(1), pick));
+     set.insert(Filter::new("omit", 1, Some(1), omit));
+@@ -19,18 +25,18 @@ pub fn register(set: &mut FilterSet) {
+     set.insert(Filter::new("from_items", 0, Some(0), from_items));
+ }
+ 
+-fn keys(value: &Value, _args: &[Value]) -> Result<Value> {
++fn keys(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     let map = to_map(value)?;
+     Ok(Value::list(map.keys().map(Value::text)))
+ }
+ 
+-fn values(value: &Value, _args: &[Value]) -> Result<Value> {
++fn values(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     let map = to_map(value)?;
+     Ok(Value::list(map.values().cloned()))
+ }
+ 
+ /// Turns a map into a list of two-element `[key, value]` lists.
+-fn items(value: &Value, _args: &[Value]) -> Result<Value> {
++fn items(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     let map = to_map(value)?;
+     let pairs = map
+         .iter()
+@@ -39,8 +45,8 @@ fn items(value: &Value, _args: &[Value]) -> Result<Value> {
+ }
+ 
+ /// Reads a member, falling back to the second argument when absent.
+-fn get(value: &Value, args: &[Value]) -> Result<Value> {
+-    let key = to_text(&args[0]);
++fn get(value: &Value, args: &FilterArgs) -> Result<Value> {
++    let key = to_text(args.get(0).unwrap());
+     let fallback = args.get(1).cloned().unwrap_or(Value::Null);
+     Ok(value.member(&key).cloned().unwrap_or(fallback))
+ }
+@@ -49,17 +55,17 @@ fn get(value: &Value, args: &[Value]) -> Result<Value> {
+ ///
+ /// Keys already present keep their position and take the new value; new keys
+ /// are appended in the argument's order.
+-fn merge(value: &Value, args: &[Value]) -> Result<Value> {
++fn merge(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let mut base = to_map(value)?;
+-    let other = to_map(&args[0])?;
++    let other = to_map(args.get(0).unwrap())?;
+     base.extend_from(&other);
+     Ok(Value::Map(base))
+ }
+ 
+ /// Keeps only the named keys, in the order they were named.
+-fn pick(value: &Value, args: &[Value]) -> Result<Value> {
++fn pick(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let map = to_map(value)?;
+-    let wanted = names(&args[0]);
++    let wanted = names(args.get(0).unwrap());
+     let mut out = ValueMap::new();
+     for key in wanted {
+         if let Some(found) = map.get(&key) {
+@@ -70,9 +76,9 @@ fn pick(value: &Value, args: &[Value]) -> Result<Value> {
+ }
+ 
+ /// Drops the named keys, keeping the order of what remains.
+-fn omit(value: &Value, args: &[Value]) -> Result<Value> {
++fn omit(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let map = to_map(value)?;
+-    let unwanted = names(&args[0]);
++    let unwanted = names(args.get(0).unwrap());
+     let mut out = ValueMap::new();
+     for (key, entry) in map.iter() {
+         if !unwanted.iter().any(|name| name == key) {
+@@ -82,12 +88,12 @@ fn omit(value: &Value, args: &[Value]) -> Result<Value> {
+     Ok(Value::Map(out))
+ }
+ 
+-fn has(value: &Value, args: &[Value]) -> Result<Value> {
++fn has(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let map = to_map(value)?;
+-    Ok(Value::Bool(map.contains_key(&to_text(&args[0]))))
++    Ok(Value::Bool(map.contains_key(&to_text(args.get(0).unwrap()))))
+ }
+ 
+-fn sort_keys(value: &Value, _args: &[Value]) -> Result<Value> {
++fn sort_keys(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(Value::Map(to_map(value)?.sorted_by_key()))
+ }
+ 
+@@ -95,7 +101,7 @@ fn sort_keys(value: &Value, _args: &[Value]) -> Result<Value> {
+ ///
+ /// Entries that are not two-element lists are skipped, and a repeated key keeps
+ /// its first position with the last value.
+-fn from_items(value: &Value, _args: &[Value]) -> Result<Value> {
++fn from_items(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     let pairs = to_list(value)?;
+     let mut out = ValueMap::new();
+     for pair in pairs {
+diff --git a/src/filters/text.rs b/src/filters/text.rs
+index 4e289a9..2ae7666 100644
+--- a/src/filters/text.rs
++++ b/src/filters/text.rs
+@@ -1,7 +1,7 @@
+ //! Filters that shape text.
+ 
+ use super::args::{arg_char, arg_size, arg_text, to_text};
+-use super::{Filter, FilterSet};
++use super::{Filter, FilterArgs, FilterSet};
+ use crate::error::Result;
+ use crate::format::text as shape;
+ use crate::value::Value;
+@@ -12,21 +12,75 @@ pub fn register(set: &mut FilterSet) {
+     set.insert(Filter::new("lower", 0, Some(0), lower));
+     set.insert(Filter::new("capitalize", 0, Some(0), capitalize));
+     set.insert(Filter::new("title", 0, Some(0), title));
+-    set.insert(Filter::new("trim", 0, Some(1), trim));
+-    set.insert(Filter::new("ltrim", 0, Some(1), ltrim));
+-    set.insert(Filter::new("rtrim", 0, Some(1), rtrim));
++    set.insert(Filter::with_keywords("trim", 0, Some(1), trim, &["chars"]));
++    set.insert(Filter::with_keywords("ltrim", 0, Some(1), ltrim, &["chars"]));
++    set.insert(Filter::with_keywords("rtrim", 0, Some(1), rtrim, &["chars"]));
+     set.insert(Filter::new("squeeze", 0, Some(0), squeeze));
+-    set.insert(Filter::new("truncate", 1, Some(2), truncate));
+-    set.insert(Filter::new("truncate_words", 1, Some(2), truncate_words));
++    set.insert(Filter::with_keywords(
++        "truncate",
++        1,
++        Some(2),
++        truncate,
++        &["width", "end"],
++    ));
++    set.insert(Filter::with_keywords(
++        "truncate_words",
++        1,
++        Some(2),
++        truncate_words,
++        &["width", "end"],
++    ));
+     set.insert(Filter::new("wrap", 1, Some(1), wrap));
+-    set.insert(Filter::new("indent", 1, Some(2), indent));
+-    set.insert(Filter::new("pad_start", 1, Some(2), pad_start));
+-    set.insert(Filter::new("pad_end", 1, Some(2), pad_end));
+-    set.insert(Filter::new("center", 1, Some(2), center));
++    set.insert(Filter::with_keywords(
++        "indent",
++        1,
++        Some(2),
++        indent,
++        &["prefix", "blank"],
++    ));
++    set.insert(Filter::with_keywords(
++        "pad_start",
++        1,
++        Some(2),
++        pad_start,
++        &["width", "fill"],
++    ));
++    set.insert(Filter::with_keywords(
++        "pad_end",
++        1,
++        Some(2),
++        pad_end,
++        &["width", "fill"],
++    ));
++    set.insert(Filter::with_keywords(
++        "center",
++        1,
++        Some(2),
++        center,
++        &["width", "fill"],
++    ));
+     set.insert(Filter::new("repeat", 1, Some(1), repeat));
+-    set.insert(Filter::new("slice", 1, Some(2), slice));
+-    set.insert(Filter::new("replace", 2, Some(3), replace));
+-    set.insert(Filter::new("split", 0, Some(2), split));
++    set.insert(Filter::with_keywords(
++        "slice",
++        1,
++        Some(2),
++        slice,
++        &["start", "end"],
++    ));
++    set.insert(Filter::with_keywords(
++        "replace",
++        2,
++        Some(3),
++        replace,
++        &["pattern", "replacement", "count"],
++    ));
++    set.insert(Filter::with_keywords(
++        "split",
++        0,
++        Some(2),
++        split,
++        &["sep", "limit"],
++    ));
+     set.insert(Filter::new("lines", 0, Some(0), lines));
+     set.insert(Filter::new("starts_with", 1, Some(1), starts_with));
+     set.insert(Filter::new("ends_with", 1, Some(1), ends_with));
+@@ -38,27 +92,27 @@ pub fn register(set: &mut FilterSet) {
+     set.insert(Filter::new("char_at", 1, Some(1), char_at));
+ }
+ 
+-fn upper(value: &Value, _args: &[Value]) -> Result<Value> {
++fn upper(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(Value::text(to_text(value).to_uppercase()))
+ }
+ 
+-fn lower(value: &Value, _args: &[Value]) -> Result<Value> {
++fn lower(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(Value::text(to_text(value).to_lowercase()))
+ }
+ 
+-fn capitalize(value: &Value, _args: &[Value]) -> Result<Value> {
++fn capitalize(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(Value::text(shape::capitalize(&to_text(value))))
+ }
+ 
+-fn title(value: &Value, _args: &[Value]) -> Result<Value> {
++fn title(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(Value::text(shape::title_case(&to_text(value))))
+ }
+ 
+ /// `trim` with no argument removes whitespace; with one it removes any of the
+ /// characters in the argument.
+-fn trim(value: &Value, args: &[Value]) -> Result<Value> {
++fn trim(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let text = to_text(value);
+-    Ok(Value::text(match args.first() {
++    Ok(Value::text(match args.get(0) {
+         None => text.trim().to_string(),
+         Some(set) => {
+             let cutset: Vec<char> = to_text(set).chars().collect();
+@@ -67,9 +121,9 @@ fn trim(value: &Value, args: &[Value]) -> Result<Value> {
+     }))
+ }
+ 
+-fn ltrim(value: &Value, args: &[Value]) -> Result<Value> {
++fn ltrim(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let text = to_text(value);
+-    Ok(Value::text(match args.first() {
++    Ok(Value::text(match args.get(0) {
+         None => text.trim_start().to_string(),
+         Some(set) => {
+             let cutset: Vec<char> = to_text(set).chars().collect();
+@@ -79,9 +133,9 @@ fn ltrim(value: &Value, args: &[Value]) -> Result<Value> {
+     }))
+ }
+ 
+-fn rtrim(value: &Value, args: &[Value]) -> Result<Value> {
++fn rtrim(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let text = to_text(value);
+-    Ok(Value::text(match args.first() {
++    Ok(Value::text(match args.get(0) {
+         None => text.trim_end().to_string(),
+         Some(set) => {
+             let cutset: Vec<char> = to_text(set).chars().collect();
+@@ -90,11 +144,11 @@ fn rtrim(value: &Value, args: &[Value]) -> Result<Value> {
+     }))
+ }
+ 
+-fn squeeze(value: &Value, _args: &[Value]) -> Result<Value> {
++fn squeeze(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(Value::text(shape::squeeze(&to_text(value))))
+ }
+ 
+-fn truncate(value: &Value, args: &[Value]) -> Result<Value> {
++fn truncate(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let width = arg_size(args, 0, 0)?;
+     let ellipsis = arg_text(args, 1, "…");
+     Ok(Value::text(shape::truncate(
+@@ -104,7 +158,7 @@ fn truncate(value: &Value, args: &[Value]) -> Result<Value> {
+     )))
+ }
+ 
+-fn truncate_words(value: &Value, args: &[Value]) -> Result<Value> {
++fn truncate_words(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let width = arg_size(args, 0, 0)?;
+     let ellipsis = arg_text(args, 1, "…");
+     Ok(Value::text(shape::truncate_words(
+@@ -114,42 +168,42 @@ fn truncate_words(value: &Value, args: &[Value]) -> Result<Value> {
+     )))
+ }
+ 
+-fn wrap(value: &Value, args: &[Value]) -> Result<Value> {
++fn wrap(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let width = arg_size(args, 0, 0)?;
+     let lines = shape::wrap(&to_text(value), width);
+     Ok(Value::list(lines.into_iter().map(Value::Text)))
+ }
+ 
+-fn indent(value: &Value, args: &[Value]) -> Result<Value> {
++fn indent(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let prefix = arg_text(args, 0, "  ");
+     let blank = super::args::arg_flag(args, 1, false);
+     Ok(Value::text(shape::indent(&to_text(value), &prefix, blank)))
+ }
+ 
+-fn pad_start(value: &Value, args: &[Value]) -> Result<Value> {
++fn pad_start(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let width = arg_size(args, 0, 0)?;
+     let fill = arg_char(args, 1, ' ')?;
+     Ok(Value::text(shape::pad_start(&to_text(value), width, fill)))
+ }
+ 
+-fn pad_end(value: &Value, args: &[Value]) -> Result<Value> {
++fn pad_end(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let width = arg_size(args, 0, 0)?;
+     let fill = arg_char(args, 1, ' ')?;
+     Ok(Value::text(shape::pad_end(&to_text(value), width, fill)))
+ }
+ 
+-fn center(value: &Value, args: &[Value]) -> Result<Value> {
++fn center(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let width = arg_size(args, 0, 0)?;
+     let fill = arg_char(args, 1, ' ')?;
+     Ok(Value::text(shape::pad_center(&to_text(value), width, fill)))
+ }
+ 
+-fn repeat(value: &Value, args: &[Value]) -> Result<Value> {
++fn repeat(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let count = arg_size(args, 0, 0)?;
+     Ok(Value::text(shape::repeat(&to_text(value), count)))
+ }
+ 
+-fn slice(value: &Value, args: &[Value]) -> Result<Value> {
++fn slice(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let text = to_text(value);
+     let length = text.chars().count();
+     let start = crate::value::number::clamp_bound(super::args::arg_integer(args, 0, 0)?, length);
+@@ -161,10 +215,10 @@ fn slice(value: &Value, args: &[Value]) -> Result<Value> {
+ }
+ 
+ /// Replaces occurrences of a pattern. A third argument caps how many.
+-fn replace(value: &Value, args: &[Value]) -> Result<Value> {
++fn replace(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let text = to_text(value);
+-    let pattern = to_text(&args[0]);
+-    let replacement = to_text(&args[1]);
++    let pattern = to_text(args.get(0).unwrap());
++    let replacement = to_text(args.get(1).unwrap());
+     if pattern.is_empty() {
+         return Ok(Value::text(text));
+     }
+@@ -179,9 +233,9 @@ fn replace(value: &Value, args: &[Value]) -> Result<Value> {
+ 
+ /// Splits on a separator, or on whitespace when none is given. A second
+ /// argument caps the number of pieces, with the remainder left in the last one.
+-fn split(value: &Value, args: &[Value]) -> Result<Value> {
++fn split(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let text = to_text(value);
+-    let pieces: Vec<String> = match args.first() {
++    let pieces: Vec<String> = match args.get(0) {
+         None => text.split_whitespace().map(str::to_string).collect(),
+         Some(separator) => {
+             let separator = to_text(separator);
+@@ -203,7 +257,7 @@ fn split(value: &Value, args: &[Value]) -> Result<Value> {
+     Ok(Value::list(pieces.into_iter().map(Value::Text)))
+ }
+ 
+-fn lines(value: &Value, _args: &[Value]) -> Result<Value> {
++fn lines(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     let text = to_text(value);
+     Ok(Value::list(
+         text.split('\n')
+@@ -211,39 +265,39 @@ fn lines(value: &Value, _args: &[Value]) -> Result<Value> {
+     ))
+ }
+ 
+-fn starts_with(value: &Value, args: &[Value]) -> Result<Value> {
+-    Ok(Value::Bool(to_text(value).starts_with(&to_text(&args[0]))))
++fn starts_with(value: &Value, args: &FilterArgs) -> Result<Value> {
++    Ok(Value::Bool(to_text(value).starts_with(&to_text(args.get(0).unwrap()))))
+ }
+ 
+-fn ends_with(value: &Value, args: &[Value]) -> Result<Value> {
+-    Ok(Value::Bool(to_text(value).ends_with(&to_text(&args[0]))))
++fn ends_with(value: &Value, args: &FilterArgs) -> Result<Value> {
++    Ok(Value::Bool(to_text(value).ends_with(&to_text(args.get(0).unwrap()))))
+ }
+ 
+-fn camel(value: &Value, _args: &[Value]) -> Result<Value> {
++fn camel(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(Value::text(shape::camel_case(&to_text(value))))
+ }
+ 
+-fn kebab(value: &Value, _args: &[Value]) -> Result<Value> {
++fn kebab(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(Value::text(shape::kebab_case(&to_text(value))))
+ }
+ 
+-fn snake(value: &Value, _args: &[Value]) -> Result<Value> {
++fn snake(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(Value::text(shape::snake_case(&to_text(value))))
+ }
+ 
+-fn pascal(value: &Value, _args: &[Value]) -> Result<Value> {
++fn pascal(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(Value::text(shape::pascal_case(&to_text(value))))
+ }
+ 
+-fn word_count(value: &Value, _args: &[Value]) -> Result<Value> {
++fn word_count(value: &Value, _args: &FilterArgs) -> Result<Value> {
+     Ok(Value::from(to_text(value).split_whitespace().count()))
+ }
+ 
+ /// Reads one character by signed index, or null when out of range.
+-fn char_at(value: &Value, args: &[Value]) -> Result<Value> {
++fn char_at(value: &Value, args: &FilterArgs) -> Result<Value> {
+     let text = to_text(value);
+     let chars: Vec<char> = text.chars().collect();
+-    let index = super::args::to_integer(&args[0])?;
++    let index = super::args::to_integer(args.get(0).unwrap())?;
+     match crate::value::number::resolve_index(index, chars.len()) {
+         Some(position) => Ok(Value::text(chars[position].to_string())),
+         None => Ok(Value::Null),
+diff --git a/src/runtime/eval.rs b/src/runtime/eval.rs
+index 2f761fa..70e89c4 100644
+--- a/src/runtime/eval.rs
++++ b/src/runtime/eval.rs
+@@ -92,22 +92,36 @@ impl<'a> Evaluator<'a> {
+                 ..
+             } => {
+                 let value = self.eval(operand, scope)?;
+-                let mut arguments = Vec::with_capacity(args.len());
++                let mut evaluated = Vec::with_capacity(args.len());
+                 for arg in args {
+-                    arguments.push(self.eval(arg, scope)?);
+-                }
+-                self.filters.apply(name, &value, &arguments).map_err(|err| {
+-                    if err.kind == ErrorKind::UnknownFilter {
+-                        let hints = self.filters.suggestions(name);
+-                        if let Some(closest) = hints.first() {
+-                            return Error::new(
+-                                ErrorKind::UnknownFilter,
+-                                format!("`{name}` is not a filter; did you mean `{closest}`?"),
+-                            );
++                    match arg {
++                        crate::syntax::FilterArg::Positional(expr) => {
++                            evaluated.push((None, self.eval(expr, scope)?));
++                        }
++                        crate::syntax::FilterArg::Keyword {
++                            name: keyword,
++                            value: expr,
++                            ..
++                        } => {
++                            evaluated.push((Some(keyword.clone()), self.eval(expr, scope)?));
+                         }
+                     }
+-                    err
+-                })
++                }
++                let Some(filter) = self.filters.get(name) else {
++                    let hints = self.filters.suggestions(name);
++                    if let Some(closest) = hints.first() {
++                        return Err(Error::new(
++                            ErrorKind::UnknownFilter,
++                            format!("`{name}` is not a filter; did you mean `{closest}`?"),
++                        ));
++                    }
++                    return Err(Error::new(
++                        ErrorKind::UnknownFilter,
++                        format!("`{name}` is not a filter"),
++                    ));
++                };
++                let bound = self.filters.bind_args(name, filter, &evaluated)?;
++                self.filters.apply_bound(name, &value, &bound)
+             }
+             Expr::List { items, .. } => {
+                 let mut values = Vec::with_capacity(items.len());
+diff --git a/src/runtime/render.rs b/src/runtime/render.rs
+index f232006..1493ca7 100644
+--- a/src/runtime/render.rs
++++ b/src/runtime/render.rs
+@@ -247,17 +247,36 @@ impl<'a> Renderer<'a> {
+                 let result = self.render_nodes(body, source, scope, blocks, depth, &mut inner);
+                 scope.pop();
+                 result?;
+-                let mut arguments = Vec::with_capacity(args.len());
++                let mut evaluated = Vec::with_capacity(args.len());
+                 for arg in args {
+-                    arguments.push(evaluator.eval(arg, scope)?);
++                    match arg {
++                        crate::syntax::FilterArg::Positional(expr) => {
++                            evaluated.push((None, evaluator.eval(expr, scope)?));
++                        }
++                        crate::syntax::FilterArg::Keyword {
++                            name: keyword,
++                            value: expr,
++                            ..
++                        } => {
++                            evaluated
++                                .push((Some(keyword.clone()), evaluator.eval(expr, scope)?));
++                        }
++                    }
+                 }
+-                let filtered = self
+-                    .filters
+-                    .apply(name, &Value::text(inner), &arguments)
+-                    .map_err(|err| {
+-                        err.or_at(source.location(node.offset()))
+-                            .or_in_template(source.name())
+-                    })?;
++                let filtered = (|| {
++                    let Some(filter) = self.filters.get(name) else {
++                        return Err(crate::error::Error::new(
++                            crate::error::ErrorKind::UnknownFilter,
++                            format!("`{name}` is not a filter"),
++                        ));
++                    };
++                    let bound = self.filters.bind_args(name, filter, &evaluated)?;
++                    self.filters.apply_bound(name, &Value::text(inner), &bound)
++                })()
++                .map_err(|err| {
++                    err.or_at(source.location(node.offset()))
++                        .or_in_template(source.name())
++                })?;
+                 out.push_str(&to_text(&filtered));
+             }
+             Node::Include { name, context, .. } => {
+diff --git a/src/syntax/ast.rs b/src/syntax/ast.rs
+index 6c78bdc..c908f56 100644
+--- a/src/syntax/ast.rs
++++ b/src/syntax/ast.rs
+@@ -117,6 +117,31 @@ impl BinaryOp {
+     }
+ }
+ 
++/// One argument to a filter call: positional or `name=value`.
++#[derive(Debug, Clone, PartialEq)]
++pub enum FilterArg {
++    /// A bare expression in the argument list.
++    Positional(Expr),
++    /// A keyword argument `name=value`.
++    Keyword {
++        /// The keyword name.
++        name: String,
++        /// The value expression.
++        value: Expr,
++        /// Byte offset of the keyword name in the template.
++        offset: usize,
++    },
++}
++
++impl FilterArg {
++    /// The value expression, whether positional or keyword.
++    pub fn value(&self) -> &Expr {
++        match self {
++            FilterArg::Positional(expr) | FilterArg::Keyword { value: expr, .. } => expr,
++        }
++    }
++}
++
+ /// An expression.
+ #[derive(Debug, Clone, PartialEq)]
+ pub enum Expr {
+@@ -179,7 +204,7 @@ pub enum Expr {
+         /// The filter's name.
+         name: String,
+         /// The filter's extra arguments.
+-        args: Vec<Expr>,
++        args: Vec<FilterArg>,
+         /// Byte offset in the template.
+         offset: usize,
+     },
+@@ -270,7 +295,7 @@ impl Expr {
+             Expr::Filter { operand, args, .. } => {
+                 operand.collect_names(out);
+                 for arg in args {
+-                    arg.collect_names(out);
++                    arg.value().collect_names(out);
+                 }
+             }
+             Expr::List { items, .. } => {
+@@ -310,7 +335,7 @@ impl Expr {
+             } => {
+                 operand.collect_filters(out);
+                 for arg in args {
+-                    arg.collect_filters(out);
++                    arg.value().collect_filters(out);
+                 }
+                 out.push(name.clone());
+             }
+@@ -446,7 +471,7 @@ pub enum Node {
+         /// The filter applied to the rendered body.
+         name: String,
+         /// The filter's extra arguments.
+-        args: Vec<Expr>,
++        args: Vec<FilterArg>,
+         /// The body whose output is filtered.
+         body: Vec<Node>,
+         /// Byte offset in the template.
+diff --git a/src/syntax/mod.rs b/src/syntax/mod.rs
+index f61c4c7..9c7a51c 100644
+--- a/src/syntax/mod.rs
++++ b/src/syntax/mod.rs
+@@ -7,7 +7,7 @@ pub mod printer;
+ pub mod scanner;
+ pub mod token;
+ 
+-pub use ast::{BinaryOp, Branch, Expr, Node, Template, UnaryOp};
++pub use ast::{BinaryOp, Branch, Expr, FilterArg, Node, Template, UnaryOp};
+ pub use parser::{parse_expression, parse_template};
+ pub use printer::{outline, print_expression, print_template};
+ pub use scanner::{scan, Chunk, Trim};
+diff --git a/src/syntax/parser.rs b/src/syntax/parser.rs
+index f7da92f..721ee2b 100644
+--- a/src/syntax/parser.rs
++++ b/src/syntax/parser.rs
+@@ -1,6 +1,6 @@
+ //! Phase two of parsing: expressions, tags and the template body.
+ 
+-use super::ast::{BinaryOp, Branch, Expr, Node, Template, UnaryOp};
++use super::ast::{BinaryOp, Branch, Expr, FilterArg, Node, Template, UnaryOp};
+ use super::lexer::tokenize;
+ use super::scanner::{scan, Chunk};
+ use super::token::{Spanned, Token};
+@@ -349,7 +349,7 @@ impl ExprParser<'_> {
+                             self.source.location(spanned.offset),
+                         ));
+                     };
+-                    let args = self.parse_call_args()?;
++                    let args = self.parse_filter_args()?;
+                     expr = Expr::Filter {
+                         operand: Box::new(expr),
+                         name,
+@@ -373,6 +373,59 @@ impl ExprParser<'_> {
+         }
+     }
+ 
++    fn parse_filter_args(&mut self) -> Result<Vec<FilterArg>> {
++        if !matches!(self.peek(), Some(Token::OpenParen)) {
++            return Ok(Vec::new());
++        }
++        self.position += 1;
++        let mut args = Vec::new();
++        let mut seen_keyword = false;
++        if !matches!(self.peek(), Some(Token::CloseParen)) {
++            loop {
++                let is_keyword = matches!(self.peek(), Some(Token::Ident(_)))
++                    && matches!(self.peek_at(1), Some(Token::Assign));
++                if is_keyword {
++                    seen_keyword = true;
++                    let spanned = self.advance().expect("peeked ident");
++                    let offset = spanned.offset;
++                    let Token::Ident(name) = spanned.token else {
++                        unreachable!("peeked Ident");
++                    };
++                    self.position += 1; // consume `=`
++                    match self.peek() {
++                        None | Some(Token::CloseParen) | Some(Token::Comma) => {
++                            return Err(Error::syntax(
++                                format!("expected a value after `{name}=`"),
++                                self.source.location(self.offset()),
++                            ));
++                        }
++                        _ => {}
++                    }
++                    let value = self.parse(0)?;
++                    args.push(FilterArg::Keyword { name, value, offset });
++                } else {
++                    if seen_keyword {
++                        return Err(Error::syntax(
++                            "positional argument after keyword argument",
++                            self.source.location(self.offset()),
++                        ));
++                    }
++                    let value = self.parse(0)?;
++                    args.push(FilterArg::Positional(value));
++                }
++                if !matches!(self.peek(), Some(Token::Comma)) {
++                    break;
++                }
++                self.position += 1;
++                if matches!(self.peek(), Some(Token::CloseParen)) {
++                    break;
++                }
++            }
++        }
++        self.expect(&Token::CloseParen)?;
++        Ok(args)
++    }
++
+     fn parse_call_args(&mut self) -> Result<Vec<Expr>> {
+         if !matches!(self.peek(), Some(Token::OpenParen)) {
+             return Ok(Vec::new());
+@@ -716,7 +769,7 @@ impl Builder<'_> {
+                 self.source.location(spanned.offset),
+             ));
+         };
+-        let args = parser.parse_call_args()?;
++        let args = parser.parse_filter_args()?;
+         parser.expect_end()?;
+         let (body, tail) = self.parse_body(&["endfilter"])?;
+         if tail.is_none() {
+@@ -1210,6 +1263,42 @@ mod tests {
+         assert_eq!(shape("a | pad(3, \"0\")"), "(a | pad(3, \"0\"))");
+     }
+ 
++    #[test]
++    fn filter_keyword_arguments_parse_and_print() {
++        assert_eq!(
++            shape("x | truncate(12, end=\"…\")"),
++            "(x | truncate(12, end=\"…\"))"
++        );
++        match expr("x | truncate(width=12, end=\"…\")") {
++            Expr::Filter { args, .. } => {
++                assert_eq!(args.len(), 2);
++                match &args[0] {
++                    FilterArg::Keyword { name, .. } => assert_eq!(name, "width"),
++                    other => panic!("expected keyword, got {other:?}"),
++                }
++                match &args[1] {
++                    FilterArg::Keyword { name, .. } => assert_eq!(name, "end"),
++                    other => panic!("expected keyword, got {other:?}"),
++                }
++            }
++            other => panic!("expected filter, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn positional_after_keyword_is_rejected() {
++        let err = expr_err("x | truncate(end=\"…\", 12)");
++        assert!(err.message.contains("positional argument after keyword"));
++    }
++
++    #[test]
++    fn malformed_keyword_assigns_are_rejected() {
++        let err = expr_err("x | truncate(end=)");
++        assert!(err.message.contains("expected a value after `end=`"));
++        let err = expr_err("x | truncate(width=, end=\"…\")");
++        assert!(err.message.contains("expected a value after `width=`"));
++    }
++
+     #[test]
+     fn collection_literals_parse() {
+         assert_eq!(shape("[1, 2]"), "[1, 2]");
+diff --git a/src/syntax/printer.rs b/src/syntax/printer.rs
+index 69b2bbe..3fa5722 100644
+--- a/src/syntax/printer.rs
++++ b/src/syntax/printer.rs
+@@ -5,7 +5,7 @@
+ //! parenthesized so the shape of the tree is unambiguous; postfix chains print
+ //! the way they were written.
+ 
+-use super::ast::{Expr, Node, Template, UnaryOp};
++use super::ast::{Expr, FilterArg, Node, Template, UnaryOp};
+ use crate::value::Value;
+ 
+ /// Renders an expression with explicit parentheses around every operator.
+@@ -39,7 +39,15 @@ pub fn print_expression(expr: &Expr) -> String {
+             if args.is_empty() {
+                 format!("({rendered} | {name})")
+             } else {
+-                let rendered_args: Vec<String> = args.iter().map(print_expression).collect();
++                let rendered_args: Vec<String> = args
++                    .iter()
++                    .map(|arg| match arg {
++                        FilterArg::Positional(expr) => print_expression(expr),
++                        FilterArg::Keyword { name, value, .. } => {
++                            format!("{name}={}", print_expression(value))
++                        }
++                    })
++                    .collect();
+                 format!("({rendered} | {name}({}))", rendered_args.join(", "))
+             }
+         }
+@@ -203,7 +211,15 @@ fn print_node(node: &Node, out: &mut String) {
+             let rendered = if args.is_empty() {
+                 name.clone()
+             } else {
+-                let rendered_args: Vec<String> = args.iter().map(print_expression).collect();
++                let rendered_args: Vec<String> = args
++                    .iter()
++                    .map(|arg| match arg {
++                        FilterArg::Positional(expr) => print_expression(expr),
++                        FilterArg::Keyword { name, value, .. } => {
++                            format!("{name}={}", print_expression(value))
++                        }
++                    })
++                    .collect();
+                 format!("{name}({})", rendered_args.join(", "))
+             };
+             out.push_str(&format!("{{% filter {rendered} %}}"));
+diff --git a/tests/filter_library.rs b/tests/filter_library.rs
+index 6c1bf2b..74791aa 100644
+--- a/tests/filter_library.rs
++++ b/tests/filter_library.rs
+@@ -191,9 +191,12 @@ fn filters_take_expressions_as_arguments() {
+ 
+ #[test]
+ fn a_custom_filter_joins_the_library() {
+-    fn exclaim(value: &Value, args: &[Value]) -> stencilworks::Result<Value> {
++    fn exclaim(
++        value: &Value,
++        args: &stencilworks::filters::FilterArgs,
++    ) -> stencilworks::Result<Value> {
+         let count = args
+-            .first()
++            .get(0)
+             .and_then(|arg| arg.as_number())
+             .map(|n| n as usize)
+             .unwrap_or(1);

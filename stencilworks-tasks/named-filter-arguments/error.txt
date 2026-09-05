@@ -1,2 +1,16 @@
-# Pipeline errors — cleared (ready for first submit)
-# Paste validation / quality-review output here after each failed run.
+READY — first submit for named-filter-arguments
+
+Bundle built Sep 5 with lessons from loop-cycle-controls:
+  - solution.patch parser import rewritten for pre-macro (no MacroParam)
+  - P2P = 617 (all tests/macros.rs ids removed)
+  - test.sh has no --test macros
+  - test.patch = 2 test files only; nextest.toml created in test.sh
+
+Metrics:
+  Solution: 730 +lines, 17 files
+  Tests: 1104 +lines, 2 files, 69 F2P
+  Instruction: 221 words
+  P2P: 617
+
+Before pasting, run:
+  python stencilworks-tasks/named-filter-arguments/verify_bundle.py

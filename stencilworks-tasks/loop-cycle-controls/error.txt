@@ -1,105 +1,28 @@
-loop-cycle-controls
-Enhancement
-Validation Failed
-Report a problem
-stencilworks-render-core · environment v2 · base 3f4470fff4 · submitted Sep 4, 10:52 PM PDT
+RESOLVED — Quality review Attempt 8 ready (from Attempt 5 log)
 
-Validation failed — review the results below, then revise your files and resubmit.
+Quality failed on 8 criteria. Root causes and fixes:
 
-Fix and resubmit
-Pipeline
-Files
-Edit & resubmit
+1) anti cheating / report integrity / separate verifier integrity
+   - Dropping privileges alone is not enough: a detached build.rs running as the
+     same builder that owns CARGO_TARGET_DIR can replace finished libtest
+     binaries so --list and exit codes lie.
+   - Fix: after cargo --no-run, copy binaries into /tmp/stencilworks-verifier-sealed
+     as root (mode 0555), kill builder leftovers (pkill + /proc), freeze TARGET,
+     SHA-256 check sealed copies before --list and each test, and run discovery/
+     grading as root against sealed paths only.
 
-Automated checks
+2) behavior in task description / self containedness / acceptance breadth /
+   behavioral test surface
+   - Tests assert exact outline fragments `cycle 2` and `cycle band/2`, but the
+     instruction only said "names and counts" without the delimiter/shape.
+   - Fix: instruction now requires anonymous `cycle N` and named `cycle <name>/N`
+     with the example `cycle band/2`.
 
-Required files, configuration values, patch scope, instruction bounds
+3) instruction reads naturally
+   - Flagged awkward phrases: "ought to be introduced such that", "They operate
+     using different loops in one rendering", "names associated with the count
+     of their occurrence".
+   - Fix: rewritten in plain engineer voice (283 words); those phrases removed.
 
-Sep 4, 10:52 PM PDT
-passed
-
-AI check
-
-The instruction must be written by you — not generated
-
-Sep 4, 10:52 PM PDT
-passed
-
-Originality
-
-Compared against previously submitted tasks; near-duplicates are rejected
-
-Sep 4, 10:52 PM PDT
-passed
-
-Reference verification
-
-Your reference solution must pass every run; the unchanged repository must fail every run
-
-Sep 4, 10:52 PM PDT
-failed
-Reference solution
-
-Every run must pass (reward 1)
-
-fail
-#1
-#2
-#3
-No-change baseline
-
-Every run must fail (reward 0)
-
-pass
-#1
-#2
-#3
-This check ran 4 times. Viewing:
-Attempt 4 · latest
-Attempt 3
-Attempt 2
-Attempt 1
-Reference verification
-
-completed
-c19MGQnGAsJYdpavdIpt
-
-Duration
-
-2m 25s
-
-Trial	Status	Reward	Runtime
-#1	completed	0	0s
-#2	completed	0	0s
-#3	completed	0	0s
-#4	completed	0	1s
-#5	completed	0	1s
-#6	completed	0	1s
-Browse job directory
-
-Quality review
-
-Automated review of the full bundle — instruction/test alignment, verifier integrity
-
-pending
-
-Calibration I
-
-Automated trials confirm the task is not too easy
-
-pending
-
-Calibration II
-
-Automated trials confirm the task sits inside the target difficulty range
-
-pending
-
-Run audit
-
-Unsuccessful calibration runs are audited — environment defects fail, genuine difficulty passes
-
-pending
-Validation failed
-
-Reference verification failed: reference-solution runs scored [0, 0, 0] — every run must score 1
+Paste: instruction.md, solution/solution.patch (unchanged), tests/test.patch,
+tests/config.json, tests/test.sh. Run verify_bundle.py before upload.

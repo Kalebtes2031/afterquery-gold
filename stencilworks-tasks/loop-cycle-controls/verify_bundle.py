@@ -93,18 +93,77 @@ def main() -> None:
     ok(f"config: {len(f2p)} F2P, {len(p2p)} P2P, junit grade")
 
     test_sh = (ROOT / "tests" / "test.sh").read_text(encoding="utf-8")
-    if "cat > .config/nextest.toml" not in test_sh:
-        fail("test.sh must create .config/nextest.toml in RUN TESTS")
-    if "cycles" not in test_sh or "cycle_parse_and_outline" not in test_sh:
-        fail("test.sh must run cycles + cycle_parse_and_outline for F2P")
+    if "HIDDEN" not in test_sh or "shutil.move" not in test_sh:
+        fail("test.sh must hide /tests/config.json during cargo build (anti-cheat)")
+    if "setuid" not in test_sh or "SW_BUILD_USER" not in test_sh:
+        fail("test.sh must drop privileges (setuid) so root build.rs cannot rewrite tests")
+    if "stencilworks-verifier-sealed" not in test_sh and "SEALED" not in test_sh:
+        fail("test.sh must seal libtest binaries into a root-owned immutable directory")
+    if "kill_builder_leftovers" not in test_sh and "pkill" not in test_sh:
+        fail("test.sh must kill detached builder processes before grading")
+    if "sha256" not in test_sh.lower() and "file_sha256" not in test_sh:
+        fail("test.sh must checksum sealed binaries so mutations are detected")
+    if "as_builder=False" not in test_sh:
+        fail("test.sh must run --list/tests as root against sealed binaries (not builder)")
+    if "cycle_parse_and_behavior" not in test_patch and "cycles.rs" not in test_patch:
+        fail("test.patch must include cycle suites")
+    if "cycle_tag_runs_inside_a_block_body" not in test_patch:
+        fail("test.patch must cover cycle tag inside block bodies")
+    if "outline_lists_cycle_nodes_with_value_counts" not in test_patch:
+        fail("test.patch must grade outline value-count formatting")
+    if "outline_shows_named_cycle_groups" not in test_patch:
+        fail("test.patch must grade named outline groups")
+    if 'contains("inside a for loop")' not in test_patch:
+        fail("test.patch must assert loop.cycle/anonymous errors mention inside a for loop")
+    if "cycle_tag_runs_inside_a_block_body" not in f2p:
+        fail("config F2P must include cycle_tag_runs_inside_a_block_body")
+    if "outline_lists_cycle_nodes_with_value_counts" not in f2p:
+        fail("config F2P must include outline_lists_cycle_nodes_with_value_counts")
     if "--test macros" in test_sh:
         fail("test.sh still references --test macros (doesn't exist on pre-macro platform)")
-    ok("test.sh has nextest setup + cycle suites, no macros ref")
+    ok("anti-cheat drop-priv + outline/error/block coverage present")
 
-    # Check no macro-related P2P tests survived
-    macro_keywords = ["macro", "caller", "call_block", "import_as", "from_import",
-                       "call_expression", "omitted_defaults_use_the_declared",
-                       "provided_arguments_override_defaults"]
+    lower = instruction.lower()
+    awkward = [
+        "ought to be introduced such that",
+        "they operate using different loops in one rendering",
+        "names associated with the count of their occurrence",
+        "there will be some differences in the implementation",
+        "number of pointers",
+    ]
+    hits_awk = [p for p in awkward if p in lower]
+    if hits_awk:
+        fail(f"instruction still has awkward generated phrasing: {hits_awk}")
+    if "first identifier" in lower and "when there are no other expressions" in lower:
+        fail("instruction still has the reversed first-identifier naming rule")
+    if "followed directly by another value is the group name" not in lower and "followed directly by another value is a group name" not in lower:
+        fail("instruction must state: leading identifier followed by another value is the group name")
+    if "lone identifier" not in lower:
+        fail("instruction must state lone identifiers are values")
+    if "empty string" not in lower and "no arguments" not in lower:
+        fail("instruction must state empty loop.cycle() renders empty")
+    if "trailing comma" not in lower:
+        fail("instruction must state trailing comma handling")
+    if "parse at the template root" not in lower and "may parse at the template root" not in lower:
+        fail("instruction must state anonymous tags may parse at root but fail at render")
+    if "cycle band/2" not in instruction:
+        fail("instruction must state exact outline example cycle band/2")
+    if "cycle n" not in lower and "anonymous ones outline as" not in lower:
+        fail("instruction must state anonymous outline shape cycle N")
+    if "across separate loops" not in lower and "keep going across separate loops" not in lower:
+        fail("instruction must state named-cycle lifetime across loops")
+    ok("instruction naming, edges, outline, and natural phrasing checks passed")
+
+    macro_keywords = [
+        "macro",
+        "caller",
+        "call_block",
+        "import_as",
+        "from_import",
+        "call_expression",
+        "omitted_defaults_use_the_declared",
+        "provided_arguments_override_defaults",
+    ]
     bad_p2p = [t for t in p2p if any(kw in t for kw in macro_keywords)]
     if bad_p2p:
         fail(f"P2P still has macro-related tests: {bad_p2p}")
@@ -115,7 +174,6 @@ def main() -> None:
         "loop cycle outside a for loop is an error",
         "check rejects a cycle tag with no values",
     ]
-    lower = instruction.lower()
     hits = [p for p in mirror_phrases if p in lower]
     if hits:
         fail(f"instruction mirrors test titles: {hits}")

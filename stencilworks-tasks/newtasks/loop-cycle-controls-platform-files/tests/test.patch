@@ -1,10 +1,10 @@
-diff --git a/tests/cycle_parse_and_behavior.rs b/tests/cycle_parse_and_behavior.rs
+diff --git a/tests/cycle_parse_and_outline.rs b/tests/cycle_parse_and_outline.rs
 new file mode 100644
-index 0000000..8bcb491
+index 0000000..6483165
 --- /dev/null
-+++ b/tests/cycle_parse_and_behavior.rs
-@@ -0,0 +1,440 @@
-+//! Public parser and rendering behavior for loop cycling.
++++ b/tests/cycle_parse_and_outline.rs
+@@ -0,0 +1,394 @@
++//! Parser, outline, and structural tests for loop cycling.
 +
 +use stencilworks::syntax::outline;
 +use stencilworks::{parse_template, Environment, Source, Value, ValueMap};
@@ -49,37 +49,34 @@ index 0000000..8bcb491
 +}
 +
 +#[test]
++fn parse_rejects_an_empty_cycle_tag() {
++    let err = parse_template(&Source::new("t", "{% cycle %}")).unwrap_err();
++    assert!(err.to_string().contains("at least one value"));
++}
++
++#[test]
 +fn parse_treats_a_comma_first_token_as_a_value_not_a_group() {
 +    let parsed = parse_template(&Source::new("t", r#"{% cycle left, right %}"#)).unwrap();
 +    assert_eq!(parsed.nodes.len(), 1);
 +}
 +
 +#[test]
-+fn comma_separated_identifiers_are_anonymous_cycle_values() {
-+    let mut map = ctx(&["1", "2", "3"]);
-+    map.insert("left", Value::text("L"));
-+    map.insert("right", Value::text("R"));
-+    let out = render_ctx(
-+        r#"{% for item in items %}{% cycle left, right %}{% endfor %}"#,
-+        &map,
-+    );
-+    assert_eq!(out, "LRL");
++fn outline_lists_cycle_nodes_with_value_counts() {
++    let parsed = parse_template(&Source::new(
++        "page",
++        r#"{% for x in xs %}{% cycle "a", "b" %}{% endfor %}"#,
++    ))
++    .unwrap();
++    let text = outline(&parsed);
++    assert!(text.contains("for x"));
++    assert!(text.contains("cycle 2"));
 +}
 +
 +#[test]
-+fn named_cycle_values_accept_filter_pipeline_expressions() {
-+    let out = render(
-+        r#"{% cycle band " left " | trim | upper, "right" | upper %}{% cycle band " left " | trim | upper, "right" | upper %}"#,
-+    );
-+    assert_eq!(out, "LEFTRIGHT");
-+}
-+
-+#[test]
-+fn a_named_group_is_selected_without_a_comma_after_its_name() {
-+    let out = render(
-+        r#"{% cycle band "x", "y" %}{% cycle band "x", "y" %}"#,
-+    );
-+    assert_eq!(out, "xy");
++fn outline_shows_named_cycle_groups() {
++    let parsed = parse_template(&Source::new("t", r#"{% cycle band "1", "2" %}"#)).unwrap();
++    let text = outline(&parsed);
++    assert!(text.contains("cycle band/2"));
 +}
 +
 +#[test]
@@ -122,19 +119,21 @@ index 0000000..8bcb491
 +}
 +
 +#[test]
-+fn loop_cycle_expression_parses_at_root_but_rendering_rejects_it() {
-+    let text = r#"{{ loop.cycle("a") }}"#;
-+    assert!(parse_template(&Source::new("t", text)).is_ok());
-+    let err = Environment::new().render("t", text, &ValueMap::new()).unwrap_err();
-+    assert!(err.to_string().contains("inside a for loop"));
++fn loop_cycle_error_mentions_for_loop() {
++    let err = Environment::new()
++        .render("t", r#"{{ loop.cycle("a") }}"#, &ValueMap::new())
++        .unwrap_err();
++    let message = err.to_string();
++    assert!(message.contains("inside a for loop"));
 +}
 +
 +#[test]
-+fn anonymous_cycle_tag_parses_at_root_but_rendering_rejects_it() {
-+    let text = r#"{% cycle "a" %}"#;
-+    assert!(parse_template(&Source::new("t", text)).is_ok());
-+    let err = Environment::new().render("t", text, &ValueMap::new()).unwrap_err();
-+    assert!(err.to_string().contains("inside a for loop"));
++fn anonymous_cycle_error_mentions_for_loop() {
++    let err = Environment::new()
++        .render("t", r#"{% cycle "a" %}"#, &ValueMap::new())
++        .unwrap_err();
++    let message = err.to_string();
++    assert!(message.contains("inside a for loop"));
 +}
 +
 +#[test]
@@ -234,15 +233,6 @@ index 0000000..8bcb491
 +}
 +
 +#[test]
-+fn cycle_tag_runs_inside_a_block_body() {
-+    let out = render_ctx(
-+        r#"{% for item in items %}<{% block cell %}{% cycle "0", "1" %}{% endblock %}>{% endfor %}"#,
-+        &ctx(&["a", "b", "c"]),
-+    );
-+    assert_eq!(out, "<0><1><0>");
-+}
-+
-+#[test]
 +fn empty_cycle_argument_list_to_loop_cycle_yields_empty_output() {
 +    let out = render_ctx(
 +        r#"{% for item in items %}<{{ loop.cycle() }}>{% endfor %}"#,
@@ -273,36 +263,19 @@ index 0000000..8bcb491
 +}
 +
 +#[test]
-+fn raw_cycle_text_stays_literal_before_a_real_named_cycle() {
-+    let out = render(
-+        r#"{% raw %}{% cycle "a" %}{% endraw %}{% cycle band "b", "c" %}"#,
-+    );
-+    assert_eq!(out, r#"{% cycle "a" %}b"#);
++fn parse_cycle_inside_raw_block_still_parses_when_outside_raw() {
++    let parsed = parse_template(&Source::new(
++        "t",
++        r#"{% raw %}{% cycle "a" %}{% endraw %}{% cycle "b" %}"#,
++    ))
++    .unwrap();
++    assert_eq!(parsed.nodes.len(), 2);
 +}
 +
 +#[test]
 +fn template_with_only_named_cycle_tags_renders_without_a_loop() {
 +    let out = render(r#"{% cycle g "a", "b", "c" %}{% cycle g "a", "b", "c" %}{% cycle g "a", "b", "c" %}"#);
 +    assert_eq!(out, "abc");
-+}
-+
-+#[test]
-+fn named_cycle_position_carries_from_one_loop_to_the_next() {
-+    let mut map = ValueMap::new();
-+    map.insert("first", list(&["1"]));
-+    map.insert("second", list(&["2", "3"]));
-+    let out = render_ctx(
-+        r#"{% for x in first %}{% cycle band "a", "b" %}{% endfor %}|{% for x in second %}{% cycle band "a", "b" %}{% endfor %}"#,
-+        &map,
-+    );
-+    assert_eq!(out, "a|ba");
-+}
-+
-+#[test]
-+fn named_cycle_state_is_fresh_for_each_render() {
-+    let template = r#"{% cycle band "a", "b" %}{% cycle band "a", "b" %}"#;
-+    assert_eq!(render(template), "ab");
-+    assert_eq!(render(template), "ab");
 +}
 +
 +#[test]
@@ -425,31 +398,13 @@ index 0000000..8bcb491
 +    );
 +    assert_eq!(out, "[a][b][a]");
 +}
-+
-+#[test]
-+fn outline_lists_cycle_nodes_with_value_counts() {
-+    let parsed = parse_template(&Source::new(
-+        "t",
-+        r#"{% for x in items %}{% cycle "a", "b" %}{% endfor %}"#,
-+    ))
-+    .unwrap();
-+    let text = outline(&parsed);
-+    assert!(text.contains("for x"));
-+    assert!(text.contains("cycle 2"));
-+}
-+
-+#[test]
-+fn outline_shows_named_cycle_groups() {
-+    let parsed = parse_template(&Source::new("t", r#"{% cycle band "1", "2" %}"#)).unwrap();
-+    let text = outline(&parsed);
-+    assert!(text.contains("cycle band/2"));
-+}
+\ No newline at end of file
 diff --git a/tests/cycles.rs b/tests/cycles.rs
 new file mode 100644
-index 0000000..dfc9511
+index 0000000..3ec7eb3
 --- /dev/null
 +++ b/tests/cycles.rs
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,214 @@
 +//! Loop cycling through `loop.cycle` and the `{% cycle %}` tag.
 +
 +use stencilworks::{parse_template, Environment, Source, Value, ValueMap};
@@ -460,6 +415,12 @@ index 0000000..dfc9511
 +
 +fn render(text: &str, context: &ValueMap) -> String {
 +    Environment::new().render("t", text, context).unwrap()
++}
++
++fn fail(text: &str, context: &ValueMap) -> stencilworks::Error {
++    Environment::new()
++        .render("t", text, context)
++        .unwrap_err()
 +}
 +
 +fn ctx(items: &[&str]) -> ValueMap {
@@ -497,9 +458,7 @@ index 0000000..dfc9511
 +
 +#[test]
 +fn loop_cycle_outside_a_for_loop_is_an_error() {
-+    let text = r#"{{ loop.cycle("a") }}"#;
-+    assert!(parse_template(&Source::new("t", text)).is_ok());
-+    let err = Environment::new().render("t", text, &ValueMap::new()).unwrap_err();
++    let err = fail(r#"{{ loop.cycle("a") }}"#, &ValueMap::new());
 +    assert!(err.to_string().contains("inside a for loop"));
 +}
 +
@@ -529,9 +488,7 @@ index 0000000..dfc9511
 +
 +#[test]
 +fn anonymous_cycle_outside_a_for_loop_is_an_error() {
-+    let text = r#"{% cycle "a", "b" %}"#;
-+    assert!(parse_template(&Source::new("t", text)).is_ok());
-+    let err = Environment::new().render("t", text, &ValueMap::new()).unwrap_err();
++    let err = fail(r#"{% cycle "a", "b" %}"#, &ValueMap::new());
 +    assert!(err.to_string().contains("inside a for loop"));
 +}
 +
@@ -643,7 +600,8 @@ index 0000000..dfc9511
 +
 +#[test]
 +fn a_cycle_tag_with_no_values_is_a_parse_error() {
-+    assert!(parse_template(&Source::new("t", "{% cycle %}")).is_err());
++    let err = parse_template(&Source::new("t", "{% cycle %}")).unwrap_err();
++    assert!(err.to_string().contains("at least one value"));
 +}
 +
 +#[test]
@@ -655,3 +613,10 @@ index 0000000..dfc9511
 +    .unwrap();
 +    assert_eq!(parsed.nodes.len(), 1);
 +}
++
++#[test]
++fn check_rejects_a_cycle_tag_with_no_values() {
++    let err = parse_template(&Source::new("bad", "{% cycle %}")).unwrap_err();
++    assert!(err.to_string().contains("at least one value"));
++}
+\ No newline at end of file

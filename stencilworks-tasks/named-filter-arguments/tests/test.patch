@@ -1,0 +1,1116 @@
+diff --git a/tests/named_filter_args.rs b/tests/named_filter_args.rs
+new file mode 100644
+index 0000000..3966fbf
+--- /dev/null
++++ b/tests/named_filter_args.rs
+@@ -0,0 +1,588 @@
++//! Keyword arguments on filters, exercised through `Environment::render`.
++
++use stencilworks::{Environment, ErrorKind, Value, ValueMap};
++
++fn context() -> ValueMap {
++    let mut map = ValueMap::new();
++    map.insert("text", Value::text("Hello Brave World"));
++    map.insert("padded", Value::text("hi"));
++    map.insert("messy", Value::text("--ab--"));
++    map.insert("csvish", Value::text("a,b,c,d"));
++    map.insert("swap", Value::text("aa-aa"));
++    map.insert("n", Value::from(1234.5678));
++    map.insert("half", Value::from(1234.5));
++    map.insert("blank", Value::Null);
++    map.insert("empty", Value::text(""));
++    map.insert(
++        "items",
++        Value::list([Value::from(1.0), Value::from(2.0), Value::from(3.0)]),
++    );
++    map.insert(
++        "people",
++        Value::list([
++            Value::map([
++                ("name".to_string(), Value::text("bo")),
++                ("team".to_string(), Value::text("ops")),
++            ]),
++            Value::map([
++                ("name".to_string(), Value::text("ada")),
++                ("team".to_string(), Value::text("core")),
++            ]),
++        ]),
++    );
++    map.insert(
++        "config",
++        Value::map([
++            ("a".to_string(), Value::from(1.0)),
++            ("b".to_string(), Value::from(2.0)),
++        ]),
++    );
++    map.insert("multiline", Value::text("a\n\nb"));
++    map.insert("width", Value::from(8.0));
++    map.insert("suffix", Value::text("..."));
++    map
++}
++
++fn render(text: &str) -> String {
++    Environment::new().render("t", text, &context()).unwrap()
++}
++
++fn fail(text: &str) -> stencilworks::Error {
++    Environment::new()
++        .render("page.html", text, &context())
++        .unwrap_err()
++}
++
++#[test]
++fn truncate_accepts_positional_width_with_keyword_end_using_ascii_dots() {
++    assert_eq!(
++        render(r#"{{ text | truncate(12, end="...") }}"#),
++        "Hello Bra..."
++    );
++    assert_eq!(
++        render(r#"{{ text | truncate(8, end="..") }}"#),
++        "Hello .."
++    );
++}
++
++#[test]
++fn truncate_accepts_positional_width_with_unicode_ellipsis_keyword() {
++    assert_eq!(
++        render("{{ text | truncate(12, end=\"…\") }}"),
++        "Hello Brave…"
++    );
++    assert_eq!(
++        render("{{ text | truncate(8, end=\"…\") }}"),
++        "Hello B…"
++    );
++}
++
++#[test]
++fn truncate_accepts_both_width_and_end_as_keywords() {
++    assert_eq!(
++        render(r#"{{ text | truncate(width=12, end="...") }}"#),
++        "Hello Bra..."
++    );
++    assert_eq!(
++        render("{{ text | truncate(width=8, end=\"…\") }}"),
++        "Hello B…"
++    );
++    assert_eq!(
++        render(r#"{{ text | truncate(end="!", width=10) }}"#),
++        "Hello Bra!"
++    );
++}
++
++#[test]
++fn pad_family_accepts_fill_keyword_alongside_width() {
++    assert_eq!(
++        render(r#"{{ padded | pad_start(width=5, fill="*") }}"#),
++        "***hi"
++    );
++    assert_eq!(
++        render(r#"{{ padded | pad_end(width=5, fill="-") }}"#),
++        "hi---"
++    );
++    assert_eq!(
++        render(r#"{{ padded | center(width=6, fill=".") }}"#),
++        "..hi.."
++    );
++    assert_eq!(
++        render(r#"{{ padded | pad_start(5, fill="0") }}"#),
++        "000hi"
++    );
++}
++
++#[test]
++fn indent_accepts_prefix_and_blank_keywords() {
++    assert_eq!(
++        render(r#"{{ multiline | indent(prefix=">") }}"#),
++        ">a\n\n>b"
++    );
++    assert_eq!(
++        render(r#"{{ multiline | indent(prefix=">", blank=true) }}"#),
++        ">a\n>\n>b"
++    );
++    assert_eq!(
++        render(r#"{{ multiline | indent(prefix=">>", blank=false) }}"#),
++        ">>a\n\n>>b"
++    );
++}
++
++#[test]
++fn replace_accepts_count_keyword_to_limit_substitutions() {
++    assert_eq!(
++        render(r#"{{ swap | replace(pattern="a", replacement="x", count=2) }}"#),
++        "xx-aa"
++    );
++    assert_eq!(
++        render(r#"{{ swap | replace("a", "x", count=1) }}"#),
++        "xa-aa"
++    );
++    assert_eq!(
++        render(r#"{{ swap | replace(pattern="a", replacement="x") }}"#),
++        "xx-xx"
++    );
++}
++
++#[test]
++fn split_accepts_sep_and_limit_keywords() {
++    assert_eq!(
++        render(r#"{{ csvish | split(sep=",", limit=2) | join(sep="|") }}"#),
++        "a|b,c,d"
++    );
++    assert_eq!(
++        render(r#"{{ csvish | split(sep=",") | length }}"#),
++        "4"
++    );
++    assert_eq!(
++        render(r#"{{ csvish | split(sep=",", limit=3) | join("-") }}"#),
++        "a-b-c,d"
++    );
++}
++
++#[test]
++fn trim_variants_accept_chars_keyword() {
++    assert_eq!(render(r#"{{ messy | trim(chars="-") }}"#), "ab");
++    assert_eq!(render(r#"{{ messy | ltrim(chars="-") }}"#), "ab--");
++    assert_eq!(render(r#"{{ messy | rtrim(chars="-") }}"#), "--ab");
++    assert_eq!(
++        render(r#"{{ "xxabxx" | trim(chars="x") }}"#),
++        "ab"
++    );
++}
++
++#[test]
++fn slice_accepts_start_and_end_keywords() {
++    assert_eq!(
++        render(r#"{{ text | slice(start=0, end=5) }}"#),
++        "Hello"
++    );
++    assert_eq!(
++        render(r#"{{ text | slice(start=6, end=11) }}"#),
++        "Brave"
++    );
++    assert_eq!(
++        render(r#"{{ text | slice(6, end=11) }}"#),
++        "Brave"
++    );
++}
++
++#[test]
++fn join_accepts_sep_and_final_sep_keywords() {
++    assert_eq!(
++        render(r#"{{ items | join(sep=",", final_sep=" and ") }}"#),
++        "1,2 and 3"
++    );
++    assert_eq!(
++        render(r#"{{ items | join(sep="-") }}"#),
++        "1-2-3"
++    );
++    assert_eq!(
++        render(r#"{{ items | join(final_sep=" + ", sep=", ") }}"#),
++        "1, 2 + 3"
++    );
++}
++
++#[test]
++fn sort_accepts_field_keyword_for_record_lists() {
++    assert_eq!(
++        render(r#"{{ people | sort(field="name") | pluck("name") | join(",") }}"#),
++        "ada,bo"
++    );
++    assert_eq!(
++        render(r#"{{ people | sort(field="team") | pluck("team") | join("/") }}"#),
++        "core/ops"
++    );
++}
++
++#[test]
++fn get_accepts_key_and_default_keywords() {
++    assert_eq!(
++        render(r#"{{ config | get(key="a") }}"#),
++        "1"
++    );
++    assert_eq!(
++        render(r#"{{ config | get(key="z", default="missing") }}"#),
++        "missing"
++    );
++    assert_eq!(
++        render(r#"{{ config | get("z", default="gone") }}"#),
++        "gone"
++    );
++}
++
++#[test]
++fn default_filter_accepts_fallback_and_falsy_keywords() {
++    assert_eq!(
++        render(r#"{{ blank | default(fallback="none") }}"#),
++        "none"
++    );
++    assert_eq!(
++        render(r#"{{ empty | default(fallback="none") }}"#),
++        ""
++    );
++    assert_eq!(
++        render(r#"{{ empty | default(fallback="none", falsy=true) }}"#),
++        "none"
++    );
++    assert_eq!(
++        render(r#"{{ text | default(fallback="x", falsy=true) }}"#),
++        "Hello Brave World"
++    );
++}
++
++#[test]
++fn round_accepts_digits_keyword() {
++    assert_eq!(render(r#"{{ n | round(digits=2) }}"#), "1234.57");
++    assert_eq!(render(r#"{{ n | round(digits=0) }}"#), "1235");
++    assert_eq!(render(r#"{{ 1.005 | round(digits=2) }}"#), "1.01");
++}
++
++#[test]
++fn mixed_positional_then_keyword_binds_remaining_slots() {
++    assert_eq!(
++        render(r#"{{ text | truncate(10, end="!") }}"#),
++        "Hello Bra!"
++    );
++    assert_eq!(
++        render(r#"{{ padded | pad_end(4, fill=".") }}"#),
++        "hi.."
++    );
++    assert_eq!(
++        render(r#"{{ swap | replace("a", "Q", count=1) }}"#),
++        "Qa-aa"
++    );
++    assert_eq!(
++        render(r#"{{ csvish | split(",", limit=2) | first }}"#),
++        "a"
++    );
++}
++
++#[test]
++fn keyword_values_may_be_expressions_and_filter_pipelines() {
++    assert_eq!(
++        render(r#"{{ text | truncate(width=width, end=suffix) }}"#),
++        "Hello..."
++    );
++    assert_eq!(
++        render(r#"{{ text | truncate(width=items | length, end=".") }}"#),
++        "He."
++    );
++    assert_eq!(
++        render(r#"{{ text | slice(start=0, end=width | int) }}"#),
++        "Hello Br"
++    );
++    assert_eq!(
++        render(r#"{{ items | join(sep=suffix | slice(0, 1)) }}"#),
++        "1.2.3"
++    );
++}
++
++#[test]
++fn unknown_keyword_error_names_the_filter() {
++    let err = fail(r#"{{ text | truncate(width=8, nope=1) }}"#);
++    assert_eq!(err.kind, ErrorKind::Arity);
++    assert!(err.message.contains("truncate"), "{}", err.message);
++    assert!(err.message.contains("unknown keyword"), "{}", err.message);
++    assert!(err.message.contains("nope"), "{}", err.message);
++}
++
++#[test]
++fn duplicate_keyword_error_names_the_filter() {
++    let err = fail(r#"{{ text | truncate(width=5, width=8) }}"#);
++    assert_eq!(err.kind, ErrorKind::Arity);
++    assert!(err.message.contains("truncate"), "{}", err.message);
++    assert!(err.message.contains("duplicate keyword"), "{}", err.message);
++    assert!(err.message.contains("width"), "{}", err.message);
++}
++
++#[test]
++fn positional_argument_after_keyword_is_a_syntax_error() {
++    let err = fail(r#"{{ text | truncate(end="...", 12) }}"#);
++    assert_eq!(err.kind, ErrorKind::Syntax);
++    assert!(
++        err.message.contains("positional argument after keyword"),
++        "{}",
++        err.message
++    );
++}
++
++#[test]
++fn malformed_keyword_assign_without_value_is_a_syntax_error() {
++    let err = fail(r#"{{ text | truncate(end=) }}"#);
++    assert_eq!(err.kind, ErrorKind::Syntax);
++    assert!(
++        err.message.contains("expected a value after `end=`"),
++        "{}",
++        err.message
++    );
++    let err = fail(r#"{{ text | truncate(width=, end="x") }}"#);
++    assert!(
++        err.message.contains("expected a value after `width=`"),
++        "{}",
++        err.message
++    );
++}
++
++#[test]
++fn arity_still_enforced_when_required_slots_are_missing() {
++    let err = fail(r#"{{ text | truncate(end="...") }}"#);
++    assert_eq!(err.kind, ErrorKind::Arity);
++    assert!(err.message.contains("truncate"), "{}", err.message);
++    let err = fail(r#"{{ padded | pad_start(fill="*") }}"#);
++    assert_eq!(err.kind, ErrorKind::Arity);
++    assert!(err.message.contains("pad_start"), "{}", err.message);
++}
++
++#[test]
++fn filters_without_declared_keywords_reject_keyword_calls() {
++    let err = fail(r#"{{ text | upper(x=1) }}"#);
++    assert_eq!(err.kind, ErrorKind::Arity);
++    assert!(err.message.contains("upper"), "{}", err.message);
++    assert!(err.message.contains("unknown keyword"), "{}", err.message);
++    assert!(err.message.contains("x"), "{}", err.message);
++
++    let err = fail(r#"{{ items | length(n=1) }}"#);
++    assert_eq!(err.kind, ErrorKind::Arity);
++    assert!(err.message.contains("length"), "{}", err.message);
++    assert!(err.message.contains("unknown keyword"), "{}", err.message);
++}
++
++#[test]
++fn pure_positional_forms_match_equivalent_keyword_forms() {
++    assert_eq!(
++        render(r#"{{ text | truncate(8) }}"#),
++        render(r#"{{ text | truncate(width=8) }}"#)
++    );
++    assert_eq!(
++        render(r#"{{ text | truncate(10, "...") }}"#),
++        render(r#"{{ text | truncate(width=10, end="...") }}"#)
++    );
++    assert_eq!(
++        render(r#"{{ padded | pad_start(5, "*") }}"#),
++        render(r#"{{ padded | pad_start(width=5, fill="*") }}"#)
++    );
++    assert_eq!(
++        render(r#"{{ padded | pad_end(5, "-") }}"#),
++        render(r#"{{ padded | pad_end(width=5, fill="-") }}"#)
++    );
++    assert_eq!(
++        render(r#"{{ padded | center(6, ".") }}"#),
++        render(r#"{{ padded | center(width=6, fill=".") }}"#)
++    );
++}
++
++#[test]
++fn filter_block_accepts_keyword_arguments_on_the_filter_tag() {
++    assert_eq!(
++        render("{% filter indent(prefix=\">\") %}a\nb{% endfilter %}"),
++        ">a\n>b"
++    );
++    assert_eq!(
++        render("{% filter indent(prefix=\">>\", blank=true) %}a\n\nb{% endfilter %}"),
++        ">>a\n>>\n>>b"
++    );
++    assert_eq!(
++        render(r#"{% filter truncate(width=6, end="!") %}abcdefghi{% endfilter %}"#),
++        "abcde!"
++    );
++}
++
++#[test]
++fn chained_and_nested_filters_carry_keyword_arguments() {
++    assert_eq!(
++        render(r#"{{ text | lower | truncate(width=9, end="...") }}"#),
++        "hello ..."
++    );
++    assert_eq!(
++        render(r#"{{ text | slice(start=0, end=11) | truncate(width=8, end="!") }}"#),
++        "Hello B!"
++    );
++    assert_eq!(
++        render(
++            r#"{{ people | sort(field="name") | pluck("name") | join(sep="/", final_sep="+") }}"#
++        ),
++        "ada+bo"
++    );
++}
++
++#[test]
++fn multiple_independent_keyword_calls_in_one_template() {
++    let out = render(
++        r#"{{ text | truncate(width=5, end=".") }}|{{ padded | pad_start(width=4, fill="0") }}|{{ n | round(digits=1) }}"#,
++    );
++    assert_eq!(out, "Hell.|00hi|1234.6");
++    let out = render(
++        r#"{% set a = text | slice(start=0, end=5) %}{% set b = items | join(sep=":") %}{{ a }}-{{ b }}"#,
++    );
++    assert_eq!(out, "Hello-1:2:3");
++}
++
++#[test]
++fn empty_argument_lists_still_work_for_zero_arity_and_optional_slots() {
++    assert_eq!(render(r#"{{ text | upper() }}"#), "HELLO BRAVE WORLD");
++    assert_eq!(render(r#"{{ items | join() }}"#), "123");
++    assert_eq!(render(r#"{{ n | round() }}"#), "1235");
++    assert_eq!(
++        render(r#"{{ text | truncate(width=8,) }}"#),
++        render(r#"{{ text | truncate(width=8) }}"#)
++    );
++}
++
++#[test]
++fn group_json_and_csv_accept_their_declared_keywords() {
++    assert_eq!(
++        render(r#"{{ half | group(sep="_", point=",") }}"#),
++        "1_234,5"
++    );
++    assert_eq!(
++        render(r#"{{ items | json(indent=2) }}"#),
++        "[\n  1,\n  2,\n  3\n]"
++    );
++    assert_eq!(
++        render(r#"{{ items | csv(delimiter=";") }}"#),
++        "1;2;3"
++    );
++    assert_eq!(
++        render(r#"{{ half | group(sep=" ") }}"#),
++        "1 234.5"
++    );
++}
++
++#[test]
++fn unknown_keyword_messages_include_the_filter_name_for_several_filters() {
++    for (template, filter) in [
++        (r#"{{ text | slice(begin=0) }}"#, "slice"),
++        (r#"{{ items | join(glue=",") }}"#, "join"),
++        (r#"{{ n | round(places=2) }}"#, "round"),
++        (r#"{{ config | get(name="a") }}"#, "get"),
++    ] {
++        let err = fail(template);
++        assert_eq!(err.kind, ErrorKind::Arity);
++        assert!(
++            err.message.contains(filter),
++            "expected `{filter}` in {}",
++            err.message
++        );
++        assert!(
++            err.message.contains("unknown keyword"),
++            "{}",
++            err.message
++        );
++    }
++}
++
++#[test]
++fn keyword_names_are_matched_case_sensitively() {
++    let err = fail(r#"{{ text | truncate(Width=8) }}"#);
++    assert_eq!(err.kind, ErrorKind::Arity);
++    assert!(err.message.contains("truncate"), "{}", err.message);
++    assert!(err.message.contains("unknown keyword"), "{}", err.message);
++    assert!(err.message.contains("Width"), "{}", err.message);
++
++    let err = fail(r#"{{ text | truncate(END="...") }}"#);
++    assert!(err.message.contains("END"), "{}", err.message);
++}
++
++#[test]
++fn truncate_words_also_accepts_width_and_end_keywords() {
++    assert_eq!(
++        render(r#"{{ text | truncate_words(width=12, end="...") }}"#),
++        "Hello Brave..."
++    );
++    assert_eq!(
++        render("{{ text | truncate_words(11, end=\"…\") }}"),
++        "Hello…"
++    );
++}
++
++#[test]
++fn ltrim_and_rtrim_keywords_compose_with_other_text_filters() {
++    assert_eq!(
++        render(r#"{{ messy | ltrim(chars="-") | rtrim(chars="-") | upper }}"#),
++        "AB"
++    );
++    assert_eq!(
++        render(r#"{{ "  spaced  " | trim(chars=" ") | truncate(width=4, end="!") }}"#),
++        "spa!"
++    );
++}
++
++#[test]
++fn get_default_keyword_can_be_an_expression() {
++    assert_eq!(
++        render(r#"{{ config | get(key="missing", default=items | first) }}"#),
++        "1"
++    );
++    assert_eq!(
++        render(r#"{{ config | get(key="a", default=999) }}"#),
++        "1"
++    );
++}
++
++#[test]
++fn duplicate_keywords_are_rejected_across_filter_families() {
++    let err = fail(r#"{{ padded | pad_start(width=3, fill=".", fill="*") }}"#);
++    assert!(err.message.contains("pad_start"), "{}", err.message);
++    assert!(err.message.contains("duplicate keyword"), "{}", err.message);
++    assert!(err.message.contains("fill"), "{}", err.message);
++
++    let err = fail(r#"{{ blank | default(fallback="a", fallback="b") }}"#);
++    assert!(err.message.contains("default"), "{}", err.message);
++    assert!(err.message.contains("duplicate keyword"), "{}", err.message);
++}
++
++#[test]
++fn required_positional_slots_remain_required_beside_optional_keywords() {
++    let err = fail(r#"{{ swap | replace(replacement="x", count=1) }}"#);
++    assert_eq!(err.kind, ErrorKind::Arity);
++    assert!(err.message.contains("replace"), "{}", err.message);
++
++    let err = fail(r#"{{ config | get(default="x") }}"#);
++    assert_eq!(err.kind, ErrorKind::Arity);
++    assert!(err.message.contains("get"), "{}", err.message);
++}
++
++#[test]
++fn keyword_only_calls_can_skip_optional_trailing_slots() {
++    assert_eq!(
++        render(r#"{{ text | truncate(width=20) }}"#),
++        "Hello Brave World"
++    );
++    assert_eq!(
++        render(r#"{{ padded | pad_start(width=2) }}"#),
++        "hi"
++    );
++    assert_eq!(
++        render(r#"{{ items | join(sep=",") }}"#),
++        "1,2,3"
++    );
++}
++
++#[test]
++fn render_errors_for_keyword_issues_carry_the_template_name() {
++    let err = fail(r#"{{ text | truncate(bogus=1) }}"#);
++    assert_eq!(err.template.as_deref(), Some("page.html"));
++    assert!(err.message.contains("truncate"));
++}
+diff --git a/tests/named_filter_parse_and_cli.rs b/tests/named_filter_parse_and_cli.rs
+new file mode 100644
+index 0000000..0a4b474
+--- /dev/null
++++ b/tests/named_filter_parse_and_cli.rs
+@@ -0,0 +1,516 @@
++//! Parse, print, outline, and CLI coverage for keyword filter arguments.
++
++use stencilworks::cli::args::CheckArgs;
++use stencilworks::cli::commands::inspect::{check, list_filters, show_outline};
++use stencilworks::syntax::{outline, parse_expression, parse_template, print_expression, FilterArg};
++use stencilworks::{Environment, ErrorKind, Source, ValueMap};
++use std::path::PathBuf;
++
++fn expr(text: &str) -> stencilworks::syntax::Expr {
++    let source = Source::anonymous(text);
++    parse_expression(&source, text, 0).unwrap()
++}
++
++fn expr_err(text: &str) -> stencilworks::Error {
++    let source = Source::anonymous(text);
++    parse_expression(&source, text, 0).unwrap_err()
++}
++
++fn shape(text: &str) -> String {
++    print_expression(&expr(text))
++}
++
++fn template(text: &str) -> stencilworks::Template {
++    parse_template(&Source::new("t", text)).unwrap()
++}
++
++fn template_err(text: &str) -> stencilworks::Error {
++    parse_template(&Source::new("t", text)).unwrap_err()
++}
++
++struct Tree {
++    root: PathBuf,
++}
++
++impl Tree {
++    fn new(files: &[(&str, &str)]) -> Tree {
++        let stamp = std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .map(|d| d.as_nanos())
++            .unwrap_or(0);
++        let mut root = std::env::temp_dir();
++        root.push(format!(
++            "stencilworks-kw-cli-{stamp}-{:?}",
++            std::thread::current().id()
++        ));
++        std::fs::create_dir_all(&root).expect("create tree");
++        for (name, text) in files {
++            let path = root.join(name);
++            if let Some(parent) = path.parent() {
++                std::fs::create_dir_all(parent).expect("create parent");
++            }
++            std::fs::write(path, text).expect("write file");
++        }
++        Tree { root }
++    }
++
++    fn args(&self, templates: &[&str]) -> CheckArgs {
++        CheckArgs {
++            templates: templates.iter().map(|t| t.to_string()).collect(),
++            root: Some(self.root.to_string_lossy().to_string()),
++        }
++    }
++}
++
++impl Drop for Tree {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_dir_all(&self.root);
++    }
++}
++
++#[test]
++fn parse_expression_accepts_keyword_filter_arguments() {
++    match expr(r#"x | truncate(12, end="...")"#) {
++        stencilworks::syntax::Expr::Filter { name, args, .. } => {
++            assert_eq!(name, "truncate");
++            assert_eq!(args.len(), 2);
++            assert!(matches!(&args[0], FilterArg::Positional(_)));
++            match &args[1] {
++                FilterArg::Keyword { name, .. } => assert_eq!(name, "end"),
++                other => panic!("expected keyword, got {other:?}"),
++            }
++        }
++        other => panic!("expected filter, got {other:?}"),
++    }
++}
++
++#[test]
++fn parse_expression_accepts_all_keyword_argument_lists() {
++    match expr(r#"x | truncate(width=12, end="…")"#) {
++        stencilworks::syntax::Expr::Filter { args, .. } => {
++            assert_eq!(args.len(), 2);
++            match &args[0] {
++                FilterArg::Keyword { name, .. } => assert_eq!(name, "width"),
++                other => panic!("expected keyword, got {other:?}"),
++            }
++            match &args[1] {
++                FilterArg::Keyword { name, .. } => assert_eq!(name, "end"),
++                other => panic!("expected keyword, got {other:?}"),
++            }
++        }
++        other => panic!("expected filter, got {other:?}"),
++    }
++}
++
++#[test]
++fn print_expression_round_trips_end_keyword_spelling() {
++    assert_eq!(
++        shape(r#"x | truncate(12, end="...")"#),
++        r#"(x | truncate(12, end="..."))"#
++    );
++    assert_eq!(
++        shape(r#"x | truncate(width=8, end="…")"#),
++        r#"(x | truncate(width=8, end="…"))"#
++    );
++    assert_eq!(
++        shape(r#"name | pad_start(width=5, fill="*")"#),
++        r#"(name | pad_start(width=5, fill="*"))"#
++    );
++}
++
++#[test]
++fn print_expression_preserves_keyword_order_from_source() {
++    assert_eq!(
++        shape(r#"v | truncate(end="!", width=10)"#),
++        r#"(v | truncate(end="!", width=10))"#
++    );
++    assert_eq!(
++        shape(r#"v | join(final_sep=" and ", sep=",")"#),
++        r#"(v | join(final_sep=" and ", sep=","))"#
++    );
++}
++
++#[test]
++fn outline_shows_keyword_arguments_inside_output_filter_pipes() {
++    let parsed = template(r#"{{ text | truncate(width=8, end="...") }}"#);
++    let text = outline(&parsed);
++    assert!(text.contains("truncate"), "{text}");
++    assert!(text.contains("width=8"), "{text}");
++    assert!(text.contains(r#"end="...""#), "{text}");
++}
++
++#[test]
++fn outline_mentions_filter_blocks_that_use_keywords() {
++    let parsed = template(r#"{% filter indent(prefix=">") %}x{% endfilter %}"#);
++    let text = outline(&parsed);
++    assert!(text.contains("filter indent"), "{text}");
++}
++
++#[test]
++fn check_accepts_templates_that_use_keyword_filter_arguments() {
++    let tree = Tree::new(&[(
++        "page.html",
++        r#"{{ title | truncate(width=20, end="...") }}"#,
++    )]);
++    let report = check(&tree.args(&["page.html"]));
++    assert_eq!(report.code, 0);
++    assert!(report.stdout.contains("page.html: ok"));
++    assert!(report.stderr.is_empty());
++}
++
++#[test]
++fn check_accepts_a_multi_file_tree_of_keyword_templates() {
++    let tree = Tree::new(&[
++        (
++            "a.html",
++            r#"{{ name | pad_start(width=8, fill=".") }}"#,
++        ),
++        (
++            "b.html",
++            r#"{{ items | join(sep=",", final_sep=" & ") }}"#,
++        ),
++        (
++            "nested/c.html",
++            r#"{% filter indent(prefix=">") %}body{% endfilter %}"#,
++        ),
++    ]);
++    let report = check(&tree.args(&["a.html", "b.html", "nested/c.html"]));
++    assert_eq!(report.code, 0);
++    assert!(report.stdout.contains("a.html: ok"));
++    assert!(report.stdout.contains("b.html: ok"));
++    assert!(report.stdout.contains("nested/c.html: ok"));
++    assert!(report.stderr.is_empty());
++}
++
++#[test]
++fn check_rejects_positional_after_keyword_in_a_template_file() {
++    let tree = Tree::new(&[(
++        "bad.html",
++        r#"{{ name | truncate(end="...", 12) }}"#,
++    )]);
++    let report = check(&tree.args(&["bad.html"]));
++    assert_ne!(report.code, 0);
++    assert!(
++        report.stderr.contains("positional argument after keyword"),
++        "{}",
++        report.stderr
++    );
++}
++
++#[test]
++fn verbose_filter_listing_includes_truncate_keyword_names() {
++    let report = list_filters(true);
++    assert_eq!(report.code, 0);
++    let truncate_line = report
++        .stdout
++        .lines()
++        .find(|line| line.starts_with("truncate:"))
++        .expect("truncate should be listed");
++    assert!(
++        truncate_line.contains("width"),
++        "expected width in `{truncate_line}`"
++    );
++    assert!(
++        truncate_line.contains("end"),
++        "expected end in `{truncate_line}`"
++    );
++}
++
++#[test]
++fn verbose_filter_listing_includes_keywords_for_several_migrated_filters() {
++    let report = list_filters(true);
++    let body = &report.stdout;
++    for (name, needle) in [
++        ("pad_start:", "fill"),
++        ("indent:", "prefix"),
++        ("join:", "final_sep"),
++        ("default:", "fallback"),
++        ("round:", "digits"),
++        ("get:", "key"),
++        ("json:", "indent"),
++        ("csv:", "delimiter"),
++        ("group:", "sep"),
++    ] {
++        let line = body
++            .lines()
++            .find(|line| line.starts_with(name))
++            .unwrap_or_else(|| panic!("missing listing for {name}"));
++        assert!(
++            line.contains(needle),
++            "expected `{needle}` in `{line}`"
++        );
++    }
++}
++
++#[test]
++fn plain_filter_listing_still_emits_bare_names() {
++    let report = list_filters(false);
++    assert_eq!(report.code, 0);
++    let lines: Vec<&str> = report.stdout.lines().collect();
++    assert!(lines.contains(&"truncate"));
++    assert!(lines.contains(&"pad_start"));
++    assert!(!report.stdout.contains("width="));
++}
++
++#[test]
++fn parse_rejects_positional_argument_after_a_keyword() {
++    let err = expr_err(r#"x | truncate(end="...", 12)"#);
++    assert_eq!(err.kind, ErrorKind::Syntax);
++    assert!(
++        err.message.contains("positional argument after keyword"),
++        "{}",
++        err.message
++    );
++}
++
++#[test]
++fn parse_rejects_malformed_keyword_assigns() {
++    let err = expr_err(r#"x | truncate(end=)"#);
++    assert_eq!(err.kind, ErrorKind::Syntax);
++    assert!(
++        err.message.contains("expected a value after `end=`"),
++        "{}",
++        err.message
++    );
++
++    let err = expr_err(r#"x | pad_start(width=, fill="*")"#);
++    assert!(
++        err.message.contains("expected a value after `width=`"),
++        "{}",
++        err.message
++    );
++
++    let err = template_err(r#"{{ x | join(sep=) }}"#);
++    assert_eq!(err.kind, ErrorKind::Syntax);
++    assert!(
++        err.message.contains("expected a value after `sep=`"),
++        "{}",
++        err.message
++    );
++}
++
++#[test]
++fn filter_block_parse_accepts_keyword_arguments() {
++    let parsed = template(r#"{% filter indent(prefix=">", blank=true) %}x{% endfilter %}"#);
++    match &parsed.nodes[0] {
++        stencilworks::syntax::Node::FilterBlock { name, args, .. } => {
++            assert_eq!(name, "indent");
++            assert_eq!(args.len(), 2);
++            match &args[0] {
++                FilterArg::Keyword { name, .. } => assert_eq!(name, "prefix"),
++                other => panic!("expected keyword, got {other:?}"),
++            }
++            match &args[1] {
++                FilterArg::Keyword { name, .. } => assert_eq!(name, "blank"),
++                other => panic!("expected keyword, got {other:?}"),
++            }
++        }
++        other => panic!("expected filter block, got {other:?}"),
++    }
++}
++
++#[test]
++fn chained_pipes_with_keywords_parse_and_print() {
++    let printed = shape(
++        r#"items | sort(field="name") | join(sep=",", final_sep=" and ")"#,
++    );
++    assert!(printed.contains(r#"sort(field="name")"#), "{printed}");
++    assert!(printed.contains(r#"join(sep=",", final_sep=" and ")"#), "{printed}");
++}
++
++#[test]
++fn keyword_argument_names_are_case_sensitive_at_parse_time() {
++    match expr(r#"x | truncate(Width=8)"#) {
++        stencilworks::syntax::Expr::Filter { args, .. } => match &args[0] {
++            FilterArg::Keyword { name, .. } => assert_eq!(name, "Width"),
++            other => panic!("expected keyword, got {other:?}"),
++        },
++        other => panic!("expected filter, got {other:?}"),
++    }
++}
++
++#[test]
++fn trailing_comma_is_allowed_in_keyword_argument_lists() {
++    assert_eq!(
++        shape(r#"x | truncate(width=8,)"#),
++        r#"(x | truncate(width=8))"#
++    );
++    assert_eq!(
++        shape(r#"x | truncate(width=8, end="...",)"#),
++        r#"(x | truncate(width=8, end="..."))"#
++    );
++    let parsed = template(r#"{{ x | pad_end(width=4, fill="-",) }}"#);
++    assert_eq!(parsed.nodes.len(), 1);
++}
++
++#[test]
++fn show_outline_cli_reports_keyword_pipes_from_files() {
++    let tree = Tree::new(&[(
++        "page.html",
++        r#"{{ title | truncate(width=12, end="…") }}"#,
++    )]);
++    let report = show_outline(&tree.args(&["page.html"]));
++    assert_eq!(report.code, 0);
++    assert!(report.stdout.contains("# page.html"));
++    assert!(report.stdout.contains("truncate"), "{}", report.stdout);
++    assert!(report.stdout.contains("width=12"), "{}", report.stdout);
++    assert!(report.stdout.contains("end="), "{}", report.stdout);
++}
++
++#[test]
++fn show_outline_cli_reports_filter_blocks_with_keywords() {
++    let tree = Tree::new(&[(
++        "wrap.html",
++        r#"{% filter indent(prefix=">") %}line{% endfilter %}"#,
++    )]);
++    let report = show_outline(&tree.args(&["wrap.html"]));
++    assert_eq!(report.code, 0);
++    assert!(report.stdout.contains("filter indent"), "{}", report.stdout);
++}
++
++#[test]
++fn parse_template_accepts_mixed_positional_and_keyword_forms() {
++    let parsed = template(r#"{{ body | truncate(24, end="...") }}"#);
++    match &parsed.nodes[0] {
++        stencilworks::syntax::Node::Output { expr, .. } => {
++            let printed = print_expression(expr);
++            assert!(printed.contains(r#"truncate(24, end="...")"#), "{printed}");
++        }
++        other => panic!("expected output, got {other:?}"),
++    }
++}
++
++#[test]
++fn parse_template_accepts_keyword_values_that_are_themselves_filters() {
++    let printed = shape(r#"text | truncate(width=items | length, end=suffix | lower)"#);
++    assert!(printed.contains("width=(items | length)"), "{printed}");
++    assert!(printed.contains("end=(suffix | lower)"), "{printed}");
++}
++
++#[test]
++fn check_passes_templates_that_only_use_positional_forms_too() {
++    let tree = Tree::new(&[("legacy.html", r#"{{ name | truncate(12, "...") }}"#)]);
++    let report = check(&tree.args(&["legacy.html"]));
++    assert_eq!(report.code, 0);
++    assert!(report.stdout.contains("legacy.html: ok"));
++}
++
++#[test]
++fn check_reports_malformed_keyword_assigns_with_file_context() {
++    let tree = Tree::new(&[("broken.html", r#"{{ name | truncate(end=) }}"#)]);
++    let report = check(&tree.args(&["broken.html"]));
++    assert_ne!(report.code, 0);
++    assert!(
++        report.stderr.contains("expected a value after `end=`"),
++        "{}",
++        report.stderr
++    );
++    assert!(report.stderr.contains("broken.html"), "{}", report.stderr);
++}
++
++#[test]
++fn outline_of_chained_keyword_filters_keeps_each_call() {
++    let parsed = template(
++        r#"{{ people | sort(field="name") | join(sep="/") }}"#,
++    );
++    let text = outline(&parsed);
++    assert!(text.contains(r#"sort(field="name")"#), "{text}");
++    assert!(text.contains(r#"join(sep="/")"#), "{text}");
++}
++
++#[test]
++fn environment_render_still_works_for_parsed_keyword_templates() {
++    let mut context = ValueMap::new();
++    context.insert("title", stencilworks::Value::text("Hello World Today"));
++    let out = Environment::new()
++        .render(
++            "t",
++            r#"{{ title | truncate(width=10, end="...") }}"#,
++            &context,
++        )
++        .unwrap();
++    assert_eq!(out, "Hello W...");
++}
++
++#[test]
++fn empty_keyword_argument_list_parses_like_bare_filter() {
++    // Empty `()` is accepted; the printer omits vacant argument lists.
++    assert_eq!(shape("x | upper()"), "(x | upper)");
++    assert_eq!(shape("x | upper"), "(x | upper)");
++    assert_eq!(shape(r#"x | truncate(width=8,)"#), r#"(x | truncate(width=8))"#);
++}
++
++#[test]
++fn multi_file_check_fails_only_the_broken_keyword_template() {
++    let tree = Tree::new(&[
++        ("ok.html", r#"{{ a | truncate(width=4, end=".") }}"#),
++        ("bad.html", r#"{{ a | truncate(end=".", 4) }}"#),
++    ]);
++    let report = check(&tree.args(&["ok.html", "bad.html"]));
++    assert_ne!(report.code, 0);
++    assert!(report.stdout.contains("ok.html: ok"), "{}", report.stdout);
++    assert!(report.stderr.contains("bad.html"), "{}", report.stderr);
++    assert!(
++        report.stderr.contains("positional argument after keyword"),
++        "{}",
++        report.stderr
++    );
++}
++
++#[test]
++fn print_expression_round_trips_group_json_and_csv_keywords() {
++    assert_eq!(
++        shape(r#"n | group(sep="_", point=",")"#),
++        r#"(n | group(sep="_", point=","))"#
++    );
++    assert_eq!(
++        shape(r#"rows | json(indent=2)"#),
++        r#"(rows | json(indent=2))"#
++    );
++    assert_eq!(
++        shape(r#"rows | csv(delimiter=";")"#),
++        r#"(rows | csv(delimiter=";"))"#
++    );
++}
++
++#[test]
++fn filter_block_print_round_trips_keyword_spelling() {
++    let source = r#"{% filter indent(prefix=">", blank=true) %}x{% endfilter %}"#;
++    let parsed = template(source);
++    let printed = stencilworks::syntax::print_template(&parsed);
++    assert!(printed.contains(r#"indent(prefix=">", blank=true)"#), "{printed}");
++}
++
++#[test]
++fn parse_accepts_keyword_arguments_with_boolean_and_null_literals() {
++    let printed = shape(r#"v | indent(prefix=">", blank=true)"#);
++    assert!(printed.contains("blank=true"), "{printed}");
++    let printed = shape(r#"v | default(fallback=null, falsy=false)"#);
++    assert!(printed.contains("fallback=null"), "{printed}");
++    assert!(printed.contains("falsy=false"), "{printed}");
++}
++
++#[test]
++fn verbose_listing_keeps_filters_without_keywords_on_arity_only_lines() {
++    let report = list_filters(true);
++    let upper = report
++        .stdout
++        .lines()
++        .find(|line| line.starts_with("upper:"))
++        .expect("upper");
++    assert!(upper.contains("0 argument"));
++    assert!(
++        !upper.contains("argument(s) ("),
++        "upper should not list keyword names: {upper}"
++    );
++
++    let length = report
++        .stdout
++        .lines()
++        .find(|line| line.starts_with("length:"))
++        .expect("length");
++    assert!(
++        !length.contains("argument(s) ("),
++        "length should not list keyword names: {length}"
++    );
++}
