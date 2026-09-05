@@ -1,0 +1,7 @@
+The engine already has a Rust helper function called cycle, which cannot be accessed through the templates.
+
+Allow for cycles so that when you call {{ loop.cycle("odd", "even") }}, the current value is returned based on the current iteration, taking into account the number of arguments and providing a null return in case the arguments list is empty. The {% cycle "a", "b", "c" %} syntax shall be used for printing the next value from an anonymous sequence for the current loop. The syntax {% cycle name "a", "b" %} (or its appropriate equivalent) shall be used for named groups of cycles moving independently between loops within the render. You will be able to find the anonymous cycle cursor with each loop while the named groups will be available for all loops within the render. Once a loop is executed, the next loops will continue the naming for these groups. 
+
+Using loop.cycle outside a for is considered a positioning error; even though the cycle tag outside any loop may move forward in the named group of cycles, anonymous cycle causes an error. Do not change existing loop fields index, index0, revindex, revindex0, first, last, length, remaining, depth). Empty loops and forelse paths should not cause cycle groups to be left corrupted. The output of the cycling should be the same for subsequent rendering with the same template and context used. stencil check accepts well formed cycle usage and rejects cycle tag containing zero values.
+
+IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.

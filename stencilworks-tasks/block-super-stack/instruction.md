@@ -1,0 +1,7 @@
+Child blocks must wrap parent content instead of only replacing it.
+
+Add `{{ super() }}` usable only inside a block that overrides a parent block. It renders the nearest parent definition for the current block name, then continues the child. Multi-level chains stack: a grandchild calling `super()` sees the child wrap the grandparent, and each level's surrounding text stays in order. Using `super()` outside a block override, or when no parent block exists for that name, is a positioned template error that names the template and points at the call. Nested blocks each keep their own parent stack; a nested `super()` must not pull the outer block's parent body. Multiple `super()` calls in one child block re-render the same parent body each time without consuming loop state or clearing parent maps.
+
+Inheritance rules already in place stay: `{% extends %}` first, child text outside blocks dropped, cycles and depth limits unchanged. `include`, filters, escaping, and `loop` behave the same inside parent bodies rendered via `super()`. Empty parent blocks render as empty string, not an error. Expose this through `Environment::render` / `render_named` with memory and directory loaders. Templates that never call `super()` keep current output byte-for-byte. `stencil check` and `stencil outline` must accept well-formed `super()` and reject illegal uses with caret diagnostics.
+
+IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.

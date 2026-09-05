@@ -1,0 +1,7 @@
+Stop re-parsing every `include` and `extends` target on each render.
+
+Add a parse cache on `Environment` keyed by template name that stores the parsed `Template` and source metadata needed for diagnostics. Nested `include` / `extends` chains must reuse cached entries within a render and across renders on the same environment. Cache hits must produce identical output and identical error positions as a cold parse. Provide a clear operation and a simple hit/miss or entry-count statistic for tests. For `DirectoryLoader`, invalidate an entry when the file's modification time changes between loads; memory loaders never auto-invalidate—replacing a name takes effect after clear or environment rebuild.
+
+Caching must not break inheritance block maps, cycle detection, or max-depth limits. A failed parse must not poison forever: after clear or a successful reload, the corrected template is usable. Two different loaders that happen to share a name must not silently share a poisoned entry when the environment is rebuilt with a new loader. Keep public `render` / `render_named` / `parse` stable; caching is on by default for new environments. Concurrent renders are not required, but sequential nested includes must stay correct. `stencil render` of the same tree twice in one process should show cache reuse via the statistics API without changing printed output.
+
+IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.

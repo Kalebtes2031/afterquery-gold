@@ -1,0 +1,616 @@
+diff --git a/tests/cycle_parse_and_outline.rs b/tests/cycle_parse_and_outline.rs
+new file mode 100644
+index 0000000..6483165
+--- /dev/null
++++ b/tests/cycle_parse_and_outline.rs
+@@ -0,0 +1,388 @@
++//! Parser, outline, and structural tests for loop cycling.
++
++use stencilworks::syntax::outline;
++use stencilworks::{memory_environment, parse_template, Environment, Source, Value, ValueMap};
++
++fn render(text: &str) -> String {
++    Environment::new().render("t", text, &ValueMap::new()).unwrap()
++}
++
++fn render_ctx(text: &str, context: &ValueMap) -> String {
++    Environment::new().render("t", text, context).unwrap()
++}
++
++fn list(values: &[&str]) -> Value {
++    Value::List(values.iter().map(|v| Value::text(*v)).collect())
++}
++
++fn ctx(items: &[&str]) -> ValueMap {
++    let mut map = ValueMap::new();
++    map.insert("items", list(items));
++    map
++}
++
++#[test]
++fn parse_accepts_anonymous_cycle_with_three_literals() {
++    let parsed = parse_template(&Source::new("t", r#"{% cycle "a", "b", "c" %}"#)).unwrap();
++    assert_eq!(parsed.nodes.len(), 1);
++    assert_eq!(parsed.nodes[0].kind(), "cycle");
++}
++
++#[test]
++fn parse_accepts_named_cycle_with_a_group_label() {
++    let parsed =
++        parse_template(&Source::new("t", r#"{% cycle zebra "x", "y" %}"#)).unwrap();
++    assert_eq!(parsed.nodes.len(), 1);
++}
++
++#[test]
++fn parse_treats_a_lone_identifier_as_a_cycle_value() {
++    let parsed = parse_template(&Source::new("t", "{% cycle zebra %}")).unwrap();
++    assert_eq!(parsed.nodes.len(), 1);
++    assert_eq!(parsed.nodes[0].kind(), "cycle");
++}
++
++#[test]
++fn parse_rejects_an_empty_cycle_tag() {
++    let err = parse_template(&Source::new("t", "{% cycle %}")).unwrap_err();
++    assert!(err.to_string().contains("at least one value"));
++}
++
++#[test]
++fn parse_treats_a_comma_first_token_as_a_value_not_a_group() {
++    let parsed = parse_template(&Source::new("t", r#"{% cycle left, right %}"#)).unwrap();
++    assert_eq!(parsed.nodes.len(), 1);
++}
++
++#[test]
++fn outline_lists_cycle_nodes_with_value_counts() {
++    let parsed = parse_template(&Source::new(
++        "page",
++        r#"{% for x in xs %}{% cycle "a", "b" %}{% endfor %}"#,
++    ))
++    .unwrap();
++    let text = outline(&parsed);
++    assert!(text.contains("for x"));
++    assert!(text.contains("cycle 2"));
++}
++
++#[test]
++fn outline_shows_named_cycle_groups() {
++    let parsed = parse_template(&Source::new("t", r#"{% cycle band "1", "2" %}"#)).unwrap();
++    let text = outline(&parsed);
++    assert!(text.contains("cycle band/2"));
++}
++
++#[test]
++fn loop_cycle_works_when_iterating_a_map() {
++    let mut map = ValueMap::new();
++    map.insert(
++        "pairs",
++        Value::Map({
++            let mut inner = ValueMap::new();
++            inner.insert("a", Value::from(1.0));
++            inner.insert("b", Value::from(2.0));
++            inner
++        }),
++    );
++    let out = render_ctx(
++        r#"{% for key, val in pairs %}{{ loop.cycle("k", "v") }}{% endfor %}"#,
++        &map,
++    );
++    assert_eq!(out, "kv");
++}
++
++#[test]
++fn cycle_tag_runs_inside_a_filter_block_body() {
++    let out = render_ctx(
++        r#"{% for item in items %}{% filter upper %}{% cycle "a", "b" %}{% endfilter %} {% endfor %}"#,
++        &ctx(&["1", "2", "3"]),
++    );
++    assert_eq!(out, "A B A ");
++}
++
++#[test]
++fn cycle_tag_runs_inside_a_with_block() {
++    let mut map = ctx(&["1", "2"]);
++    map.insert("marker", Value::text("m"));
++    let out = render_ctx(
++        r#"{% for item in items %}{% with marker=marker %}{% cycle "x", "y" %}{% endwith %}{% endfor %}"#,
++        &map,
++    );
++    assert_eq!(out, "xy");
++}
++
++#[test]
++fn loop_cycle_error_mentions_for_loop() {
++    let err = Environment::new()
++        .render("t", r#"{{ loop.cycle("a") }}"#, &ValueMap::new())
++        .unwrap_err();
++    let message = err.to_string();
++    assert!(message.contains("inside a for loop"));
++}
++
++#[test]
++fn anonymous_cycle_error_mentions_for_loop() {
++    let err = Environment::new()
++        .render("t", r#"{% cycle "a" %}"#, &ValueMap::new())
++        .unwrap_err();
++    let message = err.to_string();
++    assert!(message.contains("inside a for loop"));
++}
++
++#[test]
++fn named_cycle_can_be_used_in_the_template_root() {
++    let out = render(r#"{% cycle g "1", "2", "3" %}"#);
++    assert_eq!(out, "1");
++}
++
++#[test]
++fn three_separate_named_groups_advance_independently() {
++    let out = render(
++        r#"{% cycle a "1", "2" %}{% cycle b "x", "y" %}{% cycle a "1", "2" %}{% cycle b "x", "y" %}"#,
++    );
++    assert_eq!(out, "1x2y");
++}
++
++#[test]
++fn loop_cycle_with_numeric_literals_renders_numbers() {
++    let out = render_ctx(
++        r#"{% for item in items %}{{ loop.cycle(1, 2) }}{% endfor %}"#,
++        &ctx(&["a", "b", "c"]),
++    );
++    assert_eq!(out, "121");
++}
++
++#[test]
++fn cycle_tag_with_numeric_expressions_renders_numbers() {
++    let mut map = ctx(&["a", "b", "c"]);
++    map.insert("one", Value::from(1.0));
++    map.insert("two", Value::from(2.0));
++    let out = render_ctx(
++        r#"{% for item in items %}{% cycle one, two %}{% endfor %}"#,
++        &map,
++    );
++    assert_eq!(out, "121");
++}
++
++#[test]
++fn loop_remaining_and_cycle_coexist_on_the_last_item() {
++    let out = render_ctx(
++        r#"{% for item in items %}{{ loop.remaining }}:{{ loop.cycle("p", "q") }};{% endfor %}"#,
++        &ctx(&["a", "b", "c"]),
++    );
++    assert_eq!(out, "2:p;1:q;0:p;");
++}
++
++#[test]
++fn loop_first_and_last_flags_stay_correct_with_cycle() {
++    let out = render_ctx(
++        r#"{% for item in items %}{% if loop.first %}F{% endif %}{% cycle "a", "b" %}{% if loop.last %}L{% endif %}{% endfor %}"#,
++        &ctx(&["1", "2", "3"]),
++    );
++    assert_eq!(out, "FabaL");
++}
++
++#[test]
++fn cycle_inside_an_if_branch_only_advances_when_the_branch_runs() {
++    let out = render_ctx(
++        r#"{% for item in items %}{% if loop.first %}{% cycle "E", "O" %}{% else %}-{% endif %}{% endfor %}"#,
++        &ctx(&["1", "2", "3", "4"]),
++    );
++    assert_eq!(out, "E---");
++}
++
++#[test]
++fn long_named_group_sequence_wraps_correctly() {
++    let template = r#"{% for item in items %}{% cycle colors "red", "green", "blue" %}{% endfor %}"#;
++    let out = render_ctx(template, &ctx(&["1", "2", "3", "4", "5", "6"]));
++    assert_eq!(out, "redgreenblueredgreenblue");
++}
++
++#[test]
++fn loop_revindex_fields_remain_available_with_cycle() {
++    let out = render_ctx(
++        r#"{% for item in items %}{{ loop.revindex }}:{% cycle "a", "b" %};{% endfor %}"#,
++        &ctx(&["1", "2", "3"]),
++    );
++    assert_eq!(out, "3:a;2:b;1:a;");
++}
++
++#[test]
++fn cycle_tag_runs_alongside_text_nodes_in_the_loop_body() {
++    let out = render_ctx(
++        r#"{% for item in items %}*{% cycle "i", "o" %}*{% endfor %}"#,
++        &ctx(&["1", "2", "3", "4"]),
++    );
++    assert_eq!(out, "*i**o**i**o*");
++}
++
++#[test]
++fn loop_cycle_renders_inside_a_nested_block_in_the_same_loop() {
++    let out = render_ctx(
++        r#"{% for item in items %}<{% block cell %}{{ loop.cycle("0", "1") }}{% endblock %}>{% endfor %}"#,
++        &ctx(&["a", "b", "c"]),
++    );
++    assert_eq!(out, "<0><1><0>");
++}
++
++#[test]
++fn empty_cycle_argument_list_to_loop_cycle_yields_empty_output() {
++    let out = render_ctx(
++        r#"{% for item in items %}<{{ loop.cycle() }}>{% endfor %}"#,
++        &ctx(&["a", "b"]),
++    );
++    assert_eq!(out, "<><>");
++}
++
++#[test]
++fn cycle_with_many_values_in_one_tag() {
++    let out = render_ctx(
++        r#"{% for item in items %}{% cycle "a", "b", "c", "d", "e" %}{% endfor %}"#,
++        &ctx(&["1", "2", "3", "4", "5", "6", "7"]),
++    );
++    assert_eq!(out, "abcdeab");
++}
++
++#[test]
++fn loop_depth_field_is_unchanged_when_using_cycle() {
++    let mut map = ValueMap::new();
++    map.insert("outer", list(&["a"]));
++    map.insert("inner", list(&["b"]));
++    let out = render_ctx(
++        r#"{% for o in outer %}{% for i in inner %}{{ loop.depth }}:{% cycle "x", "y" %};{% endfor %}{% endfor %}"#,
++        &map,
++    );
++    assert_eq!(out, "2:x;");
++}
++
++#[test]
++fn parse_cycle_inside_raw_block_still_parses_when_outside_raw() {
++    let parsed = parse_template(&Source::new(
++        "t",
++        r#"{% raw %}{% cycle "a" %}{% endraw %}{% cycle "b" %}"#,
++    ))
++    .unwrap();
++    assert_eq!(parsed.nodes.len(), 2);
++}
++
++#[test]
++fn template_with_only_named_cycle_tags_renders_without_a_loop() {
++    let out = render(r#"{% cycle g "a", "b", "c" %}{% cycle g "a", "b", "c" %}{% cycle g "a", "b", "c" %}"#);
++    assert_eq!(out, "abc");
++}
++
++#[test]
++fn loop_index0_and_cycle_tag_produce_consistent_positions() {
++    let out = render_ctx(
++        r#"{% for item in items %}{{ loop.index0 }}-{% cycle "A", "B" %};{% endfor %}"#,
++        &ctx(&["1", "2", "3", "4"]),
++    );
++    assert_eq!(out, "0-A;1-B;2-A;3-B;");
++}
++
++#[test]
++fn cycle_group_names_are_case_sensitive() {
++    let out = render(r#"{% cycle Foo "1", "2" %}{% cycle foo "x", "y" %}{% cycle Foo "1", "2" %}"#);
++    assert_eq!(out, "1x2");
++}
++
++#[test]
++fn for_else_branch_does_not_run_cycle_in_the_empty_body() {
++    let mut map = ValueMap::new();
++    map.insert("items", list(&[]));
++    let out = render_ctx(
++        r#"{% for item in items %}{% cycle "a", "b" %}{% else %}none{% endfor %}"#,
++        &map,
++    );
++    assert_eq!(out, "none");
++}
++
++#[test]
++fn loop_cycle_does_not_mutate_the_loop_map_fields() {
++    let out = render_ctx(
++        r#"{% for item in items %}{{ loop.length }}:{{ loop.cycle("a", "b") }};{% endfor %}"#,
++        &ctx(&["1", "2"]),
++    );
++    assert_eq!(out, "2:a;2:b;");
++}
++
++#[test]
++fn simultaneous_named_and_anonymous_cycles_in_one_iteration() {
++    let out = render_ctx(
++        r#"{% for item in items %}{% cycle "1", "2" %}/{% cycle pair "x", "y" %};{% endfor %}"#,
++        &ctx(&["a", "b", "c"]),
++    );
++    assert_eq!(out, "1/x;2/y;1/x;");
++}
++
++#[test]
++fn parse_cycle_with_trailing_commas_is_rejected_or_accepted_consistently() {
++    let result = parse_template(&Source::new("t", r#"{% cycle "a", "b", %}"#));
++    assert!(result.is_ok() || result.is_err());
++}
++
++#[test]
++fn check_passes_a_template_mixing_loop_cycle_and_cycle_tag() {
++    let parsed = parse_template(&Source::new(
++        "mix",
++        r#"{% for row in rows %}{{ loop.cycle("h", "l") }}{% cycle stripe "a", "b" %}{% endfor %}"#,
++    ))
++    .unwrap();
++    assert_eq!(parsed.nodes.len(), 1);
++}
++
++#[test]
++fn cycle_values_can_be_filter_pipeline_expressions() {
++    let out = render_ctx(
++        r#"{% for item in items %}{% cycle " ada " | trim | upper, "bob" | upper %}{% endfor %}"#,
++        &ctx(&["1", "2", "3"]),
++    );
++    assert_eq!(out, "ADABOBADA");
++}
++
++#[test]
++fn loop_cycle_values_can_be_filter_pipeline_expressions() {
++    let out = render_ctx(
++        r#"{% for item in items %}{{ loop.cycle(" hi " | trim, " there " | trim) }}{% endfor %}"#,
++        &ctx(&["1", "2", "3"]),
++    );
++    assert_eq!(out, "hitherehi");
++}
++
++#[test]
++fn deeply_nested_loops_each_get_distinct_anonymous_cycles() {
++    let mut map = ValueMap::new();
++    map.insert("a", list(&["1", "2"]));
++    map.insert("b", list(&["3", "4"]));
++    map.insert("c", list(&["5", "6"]));
++    let out = render_ctx(
++        r#"{% for x in a %}{% for y in b %}{% for z in c %}{% cycle "1", "2" %}{% endfor %}{% endfor %}{% endfor %}"#,
++        &map,
++    );
++    assert_eq!(out, "12121212");
++}
++
++#[test]
++fn named_cycle_survives_a_render_after_anonymous_cycle_errors_were_possible() {
++    let out = render(r#"{% cycle brand "A", "B" %}{% cycle brand "A", "B" %}"#);
++    assert_eq!(out, "AB");
++}
++
++#[test]
++fn loop_cycle_on_single_item_list() {
++    let out = render_ctx(
++        r#"{% for item in items %}{{ loop.cycle("only", "pair") }}{% endfor %}"#,
++        &ctx(&["solo"]),
++    );
++    assert_eq!(out, "only");
++}
++
++#[test]
++fn cycle_tag_output_is_concatenated_without_extra_separators() {
++    let out = render_ctx(
++        r#"{% for item in items %}[{% cycle "a", "b" %}]{% endfor %}"#,
++        &ctx(&["1", "2", "3"]),
++    );
++    assert_eq!(out, "[a][b][a]");
++}
+\ No newline at end of file
+diff --git a/tests/cycles.rs b/tests/cycles.rs
+new file mode 100644
+index 0000000..3ec7eb3
+--- /dev/null
++++ b/tests/cycles.rs
+@@ -0,0 +1,214 @@
++//! Loop cycling through `loop.cycle` and the `{% cycle %}` tag.
++
++use stencilworks::{parse_template, Environment, Source, Value, ValueMap};
++
++fn list(values: &[&str]) -> Value {
++    Value::List(values.iter().map(|text| Value::text(*text)).collect())
++}
++
++fn render(text: &str, context: &ValueMap) -> String {
++    Environment::new().render("t", text, context).unwrap()
++}
++
++fn fail(text: &str, context: &ValueMap) -> stencilworks::Error {
++    Environment::new()
++        .render("t", text, context)
++        .unwrap_err()
++}
++
++fn ctx(items: &[&str]) -> ValueMap {
++    let mut map = ValueMap::new();
++    map.insert("items", list(items));
++    map
++}
++
++#[test]
++fn loop_cycle_alternates_by_iteration_index() {
++    let out = render(
++        r#"{% for item in items %}{{ loop.cycle("odd", "even") }} {% endfor %}"#,
++        &ctx(&["a", "b", "c", "d"]),
++    );
++    assert_eq!(out, "odd even odd even ");
++}
++
++#[test]
++fn loop_cycle_wraps_by_argument_count() {
++    let out = render(
++        r#"{% for item in items %}{{ loop.cycle("a", "b", "c") }}{% endfor %}"#,
++        &ctx(&["1", "2", "3", "4", "5"]),
++    );
++    assert_eq!(out, "abcab");
++}
++
++#[test]
++fn loop_cycle_with_no_arguments_renders_nothing() {
++    let out = render(
++        r#"{% for item in items %}[{{ loop.cycle() }}]{% endfor %}"#,
++        &ctx(&["x"]),
++    );
++    assert_eq!(out, "[]");
++}
++
++#[test]
++fn loop_cycle_outside_a_for_loop_is_an_error() {
++    let err = fail(r#"{{ loop.cycle("a") }}"#, &ValueMap::new());
++    assert!(err.to_string().contains("inside a for loop"));
++}
++
++#[test]
++fn anonymous_cycle_tag_rotates_each_time_it_runs() {
++    let out = render(
++        r#"{% for item in items %}{% cycle "a", "b", "c" %}{% endfor %}"#,
++        &ctx(&["1", "2", "3", "4"]),
++    );
++    assert_eq!(out, "abca");
++}
++
++#[test]
++fn named_cycle_groups_advance_across_separate_loops() {
++    let out = render(
++        r#"{% for item in items %}{% cycle stripe "x", "y" %}{% endfor %}|{% for item in items %}{% cycle stripe "x", "y" %}{% endfor %}"#,
++        &ctx(&["1", "2"]),
++    );
++    assert_eq!(out, "xy|xy");
++}
++
++#[test]
++fn named_cycle_works_outside_a_for_loop() {
++    let out = render(r#"{% cycle row "a", "b" %}{% cycle row "a", "b" %}"#, &ValueMap::new());
++    assert_eq!(out, "ab");
++}
++
++#[test]
++fn anonymous_cycle_outside_a_for_loop_is_an_error() {
++    let err = fail(r#"{% cycle "a", "b" %}"#, &ValueMap::new());
++    assert!(err.to_string().contains("inside a for loop"));
++}
++
++#[test]
++fn nested_loops_keep_independent_anonymous_cycle_cursors() {
++    let mut map = ValueMap::new();
++    map.insert("rows", list(&["r1", "r2"]));
++    map.insert("cols", list(&["c1", "c2"]));
++    let out = render(
++        r#"{% for row in rows %}{% for col in cols %}{% cycle "A", "B" %}{% endfor %};{% endfor %}"#,
++        &map,
++    );
++    assert_eq!(out, "AB;AB;");
++}
++
++#[test]
++fn loop_cycle_in_a_nested_loop_uses_the_inner_loop_index() {
++    let mut map = ValueMap::new();
++    map.insert("rows", list(&["r1", "r2"]));
++    map.insert("cols", list(&["c1", "c2", "c3"]));
++    let out = render(
++        r#"{% for row in rows %}{% for col in cols %}{{ loop.cycle("0", "1") }}{% endfor %}|{% endfor %}"#,
++        &map,
++    );
++    assert_eq!(out, "010|010|");
++}
++
++#[test]
++fn existing_loop_fields_stay_available_alongside_cycle() {
++    let out = render(
++        r#"{% for item in items %}{{ loop.index }}:{{ loop.cycle("x", "y") }};{% endfor %}"#,
++        &ctx(&["a", "b", "c"]),
++    );
++    assert_eq!(out, "1:x;2:y;3:x;");
++}
++
++#[test]
++fn empty_loops_do_not_render_cycle_output() {
++    let mut map = ValueMap::new();
++    map.insert("items", list(&[]));
++    let out = render(
++        r#"{% for item in items %}{% cycle "a", "b" %}{% else %}empty{% endfor %}"#,
++        &map,
++    );
++    assert_eq!(out, "empty");
++}
++
++#[test]
++fn named_cycle_continues_after_an_empty_loop() {
++    let mut map = ValueMap::new();
++    map.insert("empty", list(&[]));
++    map.insert("items", list(&["a", "b"]));
++    let out = render(
++        r#"{% for x in empty %}{% cycle band "1", "2" %}{% endfor %}{% for y in items %}{% cycle band "1", "2" %}{% endfor %}"#,
++        &map,
++    );
++    assert_eq!(out, "12");
++}
++
++#[test]
++fn cycle_tag_evaluates_expressions_for_values() {
++    let mut map = ValueMap::new();
++    map.insert("items", list(&["a", "b", "c"]));
++    map.insert("left", Value::text("L"));
++    map.insert("right", Value::text("R"));
++    let out = render(
++        r#"{% for item in items %}{% cycle left, right %}{% endfor %}"#,
++        &map,
++    );
++    assert_eq!(out, "LRL");
++}
++
++#[test]
++fn repeated_renders_with_the_same_template_stay_stable() {
++    let template = r#"{% for item in items %}{{ loop.cycle("a", "b") }}{% endfor %}"#;
++    let context = ctx(&["1", "2", "3"]);
++    let first = render(template, &context);
++    let second = render(template, &context);
++    assert_eq!(first, "aba");
++    assert_eq!(second, "aba");
++}
++
++#[test]
++fn cycle_with_a_single_value_repeats_it() {
++    let out = render(
++        r#"{% for item in items %}{% cycle "only" %}{% endfor %}"#,
++        &ctx(&["1", "2", "3"]),
++    );
++    assert_eq!(out, "onlyonlyonly");
++}
++
++#[test]
++fn multiple_cycle_tags_in_one_iteration_advance_the_cursor() {
++    let out = render(
++        r#"{% for item in items %}{% cycle "a", "b" %}/{% cycle "a", "b" %};{% endfor %}"#,
++        &ctx(&["1", "2"]),
++    );
++    assert_eq!(out, "a/b;a/b;");
++}
++
++#[test]
++fn loop_cycle_and_cycle_tag_are_independent() {
++    let out = render(
++        r#"{% for item in items %}{{ loop.cycle("L", "R") }}:{% cycle "T", "B" %};{% endfor %}"#,
++        &ctx(&["1", "2", "3"]),
++    );
++    assert_eq!(out, "L:T;R:B;L:T;");
++}
++
++#[test]
++fn a_cycle_tag_with_no_values_is_a_parse_error() {
++    let err = parse_template(&Source::new("t", "{% cycle %}")).unwrap_err();
++    assert!(err.to_string().contains("at least one value"));
++}
++
++#[test]
++fn check_accepts_templates_with_cycle_tags() {
++    let parsed = parse_template(&Source::new(
++        "page",
++        r#"{% for x in xs %}{% cycle "a", "b" %}{% endfor %}"#,
++    ))
++    .unwrap();
++    assert_eq!(parsed.nodes.len(), 1);
++}
++
++#[test]
++fn check_rejects_a_cycle_tag_with_no_values() {
++    let err = parse_template(&Source::new("bad", "{% cycle %}")).unwrap_err();
++    assert!(err.to_string().contains("at least one value"));
++}
+\ No newline at end of file

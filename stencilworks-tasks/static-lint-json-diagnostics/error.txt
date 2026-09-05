@@ -1,0 +1,2 @@
+# Pipeline errors — cleared (ready for first submit)
+# Paste validation / quality-review output here after each failed run.

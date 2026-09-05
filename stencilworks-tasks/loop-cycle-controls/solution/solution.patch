@@ -1,0 +1,674 @@
+diff --git a/src/runtime/cycle.rs b/src/runtime/cycle.rs
+new file mode 100644
+index 0000000..4d91fa9
+--- /dev/null
++++ b/src/runtime/cycle.rs
+@@ -0,0 +1,167 @@
++//! Cycle-group state for `{% cycle %}` tags during rendering.
++
++use crate::error::{Error, ErrorKind, Result};
++use crate::source::Source;
++use crate::syntax::ast::Expr;
++use crate::value::ValueMap;
++use std::cell::RefCell;
++use std::collections::BTreeMap;
++use std::rc::Rc;
++
++use super::eval::Evaluator;
++use super::scope::Scope;
++use crate::filters::args::to_text;
++
++/// Tracks anonymous and named cycle cursors for one render pass.
++#[derive(Debug, Default)]
++pub struct CycleTracker {
++    loop_depth: usize,
++    anonymous: RefCell<Vec<usize>>,
++    named: RefCell<BTreeMap<String, usize>>,
++}
++
++impl CycleTracker {
++    /// Creates an empty tracker.
++    pub fn new() -> CycleTracker {
++        CycleTracker::default()
++    }
++
++    /// Enters a non-empty `{% for %}` body.
++    pub fn enter_loop(&mut self) {
++        self.loop_depth += 1;
++        self.anonymous.borrow_mut().push(0);
++    }
++
++    /// Leaves a `{% for %}` body.
++    pub fn exit_loop(&mut self) {
++        self.loop_depth = self.loop_depth.saturating_sub(1);
++        self.anonymous.borrow_mut().pop();
++    }
++
++    /// True when at least one non-empty `{% for %}` body is active.
++    pub fn in_loop(&self) -> bool {
++        self.loop_depth > 0
++    }
++
++    /// Renders the next value from a `{% cycle %}` tag.
++    pub fn render_tag(
++        &self,
++        group: Option<&str>,
++        values: &[Expr],
++        offset: usize,
++        source: &Rc<Source>,
++        scope: &mut Scope,
++        evaluator: &Evaluator<'_>,
++    ) -> Result<String> {
++        let mut rendered_values = Vec::with_capacity(values.len());
++        for value in values {
++            rendered_values.push(evaluator.eval(value, scope)?);
++        }
++        if rendered_values.is_empty() {
++            return Err(Error::syntax(
++                "`cycle` needs at least one value",
++                source.location(offset),
++            )
++            .in_template(source.name()));
++        }
++        let len = rendered_values.len();
++        let index = if let Some(name) = group {
++            let mut cursors = self.named.borrow_mut();
++            let cursor = cursors.entry(name.to_string()).or_insert(0);
++            let current = *cursor;
++            *cursor = current + 1;
++            current
++        } else {
++            if self.loop_depth == 0 {
++                return Err(Error::new(
++                    ErrorKind::Undefined,
++                    "anonymous `cycle` must appear inside a for loop",
++                )
++                .at(source.location(offset))
++                .in_template(source.name()));
++            }
++            let mut cursors = self.anonymous.borrow_mut();
++            let cursor = cursors.last_mut().ok_or_else(|| {
++                Error::new(
++                    ErrorKind::Undefined,
++                    "anonymous `cycle` must appear inside a for loop",
++                )
++                .at(source.location(offset))
++                .in_template(source.name())
++            })?;
++            let current = *cursor;
++            *cursor = current + 1;
++            current
++        };
++        Ok(to_text(&rendered_values[index % len]))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::filters::FilterSet;
++    use crate::runtime::options::Options;
++    use crate::syntax::ast::Expr;
++    use crate::syntax::parser::parse_expression;
++    use crate::source::Source;
++
++    fn literal(text: &str) -> Expr {
++        parse_expression(&Source::anonymous("x"), &format!("{text:?}"), 0).unwrap()
++    }
++
++    #[test]
++    fn named_groups_advance_independently() {
++        let tracker = CycleTracker::new();
++        let source = Rc::new(Source::new("t", "{% cycle %}"));
++        let filters = FilterSet::standard();
++        let options = Options::default();
++        let evaluator = Evaluator::new(&source, &filters, &options);
++        let mut scope = Scope::new(ValueMap::new());
++        let values = vec![literal("a"), literal("b")];
++        let first = tracker
++            .render_tag(Some("g"), &values, 0, &source, &mut scope, &evaluator)
++            .unwrap();
++        let second = tracker
++            .render_tag(Some("h"), &values, 0, &source, &mut scope, &evaluator)
++            .unwrap();
++        assert_eq!(first, "a");
++        assert_eq!(second, "a");
++    }
++
++    #[test]
++    fn anonymous_cycle_requires_an_active_loop() {
++        let tracker = CycleTracker::new();
++        let source = Rc::new(Source::new("t", "{% cycle %}"));
++        let filters = FilterSet::standard();
++        let options = Options::default();
++        let evaluator = Evaluator::new(&source, &filters, &options);
++        let mut scope = Scope::new(ValueMap::new());
++        let values = vec![literal("a")];
++        let err = tracker
++            .render_tag(None, &values, 0, &source, &mut scope, &evaluator)
++            .unwrap_err();
++        assert!(err.to_string().contains("inside a for loop"));
++    }
++
++    #[test]
++    fn anonymous_cycle_advances_inside_a_loop_frame() {
++        let mut tracker = CycleTracker::new();
++        tracker.enter_loop();
++        let source = Rc::new(Source::new("t", "{% cycle %}"));
++        let filters = FilterSet::standard();
++        let options = Options::default();
++        let evaluator = Evaluator::new(&source, &filters, &options);
++        let mut scope = Scope::new(ValueMap::new());
++        let values = vec![literal("x"), literal("y")];
++        let first = tracker
++            .render_tag(None, &values, 0, &source, &mut scope, &evaluator)
++            .unwrap();
++        let second = tracker
++            .render_tag(None, &values, 0, &source, &mut scope, &evaluator)
++            .unwrap();
++        tracker.exit_loop();
++        assert_eq!(first, "x");
++        assert_eq!(second, "y");
++    }
++}
+diff --git a/src/runtime/mod.rs b/src/runtime/mod.rs
+index 5fb613b..463eebc 100644
+--- a/src/runtime/mod.rs
++++ b/src/runtime/mod.rs
+@@ -1,5 +1,6 @@
+ //! Evaluating expressions and rendering templates.
+ 
++pub mod cycle;
+ pub mod eval;
+ pub mod loop_state;
+ pub mod macros;
+@@ -7,6 +8,7 @@ pub mod options;
+ pub mod render;
+ pub mod scope;
+ 
++pub use cycle::CycleTracker;
+ pub use eval::Evaluator;
+ pub use loop_state::LoopState;
+ pub use macros::{MacroDef, MacroRegistry};
+diff --git a/src/runtime/render.rs b/src/runtime/render.rs
+index f232006..9dcc218 100644
+--- a/src/runtime/render.rs
++++ b/src/runtime/render.rs
+@@ -1,5 +1,6 @@
+ //! Walking a syntax tree and producing output.
+ 
++use super::cycle::CycleTracker;
+ use super::eval::Evaluator;
+ use super::loop_state::LoopState;
+ use super::macros::{MacroDef, MacroRegistry};
+@@ -32,6 +33,8 @@ pub struct Renderer<'a> {
+     macros: RefCell<MacroRegistry>,
+     /// The body of the current `{% call %}` block, if any, for `{{ caller() }}`.
+     caller_body: RefCell<Option<(Vec<Node>, Rc<Source>)>>,
++    /// Anonymous and named cycle cursors for `{% cycle %}` tags.
++    cycle_tracker: RefCell<CycleTracker>,
+ }
+ 
+ impl<'a> Renderer<'a> {
+@@ -48,6 +51,7 @@ impl<'a> Renderer<'a> {
+             iterations: Cell::new(0),
+             macros: RefCell::new(MacroRegistry::new()),
+             caller_body: RefCell::new(None),
++            cycle_tracker: RefCell::new(CycleTracker::new()),
+         }
+     }
+ 
+@@ -183,6 +187,7 @@ impl<'a> Renderer<'a> {
+                     }
+                     return Ok(());
+                 }
++                self.cycle_tracker.borrow_mut().enter_loop();
+                 let length = pairs.len();
+                 for (index, (item_key, item)) in pairs.into_iter().enumerate() {
+                     self.charge_iteration(source)?;
+@@ -197,6 +202,22 @@ impl<'a> Renderer<'a> {
+                     scope.pop();
+                     result?;
+                 }
++                self.cycle_tracker.borrow_mut().exit_loop();
++            }
++            Node::Cycle {
++                group,
++                values,
++                offset,
++            } => {
++                let rendered = self.cycle_tracker.borrow().render_tag(
++                    group.as_deref(),
++                    values,
++                    *offset,
++                    source,
++                    scope,
++                    &evaluator,
++                )?;
++                out.push_str(&rendered);
+             }
+             Node::With { bindings, body, .. } => {
+                 // Bindings are introduced one at a time, so a later one can
+@@ -439,6 +460,11 @@ impl<'a> Renderer<'a> {
+     ) -> Result<String> {
+         let key = self.macro_key_from_expr(callee);
+ 
++        if is_loop_cycle_call(callee) {
++            let evaluator = Evaluator::new(source, self.filters, self.options);
++            return self.invoke_loop_cycle(args, offset, source, scope, &evaluator);
++        }
++
+         // Special case: `caller()` inside a macro body.
+         if key == "caller" && args.is_empty() {
+             let caller = self.caller_body.borrow().clone();
+@@ -543,6 +569,41 @@ impl<'a> Renderer<'a> {
+         Ok(macro_out)
+     }
+ 
++    fn invoke_loop_cycle(
++        &self,
++        args: &[Expr],
++        offset: usize,
++        source: &Rc<Source>,
++        scope: &mut Scope,
++        evaluator: &Evaluator<'_>,
++    ) -> Result<String> {
++        if !self.cycle_tracker.borrow().in_loop() {
++            return Err(Error::new(
++                ErrorKind::Undefined,
++                "`loop.cycle` must appear inside a for loop",
++            )
++            .at(source.location(offset))
++            .in_template(source.name()));
++        }
++        let Some(Value::Map(map)) = scope.get("loop") else {
++            return Err(Error::new(
++                ErrorKind::Undefined,
++                "`loop.cycle` must appear inside a for loop",
++            )
++            .at(source.location(offset))
++            .in_template(source.name()));
++        };
++        let index0 = map_usize(map.get("index0"));
++        let mut values = Vec::with_capacity(args.len());
++        for arg in args {
++            values.push(evaluator.eval(arg, scope)?);
++        }
++        if values.is_empty() {
++            return Ok(String::new());
++        }
++        Ok(to_text(&values[index0 % values.len()]))
++    }
++
+     /// The `(key, item)` pairs a `for` loop walks.
+     ///
+     /// A list yields its index alongside each element, a map yields its keys,
+@@ -614,6 +675,22 @@ pub fn is_marked_safe(expr: &Expr) -> bool {
+     matches!(expr, Expr::Filter { name, .. } if name == SAFE_FILTER)
+ }
+ 
++fn is_loop_cycle_call(callee: &Expr) -> bool {
++    matches!(
++        callee,
++        Expr::Member { base, name, .. }
++            if name == "cycle"
++                && matches!(base.as_ref(), Expr::Name { name, .. } if name == "loop")
++    )
++}
++
++fn map_usize(value: Option<&Value>) -> usize {
++    match value {
++        Some(Value::Number(number)) => crate::value::number::as_integer(*number).unwrap_or(0) as usize,
++        _ => 0,
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -935,4 +1012,88 @@ mod tests {
+         renderer.render(source, &template, &mut scope).unwrap();
+         assert_eq!(renderer.iterations(), 2);
+     }
++
++    #[test]
++    fn loop_cycle_alternates_by_iteration_index() {
++        let mut map = context();
++        map.insert("items", Value::list([
++            Value::text("a"),
++            Value::text("b"),
++            Value::text("c"),
++            Value::text("d"),
++        ]));
++        assert_eq!(
++            render_using(
++                &MemoryLoader::new(),
++                "{% for item in items %}{{ loop.cycle(\"odd\", \"even\") }} {% endfor %}",
++                map,
++                Options::new(),
++            )
++            .unwrap(),
++            "odd even odd even "
++        );
++    }
++
++    #[test]
++    fn anonymous_cycle_tag_rotates_each_time_it_runs() {
++        let mut map = context();
++        map.insert("items", Value::list([
++            Value::text("1"),
++            Value::text("2"),
++            Value::text("3"),
++            Value::text("4"),
++        ]));
++        assert_eq!(
++            render_using(
++                &MemoryLoader::new(),
++                "{% for item in items %}{% cycle \"a\", \"b\", \"c\" %}{% endfor %}",
++                map,
++                Options::new(),
++            )
++            .unwrap(),
++            "abca"
++        );
++    }
++
++    #[test]
++    fn named_cycle_groups_advance_across_separate_loops() {
++        assert_eq!(
++            render(
++                "{% for item in items %}{% cycle stripe \"x\", \"y\" %}{% endfor %}|{% for item in items %}{% cycle stripe \"x\", \"y\" %}{% endfor %}"
++            ),
++            "xy|xy"
++        );
++    }
++
++    #[test]
++    fn loop_cycle_outside_a_for_loop_is_an_error() {
++        let err = fail(r#"{{ loop.cycle("a") }}"#);
++        assert!(err.to_string().contains("inside a for loop"));
++    }
++
++    #[test]
++    fn anonymous_cycle_outside_a_for_loop_is_an_error() {
++        let err = fail(r#"{% cycle "a", "b" %}"#);
++        assert!(err.to_string().contains("inside a for loop"));
++    }
++
++    #[test]
++    fn loop_cycle_and_cycle_tag_are_independent() {
++        let mut map = context();
++        map.insert("items", Value::list([
++            Value::text("1"),
++            Value::text("2"),
++            Value::text("3"),
++        ]));
++        assert_eq!(
++            render_using(
++                &MemoryLoader::new(),
++                r#"{% for item in items %}{{ loop.cycle("L", "R") }}:{% cycle "T", "B" %};{% endfor %}"#,
++                map,
++                Options::new(),
++            )
++            .unwrap(),
++            "L:T;R:B;L:T;"
++        );
++    }
+ }
+diff --git a/src/syntax/ast.rs b/src/syntax/ast.rs
+index 6c78bdc..f967a8c 100644
+--- a/src/syntax/ast.rs
++++ b/src/syntax/ast.rs
+@@ -492,6 +492,15 @@ pub enum Node {
+         /// Byte offset in the template.
+         offset: usize,
+     },
++    /// `{% cycle [name] value, … %}`
++    Cycle {
++        /// The named group, when present.
++        group: Option<String>,
++        /// The values rotated through.
++        values: Vec<Expr>,
++        /// Byte offset in the template.
++        offset: usize,
++    },
+ }
+ 
+ impl Node {
+@@ -510,7 +519,8 @@ impl Node {
+             | Node::Macro { offset, .. }
+             | Node::CallBlock { offset, .. }
+             | Node::Import { offset, .. }
+-            | Node::FromImport { offset, .. } => *offset,
++            | Node::FromImport { offset, .. }
++            | Node::Cycle { offset, .. } => *offset,
+         }
+     }
+ 
+@@ -530,6 +540,7 @@ impl Node {
+             Node::CallBlock { .. } => "call",
+             Node::Import { .. } => "import",
+             Node::FromImport { .. } => "from",
++            Node::Cycle { .. } => "cycle",
+         }
+     }
+ 
+diff --git a/src/syntax/parser.rs b/src/syntax/parser.rs
+index f7da92f..6e50cfd 100644
+--- a/src/syntax/parser.rs
++++ b/src/syntax/parser.rs
+@@ -463,6 +463,7 @@ impl Builder<'_> {
+             "call" => self.parse_call(rest, rest_offset, offset).map(Some),
+             "import" => self.parse_import(rest, rest_offset, offset).map(Some),
+             "from" => self.parse_from(rest, rest_offset, offset).map(Some),
++            "cycle" => self.parse_cycle(rest, rest_offset, offset).map(Some),
+             "extends" => {
+                 let expr = parse_expression(self.source, &rest, rest_offset)?;
+                 let Some(Value::Text(name)) = expr.as_literal().cloned() else {
+@@ -637,6 +638,21 @@ impl Builder<'_> {
+         Ok(Node::Set { name, expr, offset })
+     }
+ 
++    fn parse_cycle(&mut self, rest: String, rest_offset: usize, offset: usize) -> Result<Node> {
++        let (group, values) = split_cycle_group(self.source, &rest, rest_offset)?;
++        if values.is_empty() {
++            return Err(Error::syntax(
++                "`cycle` needs at least one value",
++                self.source.location(offset),
++            ));
++        }
++        Ok(Node::Cycle {
++            group,
++            values,
++            offset,
++        })
++    }
++
+     fn parse_with(&mut self, rest: String, rest_offset: usize, offset: usize) -> Result<Node> {
+         let mut bindings = Vec::new();
+         for (piece, piece_offset) in split_top_level_commas(&rest, rest_offset) {
+@@ -1096,6 +1112,58 @@ pub fn split_top_level_commas(text: &str, base: usize) -> Vec<(String, usize)> {
+     pieces
+ }
+ 
++/// Splits a `{% cycle %}` tag into an optional group name and its values.
++pub fn split_cycle_group(
++    source: &Source,
++    rest: &str,
++    rest_offset: usize,
++) -> Result<(Option<String>, Vec<Expr>)> {
++    let text = rest.trim();
++    if text.is_empty() {
++        return Ok((None, Vec::new()));
++    }
++    let trim_start = rest.find(text).unwrap_or(0);
++    let base = rest_offset + trim_start;
++    let tokens = tokenize(source, text, base)?;
++    let Some(first) = tokens.first() else {
++        return Ok((None, Vec::new()));
++    };
++    if let Token::Ident(name) = &first.token {
++        if is_plain_name(name) {
++            let after_ident = tokens.get(1).map(|spanned| spanned.offset);
++            let text_after = match after_ident {
++                Some(offset) => &text[offset - base..],
++                None => "",
++            };
++            let trimmed_after = text_after.trim();
++            if trimmed_after.is_empty() {
++                let expr = parse_expression(source, text, base)?;
++                return Ok((None, vec![expr]));
++            }
++            if trimmed_after.starts_with(',') {
++                let values = parse_comma_separated_expressions(source, text, base)?;
++                return Ok((None, values));
++            }
++            let values = parse_comma_separated_expressions(source, trimmed_after, after_ident.unwrap())?;
++            return Ok((Some(name.clone()), values));
++        }
++    }
++    let values = parse_comma_separated_expressions(source, text, base)?;
++    Ok((None, values))
++}
++
++fn parse_comma_separated_expressions(
++    source: &Source,
++    text: &str,
++    base: usize,
++) -> Result<Vec<Expr>> {
++    let mut values = Vec::new();
++    for (piece, piece_offset) in split_top_level_commas(text, base) {
++        values.push(parse_expression(source, &piece, piece_offset)?);
++    }
++    Ok(values)
++}
++
+ /// True for the keywords that only ever close or continue a block.
+ pub fn is_closing_keyword(keyword: &str) -> bool {
+     matches!(
+@@ -1447,4 +1515,60 @@ mod tests {
+         assert!(!is_plain_name("a.b"));
+         assert!(!is_plain_name(""));
+     }
++
++    #[test]
++    fn cycle_parses_anonymous_literals() {
++        let parsed = template(r#"{% cycle "a", "b", "c" %}"#);
++        assert_eq!(parsed.nodes.len(), 1);
++        assert_eq!(parsed.nodes[0].kind(), "cycle");
++        match &parsed.nodes[0] {
++            Node::Cycle { group, values, .. } => {
++                assert!(group.is_none());
++                assert_eq!(values.len(), 3);
++            }
++            other => panic!("expected cycle, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn cycle_parses_a_named_group() {
++        let parsed = template(r#"{% cycle zebra "x", "y" %}"#);
++        match &parsed.nodes[0] {
++            Node::Cycle { group, values, .. } => {
++                assert_eq!(group.as_deref(), Some("zebra"));
++                assert_eq!(values.len(), 2);
++            }
++            other => panic!("expected cycle, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn cycle_treats_a_lone_identifier_as_a_value() {
++        let parsed = template("{% cycle zebra %}");
++        match &parsed.nodes[0] {
++            Node::Cycle { group, values, .. } => {
++                assert!(group.is_none());
++                assert_eq!(values.len(), 1);
++            }
++            other => panic!("expected cycle, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn cycle_rejects_an_empty_tag() {
++        let err = template_err("{% cycle %}");
++        assert!(err.message.contains("at least one value"));
++    }
++
++    #[test]
++    fn cycle_treats_a_comma_first_token_as_values() {
++        let parsed = template("{% cycle left, right %}");
++        match &parsed.nodes[0] {
++            Node::Cycle { group, values, .. } => {
++                assert!(group.is_none());
++                assert_eq!(values.len(), 2);
++            }
++            other => panic!("expected cycle, got {other:?}"),
++        }
++    }
+ }
+diff --git a/src/syntax/printer.rs b/src/syntax/printer.rs
+index 69b2bbe..cee7cfb 100644
+--- a/src/syntax/printer.rs
++++ b/src/syntax/printer.rs
+@@ -266,6 +266,14 @@ fn print_node(node: &Node, out: &mut String) {
+                 rendered_names.join(", ")
+             ));
+         }
++        Node::Cycle { group, values, .. } => {
++            let rendered: Vec<String> = values.iter().map(print_expression).collect();
++            let inner = rendered.join(", ");
++            match group {
++                Some(name) => out.push_str(&format!("{{% cycle {name} {inner} %}}")),
++                None => out.push_str(&format!("{{% cycle {inner} %}}")),
++            }
++        }
+     }
+ }
+ 
+@@ -304,6 +312,10 @@ fn outline_nodes(nodes: &[Node], depth: usize, lines: &mut Vec<String>) {
+                 let imported: Vec<&str> = names.iter().map(|(_, local)| local.as_str()).collect();
+                 format!("from import {}", imported.join(", "))
+             }
++            Node::Cycle { group, values, .. } => match group {
++                Some(name) => format!("cycle {name}/{}", values.len()),
++                None => format!("cycle {}", values.len()),
++            },
+         };
+         lines.push(format!("{indent}{label}"));
+         for body in node.bodies() {
+@@ -457,4 +469,34 @@ mod tests {
+         let template = parse_template(&Source::new("t", "{% extends \"base\" %}hi")).unwrap();
+         assert_eq!(outline(&template), "extends base\ntext 2");
+     }
++
++    #[test]
++    fn cycle_tags_round_trip() {
++        assert_eq!(
++            round_trip(r#"{% cycle "a", "b" %}"#),
++            r#"{% cycle "a", "b" %}"#
++        );
++        assert_eq!(
++            round_trip(r#"{% cycle band "1", "2" %}"#),
++            r#"{% cycle band "1", "2" %}"#
++        );
++    }
++
++    #[test]
++    fn cycle_outlines_show_value_counts() {
++        let template = parse_template(&Source::new(
++            "t",
++            r#"{% for x in xs %}{% cycle "a", "b" %}{% endfor %}"#,
++        ))
++        .unwrap();
++        let text = outline(&template);
++        assert!(text.contains("for x"));
++        assert!(text.contains("cycle 2"));
++    }
++
++    #[test]
++    fn cycle_outlines_show_named_groups() {
++        let template = parse_template(&Source::new("t", r#"{% cycle band "1", "2" %}"#)).unwrap();
++        assert!(outline(&template).contains("cycle band/2"));
++    }
+ }

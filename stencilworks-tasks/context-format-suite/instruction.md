@@ -1,0 +1,7 @@
+Let `stencil render --data` load more than JSON without adding crates.
+
+Add hand-rolled context parsers under the data module for a YAML subset, TOML, and CSV, matching the existing JSON loader: no dependencies, depth limits, and document errors carrying line and column. YAML subset covers maps, lists, scalars (string, number, bool, null), nesting, and `#` comments; reject tabs-as-indentation, duplicate conflicting keys when documented as illegal, and ultra-deep trees. TOML covers tables, arrays, dotted keys, basic strings, integers/floats, booleans; reject unknown shapes with a positioned error. CSV loads into a list of maps using the header row as keys; empty and header-only files yield empty list results; mismatched row lengths are document errors.
+
+CLI `--data path` selects the parser by extension (`.json`, `.yaml`/`.yml`, `.toml`, `.csv`) or an explicit `--format` override. Wrong format or parse failure exits with the existing data failure code (3) and a useful diagnostic. `--set` bindings still overlay afterward with the same typing rules (`true`/`false`, numbers, lists, `@` force-text, dotted paths). Keep JSON behavior byte-compatible. Expose the new loaders on the public library API the same way JSON is exposed today, including depth-limit configuration where JSON already has one. Mixed `--data` plus multiple `--set` overlays must remain deterministic: file context loads first, then bindings win on key conflicts.
+
+IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.

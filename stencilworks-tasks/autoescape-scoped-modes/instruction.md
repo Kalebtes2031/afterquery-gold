@@ -1,0 +1,7 @@
+Make output escaping scoped and multi-mode instead of a single global HTML toggle.
+
+Extend `EscapeMode` beyond `None` and `Html` with `Xml`, `Url`, and `Js`. Add `{% autoescape "html" %}…{% endautoescape %}` (and the same for `xml`, `url`, `js`, plus `false` / `none` to disable). Nested regions push and pop the mode; leaving a region restores the previous one even after errors inside an inner region that still roll up. The active mode applies to interpolated values the same way HTML escaping does today: values are escaped unless the expression's outermost filter is `safe`. Filter blocks and `include`d templates inherit the caller's active mode unless they open their own region. Mode names are case-insensitive; unknown modes are a positioned template error.
+
+Wire CLI `--escape` so `html`, `xml`, `url`, `js`, and `none` select the initial mode for `stencil render`. Invalid `--escape` values are a usage error (exit 1). Default stays unchanged: no autoescape unless options or CLI request it. Do not double-escape values already marked safe for the active mode. Escaping must remain deterministic for the same input and mode. Existing HTML escape behavior and the `html` / `xml` / `url` filters keep working for templates that never use the new tag. `stencil check` parses autoescape regions and rejects unclosed ones.
+
+IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.

@@ -1,0 +1,7 @@
+Make `stencil check` useful for CI: strict name analysis and machine-readable diagnostics.
+
+Add `stencil check --format json` that prints a JSON array of diagnostic objects with at least `severity`, `kind`, `message`, `template`, `line`, and `column` (1-based), using the same positions as human caret output. Default human output stays as `--format text` (or unchanged default). Invalid `--format` is a usage error (exit 1). Add `--strict-names` to flag names not bound by the template's own `set` / `for` / `with` / known builtins (`loop`, `true`, `false`, `none`) on a best-effort static walk—dynamic `include` target expressions may be skipped rather than hard-erroring.
+
+Also report unknown filters, duplicate `{% block %}` names in one template, and `{% extends %}` that is not the first tag. Exit non-zero when any error-severity diagnostic exists; warnings alone may exit zero unless `--strict-names` elevates unbound-name findings to errors. Multi-file `check a b c` aggregates diagnostics for every file in stable file order. Parse errors keep working and appear in both text and JSON forms with the same coordinates. No network and no extra crates. Existing `check` without new flags remains a successful parse-only gate for valid templates. JSON output must be a single array (no trailing logs) so CI can pipe it to `jq`.
+
+IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.

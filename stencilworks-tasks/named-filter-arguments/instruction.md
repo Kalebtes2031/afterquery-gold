@@ -1,0 +1,7 @@
+Filter calls need keyword arguments, not only positional ones.
+
+Allow `{{ value | truncate(12, end="…") }}` and mixed forms where all positionals come first and keywords follow. Update the expression grammar, AST, and printer so filter arguments round-trip through outline/print. Unknown keyword names, duplicate keywords, a positional after a keyword, and arity violations must raise positioned template errors with clear messages that name the filter. Filters that already accept optional trailing positionals keep working; migrate filters with optional tails (at least truncate / pad-style text filters and similar) so either positional or keyword style works when both are defined for a slot.
+
+`Filter` arity checks and the registry remain the source of truth for how many arguments are legal; keywords map onto those slots by documented names per filter. Keyword values may be any expression, including filter pipelines, and evaluate left-to-right before the filter runs. `stencil filters -v` still lists filters and should show declared keyword names when present. Existing templates that use only positional arguments keep identical behavior and output. Malformed `name=` fragments in filter argument lists are parse errors, not silent ignores. Filters that declare no keywords must still reject keyword calls with a message naming the unknown keyword.
+
+IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.

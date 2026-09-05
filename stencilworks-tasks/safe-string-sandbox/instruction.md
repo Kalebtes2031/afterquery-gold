@@ -1,0 +1,7 @@
+Escaping needs a first-class safe string, and risky templates need a sandbox switch.
+
+Introduce a marked-safe text variant in `Value` (or an equivalent durable flag) so `| safe` and values produced as safe survive concatenation (`~`), selected filter pipelines, and rendering under HTML (and other) autoescape without being escaped again. Ordinary text stays escapable. Document which filters clear vs preserve the safe mark; at minimum `safe` sets it, and converting arbitrary input with `string` clears it unless the input was already safe. Concatenating safe with unsafe yields unsafe unless both sides are safe.
+
+Add sandbox options on `Options` / `Environment`: an optional filter allowlist or denylist (denied or unknown filters error with a positioned message), and a flag that forbids `include` / `extends` names that are not string literals (dynamic names become template errors). Existing recursion and include depth limits stay enforced. Default environments remain permissive and match today's behavior byte-for-byte on current templates. Expose sandbox via library options and CLI flags (for example `--sandbox` or discrete flags) without breaking existing scripts. Tests must show safe HTML round-trips and rejected dynamic includes under sandbox while allowlisted filters still run. Denylist and allowlist must not both be active in a conflicting way—document one-wins or reject the combination.
+
+IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.
