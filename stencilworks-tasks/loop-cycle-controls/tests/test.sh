@@ -46,7 +46,6 @@ INTEGRATION_BINS = {
     "diagnostics",
     "filter_library",
     "inheritance",
-    "macros",
     "rendering",
     "cycles",
     "cycle_parse_and_outline",
@@ -103,7 +102,6 @@ run_log cargo nextest run --profile ci \
   --test diagnostics \
   --test filter_library \
   --test inheritance \
-  --test macros \
   --test rendering
 copy_junit_report target/nextest/ci/junit.xml /logs/verifier/base.xml
 

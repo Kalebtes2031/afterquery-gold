@@ -70,7 +70,18 @@ def main() -> None:
         fail("test.sh must create .config/nextest.toml in RUN TESTS")
     if "cycles" not in test_sh or "cycle_parse_and_outline" not in test_sh:
         fail("test.sh must run cycles + cycle_parse_and_outline for F2P")
-    ok("test.sh has nextest setup + cycle suites")
+    if "--test macros" in test_sh:
+        fail("test.sh still references --test macros (doesn't exist on pre-macro platform)")
+    ok("test.sh has nextest setup + cycle suites, no macros ref")
+
+    # Check no macro-related P2P tests survived
+    macro_keywords = ["macro", "caller", "call_block", "import_as", "from_import",
+                       "call_expression", "omitted_defaults_use_the_declared",
+                       "provided_arguments_override_defaults"]
+    bad_p2p = [t for t in p2p if any(kw in t for kw in macro_keywords)]
+    if bad_p2p:
+        fail(f"P2P still has macro-related tests: {bad_p2p}")
+    ok(f"no macro-related P2P tests remain")
 
     mirror_phrases = [
         "loop cycle error mentions for loop",

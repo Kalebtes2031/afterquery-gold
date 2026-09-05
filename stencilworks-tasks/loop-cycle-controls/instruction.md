@@ -1,9 +1,9 @@
-Expose loop cycling in Stencilworks templates so authors can rotate values across `for` loop iterations.
+Loop cycling must be revealed in the Stencilworks templates so that the author can cycle through their values with each iteration of the `for` loop.
 
-Wire `{{ loop.cycle("a", "b", ...) }}` to pick the value at the current iteration index, wrapping by argument count; zero arguments yield empty output. Add a `{% cycle ... %}` tag that emits the next value from a comma-separated list each time it runs. An optional first identifier names a group so separate named groups advance independently across the render; anonymous groups reset when a new loop starts. Named groups keep their cursor across later loops in the same render.
+To implement this, you need to use `{{ loop.cycle("a", "b", ...) }}` so that you can access the current iteration index value while the function uses the number of passed values repeatedly and produces an empty result when not provided with arguments. The `{% cycle ... %}` tag must also be created to provide the next item of the value separated with a comma every time it is called, with the optional first identifier allowing to name the group which makes it possible for different named groups to make progress independently of each other while unnamed groups go back to the first value of a collection every time the new loop starts.
 
-Both forms must run only inside an active `for` loop and error when used elsewhere. Existing `loop` fields (`index`, `index0`, `revindex`, `revindex0`, `first`, `last`, `length`, `remaining`, `depth`) stay unchanged. Empty loops must not advance or print cycle output. Re-rendering the same template with the same data must stay stable. Cycle output concatenates without extra separators; values may be expressions, filters, or numbers rendered as text.
+Two approaches to perform the task must be implemented in an active 'for' loop. The loop-related variables (index, index0, revindex, revindex0, first, last, length, and remaining and depth) must work accurately. It has to be noted that empty lines never participate in the looping process. One and the same template can be used for rendering several times with the same data.
 
-`stencil check` and `stencil outline` should accept well-formed cycle syntax. Parse time must reject a cycle tag with no values. Named group labels are case-sensitive.
+Stencil check and stencil outline must accept valid cycle syntax. The parsing mechanism will fail to recognize cycle tags with an empty value. The group names must be precise.
 
-IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.
+IMPORTANT: Please work on this in a new branch from the `main` branch and commit everything afterward.
