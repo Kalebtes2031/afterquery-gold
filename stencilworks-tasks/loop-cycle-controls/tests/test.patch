@@ -3,11 +3,11 @@ new file mode 100644
 index 0000000..6483165
 --- /dev/null
 +++ b/tests/cycle_parse_and_outline.rs
-@@ -0,0 +1,388 @@
+@@ -0,0 +1,394 @@
 +//! Parser, outline, and structural tests for loop cycling.
 +
 +use stencilworks::syntax::outline;
-+use stencilworks::{memory_environment, parse_template, Environment, Source, Value, ValueMap};
++use stencilworks::{parse_template, Environment, Source, Value, ValueMap};
 +
 +fn render(text: &str) -> String {
 +    Environment::new().render("t", text, &ValueMap::new()).unwrap()
@@ -323,9 +323,15 @@ index 0000000..6483165
 +}
 +
 +#[test]
-+fn parse_cycle_with_trailing_commas_is_rejected_or_accepted_consistently() {
-+    let result = parse_template(&Source::new("t", r#"{% cycle "a", "b", %}"#));
-+    assert!(result.is_ok() || result.is_err());
++fn a_trailing_comma_in_a_cycle_tag_adds_no_extra_value() {
++    let parsed = parse_template(&Source::new("t", r#"{% cycle "a", "b", %}"#)).unwrap();
++    assert_eq!(parsed.nodes.len(), 1);
++    assert_eq!(parsed.nodes[0].kind(), "cycle");
++    let out = render_ctx(
++        r#"{% for item in items %}{% cycle "a", "b", %}{% endfor %}"#,
++        &ctx(&["1", "2", "3", "4"]),
++    );
++    assert_eq!(out, "abab");
 +}
 +
 +#[test]

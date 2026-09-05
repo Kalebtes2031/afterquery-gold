@@ -5,5 +5,5 @@ set -uo pipefail
 cd /app || exit 0
 mkdir -p /logs/artifacts
 git config --global --add safe.directory /app 2>/dev/null || true
-git diff --binary 52713c922b68e74da1e9ed6c3ba44a6724a3e707 HEAD > /logs/artifacts/model.patch 2>/dev/null || true
+git diff --binary 3f4470fff4b1cd4509df4bf33af692315190d1e3 HEAD > /logs/artifacts/model.patch 2>/dev/null || true
 echo "[pre_artifacts] captured $(wc -c < /logs/artifacts/model.patch) bytes"

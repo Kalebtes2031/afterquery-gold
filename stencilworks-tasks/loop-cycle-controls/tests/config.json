@@ -1,7 +1,9 @@
 {
-  "base_commit": "52713c922b68e74da1e9ed6c3ba44a6724a3e707",
+  "base_commit": "3f4470fff4b1cd4509df4bf33af692315190d1e3",
   "f2p_node_ids": [
     "a_cycle_tag_with_no_values_is_a_parse_error",
+    "a_trailing_comma_in_a_cycle_tag_adds_no_extra_value",
+    "anonymous_cycle_error_mentions_for_loop",
     "anonymous_cycle_outside_a_for_loop_is_an_error",
     "anonymous_cycle_tag_rotates_each_time_it_runs",
     "check_accepts_templates_with_cycle_tags",
@@ -54,15 +56,13 @@
     "parse_accepts_anonymous_cycle_with_three_literals",
     "parse_accepts_named_cycle_with_a_group_label",
     "parse_cycle_inside_raw_block_still_parses_when_outside_raw",
-    "parse_cycle_with_trailing_commas_is_rejected_or_accepted_consistently",
     "parse_rejects_an_empty_cycle_tag",
     "parse_treats_a_comma_first_token_as_a_value_not_a_group",
     "parse_treats_a_lone_identifier_as_a_cycle_value",
     "repeated_renders_with_the_same_template_stay_stable",
     "simultaneous_named_and_anonymous_cycles_in_one_iteration",
     "template_with_only_named_cycle_tags_renders_without_a_loop",
-    "three_separate_named_groups_advance_independently",
-    "\ufeffanonymous_cycle_error_mentions_for_loop"
+    "three_separate_named_groups_advance_independently"
   ],
   "p2p_node_ids": [
     "a_base_template_reports_no_parent",
@@ -102,6 +102,7 @@
     "caller_outside_a_call_block_errors",
     "check_reports_each_template",
     "check_succeeds_when_every_template_parses",
+    "cli::args::tests::a_missing_option_value_is_reported",
     "cli::args::tests::check_takes_many_templates",
     "cli::args::tests::escape_modes_are_validated",
     "cli::args::tests::filters_takes_a_verbose_flag",
@@ -528,8 +529,6 @@
     "source::tests::snippets_of_missing_lines_are_empty",
     "source::tests::snippets_place_the_caret_under_the_column",
     "source::tests::trailing_newline_creates_a_final_line",
-    "src\\lib.rs - (line 20)",
-    "src\\lib.rs - (line 34)",
     "stray_closing_tags_are_reported",
     "syntax::ast::tests::expressions_report_their_offset",
     "syntax::ast::tests::for_nodes_expose_the_empty_body",
@@ -712,16 +711,14 @@
     "value::tests::numbers_are_snapped_on_construction",
     "well_formed_macro_tags_parse",
     "whitespace_control_removes_layout_noise",
-    "whitespace_inside_macros_is_preserved",
-    "\ufeffcli::args::tests::a_missing_option_value_is_reported"
+    "whitespace_inside_macros_is_preserved"
   ],
   "grade": {
-    "format": "ctrf",
-    "node_id": "name",
+    "format": "junit",
     "tool_label": "cargo-nextest",
     "reports": [
-      "/logs/verifier/base_ctrf.json",
-      "/logs/verifier/new_ctrf.json"
+      "/logs/verifier/base.xml",
+      "/logs/verifier/new.xml"
     ]
   }
 }

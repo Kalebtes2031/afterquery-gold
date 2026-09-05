@@ -1,78 +1,82 @@
 # loop-cycle-controls — Progress Log
 
-Task: afterquery/loop-cycle-controls (stencilworks / newrepofromafterquery)
-Batch slot: **1 / 4 sprint focus**
-Theme: `loop.cycle` + `{% cycle %}` tag
-Primary modules: runtime/{cycle,render,loop_state}, syntax/{ast,parser,printer}
+Task: afterquery/loop-cycle-controls (stencilworks-render-core)
 Last updated: Sep 5, 2026
 
 ---
 
-## Status
+## Pipeline status
 
-| Stage | Result |
-|---|---|
-| Draft scaffold | done |
-| Instruction draft | done (~201 words) |
-| Solution patch | done — **508** added src lines, **6** files |
-| Test patch | done — **602** added lines, **2** files, **62** F2P |
-| config.json | done — 649 P2P + 62 F2P ids |
-| test.sh RUN TESTS | done — full frame; sync RUN TESTS with platform Rust seed if needed |
-| task.toml + frozen bundle | done — see BUNDLE.md (update docker_image after env publish) |
-| Local fail@base / pass@solution | verified |
-| Platform submit | **ready** |
-| Automated checks | — |
+| Stage | Att 1 | Att 2 | Att 3 | Att 4 (ready) |
+|---|---|---|---|---|
+| Automated checks | ❌ | ✅ | ❌ | **fix ready** |
+| AI check | — | ✅ | — | pending |
+| Originality | — | ✅ | — | pending |
+| Reference verification | — | ❌ | — | pending |
+| Quality review | — | — | — | pending |
+| Calibration I/II | — | — | — | pending |
 
 ---
 
-## Base commit
+## Mistakes log (learn once, don't repeat)
+
+| # | Mistake | Pipeline hit | Correct rule |
+|---|---|---|---|
+| 1 | Used local base `52713c9` in config | Automated checks | **`base_commit` = published env hash** (`3f4470fff4b1cd4509df4bf33af692315190d1e3`) |
+| 2 | Uploaded hand-built `test.sh` (missing frame comments) | Automated checks | **Only edit RUN TESTS block**; keep platform-seeded frame byte-identical |
+| 3 | Used Node/CTRF config on Rust task | Automated checks | Rust seed: **`junit`** + `base.xml`/`new.xml` + `cargo-nextest` |
+| 4 | JUnit normalize prefixed integration ids (`stencilworks::cycles::…`) | Reference verification | Config ids = **bare fn names** for integration tests; fix in **test.sh** RUN TESTS |
+| 5 | Windows BOM in config test ids (`\ufeff…`) | Reference verification | Regenerate ids from **`cargo test --list`**; strip BOM; Linux is authoritative |
+| 6 | Put `.config/nextest.toml` in **test.patch** | Automated checks | **test.patch = test files only** (`tests/*.rs`); write nextest config in **test.sh RUN TESTS** |
+| 7 | Instruction copied F2P test titles verbatim | Warnings / quality | Write **behavioral prose**; never restate test function names |
+
+---
+
+## Attempt history
+
+### Attempt 1 — Automated checks failed
+- Missing `test.sh` canonical frame comments
+- Wrong `base_commit` (local vs platform)
+
+### Attempt 2 — Reference verification failed
+- Reference runs reward 0 (~1s runtime → grading/report mismatch)
+- JUnit id normalization bug + BOM in config + nextest profile missing at runtime
+
+### Attempt 3 — Automated checks failed
+- Added `.config/nextest.toml` to test.patch (forbidden — not a test file)
+
+### Attempt 4 — Fixes ready
+| File | Fix |
+|---|---|
+| `tests/test.patch` | **2 test files only** (602 lines); no `.config/` |
+| `tests/test.sh` | Creates `.config/nextest.toml` inside RUN TESTS; fixed `normalize_junit` |
+| `tests/config.json` | Platform base; 62 F2P + 649 P2P; no BOM; junit grade |
+| `instruction.md` | 203 words; no test-title mirroring |
+| `verify_bundle.py` | Pre-submit gate — fails if test.patch touches non-test paths |
+
+---
+
+## Local verification (proxy base `52713c9`)
 
 ```
-52713c922b68e74da1e9ed6c3ba44a6724a3e707
+git reset --hard 52713c9 && git clean -fd
+git apply --whitespace=nowarn tests/test.patch        # F2P fail ✓
+git apply --whitespace=nowarn solution/solution.patch # all pass ✓
 ```
 
-Publish this hash when creating the stencilworks environment (includes macros; excludes cycle feature).
+---
+
+## Resubmit checklist (Attempt 4)
+
+- [x] Remove `.config/nextest.toml` from test.patch
+- [x] Write nextest profile in test.sh RUN TESTS only
+- [x] Keep JUnit normalize fix + clean config ids
+- [x] Rewrite instruction (no test mirroring)
+- [ ] Paste all updated files on platform
+- [ ] Pass automated checks → reference verification → quality → calibration
 
 ---
 
-## Bundle paths
+## Files to paste
 
-| File | Location |
-|---|---|
-| instruction.md | `stencilworks-tasks/loop-cycle-controls/instruction.md` |
-| task.toml | `stencilworks-tasks/loop-cycle-controls/task.toml` |
-| pre_artifacts.sh | `stencilworks-tasks/loop-cycle-controls/pre_artifacts.sh` |
-| environment/Dockerfile | `stencilworks-tasks/loop-cycle-controls/environment/Dockerfile` |
-| solution/solution.patch | `stencilworks-tasks/loop-cycle-controls/solution/solution.patch` |
-| solution/solve.sh | `stencilworks-tasks/loop-cycle-controls/solution/solve.sh` |
-| tests/test.patch | `stencilworks-tasks/loop-cycle-controls/tests/test.patch` |
-| tests/config.json | `stencilworks-tasks/loop-cycle-controls/tests/config.json` |
-| tests/test.sh | `stencilworks-tasks/loop-cycle-controls/tests/test.sh` (full frame + RUN TESTS) |
-| tests/grader.py | `stencilworks-tasks/loop-cycle-controls/tests/grader.py` (frozen copy) |
-| tests/Dockerfile | `stencilworks-tasks/loop-cycle-controls/tests/Dockerfile` |
-| BUNDLE.md | `stencilworks-tasks/loop-cycle-controls/BUNDLE.md` — layout guide |
-
-See **BUNDLE.md** for editable vs frozen files and placeholder fields in `task.toml`.
-
----
-
-## Local verification
-
-- Base + test.patch → cycle tests **fail** (feature missing)
-- Base + test.patch + solution.patch → cycle tests **pass**, full suite green
-
----
-
-## Submit checklist
-
-- [ ] Publish environment with base commit above
-- [ ] Create task on platform; paste instruction + patches + config
-- [ ] Paste RUN TESTS section into seeded `test.sh` (use platform Rust/cargo CTRF template if provided)
-- [ ] Fill `display_title` / `display_description` in task.toml
-- [ ] Submit and monitor pipeline
-
----
-
-## Errors & fixes
-
-_(none on platform yet)_
+See `SUBMIT.md`.

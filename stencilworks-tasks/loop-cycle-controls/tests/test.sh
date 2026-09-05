@@ -11,6 +11,9 @@ cd /app || { mkdir -p /logs/verifier; exit 6; }
 python3 /tests/grader.py prepare || exit $?
 [ -f /logs/verifier/reward.json ] && exit 0   # model.patch didn't apply -> graded 0
 
+# Canonical raw-output log: send every suite's combined stdout+stderr here
+# (use run_log, or pipe through tee -a "$RUN_LOG" when feeding a reporter) so
+# the reason a test failed is never lost. Never silence a test run.
 export RUN_LOG=/logs/verifier/run.log
 : > "$RUN_LOG" 2>/dev/null || true
 run_log() { echo "+ $*" >> "$RUN_LOG" 2>/dev/null; "$@" 2>&1 | tee -a "$RUN_LOG"; return "${PIPESTATUS[0]}"; }
@@ -18,130 +21,103 @@ run_log() { echo "+ $*" >> "$RUN_LOG" 2>/dev/null; "$@" 2>&1 | tee -a "$RUN_LOG"
 # >>> RUN TESTS (task-specific) <<<
 set +e
 
-install -d -o root -g root -m 0755 /logs/verifier
+rm -f /logs/verifier/base.xml /logs/verifier/new.xml
 
-rm -f \
-  /logs/verifier/base_ctrf.json \
-  /logs/verifier/new_ctrf.json
+# Verifier-only nextest profile (must not live in test.patch — test files only).
+mkdir -p .config
+cat > .config/nextest.toml <<'EOF'
+[profile.ci]
+retries = 0
+fail-fast = false
 
-export CARGO_HOME=/tmp/stencilworks-cargo
-export CARGO_TARGET_DIR=/tmp/stencilworks-target
-mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"
+[profile.ci.junit]
+path = "junit.xml"
+EOF
 
-CTRF_REPORTER="$(
-  node -e '
-try {
-  const resolved = require.resolve(
-    "jest-ctrf-json-reporter",
-    { paths: ["/opt/ctrf"] }
-  );
-  if (!resolved.startsWith("/opt/ctrf/")) {
-    process.exit(2);
-  }
-  process.stdout.write(resolved);
-} catch (_) {
-  process.exit(1);
+normalize_junit() {
+  python3 - "$1" "$2" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+# Integration test binaries use bare function names in cargo/nextest listings.
+INTEGRATION_BINS = {
+    "cli",
+    "context_data",
+    "diagnostics",
+    "filter_library",
+    "inheritance",
+    "macros",
+    "rendering",
+    "cycles",
+    "cycle_parse_and_outline",
 }
-'
-)"
 
-if [ -z "$CTRF_REPORTER" ] || [[ "$CTRF_REPORTER" != /opt/ctrf/* ]]; then
-  echo "Trusted CTRF reporter could not be resolved" | tee -a "$RUN_LOG"
-  exit 6
-fi
 
-CTRF_DIGEST_BEFORE="$(
-  find /opt/ctrf -type file -print0 \
-    | sort -z \
-    | xargs -0 sha256sum \
-    | sha256sum \
-    | awk '{print $1}'
-)"
+def node_id(name, classname):
+    name = (name or "").strip()
+    classname = (classname or "").strip()
+    if not name:
+        return None
+    if "::" in name:
+        return name
+    if classname:
+        last = classname.split("::")[-1]
+        if last in INTEGRATION_BINS:
+            return name
+        if "::" in classname:
+            return f"{classname}::{name}"
+    return name
 
-run_cargo_suite() {
-  local label="$1"
-  shift
-  local runner_dir="/tmp/stencilworks-${label}"
-  rm -rf "$runner_dir/ctrf"
-  mkdir -p "$runner_dir/ctrf"
-  export CTRF_REPORTER_OUTPUT="$runner_dir/ctrf/ctrf-report.json"
 
-  timeout \
-    --signal=TERM \
-    --kill-after=30s \
-    900 \
-    cargo test \
-      --no-fail-fast \
-      "$@" \
-      2>&1 | tee -a "$RUN_LOG"
+src, dst = sys.argv[1], sys.argv[2]
+try:
+    root = ET.parse(src).getroot()
+except Exception:
+    root = ET.Element("testsuites")
+for tc in root.iter("testcase"):
+    nid = node_id(tc.attrib.get("name"), tc.attrib.get("classname"))
+    if not nid:
+        continue
+    tc.set("name", nid)
+    tc.set("classname", "")
+ET.ElementTree(root).write(dst, encoding="unicode", xml_declaration=True)
+PY
+}
 
-  local exit_code=${PIPESTATUS[0]}
-
-  if [ ! -f "$CTRF_REPORTER_OUTPUT" ]; then
-    echo "CTRF report missing for ${label}" | tee -a "$RUN_LOG"
-    return 6
+copy_junit_report() {
+  local src="$1"
+  local dst="$2"
+  if [ -f "$src" ]; then
+    normalize_junit "$src" "$dst"
+    return 0
   fi
-
-  echo "$runner_dir/ctrf/ctrf-report.json"
-  return "$exit_code"
+  echo "JUnit report missing: $src" | tee -a "$RUN_LOG"
+  return 1
 }
 
 # P2P: library tests plus every integration file except the held-out cycle suites.
-BASE_SOURCE="$(
-  run_cargo_suite regression \
-    --lib \
-    --test cli \
-    --test context_data \
-    --test diagnostics \
-    --test filter_library \
-    --test inheritance \
-    --test macros \
-    --test rendering
-)"
-BASE_EXIT=$?
-
-install \
-  -o root \
-  -g root \
-  -m 0444 \
-  "$BASE_SOURCE" \
-  /logs/verifier/base_ctrf.json || exit 6
+run_log cargo nextest run --profile ci \
+  --lib \
+  --test cli \
+  --test context_data \
+  --test diagnostics \
+  --test filter_library \
+  --test inheritance \
+  --test macros \
+  --test rendering
+copy_junit_report target/nextest/ci/junit.xml /logs/verifier/base.xml
 
 # F2P: held-out cycle integration tests only.
-NEW_SOURCE="$(
-  run_cargo_suite behavior \
-    --test cycles \
-    --test cycle_parse_and_outline
-)"
-NEW_EXIT=$?
-
-install \
-  -o root \
-  -g root \
-  -m 0444 \
-  "$NEW_SOURCE" \
-  /logs/verifier/new_ctrf.json || exit 6
-
-CTRF_DIGEST_AFTER="$(
-  find /opt/ctrf -type file -print0 \
-    | sort -z \
-    | xargs -0 sha256sum \
-    | sha256sum \
-    | awk '{print $1}'
-)"
-
-if [ "$CTRF_DIGEST_BEFORE" != "$CTRF_DIGEST_AFTER" ]; then
-  echo "Trusted CTRF reporter changed while tests were running" \
-    | tee -a "$RUN_LOG"
-  exit 6
-fi
-
-echo "regression suite exit: $BASE_EXIT" | tee -a "$RUN_LOG"
-echo "cycle suite exit: $NEW_EXIT" | tee -a "$RUN_LOG"
+run_log cargo nextest run --profile ci \
+  --test cycles \
+  --test cycle_parse_and_outline
+copy_junit_report target/nextest/ci/junit.xml /logs/verifier/new.xml
 
 set -e
 # >>> END RUN TESTS <<<
 
+# Surface raw suite output into stdout (the harness captures it) so failures
+# stay debuggable even when a framework report omits the reason.
 _seen=""
 for _rl in "$RUN_LOG" /logs/verifier/*_run.log /logs/verifier/*-run.log /logs/verifier/*.log /logs/verifier/*.out; do
   [ -f "$_rl" ] && [ -s "$_rl" ] || continue
@@ -156,6 +132,8 @@ echo "===== grade ====="
 python3 /tests/grader.py grade
 log "reward.json=$(cat /logs/verifier/reward.json 2>/dev/null)"
 
+# Uniform top level: keep only the canonical artifacts in /logs/verifier and
+# move every framework-native report/log under reports/.
 mkdir -p /logs/verifier/reports 2>/dev/null
 for _f in /logs/verifier/*; do
   case "${_f##*/}" in

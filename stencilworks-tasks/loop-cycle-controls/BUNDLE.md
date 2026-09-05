@@ -42,7 +42,7 @@ loop-cycle-controls/
 1. **Publish environment** for `newrepofromafterquery` using `environment/Dockerfile` (or platform UI).
 2. Copy published **`docker_image`** tag into `task.toml` → `[environment].docker_image` and `tests/Dockerfile` `FROM` line.
 3. Copy **`repository_url`** into `task.toml` after the repo is connected.
-4. Confirm **`base_commit_hash`** = `52713c922b68e74da1e9ed6c3ba44a6724a3e707` matches the published environment.
+4. Confirm **`base_commit_hash`** matches the **published environment version** (platform UI shows abbreviated hash; use full 40-char value in `config.json`, `task.toml`, and `pre_artifacts.sh`). Do **not** use the local prep commit unless it is identical to the published env.
 5. **Create task** on platform → replace local frozen files with platform-seeded versions if they differ.
 6. Paste your five editable artifacts + fill `display_title` / `display_description`.
 

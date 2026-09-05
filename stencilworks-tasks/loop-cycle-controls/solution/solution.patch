@@ -9,7 +9,6 @@ index 0000000..4d91fa9
 +use crate::error::{Error, ErrorKind, Result};
 +use crate::source::Source;
 +use crate::syntax::ast::Expr;
-+use crate::value::ValueMap;
 +use std::cell::RefCell;
 +use std::collections::BTreeMap;
 +use std::rc::Rc;
@@ -111,6 +110,7 @@ index 0000000..4d91fa9
 +    use crate::syntax::ast::Expr;
 +    use crate::syntax::parser::parse_expression;
 +    use crate::source::Source;
++    use crate::value::ValueMap;
 +
 +    fn literal(text: &str) -> Expr {
 +        parse_expression(&Source::anonymous("x"), &format!("{text:?}"), 0).unwrap()

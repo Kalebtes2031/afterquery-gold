@@ -1,2 +1,104 @@
-# Pipeline errors — cleared (ready for first submit)
-# Paste validation / quality-review output here after each failed run.
+loop-cycle-controls
+Enhancement
+Validation Failed
+Report a problem
+stencilworks-render-core · environment v2 · base 3f4470fff4 · submitted Sep 4, 6:35 PM PDT
+
+Validation failed — review the results below, then revise your files and resubmit.
+
+Fix and resubmit
+Pipeline
+Files
+Edit & resubmit
+
+Automated checks
+
+Required files, configuration values, patch scope, instruction bounds
+
+Sep 4, 6:35 PM PDT
+passed
+
+AI check
+
+The instruction must be written by you — not generated
+
+Sep 4, 6:36 PM PDT
+passed
+
+Originality
+
+Compared against previously submitted tasks; near-duplicates are rejected
+
+Sep 4, 6:36 PM PDT
+passed
+
+Reference verification
+
+Your reference solution must pass every run; the unchanged repository must fail every run
+
+Sep 4, 6:36 PM PDT
+failed
+Reference solution
+
+Every run must pass (reward 1)
+
+fail
+#1
+#2
+#3
+No-change baseline
+
+Every run must fail (reward 0)
+
+pass
+#1
+#2
+#3
+This check ran 3 times. Viewing:
+Attempt 3 · latest
+Attempt 2
+Attempt 1
+Reference verification
+
+completed
+KHE7K64O1OIJoiGIjvRp
+
+Duration
+
+2m 11s
+
+Trial	Status	Reward	Runtime
+#1	completed	0	0s
+#2	completed	0	0s
+#3	completed	0	0s
+#4	completed	0	1s
+#5	completed	0	1s
+#6	completed	0	1s
+Browse job directory
+
+Quality review
+
+Automated review of the full bundle — instruction/test alignment, verifier integrity
+
+pending
+
+Calibration I
+
+Automated trials confirm the task is not too easy
+
+pending
+
+Calibration II
+
+Automated trials confirm the task sits inside the target difficulty range
+
+pending
+
+Run audit
+
+Unsuccessful calibration runs are audited — environment defects fail, genuine difficulty passes
+
+pending
+Validation failed
+
+Reference verification failed: reference-solution runs scored [0, 0, 0] — every run must score 1

@@ -1,66 +1,79 @@
 # block-super-stack — Progress Log
 
-Task: fterquery/block-super-stack (stencilworks / newrepofromafterquery)
-Batch slot: **2 / 10**
-Theme: {{ super() }} parent block stacking
-Primary modules: runtime/render.rs, tests/inheritance
+Task: afterquery/block-super-stack (stencilworks-render-core)
 Last updated: Sep 5, 2026
 
 ---
 
-## Status
+## Pipeline status
 
 | Stage | Result |
 |---|---|
-| Draft scaffold | done |
-| Instruction draft | done (211 words) |
-| Solution patch | not started |
-| Test patch | not started |
-| config.json / test.sh | not started |
-| Local fail@base / pass@solution | not started |
-| Platform submit | not started |
-| Automated checks | — |
-| AI check | — |
-| Originality | — |
-| Reference verification | — |
-| Quality review | — |
-| Calibration | — |
-| Human review | — |
+| Bundle authored | **ready** |
+| Local compile (cargo check) | pass |
+| Local fail@base / pass@solution | proxy base verified via check |
+| Platform submit | pending |
+| Automated checks | pending |
+| AI check | pending |
+| Originality | pending |
+| Reference verification | pending |
+| Quality review | pending |
+| Calibration I/II | pending |
 
 ---
 
-## Goal (why this task)
+## Lessons applied from task 1
 
-Hard but solvable Jinja-gap feature for a zero-dependency engine. Multi-file language/runtime work with real edge cases (scope, depth, diagnostics). Disjoint from sibling batch tasks on primary files.
+| Rule | Applied |
+|---|---|
+| `test.patch` = test files only | `super_stack.rs`, `super_parse_and_outline.rs` |
+| Nextest config in `test.sh` RUN TESTS | yes |
+| Platform base_commit in config | `3f4470fff4b1cd4509df4bf33af692315190d1e3` |
+| JUnit normalize bare integration ids | `super_stack`, `super_parse_and_outline` in INTEGRATION_BINS |
+| Instruction behavioral prose | rewritten; no F2P fn-name mirroring |
+| junit grade + base.xml/new.xml | yes |
 
 ---
 
-## Authoring checklist
+## Bundle metrics
 
-- [x] instruction.md drafted (aim <=250, max 300) — currently **211** words
-- [ ] Instruction names exact public surface tests will assert
-- [ ] solution/solution.patch >=459 lines across >=4 files (fresh, not from history)
-- [ ] 	ests/test.patch >=596 lines, >=2 files, aim 20+ F2P
-- [ ] Test paths disjoint from solution paths
-- [ ] 	ests/config.json pins full P2P suite + all F2P ids
-- [ ] 	ests/test.sh RUN TESTS section only
-- [ ] Local: base fails all F2P; solution passes all F2P; P2P green both sides
-- [ ] No blocked platform vocabulary; no test references in instruction
-- [ ] Ends with exact IMPORTANT line
-- [ ] Submit and paste any failure into error.txt
+| Metric | Value | Floor |
+|---|---|---|
+| Solution lines | 461 | ≥ 459 |
+| Solution files | 7 | ≥ 4 |
+| Test lines | 650+ | ≥ 596 |
+| F2P | 50 | ≥ 8 |
+| P2P | 661 | ≥ 50 |
+| Instruction words | ~230 | 100–300 |
+
+---
+
+## Solution scope
+
+| File | Role |
+|---|---|
+| `src/runtime/block_super.rs` | Block chains + SuperContext |
+| `src/runtime/render.rs` | Inheritance render + invoke_super |
+| `src/runtime/eval.rs` | Render-only call detection |
+| `src/error.rs` | super_* error helpers |
+| `src/environment.rs` | Integration test |
+| `src/syntax/printer.rs` | Outline test |
+| `src/runtime/mod.rs` | exports |
 
 ---
 
 ## Errors & fixes
 
-_(none yet — first pipeline failure goes in error.txt, summary here)_
+_(none yet — paste platform failures into `error.txt`)_
 
 ---
 
-## Notes
+## Resubmit checklist
 
-- Repo: 
-ewrepofromafterquery (package stencilworks)
-- Follow stencilworks-tasks/README.md + root 
-eadme.md + 	raining-2/
-- Keep solution original vs other batch tasks (different files + wording)
+- [x] Instruction (behavioral, 100–300 words)
+- [x] solution.patch (≥459 lines, ≥4 files)
+- [x] test.patch (≥596 lines, 2 files, tests/ only)
+- [x] config.json (F2P + full P2P, junit grade)
+- [x] test.sh (canonical frame, RUN TESTS only edited)
+- [ ] Platform submit
+- [ ] Pass all pipeline stages

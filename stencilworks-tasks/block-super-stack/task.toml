@@ -2,12 +2,12 @@ schema_version = "1.1"
 artifacts = ["/logs/artifacts/model.patch"]
 
 [task]
-name = "afterquery/loop-cycle-controls"
+name = "afterquery/block-super-stack"
 
 [metadata]
-task_id = "loop-cycle-controls"
-display_title = "Loop Cycle Controls for Template Loops"
-display_description = "Expose loop cycling in Stencilworks templates through loop.cycle expressions and a cycle tag, with named and anonymous groups, correct nesting, and parse-time validation."
+task_id = "block-super-stack"
+display_title = "Block Super Stack for Template Inheritance"
+display_description = "Add {{ super() }} to Stencilworks so child blocks can wrap parent block bodies across multi-level extends chains, with scoped stacks, diagnostics, and unchanged output when super is unused."
 category = "enhancement"
 language = "rust"
 repository_url = "REPLACE_WITH_PUBLISHED_STENCILWORKS_REPO_URL"

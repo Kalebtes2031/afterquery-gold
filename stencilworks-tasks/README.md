@@ -13,7 +13,7 @@ Base commit: pick deliberately when publishing the environment (feature must not
 | Order | Task id | Theme | Why selected | Status |
 |---|---|---|---|---|
 | 1 | `loop-cycle-controls` | `loop.cycle` + `{% cycle %}` | Core `cycle()` already in `loop_state.rs`; smallest gap to close | 🔄 in progress |
-| 2 | `block-super-stack` | `{{ super() }}` parent stacking | Inheritance infra + 14 tests exist; focused render change | ⬜ queued |
+| 2 | `block-super-stack` | `{{ super() }}` parent stacking | Inheritance infra + 14 tests exist; focused render change | ✅ bundle ready |
 | 3 | `named-filter-arguments` | Keyword filter args | Disjoint files; rich F2P surface (arity, keywords, errors) | ⬜ queued |
 | 4 | `autoescape-scoped-modes` | Scoped autoescape + Xml/Url/Js | Builds on existing escape/options/CLI; high template value | ⬜ queued |
 
