@@ -26,6 +26,26 @@ rm -f /logs/verifier/base_ctrf.json /logs/verifier/new_ctrf.json \
 
 TRUSTED_CONFIG=/app/.gold-vitest.config.ts
 TRUSTED_SETUP=/app/.gold-vitest.setup.ts
+TRUSTED_NODE_SHIM=/app/.gold-node-shim.cjs
+
+# Published-environment Node runtimes older than 22 lack
+# worker_threads.markAsUncloneable, which the project's pinned jsdom pulls in
+# unconditionally via undici's Cache Storage globals, crashing the jsdom
+# environment before any test can run. Polyfill it as a no-op when absent so
+# the suites below can execute; this changes no dependency and is inert once
+# the runtime already provides the function.
+cat > "$TRUSTED_NODE_SHIM" <<'NODE_SHIM'
+const wt = require("node:worker_threads");
+if (typeof wt.markAsUncloneable !== "function") {
+  wt.markAsUncloneable = function markAsUncloneable() {};
+}
+NODE_SHIM
+
+# Preload it into every Node process this script spawns (the CLI itself, any
+# forked/threaded vitest workers, and the version-check calls below) via
+# NODE_OPTIONS rather than a vitest-specific config key, so it takes effect
+# regardless of which vitest major version the published environment resolves.
+export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require $TRUSTED_NODE_SHIM"
 
 cat > "$TRUSTED_CONFIG" <<'VITEST_CONFIG'
 export default {
