@@ -1,0 +1,38 @@
+schema_version = "1.1"
+artifacts = ["/logs/artifacts/model.patch"]
+
+[task]
+name = "afterquery/autoescape-scoped-modes"
+
+[metadata]
+task_id = "autoescape-scoped-modes"
+display_title = "Scoped Autoescape Modes for Template Output"
+display_description = "Add Xml, Url, and Js escape modes plus {% autoescape %} regions with nested scopes, CLI --escape wiring, safe-filter suppression, and stencil check validation."
+category = "enhancement"
+language = "rust"
+repository_url = "REPLACE_WITH_PUBLISHED_STENCILWORKS_REPO_URL"
+base_commit_hash = "3f4470fff4b1cd4509df4bf33af692315190d1e3"
+
+[agent]
+timeout_sec = 5400
+
+[verifier]
+environment_mode = "separate"
+timeout_sec = 1800
+
+[verifier.environment]
+build_timeout_sec = 1800
+cpus = 2
+memory_mb = 8192
+storage_mb = 20480
+allow_internet = false
+
+[environment]
+build_timeout_sec = 1800
+docker_image = "REPLACE_WITH_PUBLISHED_ENV_IMAGE_TAG"
+os = "linux"
+cpus = 2
+memory_mb = 8192
+storage_mb = 20480
+gpus = 0
+allow_internet = false

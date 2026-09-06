@@ -1,0 +1,741 @@
+diff --git a/src/cli/args.rs b/src/cli/args.rs
+index 6ed610e..28c8f50 100644
+--- a/src/cli/args.rs
++++ b/src/cli/args.rs
+@@ -206,7 +206,7 @@ render options:
+   -s, --set <k=v>       bind one value; may be repeated, applied after --data
+   -o, --out <file>      write to a file instead of standard output
+   -r, --root <dir>      directory templates are loaded from
+-  -e, --escape <mode>   `none` (default) or `html`
++  -e, --escape <mode>   `none` (default), `html`, `xml`, `url`, or `js`
+       --strict          unbound names are an error (default)
+       --lenient         unbound names render as nothing
+ "
+@@ -298,7 +298,23 @@ mod tests {
+             render_args(&["render", "p", "-e", "html"]).escape,
+             EscapeMode::Html
+         );
+-        let err = parse_args(&["render", "p", "-e", "xml"]).unwrap_err();
++        assert_eq!(
++            render_args(&["render", "p", "-e", "xml"]).escape,
++            EscapeMode::Xml
++        );
++        assert_eq!(
++            render_args(&["render", "p", "-e", "url"]).escape,
++            EscapeMode::Url
++        );
++        assert_eq!(
++            render_args(&["render", "p", "-e", "js"]).escape,
++            EscapeMode::Js
++        );
++        assert_eq!(
++            render_args(&["render", "p", "-e", "none"]).escape,
++            EscapeMode::None
++        );
++        let err = parse_args(&["render", "p", "-e", "nope"]).unwrap_err();
+         assert!(err.message.contains("not an escape mode"));
+     }
+ 
+diff --git a/src/format/escape.rs b/src/format/escape.rs
+index cbd047a..c0af1c1 100644
+--- a/src/format/escape.rs
++++ b/src/format/escape.rs
+@@ -1,5 +1,63 @@
+ //! Escaping for the output languages a template usually targets.
+ 
++/// How `{{ … }}` output is escaped.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
++pub enum EscapeMode {
++    /// Values are written verbatim.
++    #[default]
++    None,
++    /// Values are HTML escaped unless the expression's outermost filter is
++    /// `safe`.
++    Html,
++    /// Values are escaped for XML attribute contexts.
++    Xml,
++    /// Values are percent-encoded for URL contexts.
++    Url,
++    /// Values are escaped for JavaScript string contexts.
++    Js,
++}
++
++impl EscapeMode {
++    /// The name used on the command line and in diagnostics.
++    pub fn name(self) -> &'static str {
++        match self {
++            EscapeMode::None => "none",
++            EscapeMode::Html => "html",
++            EscapeMode::Xml => "xml",
++            EscapeMode::Url => "url",
++            EscapeMode::Js => "js",
++        }
++    }
++
++    /// Parses a mode name, case-insensitively.
++    pub fn parse_case_insensitive(name: &str) -> Option<EscapeMode> {
++        match name.to_ascii_lowercase().as_str() {
++            "none" | "off" | "false" => Some(EscapeMode::None),
++            "html" => Some(EscapeMode::Html),
++            "xml" => Some(EscapeMode::Xml),
++            "url" => Some(EscapeMode::Url),
++            "js" => Some(EscapeMode::Js),
++            _ => None,
++        }
++    }
++
++    /// Parses a mode name for the command line.
++    pub fn parse(name: &str) -> Option<EscapeMode> {
++        Self::parse_case_insensitive(name)
++    }
++
++    /// Escapes text for this mode.
++    pub fn apply(self, text: &str) -> String {
++        match self {
++            EscapeMode::None => text.to_string(),
++            EscapeMode::Html => html(text),
++            EscapeMode::Xml => xml_attribute(text),
++            EscapeMode::Url => url(text),
++            EscapeMode::Js => js(text),
++        }
++    }
++}
++
+ /// The five characters HTML escaping replaces.
+ pub const HTML_UNSAFE: [char; 5] = ['&', '<', '>', '"', '\''];
+ 
+@@ -122,6 +180,28 @@ pub fn shell_word(text: &str) -> String {
+     format!("'{}'", text.replace('\'', "'\\''"))
+ }
+ 
++/// Escapes text for embedding in a JavaScript string literal.
++pub fn js(text: &str) -> String {
++    let mut out = String::with_capacity(text.len());
++    for ch in text.chars() {
++        match ch {
++            '\\' => out.push_str("\\\\"),
++            '\'' => out.push_str("\\'"),
++            '"' => out.push_str("\\\""),
++            '\n' => out.push_str("\\n"),
++            '\r' => out.push_str("\\r"),
++            '\t' => out.push_str("\\t"),
++            '\u{2028}' => out.push_str("\\u2028"),
++            '\u{2029}' => out.push_str("\\u2029"),
++            '<' => out.push_str("\\u003c"),
++            '>' => out.push_str("\\u003e"),
++            ch if ch.is_control() => out.push_str(&format!("\\u{:04x}", ch as u32)),
++            other => out.push(other),
++        }
++    }
++    out
++}
++
+ /// Escapes the characters that are special inside an XML attribute value.
+ pub fn xml_attribute(text: &str) -> String {
+     html(text)
+@@ -227,6 +307,34 @@ mod tests {
+         assert_eq!(xml_attribute("<x>"), "&lt;x&gt;");
+     }
+ 
++    #[test]
++    fn js_escaping_covers_script_specials() {
++        assert_eq!(js("a\"b"), "a\\\"b");
++        assert_eq!(js("it's"), "it\\'s");
++        assert_eq!(js("a\nb"), "a\\nb");
++        assert_eq!(js("</script>"), "\\u003c/script\\u003e");
++    }
++
++    #[test]
++    fn escape_modes_apply_their_encoding() {
++        assert_eq!(EscapeMode::Html.apply("<b>"), "&lt;b&gt;");
++        assert_eq!(EscapeMode::Xml.apply("a\tb"), "a&#9;b");
++        assert_eq!(EscapeMode::Url.apply("a b"), "a%20b");
++        assert_eq!(EscapeMode::Js.apply("'"), "\\'");
++        assert_eq!(EscapeMode::None.apply("<b>"), "<b>");
++    }
++
++    #[test]
++    fn escape_modes_parse_case_insensitively() {
++        assert_eq!(
++            EscapeMode::parse_case_insensitive("HTML"),
++            Some(EscapeMode::Html)
++        );
++        assert_eq!(EscapeMode::parse_case_insensitive("Js"), Some(EscapeMode::Js));
++        assert_eq!(EscapeMode::parse_case_insensitive("FALSE"), Some(EscapeMode::None));
++        assert!(EscapeMode::parse_case_insensitive("nope").is_none());
++    }
++
+     #[test]
+     fn tag_stripping_keeps_the_text() {
+         assert_eq!(strip_tags("<b>bold</b>"), "bold");
+diff --git a/src/format/mod.rs b/src/format/mod.rs
+index e573368..89a2b69 100644
+--- a/src/format/mod.rs
++++ b/src/format/mod.rs
+@@ -8,6 +8,7 @@ pub use number::{
+     byte_size, fixed, general, group_digits, grouped, percent, roman, scientific,
+     trim_trailing_zeros,
+ };
++pub use escape::EscapeMode;
+ pub use text::{
+     camel_case, capitalize, indent, kebab_case, pad_center, pad_end, pad_start, pascal_case,
+     repeat, reverse, slice, snake_case, squeeze, title_case, truncate, truncate_words, wrap,
+diff --git a/src/runtime/options.rs b/src/runtime/options.rs
+index 97b2d32..fabee13 100644
+--- a/src/runtime/options.rs
++++ b/src/runtime/options.rs
+@@ -2,41 +2,7 @@
+ 
+ use std::fmt;
+ 
+-/// How `{{ … }}` output is escaped.
+-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+-pub enum EscapeMode {
+-    /// Values are written verbatim.
+-    #[default]
+-    None,
+-    /// Values are HTML escaped unless the expression's outermost filter is
+-    /// `safe`.
+-    Html,
+-}
+-
+-impl EscapeMode {
+-    /// The name used on the command line and in diagnostics.
+-    pub fn name(self) -> &'static str {
+-        match self {
+-            EscapeMode::None => "none",
+-            EscapeMode::Html => "html",
+-        }
+-    }
+-
+-    /// Parses a mode name.
+-    pub fn parse(name: &str) -> Option<EscapeMode> {
+-        match name {
+-            "none" | "off" => Some(EscapeMode::None),
+-            "html" => Some(EscapeMode::Html),
+-            _ => None,
+-        }
+-    }
+-}
+-
+-impl fmt::Display for EscapeMode {
+-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        f.write_str(self.name())
+-    }
+-}
++pub use crate::format::escape::EscapeMode;
+ 
+ /// The filter whose presence at the top of an output expression suppresses
+ /// escaping.
+@@ -97,6 +63,12 @@ impl Default for Options {
+     }
+ }
+ 
++impl fmt::Display for EscapeMode {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(self.name())
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -128,7 +100,9 @@ mod tests {
+         assert_eq!(EscapeMode::parse("html"), Some(EscapeMode::Html));
+         assert_eq!(EscapeMode::parse("none"), Some(EscapeMode::None));
+         assert_eq!(EscapeMode::parse("off"), Some(EscapeMode::None));
+-        assert_eq!(EscapeMode::parse("xml"), None);
++        assert_eq!(EscapeMode::parse("xml"), Some(EscapeMode::Xml));
++        assert_eq!(EscapeMode::parse("url"), Some(EscapeMode::Url));
++        assert_eq!(EscapeMode::parse("js"), Some(EscapeMode::Js));
+     }
+ 
+     #[test]
+diff --git a/src/runtime/render.rs b/src/runtime/render.rs
+index f232006..caf19b4 100644
+--- a/src/runtime/render.rs
++++ b/src/runtime/render.rs
+@@ -30,6 +30,8 @@ pub struct Renderer<'a> {
+     options: &'a Options,
+     iterations: Cell<usize>,
+     macros: RefCell<MacroRegistry>,
++    /// Active escape modes, innermost last.
++    escape_stack: RefCell<Vec<EscapeMode>>,
+     /// The body of the current `{% call %}` block, if any, for `{{ caller() }}`.
+     caller_body: RefCell<Option<(Vec<Node>, Rc<Source>)>>,
+ }
+@@ -47,6 +49,7 @@ impl<'a> Renderer<'a> {
+             options,
+             iterations: Cell::new(0),
+             macros: RefCell::new(MacroRegistry::new()),
++            escape_stack: RefCell::new(vec![options.escape]),
+             caller_body: RefCell::new(None),
+         }
+     }
+@@ -411,6 +414,12 @@ impl<'a> Renderer<'a> {
+                 self.caller_body.replace(previous_caller);
+                 out.push_str(&rendered);
+             }
++            Node::Autoescape { mode, body, .. } => {
++                self.escape_stack.borrow_mut().push(*mode);
++                let result = self.render_nodes(body, source, scope, blocks, depth, out);
++                self.escape_stack.borrow_mut().pop();
++                result?;
++            }
+         }
+         Ok(())
+     }
+@@ -587,24 +596,34 @@ impl<'a> Renderer<'a> {
+         Ok(())
+     }
+ 
++    fn active_escape(&self) -> EscapeMode {
++        *self
++            .escape_stack
++            .borrow()
++            .last()
++            .unwrap_or(&self.options.escape)
++    }
++
+     /// Renders a value for output, escaping it when the mode asks and the
+     /// expression did not end in `safe`.
+     fn present(&self, expr: &Expr, value: &Value) -> String {
+         let text = to_text(value);
+-        match self.options.escape {
+-            EscapeMode::None => text,
+-            EscapeMode::Html if is_marked_safe(expr) => text,
+-            EscapeMode::Html => crate::format::escape::html(&text),
++        let mode = self.active_escape();
++        if mode == EscapeMode::None || is_marked_safe(expr) {
++            text
++        } else {
++            mode.apply(&text)
+         }
+     }
+ 
+     /// Renders an already-produced string for output, applying escaping based
+     /// on the surrounding expression.
+     fn present_text(&self, expr: &Expr, text: &str) -> String {
+-        match self.options.escape {
+-            EscapeMode::None => text.to_string(),
+-            EscapeMode::Html if is_marked_safe(expr) => text.to_string(),
+-            EscapeMode::Html => crate::format::escape::html(text),
++        let mode = self.active_escape();
++        if mode == EscapeMode::None || is_marked_safe(expr) {
++            text.to_string()
++        } else {
++            mode.apply(text)
+         }
+     }
+ }
+@@ -935,4 +954,143 @@ mod tests {
+         renderer.render(source, &template, &mut scope).unwrap();
+         assert_eq!(renderer.iterations(), 2);
+     }
++
++    #[test]
++    fn autoescape_html_region_escapes_output() {
++        let options = Options::new();
++        let rendered = render_with(
++            r#"{% autoescape "html" %}{{ markup }}{% endautoescape %}"#,
++            context(),
++            options,
++        )
++        .unwrap();
++        assert_eq!(rendered, "&lt;b&gt;");
++    }
++
++    #[test]
++    fn autoescape_js_region_escapes_quotes() {
++        let options = Options::new();
++        let mut map = context();
++        map.insert("quote", Value::text(r#"say "hi""#));
++        let rendered = render_with(
++            r#"{% autoescape "js" %}{{ quote }}{% endautoescape %}"#,
++            map,
++            options,
++        )
++        .unwrap();
++        assert!(rendered.contains("\\\""));
++    }
++
++    #[test]
++    fn autoescape_url_region_percent_encodes() {
++        let options = Options::new();
++        let mut map = context();
++        map.insert("path", Value::text("a b"));
++        let rendered = render_with(
++            r#"{% autoescape "url" %}{{ path }}{% endautoescape %}"#,
++            map,
++            options,
++        )
++        .unwrap();
++        assert_eq!(rendered, "a%20b");
++    }
++
++    #[test]
++    fn autoescape_xml_region_escapes_markup() {
++        let options = Options::new();
++        let rendered = render_with(
++            r#"{% autoescape "xml" %}{{ markup }}{% endautoescape %}"#,
++            context(),
++            options,
++        )
++        .unwrap();
++        assert_eq!(rendered, "&lt;b&gt;");
++    }
++
++    #[test]
++    fn nested_autoescape_restores_outer_mode() {
++        let options = Options::new();
++        let mut map = context();
++        map.insert("a", Value::text("<a>"));
++        map.insert("b", Value::text("<b>"));
++        let rendered = render_with(
++            r#"{% autoescape "html" %}{{ a }}{% autoescape "none" %}{{ b }}{% endautoescape %}{{ a }}{% endautoescape %}"#,
++            map,
++            options,
++        )
++        .unwrap();
++        assert_eq!(rendered, "&lt;a&gt;<b>&lt;a&gt;");
++    }
++
++    #[test]
++    fn autoescape_none_turns_off_global_html_mode() {
++        let options = Options::new().escaping(EscapeMode::Html);
++        let rendered = render_with(
++            r#"{% autoescape "none" %}{{ markup }}{% endautoescape %}"#,
++            context(),
++            options,
++        )
++        .unwrap();
++        assert_eq!(rendered, "<b>");
++    }
++
++    #[test]
++    fn safe_suppresses_autoescape_in_a_region() {
++        let options = Options::new();
++        let rendered = render_with(
++            r#"{% autoescape "html" %}{{ markup | safe }}{% endautoescape %}"#,
++            context(),
++            options,
++        )
++        .unwrap();
++        assert_eq!(rendered, "<b>");
++    }
++
++    #[test]
++    fn includes_inherit_autoescape_from_the_caller() {
++        let loader = MemoryLoader::new().with("part", "{{ markup }}");
++        let options = Options::new();
++        let rendered = render_using(
++            &loader,
++            r#"{% autoescape "html" %}{% include "part" %}{% endautoescape %}"#,
++            context(),
++            options,
++        )
++        .unwrap();
++        assert_eq!(rendered, "&lt;b&gt;");
++    }
++
++    #[test]
++    fn filter_blocks_inherit_autoescape_from_the_caller() {
++        let options = Options::new();
++        let rendered = render_with(
++            r#"{% autoescape "html" %}{% filter upper %}{{ markup }}{% endfilter %}{% endautoescape %}"#,
++            context(),
++            options,
++        )
++        .unwrap();
++        assert_eq!(rendered, "&LT;B&GT;");
++    }
++
++    #[test]
++    fn global_js_mode_escapes_interpolations() {
++        let options = Options::new().escaping(EscapeMode::Js);
++        let mut map = context();
++        map.insert("quote", Value::text("'"));
++        let rendered = render_with("{{ quote }}", map, options).unwrap();
++        assert_eq!(rendered, "\\'");
++    }
++
++    #[test]
++    fn inner_render_errors_still_restore_escape_mode() {
++        let err = render_with(
++            r#"{% autoescape "html" %}{{ missing }}{% endautoescape %}"#,
++            context(),
++            Options::new(),
++        )
++        .unwrap_err();
++        assert!(err.kind == ErrorKind::Undefined || err.message.contains("missing"));
++        let after = render_with("{{ markup }}", context(), Options::new()).unwrap();
++        assert_eq!(after, "<b>");
++    }
+ }
+diff --git a/src/syntax/ast.rs b/src/syntax/ast.rs
+index 6c78bdc..febd7a7 100644
+--- a/src/syntax/ast.rs
++++ b/src/syntax/ast.rs
+@@ -1,6 +1,7 @@
+ //! The syntax tree a template parses into.
+ 
+ use crate::value::Value;
++use crate::format::escape::EscapeMode;
+ use std::collections::BTreeMap;
+ 
+ /// A prefix operator.
+@@ -492,6 +493,15 @@ pub enum Node {
+         /// Byte offset in the template.
+         offset: usize,
+     },
++    /// `{% autoescape "html" %}…{% endautoescape %}`
++    Autoescape {
++        /// The escape mode active inside the body.
++        mode: EscapeMode,
++        /// The body rendered under the mode.
++        body: Vec<Node>,
++        /// Byte offset in the template.
++        offset: usize,
++    },
+ }
+ 
+ impl Node {
+@@ -510,7 +520,8 @@ impl Node {
+             | Node::Macro { offset, .. }
+             | Node::CallBlock { offset, .. }
+             | Node::Import { offset, .. }
+-            | Node::FromImport { offset, .. } => *offset,
++            | Node::FromImport { offset, .. }
++            | Node::Autoescape { offset, .. } => *offset,
+         }
+     }
+ 
+@@ -530,6 +541,7 @@ impl Node {
+             Node::CallBlock { .. } => "call",
+             Node::Import { .. } => "import",
+             Node::FromImport { .. } => "from",
++            Node::Autoescape { .. } => "autoescape",
+         }
+     }
+ 
+@@ -558,7 +570,8 @@ impl Node {
+             | Node::Block { body, .. }
+             | Node::FilterBlock { body, .. }
+             | Node::Macro { body, .. }
+-            | Node::CallBlock { body, .. } => {
++            | Node::CallBlock { body, .. }
++            | Node::Autoescape { body, .. } => {
+                 vec![body]
+             }
+             _ => Vec::new(),
+diff --git a/src/syntax/parser.rs b/src/syntax/parser.rs
+index f7da92f..8d6b8f2 100644
+--- a/src/syntax/parser.rs
++++ b/src/syntax/parser.rs
+@@ -463,6 +463,7 @@ impl Builder<'_> {
+             "call" => self.parse_call(rest, rest_offset, offset).map(Some),
+             "import" => self.parse_import(rest, rest_offset, offset).map(Some),
+             "from" => self.parse_from(rest, rest_offset, offset).map(Some),
++            "autoescape" => self.parse_autoescape(rest, rest_offset, offset).map(Some),
+             "extends" => {
+                 let expr = parse_expression(self.source, &rest, rest_offset)?;
+                 let Some(Value::Text(name)) = expr.as_literal().cloned() else {
+@@ -733,6 +734,45 @@ impl Builder<'_> {
+         })
+     }
+ 
++    fn parse_autoescape(
++        &mut self,
++        rest: String,
++        rest_offset: usize,
++        offset: usize,
++    ) -> Result<Node> {
++        use crate::format::escape::EscapeMode;
++        let expr = parse_expression(self.source, &rest, rest_offset)?;
++        let mode = match &expr {
++            Expr::Literal {
++                value: Value::Text(name),
++                ..
++            } => EscapeMode::parse_case_insensitive(name).ok_or_else(|| {
++                Error::syntax(
++                    format!("unknown autoescape mode `{name}`"),
++                    self.source.location(expr.offset()),
++                )
++            })?,
++            Expr::Literal {
++                value: Value::Bool(false),
++                ..
++            } => EscapeMode::None,
++            _ => {
++                return Err(Error::syntax(
++                    "`autoescape` needs a mode name in quotes or `false`",
++                    self.source.location(rest_offset),
++                ));
++            }
++        };
++        let (body, tail) = self.parse_body(&["endautoescape"])?;
++        if tail.is_none() {
++            return Err(Error::syntax(
++                "missing `endautoescape`",
++                self.source.location(offset),
++            ));
++        }
++        Ok(Node::Autoescape { mode, body, offset })
++    }
++
+     fn parse_include(&mut self, rest: String, rest_offset: usize, offset: usize) -> Result<Node> {
+         let tokens = tokenize(self.source, &rest, rest_offset)?;
+         let end = rest_offset + rest.len();
+@@ -1102,6 +1142,7 @@ pub fn is_closing_keyword(keyword: &str) -> bool {
+         keyword,
+         "elif"
+             | "else"
++            | "endautoescape"
+             | "endblock"
+             | "endcall"
+             | "endfilter"
+@@ -1130,6 +1171,7 @@ pub fn is_plain_name(text: &str) -> bool {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use crate::format::escape::EscapeMode;
+     use crate::syntax::printer::print_expression;
+ 
+     fn expr(text: &str) -> Expr {
+@@ -1447,4 +1489,112 @@ mod tests {
+         assert!(!is_plain_name("a.b"));
+         assert!(!is_plain_name(""));
+     }
++
++    #[test]
++    fn autoescape_parses_supported_modes() {
++        for (source, expected) in [
++            (r#"{% autoescape "html" %}x{% endautoescape %}"#, EscapeMode::Html),
++            (r#"{% autoescape "xml" %}x{% endautoescape %}"#, EscapeMode::Xml),
++            (r#"{% autoescape "url" %}x{% endautoescape %}"#, EscapeMode::Url),
++            (r#"{% autoescape "js" %}x{% endautoescape %}"#, EscapeMode::Js),
++            (r#"{% autoescape "none" %}x{% endautoescape %}"#, EscapeMode::None),
++        ] {
++            match &template(source).nodes[0] {
++                Node::Autoescape { mode, body, .. } => {
++                    assert_eq!(*mode, expected);
++                    assert_eq!(body.len(), 1);
++                }
++                other => panic!("expected autoescape, got {other:?}"),
++            }
++        }
++    }
++
++    #[test]
++    fn autoescape_accepts_false_and_off_aliases() {
++        for source in [
++            r#"{% autoescape false %}x{% endautoescape %}"#,
++            r#"{% autoescape "off" %}x{% endautoescape %}"#,
++            r#"{% autoescape "none" %}x{% endautoescape %}"#,
++        ] {
++            match &template(source).nodes[0] {
++                Node::Autoescape { mode, .. } => assert_eq!(*mode, EscapeMode::None),
++                other => panic!("expected autoescape, got {other:?}"),
++            }
++        }
++    }
++
++    #[test]
++    fn autoescape_mode_names_are_case_insensitive_at_parse_time() {
++        match &template(r#"{% autoescape "HTML" %}x{% endautoescape %}"#).nodes[0] {
++            Node::Autoescape { mode, .. } => assert_eq!(*mode, EscapeMode::Html),
++            other => panic!("expected autoescape, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn autoescape_rejects_unknown_modes() {
++        let err = template_err(r#"{% autoescape "nope" %}x{% endautoescape %}"#);
++        assert!(err.message.contains("unknown autoescape mode"));
++    }
++
++    #[test]
++    fn autoescape_requires_endautoescape() {
++        assert!(template_err(r#"{% autoescape "html" %}x"#)
++            .message
++            .contains("missing `endautoescape`"));
++    }
++
++    #[test]
++    fn stray_endautoescape_is_reported() {
++        assert!(template_err("{% endautoescape %}")
++            .message
++            .contains("unexpected `endautoescape`"));
++    }
++
++    #[test]
++    fn nested_autoescape_regions_parse() {
++        let parsed = template(
++            r#"{% autoescape "html" %}{% autoescape "js" %}x{% endautoescape %}{% endautoescape %}"#,
++        );
++        match &parsed.nodes[0] {
++            Node::Autoescape { mode, body, .. } => {
++                assert_eq!(*mode, EscapeMode::Html);
++                match &body[0] {
++                    Node::Autoescape { mode: inner, .. } => assert_eq!(*inner, EscapeMode::Js),
++                    other => panic!("expected inner autoescape, got {other:?}"),
++                }
++            }
++            other => panic!("expected autoescape, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn autoescape_rejects_dynamic_mode_expressions() {
++        assert!(template_err("{% autoescape mode %}x{% endautoescape %}")
++            .message
++            .contains("needs a mode name"));
++    }
++
++    #[test]
++    fn autoescape_can_wrap_filter_blocks() {
++        match &template(r#"{% autoescape "html" %}{% filter upper %}x{% endfilter %}{% endautoescape %}"#).nodes[0]
++        {
++            Node::Autoescape { body, .. } => match &body[0] {
++                Node::FilterBlock { .. } => {}
++                other => panic!("expected filter block, got {other:?}"),
++            },
++            other => panic!("expected autoescape, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn autoescape_can_wrap_include_tags() {
++        match &template(r#"{% autoescape "html" %}{% include "part" %}{% endautoescape %}"#).nodes[0] {
++            Node::Autoescape { body, .. } => match &body[0] {
++                Node::Include { .. } => {}
++                other => panic!("expected include, got {other:?}"),
++            },
++            other => panic!("expected autoescape, got {other:?}"),
++        }
++    }
+ }
+diff --git a/src/syntax/printer.rs b/src/syntax/printer.rs
+index 69b2bbe..f56e12f 100644
+--- a/src/syntax/printer.rs
++++ b/src/syntax/printer.rs
+@@ -266,6 +266,11 @@ fn print_node(node: &Node, out: &mut String) {
+                 rendered_names.join(", ")
+             ));
+         }
++        Node::Autoescape { mode, body, .. } => {
++            out.push_str(&format!("{{% autoescape \"{}\" %}}", mode.name()));
++            print_nodes(body, out);
++            out.push_str("{% endautoescape %}");
++        }
+     }
+ }
+ 
+@@ -304,6 +309,7 @@ fn outline_nodes(nodes: &[Node], depth: usize, lines: &mut Vec<String>) {
+                 let imported: Vec<&str> = names.iter().map(|(_, local)| local.as_str()).collect();
+                 format!("from import {}", imported.join(", "))
+             }
++            Node::Autoescape { mode, .. } => format!("autoescape {}", mode.name()),
+         };
+         lines.push(format!("{indent}{label}"));
+         for body in node.bodies() {

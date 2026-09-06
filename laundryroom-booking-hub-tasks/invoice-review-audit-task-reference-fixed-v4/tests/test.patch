@@ -1,0 +1,662 @@
+diff --git a/src/__tests__/invoice-review-normalizer.test.ts b/src/__tests__/invoice-review-normalizer.test.ts
+new file mode 100644
+index 0000000..be8e763
+--- /dev/null
++++ b/src/__tests__/invoice-review-normalizer.test.ts
+@@ -0,0 +1,246 @@
++import { describe, expect, it } from "vitest";
++import { InvoiceReviewNormalizer } from "@/lib/invoice/review";
++
++const normalizer = new InvoiceReviewNormalizer();
++
++const baseInvoice = (overrides: Record<string, unknown> = {}) => ({
++  id: "inv-doc-1",
++  invoiceNumber: " INV-10 ",
++  laundryId: " LD-5 ",
++  customerId: " customer-1 ",
++  customerName: "  Jane   Doe ",
++  mainServiceName: " Wash   & Fold ",
++  branchId: " branch-a ",
++  status: "balance",
++  totalBill: 1000,
++  paidAmount: 400,
++  balance: 600,
++  createdAt: "2026-08-20T10:30:00.000Z",
++  paymentLogs: [
++    {
++      amount: 400,
++      createdAt: "2026-08-20T11:00:00.000Z",
++      createdBy: "staff-1",
++      createdByUsername: "Alex",
++    },
++  ],
++  ...overrides,
++});
++
++describe("Invoice review normalization", () => {
++  it("trims and collapses customer-facing text fields", () => {
++    const record = normalizer.normalize([baseInvoice()]).records[0];
++    expect(record.invoiceNumber).toBe("INV-10");
++    expect(record.customerName).toBe("Jane Doe");
++    expect(record.mainServiceName).toBe("Wash & Fold");
++    expect(record.branchId).toBe("branch-a");
++  });
++
++  it("keeps a supplied document id", () => {
++    const record = normalizer.normalize([baseInvoice()]).records[0];
++    expect(record.id).toBe("inv-doc-1");
++  });
++
++  it("creates a stable fallback id when id is absent", () => {
++    const records = normalizer.normalize([
++      baseInvoice({ id: undefined }),
++      baseInvoice({ id: "", invoiceNumber: "INV-11" }),
++    ]).records;
++    expect(records.map((record) => record.id)).toEqual(["invoice-1", "invoice-2"]);
++  });
++
++  it("normalizes status case and surrounding whitespace", () => {
++    const record = normalizer.normalize([baseInvoice({ status: " Cleared " })]).records[0];
++    expect(record.status).toBe("cleared");
++  });
++
++  it("flags an unsupported non-empty status", () => {
++    const record = normalizer.normalize([baseInvoice({ status: "refunded" })]).records[0];
++    expect(record.status).toBeNull();
++    expect(record.issues).toContain("invalid_status");
++  });
++
++  it("flags a missing invoice number", () => {
++    const record = normalizer.normalize([baseInvoice({ invoiceNumber: "   " })]).records[0];
++    expect(record.issues).toContain("missing_invoice_number");
++  });
++
++  it("flags a missing customer name", () => {
++    const record = normalizer.normalize([baseInvoice({ customerName: undefined })]).records[0];
++    expect(record.issues).toContain("missing_customer_name");
++  });
++
++  it("accepts numeric strings and comma-formatted money", () => {
++    const record = normalizer.normalize([
++      baseInvoice({ totalBill: "1,200.50", paidAmount: "200.25", balance: "1000.25" }),
++    ]).records[0];
++    expect(record.totalBill).toBe(1200.5);
++    expect(record.paidAmount).toBe(200.25);
++    expect(record.balance).toBe(1000.25);
++  });
++
++  it("flags non-numeric total bill values", () => {
++    const record = normalizer.normalize([baseInvoice({ totalBill: "many" })]).records[0];
++    expect(record.totalBill).toBeNull();
++    expect(record.issues).toContain("invalid_total_bill");
++  });
++
++  it("flags non-numeric paid amount values", () => {
++    const record = normalizer.normalize([baseInvoice({ paidAmount: {} })]).records[0];
++    expect(record.paidAmount).toBeNull();
++    expect(record.issues).toContain("invalid_paid_amount");
++  });
++
++  it("flags non-numeric stored balance values", () => {
++    const record = normalizer.normalize([baseInvoice({ balance: "-" })]).records[0];
++    expect(record.balance).toBeNull();
++    expect(record.issues).toContain("invalid_balance");
++  });
++
++  it("flags negative money fields independently", () => {
++    const record = normalizer.normalize([
++      baseInvoice({ totalBill: -10, paidAmount: -5, balance: -2 }),
++    ]).records[0];
++    expect(record.issues).toEqual(
++      expect.arrayContaining(["negative_total_bill", "negative_paid_amount", "negative_balance"]),
++    );
++  });
++
++  it("computes expected balance from billed minus paid", () => {
++    const record = normalizer.normalize([baseInvoice({ totalBill: 755.25, paidAmount: 155.1 })]).records[0];
++    expect(record.expectedBalance).toBe(600.15);
++    expect(record.outstanding).toBe(600.15);
++  });
++
++  it("flags a stored balance that disagrees with computed balance", () => {
++    const record = normalizer.normalize([baseInvoice({ balance: 500 })]).records[0];
++    expect(record.expectedBalance).toBe(600);
++    expect(record.issues).toContain("balance_mismatch");
++  });
++
++  it("treats tiny sub-cent balance differences as equivalent", () => {
++    const record = normalizer.normalize([baseInvoice({ balance: 600.004 })]).records[0];
++    expect(record.issues).not.toContain("balance_mismatch");
++  });
++
++  it("flags overpayment and clamps outstanding to zero", () => {
++    const record = normalizer.normalize([
++      baseInvoice({ totalBill: 100, paidAmount: 125, balance: -25, status: "cleared" }),
++    ]).records[0];
++    expect(record.issues).toContain("overpayment");
++    expect(record.outstanding).toBe(0);
++  });
++
++  it("derives pending as the expected status when nothing has been paid", () => {
++    const record = normalizer.normalize([
++      baseInvoice({ totalBill: 500, paidAmount: 0, balance: 500, status: "pending" }),
++    ]).records[0];
++    expect(record.expectedStatus).toBe("pending");
++    expect(record.issues).not.toContain("status_mismatch");
++  });
++
++  it("derives balance as the expected status for a partial payment", () => {
++    const record = normalizer.normalize([baseInvoice()]).records[0];
++    expect(record.expectedStatus).toBe("balance");
++  });
++
++  it("derives cleared as the expected status for a fully paid invoice", () => {
++    const record = normalizer.normalize([
++      baseInvoice({ totalBill: 500, paidAmount: 500, balance: 0, status: "cleared" }),
++    ]).records[0];
++    expect(record.expectedStatus).toBe("cleared");
++  });
++
++  it("flags a non-cancelled status that disagrees with payment state", () => {
++    const record = normalizer.normalize([
++      baseInvoice({ totalBill: 500, paidAmount: 500, balance: 0, status: "pending" }),
++    ]).records[0];
++    expect(record.issues).toContain("status_mismatch");
++  });
++
++  it("preserves cancelled as the expected status without a mismatch", () => {
++    const record = normalizer.normalize([
++      baseInvoice({ status: "cancelled", totalBill: 500, paidAmount: 0, balance: 500 }),
++    ]).records[0];
++    expect(record.expectedStatus).toBe("cancelled");
++    expect(record.issues).not.toContain("status_mismatch");
++  });
++
++  it("normalizes Date and Firestore-like timestamps to ISO strings", () => {
++    const firestoreLike = { toDate: () => new Date("2026-08-21T09:00:00.000Z") };
++    const records = normalizer.normalize([
++      baseInvoice({ createdAt: new Date("2026-08-20T09:00:00.000Z") }),
++      baseInvoice({ id: "2", createdAt: firestoreLike }),
++    ]).records;
++    expect(records[0].createdAt).toBe("2026-08-20T09:00:00.000Z");
++    expect(records[1].createdAt).toBe("2026-08-21T09:00:00.000Z");
++  });
++
++  it("flags an invalid non-empty createdAt value", () => {
++    const record = normalizer.normalize([baseInvoice({ createdAt: "not-a-date" })]).records[0];
++    expect(record.createdAt).toBeNull();
++    expect(record.issues).toContain("invalid_created_at");
++  });
++
++  it("sums valid payment logs", () => {
++    const record = normalizer.normalize([
++      baseInvoice({
++        paidAmount: 450,
++        balance: 550,
++        paymentLogs: [
++          { amount: 200, createdAt: "2026-08-20T10:00:00Z" },
++          { amount: "250", createdAt: "2026-08-20T11:00:00Z" },
++        ],
++      }),
++    ]).records[0];
++    expect(record.paymentLogTotal).toBe(450);
++  });
++
++  it("flags malformed payment log records", () => {
++    const record = normalizer.normalize([
++      baseInvoice({ paymentLogs: [{ amount: "bad", createdAt: "also-bad" }] }),
++    ]).records[0];
++    expect(record.paymentLogs[0].valid).toBe(false);
++    expect(record.issues).toContain("invalid_payment_log");
++  });
++
++  it("flags when valid payment log totals disagree with paid amount", () => {
++    const record = normalizer.normalize([
++      baseInvoice({ paidAmount: 400, paymentLogs: [{ amount: 350, createdAt: "2026-08-20" }] }),
++    ]).records[0];
++    expect(record.issues).toContain("payment_log_total_mismatch");
++  });
++
++  it("does not require payment logs when an invoice has none", () => {
++    const record = normalizer.normalize([baseInvoice({ paymentLogs: undefined })]).records[0];
++    expect(record.paymentLogs).toEqual([]);
++    expect(record.paymentLogTotal).toBe(0);
++    expect(record.issues).not.toContain("payment_log_total_mismatch");
++  });
++
++  it("sets hasIssues from the final issue list", () => {
++    const clean = normalizer.normalize([baseInvoice()]).records[0];
++    const broken = normalizer.normalize([baseInvoice({ balance: 999 })]).records[0];
++    expect(clean.hasIssues).toBe(false);
++    expect(broken.hasIssues).toBe(true);
++  });
++
++  it("returns aggregate issue counts across all records", () => {
++    const result = normalizer.normalize([
++      baseInvoice({ invoiceNumber: "", customerName: "" }),
++      baseInvoice({ id: "2", invoiceNumber: "", balance: 123 }),
++    ]);
++    expect(result.issueCounts.missing_invoice_number).toBe(2);
++    expect(result.issueCounts.missing_customer_name).toBe(1);
++    expect(result.issueCounts.balance_mismatch).toBe(1);
++  });
++
++  it("does not mutate source invoice objects or payment logs", () => {
++    const source = baseInvoice({
++      paymentLogs: [{ amount: "400", createdAt: "2026-08-20T11:00:00Z" }],
++    });
++    const snapshot = JSON.stringify(source);
++    normalizer.normalize([source]);
++    expect(JSON.stringify(source)).toBe(snapshot);
++  });
++});
+diff --git a/src/__tests__/invoice-review-query-summary-csv.test.ts b/src/__tests__/invoice-review-query-summary-csv.test.ts
+new file mode 100644
+index 0000000..0ed366e
+--- /dev/null
++++ b/src/__tests__/invoice-review-query-summary-csv.test.ts
+@@ -0,0 +1,272 @@
++import { describe, expect, it } from "vitest";
++import {
++  InvoiceReviewCsvService,
++  InvoiceReviewNormalizer,
++  InvoiceReviewQueryService,
++  InvoiceReviewSummaryService,
++} from "@/lib/invoice/review";
++
++const normalizer = new InvoiceReviewNormalizer();
++const query = new InvoiceReviewQueryService();
++const summary = new InvoiceReviewSummaryService();
++const csv = new InvoiceReviewCsvService();
++
++const raw = [
++  {
++    id: "a",
++    invoiceNumber: "INV-2",
++    laundryId: "LD-9",
++    customerId: "C-1",
++    customerName: "Alice Example",
++    mainServiceName: "Laundry Standard",
++    branchId: "Branch-2",
++    status: "balance",
++    totalBill: 1000,
++    paidAmount: 250,
++    balance: 750,
++    createdAt: "2026-08-20T09:00:00Z",
++    paymentLogs: [{ amount: 250, createdAt: "2026-08-20T10:00:00Z" }],
++  },
++  {
++    id: "b",
++    invoiceNumber: "INV-10",
++    laundryId: "LD-10",
++    customerId: "C-2",
++    customerName: "Bob Stone",
++    mainServiceName: "Duvet Cleaning",
++    branchId: "Branch-10",
++    status: "cleared",
++    totalBill: 500,
++    paidAmount: 500,
++    balance: 0,
++    createdAt: "2026-08-22T09:00:00Z",
++    paymentLogs: [{ amount: 500, createdAt: "2026-08-22T10:00:00Z" }],
++  },
++  {
++    id: "c",
++    invoiceNumber: "INV-1",
++    laundryId: "LD-11",
++    customerId: "C-3",
++    customerName: "Carol Reed",
++    mainServiceName: "Suit Cleaning",
++    branchId: "Branch-2",
++    status: "pending",
++    totalBill: 800,
++    paidAmount: 0,
++    balance: 700,
++    createdAt: "2026-08-18T09:00:00Z",
++    paymentLogs: [],
++  },
++  {
++    id: "d",
++    invoiceNumber: "INV-3",
++    laundryId: "LD-12",
++    customerId: "C-4",
++    customerName: "Dana, \"D\"",
++    mainServiceName: "Carpet Cleaning",
++    branchId: "Branch-1",
++    status: "cancelled",
++    totalBill: 300,
++    paidAmount: 0,
++    balance: 300,
++    createdAt: "2026-08-19T09:00:00Z",
++    paymentLogs: [],
++  },
++];
++
++const records = normalizer.normalize(raw).records;
++
++describe("Invoice review querying", () => {
++  it("searches invoice number case-insensitively", () => {
++    expect(query.query(records, { query: "inv-10" }).items.map((x) => x.id)).toEqual(["b"]);
++  });
++
++  it("searches customer and service text", () => {
++    expect(query.query(records, { query: "duvet" }).items.map((x) => x.id)).toEqual(["b"]);
++    expect(query.query(records, { query: "alice" }).items.map((x) => x.id)).toEqual(["a"]);
++  });
++
++  it("searches laundry and customer ids", () => {
++    expect(query.query(records, { query: "ld-11" }).items.map((x) => x.id)).toEqual(["c"]);
++    expect(query.query(records, { query: "c-4" }).items.map((x) => x.id)).toEqual(["d"]);
++  });
++
++  it("filters by one or more statuses", () => {
++    const result = query.query(records, { statuses: ["balance", "pending"] });
++    expect(result.items.map((x) => x.id).sort()).toEqual(["a", "c"]);
++  });
++
++  it("filters branch ids case-insensitively", () => {
++    const result = query.query(records, { branchIds: ["branch-2"] });
++    expect(result.items.map((x) => x.id).sort()).toEqual(["a", "c"]);
++  });
++
++  it("filters records having any requested issue code", () => {
++    const result = query.query(records, { issueCodes: ["balance_mismatch"] });
++    expect(result.items.map((x) => x.id)).toEqual(["c"]);
++  });
++
++  it("filters clean and problematic records explicitly", () => {
++    expect(query.query(records, { hasIssues: true }).items.map((x) => x.id)).toEqual(["c"]);
++    expect(query.query(records, { hasIssues: false }).totalItems).toBe(3);
++  });
++
++  it("applies inclusive outstanding boundaries", () => {
++    const result = query.query(records, { minimumOutstanding: 300, maximumOutstanding: 750 });
++    expect(result.items.map((x) => x.id).sort()).toEqual(["a", "d"]);
++  });
++
++  it("naturally sorts invoice numbers", () => {
++    const result = query.query(records, { sortBy: "invoiceNumber", sortDirection: "asc" });
++    expect(result.items.map((x) => x.invoiceNumber)).toEqual(["INV-1", "INV-2", "INV-3", "INV-10"]);
++  });
++
++  it("sorts monetary values descending", () => {
++    const result = query.query(records, { sortBy: "totalBill", sortDirection: "desc" });
++    expect(result.items.map((x) => x.id)).toEqual(["a", "c", "b", "d"]);
++  });
++
++  it("uses newest createdAt first by default", () => {
++    expect(query.query(records).items.map((x) => x.id)).toEqual(["b", "a", "d", "c"]);
++  });
++
++  it("preserves source order when sort keys tie", () => {
++    const tied = normalizer.normalize([
++      { ...raw[0], id: "first", totalBill: 100 },
++      { ...raw[0], id: "second", invoiceNumber: "INV-X", totalBill: 100 },
++    ]).records;
++    expect(query.query(tied, { sortBy: "totalBill", sortDirection: "asc" }).items.map((x) => x.id)).toEqual([
++      "first",
++      "second",
++    ]);
++  });
++
++  it("uses one-based pagination", () => {
++    const result = query.query(records, { sortBy: "invoiceNumber", sortDirection: "asc", page: 2, pageSize: 2 });
++    expect(result.items.map((x) => x.invoiceNumber)).toEqual(["INV-3", "INV-10"]);
++    expect(result.page).toBe(2);
++    expect(result.totalPages).toBe(2);
++  });
++
++  it("clamps a page beyond the last page", () => {
++    const result = query.query(records, { page: 99, pageSize: 3 });
++    expect(result.page).toBe(2);
++    expect(result.items).toHaveLength(1);
++  });
++
++  it("returns page one and zero pages for an empty result", () => {
++    const result = query.query(records, { query: "no-such-invoice" });
++    expect(result).toMatchObject({ page: 1, totalItems: 0, totalPages: 0 });
++    expect(result.items).toEqual([]);
++  });
++
++  it("does not mutate the supplied normalized records", () => {
++    const before = JSON.stringify(records);
++    query.query(records, { sortBy: "invoiceNumber", branchIds: ["branch-2"] });
++    expect(JSON.stringify(records)).toBe(before);
++  });
++});
++
++describe("Invoice review summaries", () => {
++  it("counts invoices with and without issues", () => {
++    const result = summary.summarize(records);
++    expect(result.totalInvoices).toBe(4);
++    expect(result.withIssues).toBe(1);
++    expect(result.withoutIssues).toBe(3);
++  });
++
++  it("totals billed, paid and non-negative outstanding amounts", () => {
++    const result = summary.summarize(records);
++    expect(result.totalBilled).toBe(2600);
++    expect(result.totalPaid).toBe(750);
++    expect(result.totalOutstanding).toBe(1850);
++  });
++
++  it("reports aggregate issue counts", () => {
++    const result = summary.summarize(records);
++    expect(result.issueCounts.balance_mismatch).toBe(1);
++    expect(result.issueCounts.missing_invoice_number).toBe(0);
++  });
++
++  it("builds status rollups from normalized status", () => {
++    const result = summary.summarize(records);
++    const pending = result.byStatus.find((entry) => entry.status === "pending");
++    const balance = result.byStatus.find((entry) => entry.status === "balance");
++    expect(pending).toMatchObject({ count: 1, billed: 800, paid: 0, outstanding: 800, withIssues: 1 });
++    expect(balance).toMatchObject({ count: 1, billed: 1000, paid: 250, outstanding: 750, withIssues: 0 });
++  });
++
++  it("groups blank branch ids under unassigned", () => {
++    const data = normalizer.normalize([{ ...raw[0], branchId: "" }]).records;
++    expect(summary.summarize(data).byBranch[0].branchId).toBe("unassigned");
++  });
++
++  it("sorts branch rollups naturally", () => {
++    const result = summary.summarize(records);
++    expect(result.byBranch.map((entry) => entry.branchId)).toEqual(["Branch-1", "Branch-2", "Branch-10"]);
++  });
++
++  it("tracks overpaid amount separately", () => {
++    const data = normalizer.normalize([
++      { ...raw[0], totalBill: 100, paidAmount: 125, balance: -25, status: "cleared" },
++    ]).records;
++    expect(summary.summarize(data).overpaidAmount).toBe(25);
++  });
++
++  it("does not mutate records while summarizing", () => {
++    const before = JSON.stringify(records);
++    summary.summarize(records);
++    expect(JSON.stringify(records)).toBe(before);
++  });
++});
++
++describe("Invoice review CSV export", () => {
++  it("uses a fixed header order", () => {
++    const firstLine = csv.export(records).split("\n")[0];
++    expect(firstLine).toBe(
++      "Invoice ID,Invoice Number,Customer,Laundry ID,Service,Branch,Status,Total Bill,Paid Amount,Stored Balance,Expected Balance,Outstanding,Payment Log Total,Created At,Issues",
++    );
++  });
++
++  it("formats money with two decimals", () => {
++    const line = csv.export(records).split("\n")[1];
++    expect(line).toContain(",1000.00,250.00,750.00,750.00,750.00,250.00,");
++  });
++
++  it("supports semicolon and tab delimiters", () => {
++    expect(csv.export(records, { delimiter: ";" }).split("\n")[0]).toContain("Invoice ID;Invoice Number");
++    expect(csv.export(records, { delimiter: "\t" }).split("\n")[0]).toContain("Invoice ID\tInvoice Number");
++  });
++
++  it("supports CRLF line endings", () => {
++    const output = csv.export(records.slice(0, 1), { lineEnding: "\r\n" });
++    expect(output).toContain("\r\n");
++    expect(output.split("\r\n")).toHaveLength(2);
++  });
++
++  it("can export only records that have issues", () => {
++    const output = csv.export(records, { includeClean: false });
++    expect(output.split("\n")).toHaveLength(2);
++    expect(output).toContain("INV-1");
++    expect(output).not.toContain("INV-10");
++  });
++
++  it("quotes delimiters and doubles embedded quotes", () => {
++    const output = csv.export(records.filter((record) => record.id === "d"));
++    expect(output).toContain('"Dana, ""D"""');
++  });
++
++  it("joins multiple issue codes with a pipe", () => {
++    const data = normalizer.normalize([
++      { ...raw[0], invoiceNumber: "", customerName: "", balance: 999 },
++    ]).records;
++    const output = csv.export(data);
++    expect(output).toContain("missing_invoice_number|missing_customer_name|balance_mismatch");
++  });
++
++  it("does not mutate records during export", () => {
++    const before = JSON.stringify(records);
++    csv.export(records, { delimiter: ";", includeClean: false });
++    expect(JSON.stringify(records)).toBe(before);
++  });
++});
+diff --git a/src/__tests__/service-details-regression.test.ts b/src/__tests__/service-details-regression.test.ts
+new file mode 100644
+index 0000000..83a0bfc
+--- /dev/null
++++ b/src/__tests__/service-details-regression.test.ts
+@@ -0,0 +1,58 @@
++import { describe, expect, it } from "vitest";
++import { SERVICE_DETAILS, type ServiceSlug } from "@/lib/data/serviceDetails";
++
++const slugs: ServiceSlug[] = [
++  "laundry-services",
++  "duvet-cleaning",
++  "mat-cleaning",
++  "carpet-cleaning",
++  "eyelet-curtains",
++  "pillows",
++  "suits",
++];
++
++describe("Service details regression", () => {
++  for (const slug of slugs) {
++    it(`service ${slug} has a title`, () => {
++      expect(SERVICE_DETAILS[slug].title.trim().length).toBeGreaterThan(0);
++    });
++
++    it(`service ${slug} has a tagline`, () => {
++      expect(SERVICE_DETAILS[slug].tagline.trim().length).toBeGreaterThan(0);
++    });
++
++    it(`service ${slug} has a descriptive summary`, () => {
++      expect(SERVICE_DETAILS[slug].description.trim().length).toBeGreaterThan(40);
++    });
++
++    it(`service ${slug} exposes at least one package`, () => {
++      expect(SERVICE_DETAILS[slug].packages.length).toBeGreaterThan(0);
++    });
++
++    it(`service ${slug} package records have complete customer-facing fields`, () => {
++      for (const pkg of SERVICE_DETAILS[slug].packages) {
++        expect(pkg.name.trim()).not.toBe("");
++        expect(pkg.price.trim()).not.toBe("");
++        expect(pkg.turnaround.trim()).not.toBe("");
++        expect(pkg.features.length).toBeGreaterThan(0);
++      }
++    });
++
++    it(`service ${slug} exposes a process`, () => {
++      expect(SERVICE_DETAILS[slug].process.length).toBeGreaterThan(0);
++    });
++
++    it(`service ${slug} process steps have labels and descriptions`, () => {
++      for (const step of SERVICE_DETAILS[slug].process) {
++        expect(step.title.trim()).not.toBe("");
++        expect(step.description.trim()).not.toBe("");
++        expect(step.icon).toBeTruthy();
++      }
++    });
++
++    it(`service ${slug} has reasons to choose the service`, () => {
++      expect(SERVICE_DETAILS[slug].whyChoose.length).toBeGreaterThan(0);
++      expect(SERVICE_DETAILS[slug].whyChoose.every((reason) => reason.trim().length > 0)).toBe(true);
++    });
++  }
++});
+diff --git a/src/__tests__/toast-reducer-regression.test.ts b/src/__tests__/toast-reducer-regression.test.ts
+new file mode 100644
+index 0000000..17fbc63
+--- /dev/null
++++ b/src/__tests__/toast-reducer-regression.test.ts
+@@ -0,0 +1,62 @@
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { reducer } from "@/hooks/use-toast";
++
++const toast = (id: string, title = `Toast ${id}`) => ({ id, title, open: true });
++
++describe("Toast reducer regression", () => {
++  afterEach(() => vi.useRealTimers());
++
++  it("adds a toast to an empty state", () => {
++    expect(reducer({ toasts: [] }, { type: "ADD_TOAST", toast: toast("1") } as any).toasts).toHaveLength(1);
++  });
++
++  it("puts the newest toast first", () => {
++    const state = { toasts: [toast("1")] };
++    const next = reducer(state as any, { type: "ADD_TOAST", toast: toast("2") } as any);
++    expect(next.toasts[0].id).toBe("2");
++  });
++
++  it("enforces the single-toast limit", () => {
++    const state = { toasts: [toast("1")] };
++    const next = reducer(state as any, { type: "ADD_TOAST", toast: toast("2") } as any);
++    expect(next.toasts.map((entry: any) => entry.id)).toEqual(["2"]);
++  });
++
++  it("updates the matching toast", () => {
++    const state = { toasts: [toast("1")] };
++    const next = reducer(state as any, { type: "UPDATE_TOAST", toast: { id: "1", title: "Updated" } } as any);
++    expect(next.toasts[0].title).toBe("Updated");
++  });
++
++  it("leaves a toast unchanged when update id is missing", () => {
++    const state = { toasts: [toast("1")] };
++    const next = reducer(state as any, { type: "UPDATE_TOAST", toast: { id: "other", title: "Updated" } } as any);
++    expect(next.toasts[0].title).toBe("Toast 1");
++  });
++
++  it("dismisses one matching toast by closing it", () => {
++    vi.useFakeTimers();
++    const state = { toasts: [toast("1")] };
++    const next = reducer(state as any, { type: "DISMISS_TOAST", toastId: "1" } as any);
++    expect(next.toasts[0].open).toBe(false);
++  });
++
++  it("dismiss all closes every toast in state", () => {
++    vi.useFakeTimers();
++    const state = { toasts: [toast("1"), toast("2")] };
++    const next = reducer(state as any, { type: "DISMISS_TOAST" } as any);
++    expect(next.toasts.every((entry: any) => entry.open === false)).toBe(true);
++  });
++
++  it("remove by id deletes only the matching toast", () => {
++    const state = { toasts: [toast("1"), toast("2")] };
++    const next = reducer(state as any, { type: "REMOVE_TOAST", toastId: "1" } as any);
++    expect(next.toasts.map((entry: any) => entry.id)).toEqual(["2"]);
++  });
++
++  it("remove without an id clears all toasts", () => {
++    const state = { toasts: [toast("1"), toast("2")] };
++    const next = reducer(state as any, { type: "REMOVE_TOAST" } as any);
++    expect(next.toasts).toEqual([]);
++  });
++});

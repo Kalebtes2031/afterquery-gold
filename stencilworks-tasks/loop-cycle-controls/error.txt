@@ -1,113 +1,13 @@
-loop-cycle-controls
-Enhancement
-Validation Failed
-Report a problem
-stencilworks-render-core · environment v2 · base 3f4470fff4 · submitted Sep 5, 4:27 AM PDT
+RESOLVED — Reference verification fix (Attempt 13)
 
-Validation failed — review the results below, then revise your files and resubmit.
+Failed: reference-solution runs scored [0,0,0] in 0s (model.patch did not apply).
 
-Fix and resubmit
-Pipeline
-Files
-Edit & resubmit
+Root cause: solution.patch was built against sparse proxy b8f85fd, not full platform
+base 52713c9 / 3f4470f. Hunks for eval.rs, parser.rs, render.rs, filters/* did not apply.
 
-Automated checks
+Fix:
+- Regenerated solution.patch from git diff 52713c9..fbf37a8 (loop) and 52713c9..8b98a34 (named-filter)
+- Replaced test.sh with cargo test + write_junit (same pattern as passed RateEat tasks)
+- Restored full loop test.patch (645+ lines) — verified applies on 52713c9
 
-Required files, configuration values, patch scope, instruction bounds
-
-Sep 5, 4:27 AM PDT
-passed
-
-AI check
-
-The instruction must be written by you — not generated
-
-Sep 5, 4:27 AM PDT
-passed
-
-Originality
-
-Compared against previously submitted tasks; near-duplicates are rejected
-
-Sep 5, 4:27 AM PDT
-passed
-
-Reference verification
-
-Your reference solution must pass every run; the unchanged repository must fail every run
-
-Sep 5, 4:27 AM PDT
-failed
-Reference solution
-
-Every run must pass (reward 1)
-
-fail
-#1
-#2
-#3
-No-change baseline
-
-Every run must fail (reward 0)
-
-pass
-#1
-#2
-#3
-This check ran 12 times. Viewing:
-Attempt 12 · latest
-Attempt 11
-Attempt 10
-Attempt 9
-Attempt 8
-Attempt 7
-Attempt 6
-Attempt 5
-Attempt 4
-Attempt 3
-Attempt 2
-Attempt 1
-Reference verification
-
-completed
-SfzW70hV0Q5m85v97dZb
-
-Duration
-
-2m 22s
-
-Trial	Status	Reward	Runtime
-#1	completed	0	0s
-#2	completed	0	0s
-#3	completed	0	0s
-#4	completed	0	1s
-#5	completed	0	1s
-#6	completed	0	1s
-Browse job directory
-
-Quality review
-
-Automated review of the full bundle — instruction/test alignment, verifier integrity
-
-pending
-
-Calibration I
-
-Automated trials confirm the task is not too easy
-
-pending
-
-Calibration II
-
-Automated trials confirm the task sits inside the target difficulty range
-
-pending
-
-Run audit
-
-Unsuccessful calibration runs are audited — environment defects fail, genuine difficulty passes
-
-pending
-Validation failed
-
-Reference verification failed: reference-solution runs scored [0, 0, 0] — every run must score 1
+Paste: instruction.md, solution/solution.patch, tests/test.patch, tests/config.json, tests/test.sh

@@ -1,0 +1,813 @@
+diff --git a/src/lib/invoice/review/InvoiceReviewCsvService.ts b/src/lib/invoice/review/InvoiceReviewCsvService.ts
+new file mode 100644
+index 0000000..e1168cf
+--- /dev/null
++++ b/src/lib/invoice/review/InvoiceReviewCsvService.ts
+@@ -0,0 +1,79 @@
++import type { InvoiceCsvOptions, InvoiceReviewRecord } from "./types";
++
++const HEADERS = [
++  "Invoice ID",
++  "Invoice Number",
++  "Customer",
++  "Laundry ID",
++  "Service",
++  "Branch",
++  "Status",
++  "Total Bill",
++  "Paid Amount",
++  "Stored Balance",
++  "Expected Balance",
++  "Outstanding",
++  "Payment Log Total",
++  "Created At",
++  "Issues",
++];
++
++function cell(value: unknown, delimiter: string): string {
++  const text = value === null || value === undefined ? "" : String(value);
++  if (
++    text.includes(delimiter) ||
++    text.includes('"') ||
++    text.includes("\n") ||
++    text.includes("\r")
++  ) {
++    return `"${text.replace(/"/g, '""')}"`;
++  }
++  return text;
++}
++
++function money(value: number | null): string {
++  return value === null ? "" : value.toFixed(2);
++}
++
++function row(record: InvoiceReviewRecord): unknown[] {
++  return [
++    record.id,
++    record.invoiceNumber,
++    record.customerName,
++    record.laundryId,
++    record.mainServiceName,
++    record.branchId,
++    record.status ?? "",
++    money(record.totalBill),
++    money(record.paidAmount),
++    money(record.balance),
++    money(record.expectedBalance),
++    money(record.outstanding),
++    money(record.paymentLogTotal),
++    record.createdAt ?? "",
++    record.issues.join("|"),
++  ];
++}
++
++export class InvoiceReviewCsvService {
++  export(
++    records: readonly InvoiceReviewRecord[],
++    options: InvoiceCsvOptions = {},
++  ): string {
++    const delimiter = options.delimiter ?? ",";
++    const lineEnding = options.lineEnding ?? "\n";
++    const includeClean = options.includeClean ?? true;
++    const selected = includeClean ? records : records.filter((record) => record.hasIssues);
++
++    const lines = [
++      HEADERS.map((value) => cell(value, delimiter)).join(delimiter),
++      ...selected.map((record) =>
++        row(record)
++          .map((value) => cell(value, delimiter))
++          .join(delimiter),
++      ),
++    ];
++
++    return lines.join(lineEnding);
++  }
++}
+diff --git a/src/lib/invoice/review/InvoiceReviewNormalizer.ts b/src/lib/invoice/review/InvoiceReviewNormalizer.ts
+new file mode 100644
+index 0000000..c1bd49e
+--- /dev/null
++++ b/src/lib/invoice/review/InvoiceReviewNormalizer.ts
+@@ -0,0 +1,228 @@
++import {
++  INVOICE_ISSUE_CODES,
++  INVOICE_STATUSES,
++  type InvoiceIssueCode,
++  type InvoiceReviewNormalizationResult,
++  type InvoiceReviewRecord,
++  type InvoiceStatus,
++  type NormalizedPaymentLog,
++  type RawInvoiceReviewRecord,
++  type RawPaymentLog,
++} from "./types";
++
++const MONEY_TOLERANCE = 0.005;
++
++function text(value: unknown): string {
++  if (value === null || value === undefined) return "";
++  return String(value).trim().replace(/\s+/g, " ");
++}
++
++function money(value: unknown): number | null {
++  if (typeof value === "number") {
++    return Number.isFinite(value) ? round2(value) : null;
++  }
++
++  if (typeof value === "string") {
++    const trimmed = value.trim();
++    if (!trimmed) return null;
++    const parsed = Number(trimmed.replace(/,/g, ""));
++    return Number.isFinite(parsed) ? round2(parsed) : null;
++  }
++
++  return null;
++}
++
++function round2(value: number): number {
++  return Math.round((value + Number.EPSILON) * 100) / 100;
++}
++
++function timestamp(value: unknown): string | null {
++  if (value === null || value === undefined || value === "") return null;
++
++  if (value instanceof Date) {
++    return Number.isNaN(value.getTime()) ? null : value.toISOString();
++  }
++
++  if (typeof value === "string" || typeof value === "number") {
++    const parsed = new Date(value);
++    return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
++  }
++
++  if (typeof value === "object" && value !== null) {
++    const maybeTimestamp = value as {
++      toDate?: () => Date;
++      seconds?: unknown;
++      nanoseconds?: unknown;
++    };
++
++    if (typeof maybeTimestamp.toDate === "function") {
++      try {
++        const converted = maybeTimestamp.toDate();
++        return converted instanceof Date && !Number.isNaN(converted.getTime())
++          ? converted.toISOString()
++          : null;
++      } catch {
++        return null;
++      }
++    }
++
++    if (typeof maybeTimestamp.seconds === "number" && Number.isFinite(maybeTimestamp.seconds)) {
++      const nanoseconds =
++        typeof maybeTimestamp.nanoseconds === "number" && Number.isFinite(maybeTimestamp.nanoseconds)
++          ? maybeTimestamp.nanoseconds
++          : 0;
++      const millis = maybeTimestamp.seconds * 1000 + nanoseconds / 1_000_000;
++      const converted = new Date(millis);
++      return Number.isNaN(converted.getTime()) ? null : converted.toISOString();
++    }
++  }
++
++  return null;
++}
++
++function status(value: unknown): InvoiceStatus | null {
++  const normalized = text(value).toLowerCase();
++  return INVOICE_STATUSES.includes(normalized as InvoiceStatus)
++    ? (normalized as InvoiceStatus)
++    : null;
++}
++
++function expectedStatus(totalBill: number | null, paidAmount: number | null): InvoiceStatus | null {
++  if (totalBill === null || paidAmount === null || totalBill < 0 || paidAmount < 0) return null;
++  if (paidAmount <= MONEY_TOLERANCE) return "pending";
++  if (paidAmount + MONEY_TOLERANCE >= totalBill) return "cleared";
++  return "balance";
++}
++
++function normalizePaymentLog(raw: RawPaymentLog): NormalizedPaymentLog {
++  const amount = money(raw.amount);
++  const createdAt = timestamp(raw.createdAt);
++  const createdBy = text(raw.createdBy);
++  const createdByUsername = text(raw.createdByUsername);
++  const valid = amount !== null && amount >= 0 && createdAt !== null;
++
++  return {
++    amount,
++    createdAt,
++    createdBy,
++    createdByUsername,
++    valid,
++  };
++}
++
++function paymentLogs(value: unknown): NormalizedPaymentLog[] {
++  if (!Array.isArray(value)) return [];
++  return value.map((entry) =>
++    normalizePaymentLog(
++      entry && typeof entry === "object" ? (entry as RawPaymentLog) : {},
++    ),
++  );
++}
++
++function pushIssue(issues: InvoiceIssueCode[], code: InvoiceIssueCode): void {
++  if (!issues.includes(code)) issues.push(code);
++}
++
++function buildRecord(raw: RawInvoiceReviewRecord, index: number): InvoiceReviewRecord {
++  const issues: InvoiceIssueCode[] = [];
++  const id = text(raw.id) || `invoice-${index + 1}`;
++  const invoiceNumber = text(raw.invoiceNumber);
++  const customerName = text(raw.customerName);
++  const totalBill = money(raw.totalBill);
++  const paidAmount = money(raw.paidAmount);
++  const balance = money(raw.balance);
++  const normalizedStatus = status(raw.status);
++  const createdAt = timestamp(raw.createdAt);
++  const normalizedLogs = paymentLogs(raw.paymentLogs);
++
++  if (!invoiceNumber) pushIssue(issues, "missing_invoice_number");
++  if (!customerName) pushIssue(issues, "missing_customer_name");
++  if (text(raw.status) && normalizedStatus === null) pushIssue(issues, "invalid_status");
++  if (totalBill === null) pushIssue(issues, "invalid_total_bill");
++  if (paidAmount === null) pushIssue(issues, "invalid_paid_amount");
++  if (balance === null) pushIssue(issues, "invalid_balance");
++  if (totalBill !== null && totalBill < 0) pushIssue(issues, "negative_total_bill");
++  if (paidAmount !== null && paidAmount < 0) pushIssue(issues, "negative_paid_amount");
++  if (balance !== null && balance < 0) pushIssue(issues, "negative_balance");
++  if (text(raw.createdAt) && createdAt === null) pushIssue(issues, "invalid_created_at");
++
++  const validPaymentLogTotal = round2(
++    normalizedLogs.reduce((sum, entry) => {
++      return entry.valid && entry.amount !== null ? sum + entry.amount : sum;
++    }, 0),
++  );
++
++  if (normalizedLogs.some((entry) => !entry.valid)) {
++    pushIssue(issues, "invalid_payment_log");
++  }
++
++  if (
++    paidAmount !== null &&
++    normalizedLogs.length > 0 &&
++    Math.abs(validPaymentLogTotal - paidAmount) > MONEY_TOLERANCE
++  ) {
++    pushIssue(issues, "payment_log_total_mismatch");
++  }
++
++  let computedBalance: number | null = null;
++  if (totalBill !== null && paidAmount !== null) {
++    computedBalance = round2(totalBill - paidAmount);
++
++    if (paidAmount - totalBill > MONEY_TOLERANCE) {
++      pushIssue(issues, "overpayment");
++    }
++
++    if (balance !== null && Math.abs(balance - computedBalance) > MONEY_TOLERANCE) {
++      pushIssue(issues, "balance_mismatch");
++    }
++  }
++
++  const computedStatus = expectedStatus(totalBill, paidAmount);
++  if (
++    normalizedStatus !== null &&
++    normalizedStatus !== "cancelled" &&
++    computedStatus !== null &&
++    normalizedStatus !== computedStatus
++  ) {
++    pushIssue(issues, "status_mismatch");
++  }
++
++  return {
++    id,
++    invoiceNumber,
++    laundryId: text(raw.laundryId),
++    customerId: text(raw.customerId),
++    customerName,
++    mainServiceName: text(raw.mainServiceName),
++    branchId: text(raw.branchId),
++    status: normalizedStatus,
++    totalBill,
++    paidAmount,
++    balance,
++    expectedBalance: computedBalance,
++    expectedStatus: normalizedStatus === "cancelled" ? "cancelled" : computedStatus,
++    paymentLogTotal: validPaymentLogTotal,
++    createdAt,
++    paymentLogs: normalizedLogs,
++    issues,
++    hasIssues: issues.length > 0,
++    outstanding: computedBalance === null ? null : Math.max(computedBalance, 0),
++  };
++}
++
++export class InvoiceReviewNormalizer {
++  normalize(input: readonly RawInvoiceReviewRecord[]): InvoiceReviewNormalizationResult {
++    const records = input.map((raw, index) => buildRecord(raw, index));
++    const issueCounts = Object.fromEntries(
++      INVOICE_ISSUE_CODES.map((code) => [code, 0]),
++    ) as Record<InvoiceIssueCode, number>;
++
++    for (const record of records) {
++      for (const issue of record.issues) {
++        issueCounts[issue] += 1;
++      }
++    }
++
++    return { records, issueCounts };
++  }
++}
+diff --git a/src/lib/invoice/review/InvoiceReviewQueryService.ts b/src/lib/invoice/review/InvoiceReviewQueryService.ts
+new file mode 100644
+index 0000000..6fde14e
+--- /dev/null
++++ b/src/lib/invoice/review/InvoiceReviewQueryService.ts
+@@ -0,0 +1,153 @@
++import type {
++  InvoiceReviewQuery,
++  InvoiceReviewQueryResult,
++  InvoiceReviewRecord,
++  InvoiceSortBy,
++  SortDirection,
++} from "./types";
++
++const DEFAULT_PAGE_SIZE = 25;
++const MAX_PAGE_SIZE = 200;
++
++function lower(value: string): string {
++  return value.trim().toLocaleLowerCase();
++}
++
++function naturalCompare(left: string, right: string): number {
++  return left.localeCompare(right, undefined, {
++    numeric: true,
++    sensitivity: "base",
++  });
++}
++
++function numeric(value: number | null): number {
++  return value === null || Number.isNaN(value) ? Number.NEGATIVE_INFINITY : value;
++}
++
++function compare(
++  left: InvoiceReviewRecord,
++  right: InvoiceReviewRecord,
++  sortBy: InvoiceSortBy,
++): number {
++  switch (sortBy) {
++    case "invoiceNumber":
++      return naturalCompare(left.invoiceNumber, right.invoiceNumber);
++    case "customerName":
++      return naturalCompare(left.customerName, right.customerName);
++    case "createdAt":
++      return naturalCompare(left.createdAt ?? "", right.createdAt ?? "");
++    case "totalBill":
++      return numeric(left.totalBill) - numeric(right.totalBill);
++    case "paidAmount":
++      return numeric(left.paidAmount) - numeric(right.paidAmount);
++    case "outstanding":
++      return numeric(left.outstanding) - numeric(right.outstanding);
++    case "status":
++      return naturalCompare(left.status ?? "", right.status ?? "");
++  }
++}
++
++function stableSort(
++  records: readonly InvoiceReviewRecord[],
++  sortBy: InvoiceSortBy,
++  direction: SortDirection,
++): InvoiceReviewRecord[] {
++  const factor = direction === "desc" ? -1 : 1;
++  return records
++    .map((record, index) => ({ record, index }))
++    .sort((a, b) => {
++      const result = compare(a.record, b.record, sortBy);
++      return result === 0 ? a.index - b.index : result * factor;
++    })
++    .map(({ record }) => record);
++}
++
++function positiveInteger(value: number | undefined, fallback: number): number {
++  if (!Number.isFinite(value) || value === undefined) return fallback;
++  return Math.max(1, Math.floor(value));
++}
++
++export class InvoiceReviewQueryService {
++  query(
++    input: readonly InvoiceReviewRecord[],
++    options: InvoiceReviewQuery = {},
++  ): InvoiceReviewQueryResult {
++    let records = [...input];
++
++    const queryText = lower(options.query ?? "");
++    if (queryText) {
++      records = records.filter((record) =>
++        [
++          record.id,
++          record.invoiceNumber,
++          record.laundryId,
++          record.customerId,
++          record.customerName,
++          record.mainServiceName,
++          record.branchId,
++        ].some((value) => lower(value).includes(queryText)),
++      );
++    }
++
++    if (options.statuses?.length) {
++      const statuses = new Set(options.statuses);
++      records = records.filter(
++        (record) => record.status !== null && statuses.has(record.status),
++      );
++    }
++
++    if (options.branchIds?.length) {
++      const branches = new Set(options.branchIds.map(lower));
++      records = records.filter((record) => branches.has(lower(record.branchId)));
++    }
++
++    if (options.issueCodes?.length) {
++      const wanted = new Set(options.issueCodes);
++      records = records.filter((record) =>
++        record.issues.some((issue) => wanted.has(issue)),
++      );
++    }
++
++    if (typeof options.hasIssues === "boolean") {
++      records = records.filter((record) => record.hasIssues === options.hasIssues);
++    }
++
++    if (Number.isFinite(options.minimumOutstanding)) {
++      records = records.filter(
++        (record) =>
++          record.outstanding !== null &&
++          record.outstanding >= (options.minimumOutstanding as number),
++      );
++    }
++
++    if (Number.isFinite(options.maximumOutstanding)) {
++      records = records.filter(
++        (record) =>
++          record.outstanding !== null &&
++          record.outstanding <= (options.maximumOutstanding as number),
++      );
++    }
++
++    const sortBy = options.sortBy ?? "createdAt";
++    const sortDirection = options.sortDirection ?? "desc";
++    records = stableSort(records, sortBy, sortDirection);
++
++    const pageSize = Math.min(
++      MAX_PAGE_SIZE,
++      positiveInteger(options.pageSize, DEFAULT_PAGE_SIZE),
++    );
++    const totalItems = records.length;
++    const totalPages = totalItems === 0 ? 0 : Math.ceil(totalItems / pageSize);
++    const requestedPage = positiveInteger(options.page, 1);
++    const page = totalPages === 0 ? 1 : Math.min(requestedPage, totalPages);
++    const start = (page - 1) * pageSize;
++
++    return {
++      items: records.slice(start, start + pageSize),
++      page,
++      pageSize,
++      totalItems,
++      totalPages,
++    };
++  }
++}
+diff --git a/src/lib/invoice/review/InvoiceReviewSummaryService.ts b/src/lib/invoice/review/InvoiceReviewSummaryService.ts
+new file mode 100644
+index 0000000..bdd322f
+--- /dev/null
++++ b/src/lib/invoice/review/InvoiceReviewSummaryService.ts
+@@ -0,0 +1,141 @@
++import {
++  INVOICE_ISSUE_CODES,
++  INVOICE_STATUSES,
++  type InvoiceBranchSummary,
++  type InvoiceIssueCode,
++  type InvoiceReviewRecord,
++  type InvoiceReviewSummary,
++  type InvoiceStatusSummary,
++} from "./types";
++
++function amount(value: number | null): number {
++  return value === null || !Number.isFinite(value) ? 0 : value;
++}
++
++function round2(value: number): number {
++  return Math.round((value + Number.EPSILON) * 100) / 100;
++}
++
++function newStatusSummary(status: InvoiceStatusSummary["status"]): InvoiceStatusSummary {
++  return {
++    status,
++    count: 0,
++    billed: 0,
++    paid: 0,
++    outstanding: 0,
++    withIssues: 0,
++  };
++}
++
++function newBranchSummary(branchId: string): InvoiceBranchSummary {
++  return {
++    branchId,
++    count: 0,
++    billed: 0,
++    paid: 0,
++    outstanding: 0,
++    withIssues: 0,
++  };
++}
++
++function finalizeStatus(summary: InvoiceStatusSummary): InvoiceStatusSummary {
++  return {
++    ...summary,
++    billed: round2(summary.billed),
++    paid: round2(summary.paid),
++    outstanding: round2(summary.outstanding),
++  };
++}
++
++function finalizeBranch(summary: InvoiceBranchSummary): InvoiceBranchSummary {
++  return {
++    ...summary,
++    billed: round2(summary.billed),
++    paid: round2(summary.paid),
++    outstanding: round2(summary.outstanding),
++  };
++}
++
++export class InvoiceReviewSummaryService {
++  summarize(records: readonly InvoiceReviewRecord[]): InvoiceReviewSummary {
++    const issueCounts = Object.fromEntries(
++      INVOICE_ISSUE_CODES.map((code) => [code, 0]),
++    ) as Record<InvoiceIssueCode, number>;
++
++    const statusMap = new Map<InvoiceStatusSummary["status"], InvoiceStatusSummary>();
++    for (const status of INVOICE_STATUSES) {
++      statusMap.set(status, newStatusSummary(status));
++    }
++    statusMap.set("unknown", newStatusSummary("unknown"));
++
++    const branchMap = new Map<string, InvoiceBranchSummary>();
++
++    let withIssues = 0;
++    let totalBilled = 0;
++    let totalPaid = 0;
++    let totalOutstanding = 0;
++    let overpaidAmount = 0;
++
++    for (const record of records) {
++      if (record.hasIssues) withIssues += 1;
++
++      const billed = amount(record.totalBill);
++      const paid = amount(record.paidAmount);
++      const outstanding = amount(record.outstanding);
++      totalBilled += billed;
++      totalPaid += paid;
++      totalOutstanding += outstanding;
++
++      if (record.totalBill !== null && record.paidAmount !== null) {
++        overpaidAmount += Math.max(record.paidAmount - record.totalBill, 0);
++      }
++
++      for (const issue of record.issues) {
++        issueCounts[issue] += 1;
++      }
++
++      const statusKey = record.status ?? "unknown";
++      const statusSummary = statusMap.get(statusKey)!;
++      statusSummary.count += 1;
++      statusSummary.billed += billed;
++      statusSummary.paid += paid;
++      statusSummary.outstanding += outstanding;
++      if (record.hasIssues) statusSummary.withIssues += 1;
++
++      const branchId = record.branchId || "unassigned";
++      const branch = branchMap.get(branchId) ?? newBranchSummary(branchId);
++      branch.count += 1;
++      branch.billed += billed;
++      branch.paid += paid;
++      branch.outstanding += outstanding;
++      if (record.hasIssues) branch.withIssues += 1;
++      branchMap.set(branchId, branch);
++    }
++
++    const byStatus = [...statusMap.values()]
++      .filter((summary) => summary.count > 0)
++      .map(finalizeStatus);
++
++    const byBranch = [...branchMap.values()]
++      .map(finalizeBranch)
++      .sort((a, b) =>
++        a.branchId.localeCompare(b.branchId, undefined, {
++          numeric: true,
++          sensitivity: "base",
++        }),
++      );
++
++    return {
++      totalInvoices: records.length,
++      withIssues,
++      withoutIssues: records.length - withIssues,
++      totalBilled: round2(totalBilled),
++      totalPaid: round2(totalPaid),
++      totalOutstanding: round2(totalOutstanding),
++      overpaidAmount: round2(overpaidAmount),
++      issueCounts,
++      byStatus,
++      byBranch,
++    };
++  }
++}
+diff --git a/src/lib/invoice/review/index.ts b/src/lib/invoice/review/index.ts
+new file mode 100644
+index 0000000..3c411a2
+--- /dev/null
++++ b/src/lib/invoice/review/index.ts
+@@ -0,0 +1,5 @@
++export * from "./types";
++export * from "./InvoiceReviewNormalizer";
++export * from "./InvoiceReviewQueryService";
++export * from "./InvoiceReviewSummaryService";
++export * from "./InvoiceReviewCsvService";
+diff --git a/src/lib/invoice/review/types.ts b/src/lib/invoice/review/types.ts
+new file mode 100644
+index 0000000..f9f19ca
+--- /dev/null
++++ b/src/lib/invoice/review/types.ts
+@@ -0,0 +1,171 @@
++export type InvoiceStatus = "pending" | "balance" | "cleared" | "cancelled";
++
++export type InvoiceIssueCode =
++  | "missing_invoice_number"
++  | "missing_customer_name"
++  | "invalid_status"
++  | "invalid_total_bill"
++  | "invalid_paid_amount"
++  | "invalid_balance"
++  | "negative_total_bill"
++  | "negative_paid_amount"
++  | "negative_balance"
++  | "overpayment"
++  | "balance_mismatch"
++  | "status_mismatch"
++  | "payment_log_total_mismatch"
++  | "invalid_payment_log"
++  | "invalid_created_at";
++
++export type InvoiceSortBy =
++  | "invoiceNumber"
++  | "customerName"
++  | "createdAt"
++  | "totalBill"
++  | "paidAmount"
++  | "outstanding"
++  | "status";
++
++export type SortDirection = "asc" | "desc";
++
++export interface RawPaymentLog {
++  amount?: unknown;
++  createdAt?: unknown;
++  createdBy?: unknown;
++  createdByUsername?: unknown;
++}
++
++export interface RawInvoiceReviewRecord {
++  id?: unknown;
++  invoiceNumber?: unknown;
++  laundryId?: unknown;
++  customerId?: unknown;
++  customerName?: unknown;
++  mainServiceName?: unknown;
++  branchId?: unknown;
++  status?: unknown;
++  totalBill?: unknown;
++  paidAmount?: unknown;
++  balance?: unknown;
++  createdAt?: unknown;
++  paymentLogs?: unknown;
++}
++
++export interface NormalizedPaymentLog {
++  amount: number | null;
++  createdAt: string | null;
++  createdBy: string;
++  createdByUsername: string;
++  valid: boolean;
++}
++
++export interface InvoiceReviewRecord {
++  id: string;
++  invoiceNumber: string;
++  laundryId: string;
++  customerId: string;
++  customerName: string;
++  mainServiceName: string;
++  branchId: string;
++  status: InvoiceStatus | null;
++  totalBill: number | null;
++  paidAmount: number | null;
++  balance: number | null;
++  expectedBalance: number | null;
++  expectedStatus: InvoiceStatus | null;
++  paymentLogTotal: number;
++  createdAt: string | null;
++  paymentLogs: NormalizedPaymentLog[];
++  issues: InvoiceIssueCode[];
++  hasIssues: boolean;
++  outstanding: number | null;
++}
++
++export interface InvoiceReviewNormalizationResult {
++  records: InvoiceReviewRecord[];
++  issueCounts: Record<InvoiceIssueCode, number>;
++}
++
++export interface InvoiceReviewQuery {
++  query?: string;
++  statuses?: InvoiceStatus[];
++  branchIds?: string[];
++  issueCodes?: InvoiceIssueCode[];
++  hasIssues?: boolean;
++  minimumOutstanding?: number;
++  maximumOutstanding?: number;
++  sortBy?: InvoiceSortBy;
++  sortDirection?: SortDirection;
++  page?: number;
++  pageSize?: number;
++}
++
++export interface InvoiceReviewQueryResult {
++  items: InvoiceReviewRecord[];
++  page: number;
++  pageSize: number;
++  totalItems: number;
++  totalPages: number;
++}
++
++export interface InvoiceStatusSummary {
++  status: InvoiceStatus | "unknown";
++  count: number;
++  billed: number;
++  paid: number;
++  outstanding: number;
++  withIssues: number;
++}
++
++export interface InvoiceBranchSummary {
++  branchId: string;
++  count: number;
++  billed: number;
++  paid: number;
++  outstanding: number;
++  withIssues: number;
++}
++
++export interface InvoiceReviewSummary {
++  totalInvoices: number;
++  withIssues: number;
++  withoutIssues: number;
++  totalBilled: number;
++  totalPaid: number;
++  totalOutstanding: number;
++  overpaidAmount: number;
++  issueCounts: Record<InvoiceIssueCode, number>;
++  byStatus: InvoiceStatusSummary[];
++  byBranch: InvoiceBranchSummary[];
++}
++
++export interface InvoiceCsvOptions {
++  delimiter?: "," | ";" | "\t";
++  lineEnding?: "\n" | "\r\n";
++  includeClean?: boolean;
++}
++
++export const INVOICE_ISSUE_CODES: InvoiceIssueCode[] = [
++  "missing_invoice_number",
++  "missing_customer_name",
++  "invalid_status",
++  "invalid_total_bill",
++  "invalid_paid_amount",
++  "invalid_balance",
++  "negative_total_bill",
++  "negative_paid_amount",
++  "negative_balance",
++  "overpayment",
++  "balance_mismatch",
++  "status_mismatch",
++  "payment_log_total_mismatch",
++  "invalid_payment_log",
++  "invalid_created_at",
++];
++
++export const INVOICE_STATUSES: InvoiceStatus[] = [
++  "pending",
++  "balance",
++  "cleared",
++  "cancelled",
++];

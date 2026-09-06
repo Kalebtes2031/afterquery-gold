@@ -21,95 +21,79 @@ run_log() { echo "+ $*" >> "$RUN_LOG" 2>/dev/null; "$@" 2>&1 | tee -a "$RUN_LOG"
 # >>> RUN TESTS (task-specific) <<<
 set +e
 
-rm -f /logs/verifier/base.xml /logs/verifier/new.xml
+rm -f /logs/verifier/base.xml /logs/verifier/new.xml \
+      /logs/verifier/base_run.log /logs/verifier/new_run.log
+export CARGO_TERM_COLOR=never
 
-# Verifier-only nextest profile (must not live in test.patch — test files only).
-mkdir -p .config
-cat > .config/nextest.toml <<'EOF'
-[profile.ci]
-retries = 0
-fail-fast = false
-
-[profile.ci.junit]
-path = "junit.xml"
-EOF
-
-normalize_junit() {
-  python3 - "$1" "$2" <<'PY'
-import sys
-import xml.etree.ElementTree as ET
-
-# Integration test binaries use bare function names in cargo/nextest listings.
-INTEGRATION_BINS = {
-    "cli",
-    "context_data",
-    "diagnostics",
-    "filter_library",
-    "inheritance",
-    "rendering",
-    "named_filter_args",
-    "named_filter_parse_and_cli",
+run_suite() {
+  local suite_log="$1"
+  shift
+  echo "+ $*" | tee -a "$RUN_LOG" "$suite_log"
+  "$@" 2>&1 | tee -a "$RUN_LOG" "$suite_log"
+  return "${PIPESTATUS[0]}"
 }
 
-
-def node_id(name, classname):
-    name = (name or "").strip()
-    classname = (classname or "").strip()
-    if not name:
-        return None
-    if "::" in name:
-        return name
-    if classname:
-        last = classname.split("::")[-1]
-        if last in INTEGRATION_BINS:
-            return name
-        if "::" in classname:
-            return f"{classname}::{name}"
-    return name
-
+write_junit() {
+  python3 - "$1" "$2" <<'PY'
+import re
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
 
 src, dst = sys.argv[1], sys.argv[2]
-try:
-    root = ET.parse(src).getroot()
-except Exception:
-    root = ET.Element("testsuites")
-for tc in root.iter("testcase"):
-    nid = node_id(tc.attrib.get("name"), tc.attrib.get("classname"))
-    if not nid:
+ansi = re.compile(r"\x1b\[[0-9;]*m")
+line_re = re.compile(r"^test (.+?) \.\.\. (ok|FAILED|ignored)$")
+rank = {"passed": 0, "skipped": 1, "failed": 2}
+results = {}
+
+for raw in Path(src).read_text(errors="replace").splitlines():
+    line = ansi.sub("", raw).strip()
+    match = line_re.match(line)
+    if not match:
         continue
-    tc.set("name", nid)
-    tc.set("classname", "")
+    name, raw_status = match.groups()
+    status = {"ok": "passed", "ignored": "skipped", "FAILED": "failed"}[raw_status]
+    previous = results.get(name)
+    if previous is None or rank[status] > rank[previous]:
+        results[name] = status
+
+root = ET.Element("testsuites")
+suite = ET.SubElement(root, "testsuite", name="cargo-test", tests=str(len(results)))
+failures = 0
+skipped = 0
+for name, status in results.items():
+    case = ET.SubElement(suite, "testcase", name=name, classname="")
+    if status == "failed":
+        failures += 1
+        ET.SubElement(case, "failure", message="cargo test reported failure")
+    elif status == "skipped":
+        skipped += 1
+        ET.SubElement(case, "skipped")
+suite.set("failures", str(failures))
+suite.set("skipped", str(skipped))
 ET.ElementTree(root).write(dst, encoding="unicode", xml_declaration=True)
 PY
 }
 
-copy_junit_report() {
-  local src="$1"
-  local dst="$2"
-  if [ -f "$src" ]; then
-    normalize_junit "$src" "$dst"
-    return 0
-  fi
-  echo "JUnit report missing: $src" | tee -a "$RUN_LOG"
-  return 1
-}
+BASE_RUN=/logs/verifier/base_run.log
+NEW_RUN=/logs/verifier/new_run.log
+: > "$BASE_RUN"
+: > "$NEW_RUN"
 
 # P2P: library tests plus every integration file except the held-out keyword suites.
-run_log cargo nextest run --profile ci \
-  --lib \
-  --test cli \
-  --test context_data \
-  --test diagnostics \
-  --test filter_library \
-  --test inheritance \
-  --test rendering
-copy_junit_report target/nextest/ci/junit.xml /logs/verifier/base.xml
+run_suite "$BASE_RUN" cargo test --lib
+run_suite "$BASE_RUN" cargo test --test cli
+run_suite "$BASE_RUN" cargo test --test context_data
+run_suite "$BASE_RUN" cargo test --test diagnostics
+run_suite "$BASE_RUN" cargo test --test filter_library
+run_suite "$BASE_RUN" cargo test --test inheritance
+run_suite "$BASE_RUN" cargo test --test rendering
+write_junit "$BASE_RUN" /logs/verifier/base.xml
 
 # F2P: held-out named-filter integration tests only.
-run_log cargo nextest run --profile ci \
-  --test named_filter_args \
-  --test named_filter_parse_and_cli
-copy_junit_report target/nextest/ci/junit.xml /logs/verifier/new.xml
+run_suite "$NEW_RUN" cargo test --test named_filter_args
+run_suite "$NEW_RUN" cargo test --test named_filter_parse_and_cli
+write_junit "$NEW_RUN" /logs/verifier/new.xml
 
 set -e
 # >>> END RUN TESTS <<<

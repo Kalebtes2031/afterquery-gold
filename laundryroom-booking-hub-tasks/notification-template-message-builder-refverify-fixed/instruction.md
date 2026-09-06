@@ -1,0 +1,11 @@
+The order-status flow has its own message replacement code even though the template screen already exposes `{name}`, `{id}` and `{link}`. Pull that behavior into a reusable notification module. The public barrel at `src/lib/notifications/index.ts` must expose `NotificationTemplateNormalizer`, `NotificationMessageRenderer`, `WhatsAppTemplatePlanner`, `NotificationBatchComposer`, and `NotificationTemplateValidationError`.
+
+Templates are `{id?,name,key,message}`. Normalization trims the optional ID (`null` when it is blank or absent), collapses whitespace in the name, trims and lowercases the key, and trims only the outside of the message. Keys allow lowercase letters, digits and underscores. Messages may contain only `{name}`, `{id}` and `{link}`. Return exactly `id,name,key,message,variables,occurrences`: variables are unique in first-use order, while occurrences keeps every use. `normalizeAll` preserves order and rejects duplicate normalized keys. Validation codes are `EMPTY_TEMPLATE_NAME`, `EMPTY_TEMPLATE_KEY`, `INVALID_TEMPLATE_KEY`, `EMPTY_TEMPLATE_MESSAGE`, `MALFORMED_VARIABLE`, `UNKNOWN_VARIABLE`, and `DUPLICATE_TEMPLATE_KEY`.
+
+`render(template, values)` returns exactly `key,text,usedVariables,missingVariables,complete,characterCount`. Referenced values accept strings or finite numbers. Collapse name whitespace; trim ID and link. Blank, null or missing values stay as placeholders, are listed once as missing, and make the result incomplete. Invalid referenced values use `INVALID_VARIABLE_VALUE`; unused values are ignored.
+
+`plan` creates one-based WhatsApp parameters for every placeholder occurrence as `{position,variable,value}`, with `null` for missing values. Return exactly `templateName,parameters,missingVariables,ready`, using the normalized key as the template name.
+
+`compose` accepts ordered `{recipientId,values?}` rows. Trim recipient IDs and reject blanks or duplicates with `EMPTY_RECIPIENT_ID` or `DUPLICATE_RECIPIENT_ID`. Return exactly `key,messages,summary`; messages are `{recipientId,text,complete,missingVariables}`, and summary is `{total,complete,incomplete,missingByVariable}` with name, id and link counts. Empty batches are valid. These APIs must not mutate caller data.
+
+IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.

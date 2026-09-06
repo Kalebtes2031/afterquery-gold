@@ -1,0 +1,1010 @@
+diff --git a/tests/autoescape_parse_and_cli.rs b/tests/autoescape_parse_and_cli.rs
+new file mode 100644
+index 0000000..26fc030
+--- /dev/null
++++ b/tests/autoescape_parse_and_cli.rs
+@@ -0,0 +1,616 @@
++//! Parsing autoescape regions, template checking, and CLI escape flags.
++
++use std::path::PathBuf;
++use std::process::Command;
++
++use stencilworks::{
++    parse_template, Environment, EscapeMode, ErrorKind, Options, Source,
++};
++use stencilworks::syntax::printer::{outline, print_template};
++
++struct Tree {
++    root: PathBuf,
++}
++
++impl Tree {
++    fn new(files: &[(&str, &str)]) -> Tree {
++        let stamp = std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .map(|d| d.as_nanos())
++            .unwrap_or(0);
++        let mut root = std::env::temp_dir();
++        root.push(format!(
++            "stencilworks-autoescape-{stamp}-{:?}",
++            std::thread::current().id()
++        ));
++        std::fs::create_dir_all(&root).expect("create tree");
++        for (name, text) in files {
++            let path = root.join(name);
++            if let Some(parent) = path.parent() {
++                std::fs::create_dir_all(parent).expect("create parent");
++            }
++            std::fs::write(path, text).expect("write file");
++        }
++        Tree { root }
++    }
++
++    fn path(&self, name: &str) -> String {
++        self.root.join(name).to_string_lossy().to_string()
++    }
++}
++
++impl Drop for Tree {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_dir_all(&self.root);
++    }
++}
++
++struct Output {
++    stdout: String,
++    stderr: String,
++    code: i32,
++}
++
++fn stencil(arguments: &[&str]) -> Output {
++    let result = Command::new(env!("CARGO_BIN_EXE_stencil"))
++        .args(arguments)
++        .output()
++        .expect("run the binary");
++    Output {
++        stdout: String::from_utf8_lossy(&result.stdout).to_string(),
++        stderr: String::from_utf8_lossy(&result.stderr).to_string(),
++        code: result.status.code().unwrap_or(-1),
++    }
++}
++
++fn parse(name: &str, text: &str) -> stencilworks::Template {
++    parse_template(&Source::new(name, text)).unwrap()
++}
++
++fn fail_parse(name: &str, text: &str) -> stencilworks::Error {
++    parse_template(&Source::new(name, text)).unwrap_err()
++}
++
++#[test]
++fn autoescape_parses_into_a_dedicated_node() {
++    let template = parse("t", "{% autoescape \"html\" %}{{ x }}{% endautoescape %}");
++    assert_eq!(template.nodes.len(), 1);
++    assert_eq!(template.nodes[0].kind(), "autoescape");
++}
++
++#[test]
++fn autoescape_accepts_every_supported_mode() {
++    for mode in ["html", "xml", "url", "js", "none"] {
++        let text = format!("{{% autoescape \"{mode}\" %}}x{{% endautoescape %}}");
++        let template = parse("t", &text);
++        assert_eq!(template.nodes.len(), 1, "mode {mode}");
++        assert_eq!(template.nodes[0].kind(), "autoescape");
++    }
++}
++
++#[test]
++fn autoescape_accepts_boolean_false() {
++    let template = parse("t", "{% autoescape false %}{{ x }}{% endautoescape %}");
++    assert_eq!(template.nodes.len(), 1);
++    assert_eq!(template.nodes[0].kind(), "autoescape");
++}
++
++#[test]
++fn autoescape_mode_names_parse_case_insensitively() {
++    let template = parse("t", "{% autoescape \"HTML\" %}x{% endautoescape %}");
++    assert_eq!(template.nodes.len(), 1);
++    let template = parse("t", "{% autoescape \"Js\" %}x{% endautoescape %}");
++    assert_eq!(template.nodes.len(), 1);
++}
++
++#[test]
++fn unknown_autoescape_mode_is_a_positioned_syntax_error() {
++    let err = fail_parse("page", "{% autoescape \"bogus\" %}x{% endautoescape %}");
++    assert_eq!(err.kind, ErrorKind::Syntax);
++    assert!(err.message.contains("unknown autoescape mode"));
++    assert_eq!(err.template.as_deref(), Some("page"));
++}
++
++#[test]
++fn autoescape_requires_a_mode_argument() {
++    let err = fail_parse("t", "{% autoescape %}{% endautoescape %}");
++    assert_eq!(err.kind, ErrorKind::Syntax);
++}
++
++#[test]
++fn autoescape_rejects_non_literal_mode_expressions() {
++    let err = fail_parse("t", "{% autoescape html %}{% endautoescape %}");
++    assert_eq!(err.kind, ErrorKind::Syntax);
++    assert!(err.message.contains("mode name in quotes"));
++}
++
++#[test]
++fn unclosed_autoescape_is_rejected() {
++    let err = fail_parse("t", "{% autoescape \"html\" %}{{ x }}");
++    assert_eq!(err.kind, ErrorKind::Syntax);
++    assert!(err.message.contains("endautoescape"));
++}
++
++#[test]
++fn nested_autoescape_regions_parse() {
++    let text = concat!(
++        "{% autoescape \"html\" %}",
++        "a{% autoescape \"url\" %}b{% endautoescape %}c",
++        "{% endautoescape %}"
++    );
++    let template = parse("t", text);
++    assert_eq!(template.nodes.len(), 1);
++    let bodies = template.nodes[0].bodies();
++    assert_eq!(bodies.len(), 1);
++    assert_eq!(bodies[0].len(), 3);
++}
++
++#[test]
++fn stray_endautoescape_is_a_syntax_error() {
++    let err = fail_parse("t", "{% endautoescape %}");
++    assert_eq!(err.kind, ErrorKind::Syntax);
++    assert!(err.message.contains("unexpected"));
++}
++
++#[test]
++fn autoescape_round_trips_through_the_printer() {
++    let text = "{% autoescape \"html\" %}{{ x }}{% endautoescape %}";
++    let template = parse("t", text);
++    let printed = print_template(&template);
++    assert!(printed.contains("autoescape"));
++    assert!(printed.contains("endautoescape"));
++    let again = print_template(&parse("t", &printed));
++    assert_eq!(printed, again);
++}
++
++#[test]
++fn autoescape_false_prints_as_none() {
++    let template = parse("t", "{% autoescape false %}x{% endautoescape %}");
++    let printed = print_template(&template);
++    assert!(printed.contains("{% autoescape \"none\" %}"));
++}
++
++#[test]
++fn outline_shows_autoescape_and_its_body() {
++    let text = "{% autoescape \"html\" %}{{ x }}{% endautoescape %}";
++    let template = parse("t", text);
++    let rendered = outline(&template);
++    assert!(rendered.contains("autoescape html"));
++    assert!(rendered.contains("output x"));
++}
++
++#[test]
++fn outline_indents_nested_autoescape_bodies() {
++    let text = concat!(
++        "{% autoescape \"html\" %}",
++        "{% autoescape \"url\" %}{{ x }}{% endautoescape %}",
++        "{% endautoescape %}"
++    );
++    let rendered = outline(&parse("t", text));
++    assert!(rendered.contains("autoescape html"));
++    assert!(rendered.contains("  autoescape url"));
++    assert!(rendered.contains("    output x"));
++}
++
++#[test]
++fn environment_parse_accepts_autoescape() {
++    let env = Environment::new();
++    let template = env
++        .parse("t", "{% autoescape \"xml\" %}x{% endautoescape %}")
++        .unwrap();
++    assert_eq!(template.nodes[0].kind(), "autoescape");
++}
++
++#[test]
++fn environment_parse_rejects_unclosed_autoescape() {
++    let env = Environment::new();
++    let err = env
++        .parse("t", "{% autoescape \"xml\" %}x")
++        .unwrap_err();
++    assert_eq!(err.kind, ErrorKind::Syntax);
++}
++
++#[test]
++fn check_cli_accepts_valid_autoescape_templates() {
++    let tree = Tree::new(&[("page.html", "{% autoescape \"html\" %}{{ x }}{% endautoescape %}")]);
++    let out = stencil(&["check", &tree.path("page.html")]);
++    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
++}
++
++#[test]
++fn check_cli_rejects_unclosed_autoescape() {
++    let tree = Tree::new(&[("page.html", "{% autoescape \"html\" %}{{ x }}")]);
++    let out = stencil(&["check", &tree.path("page.html")]);
++    assert_eq!(out.code, 2);
++    assert!(out.stderr.contains("endautoescape") || out.stderr.contains("syntax"));
++}
++
++#[test]
++fn check_cli_rejects_unknown_autoescape_mode() {
++    let tree = Tree::new(&[(
++        "page.html",
++        "{% autoescape \"nope\" %}x{% endautoescape %}",
++    )]);
++    let out = stencil(&["check", &tree.path("page.html")]);
++    assert_eq!(out.code, 2);
++    assert!(out.stderr.contains("unknown autoescape mode"));
++}
++
++#[test]
++fn render_cli_escape_html_flag() {
++    let tree = Tree::new(&[("page.html", "{{ x }}")]);
++    let out = stencil(&[
++        "render",
++        &tree.path("page.html"),
++        "-e",
++        "html",
++        "--set",
++        "x=<b>",
++    ]);
++    assert_eq!(out.code, 0);
++    assert_eq!(out.stdout, "&lt;b&gt;");
++}
++
++#[test]
++fn render_cli_escape_xml_flag() {
++    let tree = Tree::new(&[("page.html", "{{ x }}")]);
++    let out = stencil(&[
++        "render",
++        &tree.path("page.html"),
++        "-e",
++        "xml",
++        "--set",
++        "x=a\tb",
++    ]);
++    assert_eq!(out.code, 0);
++    assert_eq!(out.stdout, "a&#9;b");
++}
++
++#[test]
++fn render_cli_escape_url_flag() {
++    let tree = Tree::new(&[("page.html", "{{ x }}")]);
++    let out = stencil(&[
++        "render",
++        &tree.path("page.html"),
++        "-e",
++        "url",
++        "--set",
++        "x=a/b",
++    ]);
++    assert_eq!(out.code, 0);
++    assert_eq!(out.stdout, "a%2Fb");
++}
++
++#[test]
++fn render_cli_escape_js_flag() {
++    let tree = Tree::new(&[("page.html", "{{ x }}")]);
++    let out = stencil(&[
++        "render",
++        &tree.path("page.html"),
++        "-e",
++        "js",
++        "--set",
++        "x=line\nbreak",
++    ]);
++    assert_eq!(out.code, 0);
++    assert_eq!(out.stdout, "line\\nbreak");
++}
++
++#[test]
++fn render_cli_escape_none_flag() {
++    let tree = Tree::new(&[("page.html", "{{ x }}")]);
++    let out = stencil(&[
++        "render",
++        &tree.path("page.html"),
++        "-e",
++        "none",
++        "--set",
++        "x=<b>",
++    ]);
++    assert_eq!(out.code, 0);
++    assert_eq!(out.stdout, "<b>");
++}
++
++#[test]
++fn render_cli_escape_is_case_insensitive() {
++    let tree = Tree::new(&[("page.html", "{{ x }}")]);
++    let out = stencil(&[
++        "render",
++        &tree.path("page.html"),
++        "-e",
++        "HTML",
++        "--set",
++        "x=<b>",
++    ]);
++    assert_eq!(out.code, 0);
++    assert_eq!(out.stdout, "&lt;b&gt;");
++}
++
++#[test]
++fn invalid_escape_flag_exits_with_usage_error() {
++    let tree = Tree::new(&[("page.html", "{{ x }}")]);
++    let out = stencil(&["render", &tree.path("page.html"), "-e", "bogus"]);
++    assert_eq!(out.code, 1);
++    assert!(out.stderr.contains("not an escape mode"));
++}
++
++#[test]
++fn help_mentions_all_escape_modes() {
++    let out = stencil(&["help"]);
++    assert_eq!(out.code, 0);
++    for mode in ["html", "xml", "url", "js", "none"] {
++        assert!(out.stdout.contains(mode), "help missing {mode}");
++    }
++}
++
++#[test]
++fn render_combines_cli_escape_with_autoescape_regions() {
++    let tree = Tree::new(&[(
++        "page.html",
++        "g={{ x }}{% autoescape \"none\" %}i={{ x }}{% endautoescape %}",
++    )]);
++    let out = stencil(&[
++        "render",
++        &tree.path("page.html"),
++        "-e",
++        "html",
++        "--set",
++        "x=<b>",
++    ]);
++    assert_eq!(out.code, 0);
++    assert_eq!(out.stdout, "g=&lt;b&gt;i=<b>");
++}
++
++#[test]
++fn outline_cli_shows_autoescape_structure() {
++    let tree = Tree::new(&[(
++        "page.html",
++        "{% autoescape \"url\" %}{{ x }}{% endautoescape %}",
++    )]);
++    let out = stencil(&["outline", &tree.path("page.html")]);
++    assert_eq!(out.code, 0);
++    assert!(out.stdout.contains("autoescape url"));
++}
++
++#[test]
++fn options_escape_modes_match_cli_values() {
++    let options = Options::new().escaping(EscapeMode::Xml);
++    assert_eq!(options.escape, EscapeMode::Xml);
++    assert_eq!(EscapeMode::parse("URL"), Some(EscapeMode::Url));
++    assert_eq!(EscapeMode::parse("JS"), Some(EscapeMode::Js));
++}
++
++#[test]
++fn autoescape_off_and_none_aliases_parse() {
++    for mode in ["off", "none", "false"] {
++        let text = format!("{{% autoescape \"{mode}\" %}}x{{% endautoescape %}}");
++        let template = parse("t", &text);
++        assert_eq!(template.nodes.len(), 1, "mode {mode}");
++    }
++}
++
++#[test]
++fn deeply_nested_autoescape_prints_all_closers() {
++    let text = concat!(
++        "{% autoescape \"html\" %}",
++        "{% autoescape \"xml\" %}",
++        "{% autoescape \"js\" %}",
++        "{{ x }}",
++        "{% endautoescape %}",
++        "{% endautoescape %}",
++        "{% endautoescape %}"
++    );
++    let printed = print_template(&parse("t", text));
++    assert_eq!(printed.matches("endautoescape").count(), 3);
++}
++
++#[test]
++fn autoescape_can_wrap_other_block_tags() {
++    let text = concat!(
++        "{% autoescape \"html\" %}",
++        "{% if x %}yes{% else %}no{% endif %}",
++        "{% endautoescape %}"
++    );
++    let template = parse("t", text);
++    assert_eq!(template.nodes.len(), 1);
++    let body = &template.nodes[0].bodies()[0];
++    assert_eq!(body.len(), 1);
++    assert_eq!(body[0].kind(), "if");
++}
++
++#[test]
++fn check_cli_accepts_nested_autoescape() {
++    let tree = Tree::new(&[(
++        "page.html",
++        concat!(
++            "{% autoescape \"html\" %}",
++            "{% autoescape \"url\" %}{{ x }}{% endautoescape %}",
++            "{% endautoescape %}"
++        ),
++    )]);
++    let out = stencil(&["check", &tree.path("page.html")]);
++    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
++}
++
++#[test]
++fn render_defaults_to_no_escape_without_cli_flag() {
++    let tree = Tree::new(&[("page.html", "{{ x }}")]);
++    let out = stencil(&["render", &tree.path("page.html"), "--set", "x=<b>"]);
++    assert_eq!(out.code, 0);
++    assert_eq!(out.stdout, "<b>");
++}
++
++#[test]
++fn autoescape_with_filter_block_parses() {
++    let text = "{% autoescape \"html\" %}{% filter upper %}x{% endfilter %}{% endautoescape %}";
++    let template = parse("t", text);
++    assert_eq!(template.nodes.len(), 1);
++    assert_eq!(template.nodes[0].bodies()[0][0].kind(), "filter");
++}
++
++#[test]
++fn autoescape_with_include_parses() {
++    let text = "{% autoescape \"html\" %}{% include \"part\" %}{% endautoescape %}";
++    let template = parse("t", text);
++    assert_eq!(template.nodes.len(), 1);
++    assert_eq!(template.nodes[0].bodies()[0][0].kind(), "include");
++}
++
++#[test]
++fn escape_mode_apply_is_deterministic() {
++    let sample = "<a&\"'>";
++    let first = EscapeMode::Html.apply(sample);
++    let second = EscapeMode::Html.apply(sample);
++    assert_eq!(first, second);
++    assert_eq!(EscapeMode::Xml.apply("a\n"), "a&#10;");
++    assert_eq!(EscapeMode::Url.apply(" "), "%20");
++    assert_eq!(EscapeMode::Js.apply("'"), "\\'");
++}
++
++#[test]
++fn parse_template_names_are_preserved_for_autoescape_errors() {
++    let err = fail_parse(
++        "widgets/list.html",
++        "{% autoescape \"html\" %}{{ x }}",
++    );
++    assert_eq!(err.template.as_deref(), Some("widgets/list.html"));
++}
++
++#[test]
++fn multiple_templates_can_each_use_autoescape_in_check() {
++    let tree = Tree::new(&[
++        ("a.html", "{% autoescape \"html\" %}a{% endautoescape %}"),
++        ("b.html", "{% autoescape \"url\" %}b{% endautoescape %}"),
++    ]);
++    let out = stencil(&["check", &tree.path("a.html"), &tree.path("b.html")]);
++    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
++}
++
++#[test]
++fn inline_escape_flag_value_works() {
++    let tree = Tree::new(&[("page.html", "{{ x }}")]);
++    let out = stencil(&[
++        "render",
++        &tree.path("page.html"),
++        "--escape=js",
++        "--set",
++        "x='",
++    ]);
++    assert_eq!(out.code, 0);
++    assert_eq!(out.stdout, "\\'");
++}
++
++#[test]
++fn autoescape_does_not_break_raw_blocks_inside() {
++    let text = "{% autoescape \"html\" %}{% raw %}{{ x }}{% endraw %}{% endautoescape %}";
++    let template = parse("t", text);
++    assert_eq!(template.nodes.len(), 1);
++    let body = &template.nodes[0].bodies()[0];
++    assert_eq!(body.len(), 1);
++    assert_eq!(body[0].kind(), "text");
++}
++
++#[test]
++fn autoescape_region_offset_is_reported_on_unknown_mode() {
++    let err = fail_parse("t", "{% autoescape \"???\" %}x{% endautoescape %}");
++    assert!(err.location.is_some());
++}
++
++#[test]
++fn render_with_autoescape_tag_overrides_cli_for_inner_region_only() {
++    let tree = Tree::new(&[(
++        "page.html",
++        concat!(
++            "g={{ x }}",
++            "{% autoescape \"none\" %}",
++            "i={{ x }}",
++            "{% endautoescape %}",
++            "g2={{ x }}"
++        ),
++    )]);
++    let out = stencil(&[
++        "render",
++        &tree.path("page.html"),
++        "-e",
++        "html",
++        "--set",
++        "x=<b>",
++    ]);
++    assert_eq!(out.code, 0);
++    assert_eq!(out.stdout, "g=&lt;b&gt;i=<b>g2=&lt;b&gt;");
++}
++
++#[test]
++fn check_reports_first_syntax_error_in_autoescape_templates() {
++    let tree = Tree::new(&[(
++        "page.html",
++        "{% autoescape \"html\" %}{% if x %}{% endautoescape %}",
++    )]);
++    let out = stencil(&["check", &tree.path("page.html")]);
++    assert_eq!(out.code, 2);
++    assert!(!out.stderr.is_empty());
++}
++
++#[test]
++fn escape_mode_names_are_stable() {
++    assert_eq!(EscapeMode::None.name(), "none");
++    assert_eq!(EscapeMode::Html.name(), "html");
++    assert_eq!(EscapeMode::Xml.name(), "xml");
++    assert_eq!(EscapeMode::Url.name(), "url");
++    assert_eq!(EscapeMode::Js.name(), "js");
++}
++
++#[test]
++fn autoescape_parsing_is_independent_of_render_options() {
++    let mut env = Environment::new();
++    env.set_options(Options::new().escaping(EscapeMode::Js));
++    let template = env
++        .parse("t", "{% autoescape \"html\" %}x{% endautoescape %}")
++        .unwrap();
++    assert_eq!(template.nodes[0].kind(), "autoescape");
++}
++
++#[test]
++fn printer_preserves_autoescape_body_content() {
++    let text = "{% autoescape \"url\" %}before{{ x }}after{% endautoescape %}";
++    let printed = print_template(&parse("t", text));
++    assert!(printed.contains("before"));
++    assert!(printed.contains("after"));
++    assert!(printed.contains("{{ x }}"));
++}
++
++#[test]
++fn cli_render_with_xml_and_autoescape_js() {
++    let tree = Tree::new(&[(
++        "page.html",
++        "{% autoescape \"js\" %}{{ x }}{% endautoescape %}",
++    )]);
++    let out = stencil(&[
++        "render",
++        &tree.path("page.html"),
++        "-e",
++        "xml",
++        "--set",
++        "x=a\nb",
++    ]);
++    assert_eq!(out.code, 0);
++    assert_eq!(out.stdout, "a\\nb");
++}
++
++#[test]
++fn autoescape_none_inside_js_cli_mode() {
++    let tree = Tree::new(&[(
++        "page.html",
++        "{% autoescape \"none\" %}{{ x }}{% endautoescape %}",
++    )]);
++    let out = stencil(&[
++        "render",
++        &tree.path("page.html"),
++        "-e",
++        "js",
++        "--set",
++        "x=line\nbreak",
++    ]);
++    assert_eq!(out.code, 0);
++    assert_eq!(out.stdout, "line\nbreak");
++}
+diff --git a/tests/autoescape_render.rs b/tests/autoescape_render.rs
+new file mode 100644
+index 0000000..50a7afc
+--- /dev/null
++++ b/tests/autoescape_render.rs
+@@ -0,0 +1,382 @@
++//! Scoped autoescape regions and multi-mode output escaping at render time.
++
++use stencilworks::{memory_environment, Environment, EscapeMode, ErrorKind, Options, Value, ValueMap};
++
++fn context() -> ValueMap {
++    let mut map = ValueMap::new();
++    map.insert("html", Value::text("<b>bold</b>"));
++    map.insert("url", Value::text("a/b?c=d"));
++    map.insert("js", Value::text("line\nbreak"));
++    map.insert("tab", Value::text("a\tb"));
++    map.insert("quote", Value::text("say \"hi\""));
++    map.insert("plain", Value::text("hello"));
++    map
++}
++
++fn render(text: &str) -> String {
++    Environment::new()
++        .render("page", text, &context())
++        .unwrap()
++}
++
++fn render_with_options(text: &str, options: Options) -> String {
++    let mut env = Environment::new();
++    env.set_options(options);
++    env.render("page", text, &context()).unwrap()
++}
++
++fn render_with_loader(text: &str, templates: &[(&str, &str)]) -> String {
++    memory_environment(templates.iter().copied())
++        .render("page", text, &context())
++        .unwrap()
++}
++
++fn fail(text: &str) -> stencilworks::Error {
++    Environment::new()
++        .render("page", text, &context())
++        .unwrap_err()
++}
++
++#[test]
++fn default_rendering_leaves_values_unescaped() {
++    assert_eq!(render("{{ html }}"), "<b>bold</b>");
++    assert_eq!(render("{{ url }}"), "a/b?c=d");
++}
++
++#[test]
++fn global_html_escape_protects_interpolations() {
++    let options = Options::new().escaping(EscapeMode::Html);
++    assert_eq!(
++        render_with_options("{{ html }}", options),
++        "&lt;b&gt;bold&lt;/b&gt;"
++    );
++}
++
++#[test]
++fn global_xml_escape_uses_attribute_rules() {
++    let options = Options::new().escaping(EscapeMode::Xml);
++    assert_eq!(render_with_options("{{ tab }}", options), "a&#9;b");
++}
++
++#[test]
++fn global_url_escape_percent_encodes() {
++    let options = Options::new().escaping(EscapeMode::Url);
++    assert_eq!(
++        render_with_options("{{ url }}", options),
++        "a%2Fb%3Fc%3Dd"
++    );
++}
++
++#[test]
++fn global_js_escape_protects_script_contexts() {
++    let options = Options::new().escaping(EscapeMode::Js);
++    assert_eq!(
++        render_with_options("{{ js }}", options),
++        "line\\nbreak"
++    );
++}
++
++#[test]
++fn autoescape_html_region_escapes_interpolations() {
++    let tpl = "{% autoescape \"html\" %}{{ html }}{% endautoescape %}";
++    assert_eq!(render(tpl), "&lt;b&gt;bold&lt;/b&gt;");
++}
++
++#[test]
++fn autoescape_xml_region_escapes_interpolations() {
++    let tpl = "{% autoescape \"xml\" %}{{ tab }}{% endautoescape %}";
++    assert_eq!(render(tpl), "a&#9;b");
++}
++
++#[test]
++fn autoescape_url_region_escapes_interpolations() {
++    let tpl = "{% autoescape \"url\" %}{{ url }}{% endautoescape %}";
++    assert_eq!(render(tpl), "a%2Fb%3Fc%3Dd");
++}
++
++#[test]
++fn autoescape_js_region_escapes_interpolations() {
++    let tpl = "{% autoescape \"js\" %}{{ quote }}{% endautoescape %}";
++    assert_eq!(render(tpl), "say \\\"hi\\\"");
++}
++
++#[test]
++fn autoescape_none_disables_escaping_inside_a_global_mode() {
++    let options = Options::new().escaping(EscapeMode::Html);
++    let tpl = "a{% autoescape \"none\" %}{{ html }}{% endautoescape %}b";
++    assert_eq!(render_with_options(tpl, options), "a<b>bold</b>b");
++}
++
++#[test]
++fn autoescape_false_disables_escaping() {
++    let options = Options::new().escaping(EscapeMode::Html);
++    let tpl = "{% autoescape false %}{{ html }}{% endautoescape %}";
++    assert_eq!(render_with_options(tpl, options), "<b>bold</b>");
++}
++
++#[test]
++fn autoescape_mode_names_are_case_insensitive() {
++    let tpl = "{% autoescape \"HTML\" %}{{ html }}{% endautoescape %}";
++    assert_eq!(render(tpl), "&lt;b&gt;bold&lt;/b&gt;");
++    let tpl = "{% autoescape \"Js\" %}{{ quote }}{% endautoescape %}";
++    assert_eq!(render(tpl), "say \\\"hi\\\"");
++}
++
++#[test]
++fn nested_autoescape_restores_the_outer_mode() {
++    let tpl = concat!(
++        "{% autoescape \"url\" %}",
++        "u={{ url }}",
++        "{% autoescape \"html\" %}h={{ html }}{% endautoescape %}",
++        "u2={{ url }}",
++        "{% endautoescape %}"
++    );
++    assert_eq!(
++        render(tpl),
++        "u=a%2Fb%3Fc%3Ddh=&lt;b&gt;bold&lt;/b&gt;u2=a%2Fb%3Fc%3Dd"
++    );
++}
++
++#[test]
++fn deeply_nested_regions_unwind_in_order() {
++    let tpl = concat!(
++        "{% autoescape \"html\" %}",
++        "a{% autoescape \"url\" %}",
++        "b{% autoescape \"js\" %}",
++        "{{ quote }}",
++        "{% endautoescape %}",
++        "c{% endautoescape %}",
++        "d{% endautoescape %}"
++    );
++    assert_eq!(render(tpl), "absay \\\"hi\\\"cd");
++}
++
++#[test]
++fn safe_filter_suppresses_html_autoescape() {
++    let tpl = "{% autoescape \"html\" %}{{ html | safe }}{% endautoescape %}";
++    assert_eq!(render(tpl), "<b>bold</b>");
++}
++
++#[test]
++fn safe_filter_suppresses_js_autoescape() {
++    let tpl = "{% autoescape \"js\" %}{{ js | safe }}{% endautoescape %}";
++    assert_eq!(render(tpl), "line\nbreak");
++}
++
++#[test]
++fn safe_must_be_outermost_to_suppress_escaping() {
++    let options = Options::new().escaping(EscapeMode::Html);
++    let tpl = "{{ html | safe | upper }}";
++    assert_eq!(render_with_options(tpl, options), "&lt;B&gt;BOLD&lt;/B&gt;");
++}
++
++#[test]
++fn safe_values_are_not_double_escaped() {
++    let tpl = "{% autoescape \"html\" %}{{ html | safe }}{% endautoescape %}";
++    assert_eq!(render(tpl), "<b>bold</b>");
++    let tpl = "{% autoescape \"html\" %}{{ html | safe }}more{% endautoescape %}";
++    assert_eq!(render(tpl), "<b>bold</b>more");
++}
++
++#[test]
++fn literal_text_outside_interpolations_is_never_escaped() {
++    let tpl = "{% autoescape \"html\" %}<p>{{ plain }}</p>{% endautoescape %}";
++    assert_eq!(render(tpl), "<p>hello</p>");
++}
++
++#[test]
++fn includes_inherit_the_callers_active_escape_mode() {
++    let tpl = "{% autoescape \"html\" %}{% include \"part\" %}{% endautoescape %}";
++    assert_eq!(
++        render_with_loader(tpl, &[("part", "{{ html }}")]),
++        "&lt;b&gt;bold&lt;/b&gt;"
++    );
++}
++
++#[test]
++fn includes_can_open_their_own_autoescape_region() {
++    let tpl = "{% autoescape \"html\" %}{% include \"part\" %}{% endautoescape %}";
++    assert_eq!(
++        render_with_loader(
++            tpl,
++            &[("part", "{% autoescape \"none\" %}{{ html }}{% endautoescape %}")]
++        ),
++        "<b>bold</b>"
++    );
++}
++
++#[test]
++fn filter_blocks_inherit_the_callers_escape_mode() {
++    let tpl = "{% autoescape \"html\" %}{% filter upper %}{{ html }}{% endfilter %}{% endautoescape %}";
++    assert_eq!(render(tpl), "&LT;B&GT;BOLD&LT;/B&GT;");
++}
++
++#[test]
++fn filter_blocks_can_nest_autoescape_regions() {
++    let tpl = concat!(
++        "{% autoescape \"url\" %}",
++        "{% filter upper %}",
++        "x{% autoescape \"html\" %}{{ html }}{% endautoescape %}",
++        "{% endfilter %}",
++        "{% endautoescape %}"
++    );
++    assert_eq!(render(tpl), "X&LT;B&GT;BOLD&LT;/B&GT;");
++}
++
++#[test]
++fn autoescape_outside_a_filter_block_still_applies_to_outputs() {
++    let tpl = "{% autoescape \"html\" %}{% filter upper %}{{ html }}{% endfilter %}{% endautoescape %}";
++    assert_eq!(render(tpl), "&LT;B&GT;BOLD&LT;/B&GT;");
++}
++
++#[test]
++fn global_mode_applies_before_autoescape_overrides_it() {
++    let options = Options::new().escaping(EscapeMode::Js);
++    let tpl = "a{{ quote }}b{% autoescape \"none\" %}{{ quote }}{% endautoescape %}c";
++    assert_eq!(
++        render_with_options(tpl, options),
++        "asay \\\"hi\\\"bsay \"hi\"c"
++    );
++}
++
++#[test]
++fn autoescape_does_not_escape_set_bindings() {
++    let tpl = "{% autoescape \"html\" %}{% set x = html %}{{ x }}{% endautoescape %}";
++    assert_eq!(render(tpl), "&lt;b&gt;bold&lt;/b&gt;");
++}
++
++#[test]
++fn autoescape_applies_inside_for_loops() {
++    let mut map = context();
++    map.insert(
++        "items",
++        Value::list([Value::text("<a>"), Value::text("<b>")]),
++    );
++    let tpl = "{% autoescape \"html\" %}{% for item in items %}{{ item }}{% endfor %}{% endautoescape %}";
++    let env = Environment::new();
++    assert_eq!(
++        env.render("page", tpl, &map).unwrap(),
++        "&lt;a&gt;&lt;b&gt;"
++    );
++}
++
++#[test]
++fn autoescape_applies_inside_if_branches() {
++    let tpl = concat!(
++        "{% autoescape \"html\" %}",
++        "{% if plain %}yes: {{ html }}{% else %}no{% endif %}",
++        "{% endautoescape %}"
++    );
++    assert_eq!(render(tpl), "yes: &lt;b&gt;bold&lt;/b&gt;");
++}
++
++#[test]
++fn autoescape_applies_inside_with_blocks() {
++    let tpl = concat!(
++        "{% autoescape \"html\" %}",
++        "{% with x = html %}{{ x }}{% endwith %}",
++        "{% endautoescape %}"
++    );
++    assert_eq!(render(tpl), "&lt;b&gt;bold&lt;/b&gt;");
++}
++
++#[test]
++fn unknown_autoescape_mode_is_a_syntax_error() {
++    let err = fail("{% autoescape \"nope\" %}{{ html }}{% endautoescape %}");
++    assert_eq!(err.kind, ErrorKind::Syntax);
++    assert!(err.message.contains("unknown autoescape mode"));
++}
++
++#[test]
++fn unclosed_autoescape_is_rejected_at_parse_time() {
++    let err = fail("{% autoescape \"html\" %}{{ html }}");
++    assert_eq!(err.kind, ErrorKind::Syntax);
++    assert!(err.message.contains("endautoescape"));
++}
++
++#[test]
++fn inner_render_errors_do_not_leak_escape_mode() {
++    let options = Options::new().escaping(EscapeMode::Html);
++    let mut env = Environment::new();
++    env.set_options(options);
++    let tpl = concat!(
++        "{% autoescape \"url\" %}",
++        "{% autoescape \"js\" %}{{ missing }}{% endautoescape %}",
++        "{% endautoescape %}"
++    );
++    let err = env.render("page", tpl, &context()).unwrap_err();
++    assert_eq!(err.kind, ErrorKind::Undefined);
++    let tpl = "{% autoescape \"html\" %}{{ html }}{% endautoescape %}";
++    assert_eq!(env.render("page", tpl, &context()).unwrap(), "&lt;b&gt;bold&lt;/b&gt;");
++}
++
++#[test]
++fn html_and_xml_filters_still_work_outside_autoescape() {
++    assert_eq!(render("{{ html | html }}"), "&lt;b&gt;bold&lt;/b&gt;");
++    assert_eq!(render("{{ tab | xml }}"), "a&#9;b");
++    assert_eq!(render("{{ url | url }}"), "a%2Fb%3Fc%3Dd");
++}
++
++#[test]
++fn deterministic_escaping_for_the_same_input_and_mode() {
++    let tpl = "{% autoescape \"html\" %}{{ html }}{% endautoescape %}";
++    let first = render(tpl);
++    let second = render(tpl);
++    assert_eq!(first, second);
++    assert_eq!(first, "&lt;b&gt;bold&lt;/b&gt;");
++}
++
++#[test]
++fn multiple_sequential_autoescape_regions_are_independent() {
++    let tpl = concat!(
++        "{% autoescape \"html\" %}{{ html }}{% endautoescape %}|",
++        "{% autoescape \"none\" %}{{ html }}{% endautoescape %}|",
++        "{% autoescape \"url\" %}{{ url }}{% endautoescape %}"
++    );
++    assert_eq!(
++        render(tpl),
++        "&lt;b&gt;bold&lt;/b&gt;|<b>bold</b>|a%2Fb%3Fc%3Dd"
++    );
++}
++
++#[test]
++fn cli_initial_mode_and_autoescape_stack_together() {
++    let options = Options::new().escaping(EscapeMode::Html);
++    let tpl = concat!(
++        "g={{ html }}",
++        "{% autoescape \"url\" %}u={{ url }}{% endautoescape %}",
++        "g2={{ html }}"
++    );
++    assert_eq!(
++        render_with_options(tpl, options),
++        "g=&lt;b&gt;bold&lt;/b&gt;u=a%2Fb%3Fc%3Ddg2=&lt;b&gt;bold&lt;/b&gt;"
++    );
++}
++
++#[test]
++fn autoescape_with_off_alias_disables_escaping() {
++    let options = Options::new().escaping(EscapeMode::Html);
++    let tpl = "{% autoescape \"off\" %}{{ html }}{% endautoescape %}";
++    assert_eq!(render_with_options(tpl, options), "<b>bold</b>");
++}
++
++#[test]
++fn adjacent_autoescape_regions_switch_modes_cleanly() {
++    let tpl = concat!(
++        "{% autoescape \"js\" %}{{ quote }}{% endautoescape %}",
++        "/",
++        "{% autoescape \"url\" %}{{ url }}{% endautoescape %}"
++    );
++    assert_eq!(render(tpl), "say \\\"hi\\\"/a%2Fb%3Fc%3Dd");
++}
++
++#[test]
++fn include_without_autoescape_inherits_global_cli_mode() {
++    let tpl = "{% include \"part\" %}";
++    let mut env = memory_environment([("part", "{{ url }}")]);
++    env.set_options(Options::new().escaping(EscapeMode::Url));
++    assert_eq!(
++        env.render("page", tpl, &context()).unwrap(),
++        "a%2Fb%3Fc%3Dd"
++    );
++}

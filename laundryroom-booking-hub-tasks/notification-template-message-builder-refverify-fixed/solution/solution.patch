@@ -1,0 +1,507 @@
+diff --git a/src/lib/notifications/batch.ts b/src/lib/notifications/batch.ts
+new file mode 100644
+index 0000000..2250a8f
+--- /dev/null
++++ b/src/lib/notifications/batch.ts
+@@ -0,0 +1,73 @@
++import { NotificationTemplateNormalizer } from "./normalizer";
++import { NotificationMessageRenderer } from "./renderer";
++import { NotificationTemplateValidationError } from "./errors";
++import {
++  type NotificationBatchResult,
++  type NotificationBatchSummary,
++  type NotificationRecipientInput,
++  type NotificationTemplateInput,
++} from "./types";
++
++export class NotificationBatchComposer {
++  constructor(
++    private readonly normalizer = new NotificationTemplateNormalizer(),
++    private readonly renderer = new NotificationMessageRenderer(normalizer),
++  ) {}
++
++  compose(
++    templateInput: NotificationTemplateInput,
++    recipients: readonly NotificationRecipientInput[],
++  ): NotificationBatchResult {
++    const template = this.normalizer.normalize(templateInput);
++    const seenRecipients = new Set<string>();
++    const summary = this.emptySummary();
++
++    const messages = recipients.map((recipient) => {
++      const recipientId = String(recipient.recipientId ?? "").trim();
++      if (!recipientId) {
++        throw new NotificationTemplateValidationError("EMPTY_RECIPIENT_ID");
++      }
++      if (seenRecipients.has(recipientId)) {
++        throw new NotificationTemplateValidationError("DUPLICATE_RECIPIENT_ID");
++      }
++      seenRecipients.add(recipientId);
++
++      const rendered = this.renderer.render(template, recipient.values ?? {});
++      summary.total += 1;
++      if (rendered.complete) {
++        summary.complete += 1;
++      } else {
++        summary.incomplete += 1;
++      }
++      rendered.missingVariables.forEach((variable) => {
++        summary.missingByVariable[variable] += 1;
++      });
++
++      return {
++        recipientId,
++        text: rendered.text,
++        complete: rendered.complete,
++        missingVariables: [...rendered.missingVariables],
++      };
++    });
++
++    return {
++      key: template.key,
++      messages,
++      summary,
++    };
++  }
++
++  private emptySummary(): NotificationBatchSummary {
++    return {
++      total: 0,
++      complete: 0,
++      incomplete: 0,
++      missingByVariable: {
++        name: 0,
++        id: 0,
++        link: 0,
++      },
++    };
++  }
++}
+diff --git a/src/lib/notifications/errors.ts b/src/lib/notifications/errors.ts
+new file mode 100644
+index 0000000..494e068
+--- /dev/null
++++ b/src/lib/notifications/errors.ts
+@@ -0,0 +1,26 @@
++import type { NotificationTemplateValidationCode } from "./types";
++
++export const NOTIFICATION_VALIDATION_MESSAGES: Readonly<
++  Record<NotificationTemplateValidationCode, string>
++> = {
++  EMPTY_TEMPLATE_NAME: "Template name is required",
++  EMPTY_TEMPLATE_KEY: "Template key is required",
++  INVALID_TEMPLATE_KEY: "Template key may contain only lowercase letters, numbers and underscores",
++  EMPTY_TEMPLATE_MESSAGE: "Template message is required",
++  MALFORMED_VARIABLE: "Template contains a malformed variable placeholder",
++  UNKNOWN_VARIABLE: "Template contains an unsupported variable placeholder",
++  DUPLICATE_TEMPLATE_KEY: "Template keys must be unique after normalization",
++  INVALID_VARIABLE_VALUE: "Template variable values must be finite numbers or strings",
++  EMPTY_RECIPIENT_ID: "Recipient id is required",
++  DUPLICATE_RECIPIENT_ID: "Recipient ids must be unique after trimming",
++};
++
++export class NotificationTemplateValidationError extends Error {
++  readonly code: NotificationTemplateValidationCode;
++
++  constructor(code: NotificationTemplateValidationCode, message?: string) {
++    super(message ?? NOTIFICATION_VALIDATION_MESSAGES[code]);
++    this.name = "NotificationTemplateValidationError";
++    this.code = code;
++  }
++}
+diff --git a/src/lib/notifications/index.ts b/src/lib/notifications/index.ts
+new file mode 100644
+index 0000000..1738c5f
+--- /dev/null
++++ b/src/lib/notifications/index.ts
+@@ -0,0 +1,21 @@
++export { NotificationTemplateNormalizer } from "./normalizer";
++export { NotificationMessageRenderer } from "./renderer";
++export { WhatsAppTemplatePlanner } from "./whatsapp";
++export { NotificationBatchComposer } from "./batch";
++export { NotificationTemplateValidationError } from "./errors";
++
++export type {
++  NotificationBatchMessage,
++  NotificationBatchResult,
++  NotificationBatchSummary,
++  NormalizedNotificationTemplate,
++  NotificationRecipientInput,
++  NotificationRenderResult,
++  NotificationTemplateInput,
++  NotificationTemplateValidationCode,
++  NotificationTemplateValues,
++  NotificationVariable,
++  NotificationVariableValue,
++  WhatsAppTemplateParameter,
++  WhatsAppTemplatePlan,
++} from "./types";
+diff --git a/src/lib/notifications/normalizer.ts b/src/lib/notifications/normalizer.ts
+new file mode 100644
+index 0000000..8eed0cc
+--- /dev/null
++++ b/src/lib/notifications/normalizer.ts
+@@ -0,0 +1,50 @@
++import { collapseWhitespace, normalizeTemplateKey, parseTemplateVariables } from "./parser";
++import { NotificationTemplateValidationError } from "./errors";
++import {
++  type NormalizedNotificationTemplate,
++  type NotificationTemplateInput,
++} from "./types";
++
++export class NotificationTemplateNormalizer {
++  normalize(template: NotificationTemplateInput): NormalizedNotificationTemplate {
++    const name = collapseWhitespace(template.name);
++    if (!name) {
++      throw new NotificationTemplateValidationError("EMPTY_TEMPLATE_NAME");
++    }
++
++    const key = normalizeTemplateKey(template.key);
++    const message = String(template.message ?? "").trim();
++    if (!message) {
++      throw new NotificationTemplateValidationError("EMPTY_TEMPLATE_MESSAGE");
++    }
++
++    const idText = template.id === null || template.id === undefined
++      ? ""
++      : String(template.id).trim();
++    const parsed = parseTemplateVariables(message);
++
++    return {
++      id: idText || null,
++      name,
++      key,
++      message,
++      variables: [...parsed.variables],
++      occurrences: [...parsed.occurrences],
++    };
++  }
++
++  normalizeAll(
++    templates: readonly NotificationTemplateInput[],
++  ): NormalizedNotificationTemplate[] {
++    const seenKeys = new Set<string>();
++
++    return templates.map((template) => {
++      const normalized = this.normalize(template);
++      if (seenKeys.has(normalized.key)) {
++        throw new NotificationTemplateValidationError("DUPLICATE_TEMPLATE_KEY");
++      }
++      seenKeys.add(normalized.key);
++      return normalized;
++    });
++  }
++}
+diff --git a/src/lib/notifications/parser.ts b/src/lib/notifications/parser.ts
+new file mode 100644
+index 0000000..de3fddb
+--- /dev/null
++++ b/src/lib/notifications/parser.ts
+@@ -0,0 +1,100 @@
++import { NotificationTemplateValidationError } from "./errors";
++import {
++  type NotificationVariable,
++  type NotificationVariableValue,
++} from "./types";
++
++export const SUPPORTED_NOTIFICATION_VARIABLES: readonly NotificationVariable[] = [
++  "name",
++  "id",
++  "link",
++] as const;
++
++export function isSupportedNotificationVariable(
++  value: string,
++): value is NotificationVariable {
++  return SUPPORTED_NOTIFICATION_VARIABLES.includes(value as NotificationVariable);
++}
++
++const TOKEN_PATTERN = /\{([^{}]*)\}/g;
++const VALID_TOKEN_NAME = /^[a-z][a-z0-9_]*$/;
++const KEY_PATTERN = /^[a-z0-9_]+$/;
++
++export function collapseWhitespace(value: unknown): string {
++  return String(value ?? "").trim().replace(/\s+/g, " ");
++}
++
++export function normalizeTemplateKey(value: unknown): string {
++  const key = String(value ?? "").trim().toLowerCase();
++  if (!key) {
++    throw new NotificationTemplateValidationError("EMPTY_TEMPLATE_KEY");
++  }
++  if (!KEY_PATTERN.test(key)) {
++    throw new NotificationTemplateValidationError("INVALID_TEMPLATE_KEY");
++  }
++  return key;
++}
++
++export function parseTemplateVariables(message: string): {
++  variables: NotificationVariable[];
++  occurrences: NotificationVariable[];
++} {
++  const occurrences: NotificationVariable[] = [];
++  const variables: NotificationVariable[] = [];
++  const seen = new Set<NotificationVariable>();
++  let cleaned = "";
++  let cursor = 0;
++  let match: RegExpExecArray | null;
++
++  TOKEN_PATTERN.lastIndex = 0;
++  while ((match = TOKEN_PATTERN.exec(message)) !== null) {
++    cleaned += message.slice(cursor, match.index);
++    cursor = match.index + match[0].length;
++
++    const rawName = match[1];
++    if (!VALID_TOKEN_NAME.test(rawName)) {
++      throw new NotificationTemplateValidationError("MALFORMED_VARIABLE");
++    }
++
++    if (!isSupportedNotificationVariable(rawName)) {
++      throw new NotificationTemplateValidationError("UNKNOWN_VARIABLE");
++    }
++
++    const variable = rawName;
++    occurrences.push(variable);
++    if (!seen.has(variable)) {
++      seen.add(variable);
++      variables.push(variable);
++    }
++  }
++  cleaned += message.slice(cursor);
++
++  if (cleaned.includes("{") || cleaned.includes("}")) {
++    throw new NotificationTemplateValidationError("MALFORMED_VARIABLE");
++  }
++
++  return { variables, occurrences };
++}
++
++export function normalizeVariableValue(
++  variable: NotificationVariable,
++  value: NotificationVariableValue,
++): string | null {
++  if (value === null || value === undefined) {
++    return null;
++  }
++
++  if (typeof value === "number") {
++    if (!Number.isFinite(value)) {
++      throw new NotificationTemplateValidationError("INVALID_VARIABLE_VALUE");
++    }
++    return String(value);
++  }
++
++  if (typeof value !== "string") {
++    throw new NotificationTemplateValidationError("INVALID_VARIABLE_VALUE");
++  }
++
++  const normalized = variable === "name" ? collapseWhitespace(value) : value.trim();
++  return normalized === "" ? null : normalized;
++}
+diff --git a/src/lib/notifications/renderer.ts b/src/lib/notifications/renderer.ts
+new file mode 100644
+index 0000000..9c38bcb
+--- /dev/null
++++ b/src/lib/notifications/renderer.ts
+@@ -0,0 +1,64 @@
++import { NotificationTemplateNormalizer } from "./normalizer";
++import { normalizeVariableValue } from "./parser";
++import type {
++  NotificationRenderResult,
++  NotificationTemplateInput,
++  NotificationTemplateValues,
++  NotificationVariable,
++} from "./types";
++
++export class NotificationMessageRenderer {
++  constructor(private readonly normalizer = new NotificationTemplateNormalizer()) {}
++
++  render(
++    templateInput: NotificationTemplateInput,
++    values: NotificationTemplateValues = {},
++  ): NotificationRenderResult {
++    const template = this.normalizer.normalize(templateInput);
++    const normalizedValues = this.valuesFor(template.variables, values);
++    const usedVariables: NotificationVariable[] = [];
++    const missingVariables: NotificationVariable[] = [];
++
++    template.variables.forEach((variable) => {
++      if (normalizedValues[variable] === null) {
++        missingVariables.push(variable);
++      } else {
++        usedVariables.push(variable);
++      }
++    });
++
++    const text = template.message.replace(
++      /\{(name|id|link)\}/g,
++      (token: string, rawVariable: string) => {
++        const variable = rawVariable as NotificationVariable;
++        return normalizedValues[variable] ?? token;
++      },
++    );
++
++    return {
++      key: template.key,
++      text,
++      usedVariables,
++      missingVariables,
++      complete: missingVariables.length === 0,
++      characterCount: text.length,
++    };
++  }
++
++  private valuesFor(
++    variables: readonly NotificationVariable[],
++    values: NotificationTemplateValues,
++  ): Record<NotificationVariable, string | null> {
++    const normalized: Record<NotificationVariable, string | null> = {
++      name: null,
++      id: null,
++      link: null,
++    };
++
++    variables.forEach((variable) => {
++      normalized[variable] = normalizeVariableValue(variable, values[variable]);
++    });
++
++    return normalized;
++  }
++}
+diff --git a/src/lib/notifications/types.ts b/src/lib/notifications/types.ts
+new file mode 100644
+index 0000000..a5cc128
+--- /dev/null
++++ b/src/lib/notifications/types.ts
+@@ -0,0 +1,84 @@
++export type NotificationVariable = "name" | "id" | "link";
++export type NotificationVariableValue = string | number | null | undefined;
++export type NotificationTemplateId = string | null;
++
++export type NotificationTemplateValidationCode =
++  | "EMPTY_TEMPLATE_NAME"
++  | "EMPTY_TEMPLATE_KEY"
++  | "INVALID_TEMPLATE_KEY"
++  | "EMPTY_TEMPLATE_MESSAGE"
++  | "MALFORMED_VARIABLE"
++  | "UNKNOWN_VARIABLE"
++  | "DUPLICATE_TEMPLATE_KEY"
++  | "INVALID_VARIABLE_VALUE"
++  | "EMPTY_RECIPIENT_ID"
++  | "DUPLICATE_RECIPIENT_ID";
++
++export interface NotificationTemplateInput {
++  id?: string | null;
++  name: string;
++  key: string;
++  message: string;
++}
++
++export interface NormalizedNotificationTemplate {
++  id: NotificationTemplateId;
++  name: string;
++  key: string;
++  message: string;
++  variables: NotificationVariable[];
++  occurrences: NotificationVariable[];
++}
++
++export interface NotificationTemplateValues {
++  name?: NotificationVariableValue;
++  id?: NotificationVariableValue;
++  link?: NotificationVariableValue;
++}
++
++export interface NotificationRenderResult {
++  key: string;
++  text: string;
++  usedVariables: NotificationVariable[];
++  missingVariables: NotificationVariable[];
++  complete: boolean;
++  characterCount: number;
++}
++
++export interface WhatsAppTemplateParameter {
++  position: number;
++  variable: NotificationVariable;
++  value: string | null;
++}
++
++export interface WhatsAppTemplatePlan {
++  templateName: string;
++  parameters: WhatsAppTemplateParameter[];
++  missingVariables: NotificationVariable[];
++  ready: boolean;
++}
++
++export interface NotificationRecipientInput {
++  recipientId: string;
++  values?: NotificationTemplateValues;
++}
++
++export interface NotificationBatchMessage {
++  recipientId: string;
++  text: string;
++  complete: boolean;
++  missingVariables: NotificationVariable[];
++}
++
++export interface NotificationBatchSummary {
++  total: number;
++  complete: number;
++  incomplete: number;
++  missingByVariable: Record<NotificationVariable, number>;
++}
++
++export interface NotificationBatchResult {
++  key: string;
++  messages: NotificationBatchMessage[];
++  summary: NotificationBatchSummary;
++}
+diff --git a/src/lib/notifications/whatsapp.ts b/src/lib/notifications/whatsapp.ts
+new file mode 100644
+index 0000000..85ef7ae
+--- /dev/null
++++ b/src/lib/notifications/whatsapp.ts
+@@ -0,0 +1,41 @@
++import { NotificationTemplateNormalizer } from "./normalizer";
++import { normalizeVariableValue } from "./parser";
++import type {
++  NotificationTemplateInput,
++  NotificationTemplateValues,
++  NotificationVariable,
++  WhatsAppTemplatePlan,
++} from "./types";
++
++export class WhatsAppTemplatePlanner {
++  constructor(private readonly normalizer = new NotificationTemplateNormalizer()) {}
++
++  plan(
++    templateInput: NotificationTemplateInput,
++    values: NotificationTemplateValues = {},
++  ): WhatsAppTemplatePlan {
++    const template = this.normalizer.normalize(templateInput);
++    const cache = new Map<NotificationVariable, string | null>();
++
++    template.variables.forEach((variable) => {
++      cache.set(variable, normalizeVariableValue(variable, values[variable]));
++    });
++
++    const parameters = template.occurrences.map((variable, index) => ({
++      position: index + 1,
++      variable,
++      value: cache.get(variable) ?? null,
++    }));
++
++    const missingVariables = template.variables.filter(
++      (variable) => (cache.get(variable) ?? null) === null,
++    );
++
++    return {
++      templateName: template.key,
++      parameters,
++      missingVariables,
++      ready: missingVariables.length === 0,
++    };
++  }
++}

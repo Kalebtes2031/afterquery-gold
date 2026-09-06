@@ -80,7 +80,7 @@ NEW_RUN=/logs/verifier/new_run.log
 : > "$BASE_RUN"
 : > "$NEW_RUN"
 
-# P2P: full pre-existing library and integration suite (no held-out cycle tests).
+# P2P: library tests plus every integration file except the held-out autoescape suites.
 run_suite "$BASE_RUN" cargo test --lib
 run_suite "$BASE_RUN" cargo test --test cli
 run_suite "$BASE_RUN" cargo test --test context_data
@@ -90,9 +90,9 @@ run_suite "$BASE_RUN" cargo test --test inheritance
 run_suite "$BASE_RUN" cargo test --test rendering
 write_junit "$BASE_RUN" /logs/verifier/base.xml
 
-# F2P: held-out cycle integration tests only.
-run_suite "$NEW_RUN" cargo test --test cycles
-run_suite "$NEW_RUN" cargo test --test cycle_parse_and_behavior
+# F2P: held-out autoescape integration tests only.
+run_suite "$NEW_RUN" cargo test --test autoescape_render
+run_suite "$NEW_RUN" cargo test --test autoescape_parse_and_cli
 write_junit "$NEW_RUN" /logs/verifier/new.xml
 
 set -e

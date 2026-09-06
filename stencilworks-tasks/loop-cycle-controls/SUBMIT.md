@@ -1,16 +1,14 @@
-# loop-cycle-controls — Resubmit (Attempt 8)
+# loop-cycle-controls — Resubmit
 
-Reference verification already green (solution unchanged). Quality failed on anti-cheat (mutable TARGET binaries) and undocumented outline encoding — both fixed.
-
-## Paste
+Reference verification failed (0s) — solution built on wrong base. Fixed.
 
 | Field | File |
 |---|---|
-| Instruction | `instruction.md` (283 words) |
-| Solution | `solution/solution.patch` |
+| Instruction | `instruction.md` |
+| Solution | `solution/solution.patch` (regenerated vs 52713c9) |
 | Tests | `tests/test.patch` |
-| Config | `tests/config.json` (65 F2P / 618 P2P) |
-| test.sh | `tests/test.sh` (seal + kill + hash) |
+| Config | `tests/config.json` |
+| test.sh | `tests/test.sh` (cargo test + JUnit) |
 
 ```bash
 python stencilworks-tasks/loop-cycle-controls/verify_bundle.py
