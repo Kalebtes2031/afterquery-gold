@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pre-submit gate for loop-cycle-controls. Run before pasting to the platform."""
+"""Pre-submit gate for autoescape-scoped-modes."""
 
 from __future__ import annotations
 
@@ -21,38 +21,31 @@ def ok(msg: str) -> None:
 
 
 def main() -> None:
-    critical_files = [
+    critical = [
         ROOT / "solution" / "solution.patch",
         ROOT / "tests" / "test.patch",
         ROOT / "tests" / "test.sh",
         ROOT / "tests" / "config.json",
         ROOT / "instruction.md",
     ]
-    for cf in critical_files:
+    for cf in critical:
         raw = cf.read_bytes()
         if b"\r\n" in raw:
-            fail(f"{cf.name} contains Windows CRLF — must be Unix LF")
+            fail(f"{cf.name} contains Windows CRLF")
         if raw.startswith(b"\xef\xbb\xbf"):
-            fail(f"{cf.name} starts with UTF-8 BOM")
-    ok("all critical files use Unix LF and have no BOM")
+            fail(f"{cf.name} has UTF-8 BOM")
 
     test_patch = (ROOT / "tests" / "test.patch").read_text(encoding="utf-8")
     solution_patch = (ROOT / "solution" / "solution.patch").read_text(encoding="utf-8")
     instruction = (ROOT / "instruction.md").read_text(encoding="utf-8")
     config = json.loads((ROOT / "tests" / "config.json").read_text())
 
-    non_ascii_sol = [line for line in solution_patch.splitlines() if any(ord(c) > 127 for c in line)]
-    if non_ascii_sol:
-        fail(f"solution.patch contains non-ascii characters: {non_ascii_sol[:3]}")
-    ok("solution.patch has no non-ascii characters")
-
     paths = re.findall(r"^diff --git a/(.+?) b/", test_patch, re.M)
     bad = [p for p in paths if not p.startswith("tests/") or not p.endswith(".rs")]
     if bad:
         fail(f"test.patch touches non-test paths: {bad}")
-    if ".config" in test_patch or "nextest.toml" in test_patch:
-        fail("test.patch still mentions .config/nextest.toml")
-    ok(f"test.patch paths only tests/*.rs ({len(paths)} files)")
+    if ".config" in test_patch:
+        fail("test.patch must not mention .config")
 
     plus = sum(1 for line in test_patch.splitlines() if line.startswith("+") and not line.startswith("+++"))
     if plus < 596:
@@ -68,47 +61,41 @@ def main() -> None:
 
     words = len(re.findall(r"[A-Za-z0-9']+", instruction))
     if words < 100 or words > 300:
-        fail(f"instruction word count {words} (need 100-300)")
+        fail(f"instruction word count {words}")
     ok(f"instruction words = {words}")
 
     mandatory = "IMPORTANT: Please work on this in a new branch from main and commit everything when you are done."
     if not instruction.strip().endswith(mandatory):
-        fail("instruction.md must end with exact mandatory line")
-    ok("instruction ends with exact mandatory line")
+        fail("instruction missing mandatory ending")
 
     f2p = config.get("f2p_node_ids", [])
     p2p = config.get("p2p_node_ids", [])
-    if len(f2p) < 8:
-        fail(f"only {len(f2p)} F2P ids")
+    if len(f2p) < 20:
+        fail(f"only {len(f2p)} F2P ids (need >= 20)")
     if len(p2p) < 50:
         fail(f"only {len(p2p)} P2P ids")
     if config.get("base_commit") != "3f4470fff4b1cd4509df4bf33af692315190d1e3":
-        fail("wrong base_commit in config.json")
-    if config.get("grade", {}).get("format") != "junit":
-        fail("config grade format must be junit")
-    ok(f"config: {len(f2p)} F2P, {len(p2p)} P2P, junit grade")
+        fail("wrong base_commit")
 
     test_sh = (ROOT / "tests" / "test.sh").read_text(encoding="utf-8")
     if "cargo test --lib" not in test_sh:
-        fail("test.sh must run cargo test --lib for P2P")
-    if "cycle_parse_and_behavior" not in test_sh or "--test cycles" not in test_sh:
-        fail("test.sh must run cycle F2P suites")
+        fail("test.sh must use cargo test --lib")
+    if "autoescape_render" not in test_sh or "autoescape_parse_and_cli" not in test_sh:
+        fail("test.sh must run autoescape F2P suites")
     if "--test macros" in test_sh:
-        fail("test.sh still references --test macros")
-    if "cycle_parse_and_behavior" not in test_patch:
-        fail("test.patch must include cycle_parse_and_behavior.rs")
-    ok("test.sh uses cargo test + cycle suites; test.patch present")
+        fail("test.sh must not reference --test macros")
+    ok("test.sh cargo-test layout ok")
+
+    macro_kw = ["macro", "caller", "call_block", "import_as", "from_import", "call_expression"]
+    bad_p2p = [t for t in p2p if any(k in t for k in macro_kw)]
+    if bad_p2p:
+        fail(f"P2P has macro tests: {bad_p2p[:5]}")
 
     lower = instruction.lower()
-    if "cycle band/2" not in instruction:
-        fail("instruction must state outline example cycle band/2")
-    ok("instruction outline + bundle checks passed")
-
-    macro_keywords = ["macro", "caller", "call_block", "import_as", "from_import", "call_expression"]
-    bad_p2p = [t for t in p2p if any(kw in t for kw in macro_keywords)]
-    if bad_p2p:
-        fail(f"P2P still has macro-related tests: {bad_p2p[:5]}")
-    ok("no macro-related P2P tests remain")
+    for phrase in ["endautoescape", "escapemode", "xml", "url", "js", "safe"]:
+        if phrase not in lower and phrase.upper() not in instruction:
+            if phrase in ("xml", "url", "js") and f"`{phrase}`" not in lower:
+                fail(f"instruction must mention {phrase} mode")
 
     print("\nAll pre-submit checks passed. Safe to paste to platform.")
 

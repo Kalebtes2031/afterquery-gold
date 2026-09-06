@@ -1725,8 +1725,8 @@ index f7da92f..721ee2b 100644
 @@ -1,6 +1,6 @@
  //! Phase two of parsing: expressions, tags and the template body.
  
--use super::ast::{BinaryOp, Branch, Expr, Node, Template, UnaryOp};
-+use super::ast::{BinaryOp, Branch, Expr, FilterArg, Node, Template, UnaryOp};
+-use super::ast::{BinaryOp, Branch, Expr, MacroParam, Node, Template, UnaryOp};
++use super::ast::{BinaryOp, Branch, Expr, FilterArg, MacroParam, Node, Template, UnaryOp};
  use super::lexer::tokenize;
  use super::scanner::{scan, Chunk};
  use super::token::{Spanned, Token};

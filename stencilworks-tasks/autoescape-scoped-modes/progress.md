@@ -1,66 +1,51 @@
 # autoescape-scoped-modes — Progress Log
 
-Task: fterquery/autoescape-scoped-modes (stencilworks / newrepofromafterquery)
-Batch slot: **3 / 10**
-Theme: Scoped autoescape + Xml/Url/Js modes
-Primary modules: runtime/options, format/escape, runtime/render, cli/args
+Task: afterquery/autoescape-scoped-modes (stencilworks / newrepofromafterquery)
+Batch slot: **4 / 4 sprint focus**
 Last updated: Sep 5, 2026
 
 ---
 
-## Status
+## Pipeline status
 
 | Stage | Result |
 |---|---|
-| Draft scaffold | done |
-| Instruction draft | done (209 words) |
-| Solution patch | not started |
-| Test patch | not started |
-| config.json / test.sh | not started |
-| Local fail@base / pass@solution | not started |
-| Platform submit | not started |
-| Automated checks | — |
-| AI check | — |
-| Originality | — |
-| Reference verification | — |
-| Quality review | — |
-| Calibration | — |
-| Human review | — |
+| Bundle authored | **ready** |
+| Local tests (gnu) | 542 lib + 89 F2P pass on solution |
+| Patches apply on `52713c9` | pass |
+| Platform submit | pending |
 
 ---
 
-## Goal (why this task)
+## Bundle metrics
 
-Hard but solvable Jinja-gap feature for a zero-dependency engine. Multi-file language/runtime work with real edge cases (scope, depth, diagnostics). Disjoint from sibling batch tasks on primary files.
-
----
-
-## Authoring checklist
-
-- [x] instruction.md drafted (aim <=250, max 300) — currently **209** words
-- [ ] Instruction names exact public surface tests will assert
-- [ ] solution/solution.patch >=459 lines across >=4 files (fresh, not from history)
-- [ ] 	ests/test.patch >=596 lines, >=2 files, aim 20+ F2P
-- [ ] Test paths disjoint from solution paths
-- [ ] 	ests/config.json pins full P2P suite + all F2P ids
-- [ ] 	ests/test.sh RUN TESTS section only
-- [ ] Local: base fails all F2P; solution passes all F2P; P2P green both sides
-- [ ] No blocked platform vocabulary; no test references in instruction
-- [ ] Ends with exact IMPORTANT line
-- [ ] Submit and paste any failure into error.txt
+| Metric | Value | Floor |
+|---|---|---|
+| Solution +lines | 474 | ≥ 459 |
+| Solution files | 8 src | ≥ 4 |
+| Test +lines | 998 | ≥ 596 |
+| Test files | 2 | ≥ 2 |
+| F2P | 89 | ≥ 20 |
+| P2P | 618 | ≥ 50 |
+| Instruction words | ~210 | 100–300 |
 
 ---
 
-## Errors & fixes
+## Lessons applied
 
-_(none yet — first pipeline failure goes in error.txt, summary here)_
+- Solution patch generated from `git diff 52713c9..520e167` (full repo, not sparse proxy)
+- `test.sh` uses **cargo test + JUnit writer** (not nextest)
+- `test.patch` = test files only
+- P2P excludes macro-related tests
+- Instruction in plain engineer voice
 
 ---
 
-## Notes
+## Resubmit checklist
 
-- Repo: 
-ewrepofromafterquery (package stencilworks)
-- Follow stencilworks-tasks/README.md + root 
-eadme.md + 	raining-2/
-- Keep solution original vs other batch tasks (different files + wording)
+- [x] instruction.md
+- [x] solution/solution.patch
+- [x] tests/test.patch
+- [x] tests/config.json
+- [x] tests/test.sh
+- [ ] Paste on platform

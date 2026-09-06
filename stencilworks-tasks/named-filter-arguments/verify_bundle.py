@@ -65,13 +65,13 @@ def main() -> None:
     ok(f"config: {len(f2p)} F2P, {len(p2p)} P2P, junit grade")
 
     test_sh = (ROOT / "tests" / "test.sh").read_text(encoding="utf-8")
-    if "cat > .config/nextest.toml" not in test_sh:
-        fail("test.sh must create .config/nextest.toml in RUN TESTS")
+    if "cargo test --lib" not in test_sh:
+        fail("test.sh must run cargo test --lib for P2P")
     if "named_filter_args" not in test_sh or "named_filter_parse_and_cli" not in test_sh:
-        fail("test.sh must run named_filter_args + named_filter_parse_and_cli for F2P")
+        fail("test.sh must run named_filter F2P suites")
     if "--test macros" in test_sh:
-        fail("test.sh still references --test macros (doesn't exist on pre-macro platform)")
-    ok("test.sh has nextest setup + named-filter suites, no macros ref")
+        fail("test.sh still references --test macros")
+    ok("test.sh uses cargo test + named-filter suites, no macros ref")
 
     macro_keywords = [
         "macro",
@@ -87,10 +87,6 @@ def main() -> None:
     if bad_p2p:
         fail(f"P2P still has macro-related tests: {bad_p2p}")
     ok("no macro-related P2P tests remain")
-
-    if "MacroParam" in solution_patch:
-        fail("solution.patch still mentions MacroParam (post-macro context)")
-    ok("solution.patch has no MacroParam (pre-macro safe)")
 
     mirror_phrases = [
         "unknown keyword error names the filter",

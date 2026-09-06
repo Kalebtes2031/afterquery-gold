@@ -1,0 +1,654 @@
+diff --git a/tests/notification_message_renderer.test.ts b/tests/notification_message_renderer.test.ts
+new file mode 100644
+index 0000000..4117f00
+--- /dev/null
++++ b/tests/notification_message_renderer.test.ts
+@@ -0,0 +1,111 @@
++import { describe, expect, it } from "vitest";
++import {
++  NotificationMessageRenderer,
++  NotificationTemplateValidationError,
++  type NotificationTemplateInput,
++} from "@/lib/notifications";
++
++const renderer = new NotificationMessageRenderer();
++const base: NotificationTemplateInput = {
++  id: "t1",
++  name: "Ready",
++  key: "order_ready",
++  message: "Hi {name}, order {id} is ready. {link}",
++};
++
++function codeOf(run: () => unknown): string | undefined {
++  try {
++    run();
++    return undefined;
++  } catch (error) {
++    return error instanceof NotificationTemplateValidationError ? error.code : undefined;
++  }
++}
++
++describe("Notification message rendering", () => {
++  it("renders every supported variable into the message", () => {
++    expect(renderer.render(base, { name: "Dawit", id: "LR-12", link: "https://x.test/12" })).toEqual({
++      key: "order_ready",
++      text: "Hi Dawit, order LR-12 is ready. https://x.test/12",
++      usedVariables: ["name", "id", "link"],
++      missingVariables: [],
++      complete: true,
++      characterCount: 49,
++    });
++  });
++
++  it("replaces every occurrence of a repeated variable", () => {
++    const input = { ...base, message: "{name}-{name}-{id}-{id}" };
++    expect(renderer.render(input, { name: "A", id: "9" }).text).toBe("A-A-9-9");
++  });
++
++  it("collapses whitespace in name values", () => {
++    expect(renderer.render({ ...base, message: "Hi {name}" }, { name: "  Mary   Jane  " }).text).toBe("Hi Mary Jane");
++  });
++
++  it("trims id and link values", () => {
++    const result = renderer.render({ ...base, message: "{id}|{link}" }, { id: "  LR-9 ", link: " https://x.test " });
++    expect(result.text).toBe("LR-9|https://x.test");
++  });
++
++  it("accepts finite numeric variable values", () => {
++    expect(renderer.render({ ...base, message: "Order {id}" }, { id: 42 }).text).toBe("Order 42");
++  });
++
++  it("treats blank variable values as missing and leaves their token unchanged", () => {
++    const result = renderer.render(base, { name: " ", id: "LR-1", link: "" });
++    expect(result.text).toBe("Hi {name}, order LR-1 is ready. {link}");
++    expect(result.missingVariables).toEqual(["name", "link"]);
++  });
++
++  it("keeps used variables in template first-use order", () => {
++    const input = { ...base, message: "{link} {name} {id}" };
++    expect(renderer.render(input, { name: "A", id: "B", link: "C" }).usedVariables).toEqual(["link", "name", "id"]);
++  });
++
++  it("keeps missing variables in template first-use order", () => {
++    const input = { ...base, message: "{link} {name} {id} {link}" };
++    expect(renderer.render(input, { id: "B" }).missingVariables).toEqual(["link", "name"]);
++  });
++
++  it("marks a render incomplete when any required template variable is missing", () => {
++    expect(renderer.render(base, { name: "A", id: "B" }).complete).toBe(false);
++  });
++
++  it("marks literal-only templates complete without values", () => {
++    const result = renderer.render({ ...base, message: "Your laundry is ready." });
++    expect(result).toMatchObject({ usedVariables: [], missingVariables: [], complete: true });
++  });
++
++  it("reports characterCount from the final rendered text", () => {
++    const result = renderer.render({ ...base, message: "Hi {name}!" }, { name: "Ada" });
++    expect(result.characterCount).toBe("Hi Ada!".length);
++  });
++
++  it("returns the normalized template key", () => {
++    expect(renderer.render({ ...base, key: " READY_2 ", message: "Done" }).key).toBe("ready_2");
++  });
++
++  it("rejects non-finite numeric values used by the template", () => {
++    expect(codeOf(() => renderer.render({ ...base, message: "{id}" }, { id: Number.POSITIVE_INFINITY }))).toBe("INVALID_VARIABLE_VALUE");
++  });
++
++  it("rejects non-string non-number values used by the template", () => {
++    expect(codeOf(() => renderer.render({ ...base, message: "{name}" }, { name: { bad: true } as any }))).toBe("INVALID_VARIABLE_VALUE");
++  });
++
++  it("ignores values for variables the template does not use", () => {
++    const result = renderer.render({ ...base, message: "Order {id}" }, { id: "5", name: { ignored: true } as any });
++    expect(result).toMatchObject({ text: "Order 5", complete: true });
++  });
++
++  it("rendering does not mutate the template or values object", () => {
++    const input = { ...base };
++    const values = { name: "  A B ", id: " 2 ", link: " x " };
++    const inputSnapshot = { ...input };
++    const valuesSnapshot = { ...values };
++    renderer.render(input, values);
++    expect(input).toEqual(inputSnapshot);
++    expect(values).toEqual(valuesSnapshot);
++  });
++});
+diff --git a/tests/notification_public_api.test.ts b/tests/notification_public_api.test.ts
+new file mode 100644
+index 0000000..a8a0e4e
+--- /dev/null
++++ b/tests/notification_public_api.test.ts
+@@ -0,0 +1,30 @@
++import { describe, expect, it } from "vitest";
++import {
++  NotificationBatchComposer,
++  NotificationMessageRenderer,
++  NotificationTemplateNormalizer,
++  NotificationTemplateValidationError,
++  WhatsAppTemplatePlanner,
++} from "@/lib/notifications";
++
++describe("Notification template public API", () => {
++  it("exports NotificationTemplateNormalizer from notification module", () => {
++    expect(typeof NotificationTemplateNormalizer).toBe("function");
++  });
++
++  it("exports NotificationMessageRenderer from notification module", () => {
++    expect(typeof NotificationMessageRenderer).toBe("function");
++  });
++
++  it("exports WhatsAppTemplatePlanner from notification module", () => {
++    expect(typeof WhatsAppTemplatePlanner).toBe("function");
++  });
++
++  it("exports NotificationBatchComposer from notification module", () => {
++    expect(typeof NotificationBatchComposer).toBe("function");
++  });
++
++  it("exports NotificationTemplateValidationError from notification module", () => {
++    expect(typeof NotificationTemplateValidationError).toBe("function");
++  });
++});
+diff --git a/tests/notification_template_normalizer.test.ts b/tests/notification_template_normalizer.test.ts
+new file mode 100644
+index 0000000..06b61aa
+--- /dev/null
++++ b/tests/notification_template_normalizer.test.ts
+@@ -0,0 +1,142 @@
++import { describe, expect, it } from "vitest";
++import {
++  NotificationTemplateNormalizer,
++  NotificationTemplateValidationError,
++  type NotificationTemplateInput,
++} from "@/lib/notifications";
++
++const normalizer = new NotificationTemplateNormalizer();
++
++const template = (overrides: Partial<NotificationTemplateInput> = {}): NotificationTemplateInput => ({
++  id: " template-1 ",
++  name: "  Order   ready  ",
++  key: " Order_Ready ",
++  message: " Hi {name}, order {id} is ready: {link} ",
++  ...overrides,
++});
++
++function codeOf(run: () => unknown): string | undefined {
++  try {
++    run();
++    return undefined;
++  } catch (error) {
++    return error instanceof NotificationTemplateValidationError ? error.code : undefined;
++  }
++}
++
++describe("Notification template normalization", () => {
++  it("normalizes the documented template fields", () => {
++    expect(normalizer.normalize(template())).toEqual({
++      id: "template-1",
++      name: "Order ready",
++      key: "order_ready",
++      message: "Hi {name}, order {id} is ready: {link}",
++      variables: ["name", "id", "link"],
++      occurrences: ["name", "id", "link"],
++    });
++  });
++
++  it("normalizes a blank optional template id to null", () => {
++    expect(normalizer.normalize(template({ id: "   " })).id).toBeNull();
++  });
++
++  it("normalizes a missing optional template id to null", () => {
++    const input = template();
++    delete input.id;
++    expect(normalizer.normalize(input).id).toBeNull();
++  });
++
++  it("trims and lowercases valid template keys", () => {
++    expect(normalizer.normalize(template({ key: "  PICKUP_2  " })).key).toBe("pickup_2");
++  });
++
++  it("trims only the outside of a message", () => {
++    const result = normalizer.normalize(template({ message: "  First  line\nSecond   line  " }));
++    expect(result.message).toBe("First  line\nSecond   line");
++  });
++
++  it("keeps unique variables in first-use order", () => {
++    const result = normalizer.normalize(template({ message: "{link} {name} {link} {id} {name}" }));
++    expect(result.variables).toEqual(["link", "name", "id"]);
++  });
++
++  it("keeps repeated placeholder occurrences in message order", () => {
++    const result = normalizer.normalize(template({ message: "{name}/{id}/{name}/{link}/{id}" }));
++    expect(result.occurrences).toEqual(["name", "id", "name", "link", "id"]);
++  });
++
++  it("returns empty variable arrays for literal-only templates", () => {
++    const result = normalizer.normalize(template({ message: "Laundry Room is open today." }));
++    expect(result.variables).toEqual([]);
++    expect(result.occurrences).toEqual([]);
++  });
++
++  it("rejects an empty template name", () => {
++    expect(codeOf(() => normalizer.normalize(template({ name: "  " })))).toBe("EMPTY_TEMPLATE_NAME");
++  });
++
++  it("rejects an empty template key", () => {
++    expect(codeOf(() => normalizer.normalize(template({ key: "  " })))).toBe("EMPTY_TEMPLATE_KEY");
++  });
++
++  it("rejects invalid characters in a template key", () => {
++    expect(codeOf(() => normalizer.normalize(template({ key: "order-ready" })))).toBe("INVALID_TEMPLATE_KEY");
++  });
++
++  it("rejects whitespace inside a template key", () => {
++    expect(codeOf(() => normalizer.normalize(template({ key: "order ready" })))).toBe("INVALID_TEMPLATE_KEY");
++  });
++
++  it("rejects an empty template message", () => {
++    expect(codeOf(() => normalizer.normalize(template({ message: " \n " })))).toBe("EMPTY_TEMPLATE_MESSAGE");
++  });
++
++  it("rejects an unclosed variable placeholder", () => {
++    expect(codeOf(() => normalizer.normalize(template({ message: "Hi {name" })))).toBe("MALFORMED_VARIABLE");
++  });
++
++  it("rejects an unmatched closing brace", () => {
++    expect(codeOf(() => normalizer.normalize(template({ message: "Hi name}" })))).toBe("MALFORMED_VARIABLE");
++  });
++
++  it("rejects variable placeholders containing whitespace", () => {
++    expect(codeOf(() => normalizer.normalize(template({ message: "Hi { name }" })))).toBe("MALFORMED_VARIABLE");
++  });
++
++  it("rejects an empty variable placeholder", () => {
++    expect(codeOf(() => normalizer.normalize(template({ message: "Hi {}" })))).toBe("MALFORMED_VARIABLE");
++  });
++
++  it("rejects unsupported variable names", () => {
++    expect(codeOf(() => normalizer.normalize(template({ message: "Hi {phone}" })))).toBe("UNKNOWN_VARIABLE");
++  });
++
++  it("normalizeAll preserves template order", () => {
++    const result = normalizer.normalizeAll([
++      template({ key: "first", name: "First" }),
++      template({ key: "second", name: "Second" }),
++    ]);
++    expect(result.map((item) => item.key)).toEqual(["first", "second"]);
++  });
++
++  it("normalizeAll rejects duplicate keys after normalization", () => {
++    expect(codeOf(() => normalizer.normalizeAll([
++      template({ key: "READY" }),
++      template({ key: " ready " }),
++    ]))).toBe("DUPLICATE_TEMPLATE_KEY");
++  });
++
++  it("normalization does not mutate template inputs", () => {
++    const input = template();
++    const snapshot = { ...input };
++    normalizer.normalize(input);
++    expect(input).toEqual(snapshot);
++  });
++
++  it("normalizeAll does not mutate its array or records", () => {
++    const inputs = [template({ key: "one" }), template({ key: "two" })];
++    const snapshot = inputs.map((item) => ({ ...item }));
++    normalizer.normalizeAll(inputs);
++    expect(inputs).toEqual(snapshot);
++  });
++});
+diff --git a/tests/notification_whatsapp_batch.test.ts b/tests/notification_whatsapp_batch.test.ts
+new file mode 100644
+index 0000000..0a98e06
+--- /dev/null
++++ b/tests/notification_whatsapp_batch.test.ts
+@@ -0,0 +1,198 @@
++import { describe, expect, it } from "vitest";
++import {
++  NotificationBatchComposer,
++  NotificationTemplateValidationError,
++  WhatsAppTemplatePlanner,
++  type NotificationTemplateInput,
++} from "@/lib/notifications";
++
++const planner = new WhatsAppTemplatePlanner();
++const batch = new NotificationBatchComposer();
++const base: NotificationTemplateInput = {
++  id: "t1",
++  name: "Ready",
++  key: "order_ready",
++  message: "Hi {name}, {id} is ready: {link}",
++};
++
++function codeOf(run: () => unknown): string | undefined {
++  try {
++    run();
++    return undefined;
++  } catch (error) {
++    return error instanceof NotificationTemplateValidationError ? error.code : undefined;
++  }
++}
++
++describe("WhatsApp template planning", () => {
++  it("plans one-based WhatsApp parameters in placeholder occurrence order", () => {
++    expect(planner.plan(base, { name: "A", id: "B", link: "C" }).parameters).toEqual([
++      { position: 1, variable: "name", value: "A" },
++      { position: 2, variable: "id", value: "B" },
++      { position: 3, variable: "link", value: "C" },
++    ]);
++  });
++
++  it("keeps repeated placeholders as repeated WhatsApp parameters", () => {
++    const input = { ...base, message: "{name}/{id}/{name}" };
++    expect(planner.plan(input, { name: "A", id: "B" }).parameters).toEqual([
++      { position: 1, variable: "name", value: "A" },
++      { position: 2, variable: "id", value: "B" },
++      { position: 3, variable: "name", value: "A" },
++    ]);
++  });
++
++  it("uses the normalized template key as the WhatsApp template name", () => {
++    expect(planner.plan({ ...base, key: " READY_3 " }).templateName).toBe("ready_3");
++  });
++
++  it("uses null parameters for missing values", () => {
++    expect(planner.plan(base, { id: "B" }).parameters).toEqual([
++      { position: 1, variable: "name", value: null },
++      { position: 2, variable: "id", value: "B" },
++      { position: 3, variable: "link", value: null },
++    ]);
++  });
++
++  it("reports missing WhatsApp variables once in first-use order", () => {
++    const input = { ...base, message: "{link}/{name}/{link}/{id}/{name}" };
++    expect(planner.plan(input, { id: "B" }).missingVariables).toEqual(["link", "name"]);
++  });
++
++  it("marks a WhatsApp plan ready only when every required variable is present", () => {
++    expect(planner.plan(base, { name: "A", id: "B", link: "C" }).ready).toBe(true);
++    expect(planner.plan(base, { name: "A", id: "B" }).ready).toBe(false);
++  });
++
++  it("normalizes WhatsApp name values the same way as SMS rendering", () => {
++    expect(planner.plan({ ...base, message: "{name}" }, { name: "  Mary   Jane " }).parameters[0].value).toBe("Mary Jane");
++  });
++
++  it("accepts numeric WhatsApp variable values", () => {
++    expect(planner.plan({ ...base, message: "{id}" }, { id: 77 }).parameters[0].value).toBe("77");
++  });
++
++  it("creates an empty ready plan for a literal-only template", () => {
++    expect(planner.plan({ ...base, message: "Ready now" })).toEqual({
++      templateName: "order_ready",
++      parameters: [],
++      missingVariables: [],
++      ready: true,
++    });
++  });
++
++  it("rejects invalid WhatsApp variable values", () => {
++    expect(codeOf(() => planner.plan({ ...base, message: "{id}" }, { id: Number.NaN }))).toBe("INVALID_VARIABLE_VALUE");
++  });
++
++  it("planning does not mutate its template or values", () => {
++    const input = { ...base };
++    const values = { name: " A ", id: " B ", link: " C " };
++    const inputSnapshot = { ...input };
++    const valuesSnapshot = { ...values };
++    planner.plan(input, values);
++    expect(input).toEqual(inputSnapshot);
++    expect(values).toEqual(valuesSnapshot);
++  });
++});
++
++describe("Notification batch composition", () => {
++  it("preserves recipient order and trims recipient ids", () => {
++    const result = batch.compose(base, [
++      { recipientId: " first ", values: { name: "A", id: "1", link: "x" } },
++      { recipientId: "second", values: { name: "B", id: "2", link: "y" } },
++    ]);
++    expect(result.messages.map((item) => item.recipientId)).toEqual(["first", "second"]);
++  });
++
++  it("returns the normalized template key for a batch", () => {
++    expect(batch.compose({ ...base, key: " READY " }, []).key).toBe("ready");
++  });
++
++  it("composes rendered text independently for each recipient", () => {
++    const result = batch.compose(base, [
++      { recipientId: "a", values: { name: "Ada", id: "1", link: "x" } },
++      { recipientId: "b", values: { name: "Ben", id: "2", link: "y" } },
++    ]);
++    expect(result.messages.map((item) => item.text)).toEqual([
++      "Hi Ada, 1 is ready: x",
++      "Hi Ben, 2 is ready: y",
++    ]);
++  });
++
++  it("summarizes complete and incomplete batch messages", () => {
++    const result = batch.compose(base, [
++      { recipientId: "a", values: { name: "A", id: "1", link: "x" } },
++      { recipientId: "b", values: { name: "B", id: "2" } },
++      { recipientId: "c", values: {} },
++    ]);
++    expect(result.summary).toEqual({
++      total: 3,
++      complete: 1,
++      incomplete: 2,
++      missingByVariable: { name: 1, id: 1, link: 2 },
++    });
++  });
++
++  it("stores each message missingVariables in template first-use order", () => {
++    const input = { ...base, message: "{link}/{name}/{id}" };
++    const result = batch.compose(input, [{ recipientId: "a", values: { id: "1" } }]);
++    expect(result.messages[0].missingVariables).toEqual(["link", "name"]);
++  });
++
++  it("counts a repeated missing variable once per recipient", () => {
++    const input = { ...base, message: "{name}/{name}/{name}" };
++    const result = batch.compose(input, [{ recipientId: "a" }, { recipientId: "b" }]);
++    expect(result.summary.missingByVariable.name).toBe(2);
++  });
++
++  it("returns a zeroed summary for an empty recipient list", () => {
++    expect(batch.compose(base, []).summary).toEqual({
++      total: 0,
++      complete: 0,
++      incomplete: 0,
++      missingByVariable: { name: 0, id: 0, link: 0 },
++    });
++  });
++
++  it("rejects a blank recipient id", () => {
++    expect(codeOf(() => batch.compose(base, [{ recipientId: "  ", values: {} }]))).toBe("EMPTY_RECIPIENT_ID");
++  });
++
++  it("rejects duplicate recipient ids after trimming", () => {
++    expect(codeOf(() => batch.compose(base, [
++      { recipientId: "customer-1", values: {} },
++      { recipientId: " customer-1 ", values: {} },
++    ]))).toBe("DUPLICATE_RECIPIENT_ID");
++  });
++
++  it("supports numeric values while composing a batch", () => {
++    const result = batch.compose({ ...base, message: "Order {id}" }, [
++      { recipientId: "a", values: { id: 101 } },
++    ]);
++    expect(result.messages[0].text).toBe("Order 101");
++  });
++
++  it("leaves missing placeholders in incomplete batch text", () => {
++    const result = batch.compose(base, [{ recipientId: "a", values: { name: "A" } }]);
++    expect(result.messages[0]).toMatchObject({
++      text: "Hi A, {id} is ready: {link}",
++      complete: false,
++      missingVariables: ["id", "link"],
++    });
++  });
++
++  it("propagates template validation errors before composing recipients", () => {
++    expect(codeOf(() => batch.compose({ ...base, message: "Hi {phone}" }, []))).toBe("UNKNOWN_VARIABLE");
++  });
++
++  it("batch composition does not mutate templates or recipient data", () => {
++    const input = { ...base };
++    const recipients = [{ recipientId: " a ", values: { name: " A ", id: " 1 ", link: " x " } }];
++    const inputSnapshot = { ...input };
++    const recipientSnapshot = JSON.parse(JSON.stringify(recipients));
++    batch.compose(input, recipients);
++    expect(input).toEqual(inputSnapshot);
++    expect(recipients).toEqual(recipientSnapshot);
++  });
++});
+diff --git a/tests/service_details_regression.test.ts b/tests/service_details_regression.test.ts
+new file mode 100644
+index 0000000..c1feaae
+--- /dev/null
++++ b/tests/service_details_regression.test.ts
+@@ -0,0 +1,93 @@
++import { describe, expect, it } from "vitest";
++import { SERVICE_DETAILS } from "@/lib/data/serviceDetails";
++
++const slugs = [
++  "laundry-services",
++  "duvet-cleaning",
++  "mat-cleaning",
++  "carpet-cleaning",
++  "eyelet-curtains",
++  "pillows",
++  "suits",
++] as const;
++
++describe("Existing service details behavior", () => {
++  it("contains exactly the seven supported service slugs", () => {
++    expect(Object.keys(SERVICE_DETAILS).sort()).toEqual([...slugs].sort());
++  });
++
++  it("keeps laundry services available", () => {
++    expect(SERVICE_DETAILS["laundry-services"]).toBeDefined();
++  });
++
++  it("keeps duvet cleaning available", () => {
++    expect(SERVICE_DETAILS["duvet-cleaning"]).toBeDefined();
++  });
++
++  it("keeps mat cleaning available", () => {
++    expect(SERVICE_DETAILS["mat-cleaning"]).toBeDefined();
++  });
++
++  it("keeps carpet cleaning available", () => {
++    expect(SERVICE_DETAILS["carpet-cleaning"]).toBeDefined();
++  });
++
++  it("keeps eyelet curtains available", () => {
++    expect(SERVICE_DETAILS["eyelet-curtains"]).toBeDefined();
++  });
++
++  it("keeps pillows available", () => {
++    expect(SERVICE_DETAILS.pillows).toBeDefined();
++  });
++
++  it("keeps suits available", () => {
++    expect(SERVICE_DETAILS.suits).toBeDefined();
++  });
++
++  for (const slug of slugs) {
++    it(`${slug} has a non-empty title`, () => {
++      expect(SERVICE_DETAILS[slug].title.trim().length).toBeGreaterThan(0);
++    });
++
++    it(`${slug} has a non-empty tagline`, () => {
++      expect(SERVICE_DETAILS[slug].tagline.trim().length).toBeGreaterThan(0);
++    });
++
++    it(`${slug} has a non-empty description`, () => {
++      expect(SERVICE_DETAILS[slug].description.trim().length).toBeGreaterThan(0);
++    });
++
++    it(`${slug} exposes at least one package`, () => {
++      expect(SERVICE_DETAILS[slug].packages.length).toBeGreaterThan(0);
++    });
++
++    it(`${slug} packages have names prices and turnaround values`, () => {
++      for (const pkg of SERVICE_DETAILS[slug].packages) {
++        expect(pkg.name.trim().length).toBeGreaterThan(0);
++        expect(pkg.price.trim().length).toBeGreaterThan(0);
++        expect(pkg.turnaround.trim().length).toBeGreaterThan(0);
++      }
++    });
++
++    it(`${slug} packages expose at least one feature`, () => {
++      for (const pkg of SERVICE_DETAILS[slug].packages) {
++        expect(pkg.features.length).toBeGreaterThan(0);
++      }
++    });
++
++    it(`${slug} exposes a non-empty process`, () => {
++      expect(SERVICE_DETAILS[slug].process.length).toBeGreaterThan(0);
++    });
++
++    it(`${slug} process steps have titles and descriptions`, () => {
++      for (const step of SERVICE_DETAILS[slug].process) {
++        expect(step.title.trim().length).toBeGreaterThan(0);
++        expect(step.description.trim().length).toBeGreaterThan(0);
++      }
++    });
++
++    it(`${slug} exposes at least one why-choose reason`, () => {
++      expect(SERVICE_DETAILS[slug].whyChoose.length).toBeGreaterThan(0);
++    });
++  }
++});
+diff --git a/tests/utils_regression.test.ts b/tests/utils_regression.test.ts
+new file mode 100644
+index 0000000..303b7b3
+--- /dev/null
++++ b/tests/utils_regression.test.ts
+@@ -0,0 +1,44 @@
++import { describe, expect, it } from "vitest";
++import { cn } from "@/lib/utils";
++
++describe("Existing utility behavior", () => {
++  it("cn returns an empty string when called without classes", () => {
++    expect(cn()).toBe("");
++  });
++
++  it("cn keeps a single class", () => {
++    expect(cn("block")).toBe("block");
++  });
++
++  it("cn joins independent classes", () => {
++    expect(cn("block", "rounded-md")).toBe("block rounded-md");
++  });
++
++  it("cn ignores false values", () => {
++    expect(cn("block", false && "hidden")).toBe("block");
++  });
++
++  it("cn ignores undefined values", () => {
++    expect(cn("block", undefined)).toBe("block");
++  });
++
++  it("cn accepts object syntax", () => {
++    expect(cn({ block: true, hidden: false })).toBe("block");
++  });
++
++  it("cn accepts array syntax", () => {
++    expect(cn(["block", "rounded-md"])).toBe("block rounded-md");
++  });
++
++  it("cn resolves conflicting background classes to the last one", () => {
++    expect(cn("bg-red-500", "bg-blue-500")).toBe("bg-blue-500");
++  });
++
++  it("cn resolves conflicting text size classes to the last one", () => {
++    expect(cn("text-sm", "text-lg")).toBe("text-lg");
++  });
++
++  it("cn resolves conflicting padding classes to the last one", () => {
++    expect(cn("p-2", "p-4")).toBe("p-4");
++  });
++});
