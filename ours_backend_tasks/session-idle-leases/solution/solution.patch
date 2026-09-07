@@ -1,0 +1,854 @@
+diff --git a/packages/backend/src/services/session_lease_types.ts b/packages/backend/src/services/session_lease_types.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/session_lease_types.ts
+@@ -0,0 +1,120 @@
++export const DEFAULT_IDLE_AFTER_SECONDS = 300;
++export const MIN_IDLE_AFTER_SECONDS = 30;
++export const MAX_IDLE_AFTER_SECONDS = 3_600;
++
++export const DEFAULT_DISCONNECT_AFTER_SECONDS = 900;
++export const MIN_DISCONNECT_AFTER_SECONDS = 60;
++export const MAX_DISCONNECT_AFTER_SECONDS = 7_200;
++
++export const SESSION_LEASE_STATES = ["active", "idle", "disconnected"] as const;
++export type SessionLeaseState = (typeof SESSION_LEASE_STATES)[number];
++
++export const SESSION_LEASE_FAILURE_REASONS = [
++  "invalid_channel",
++  "invalid_nickname",
++  "invalid_connection",
++  "not_found",
++] as const;
++export type SessionLeaseFailureReason = (typeof SESSION_LEASE_FAILURE_REASONS)[number];
++
++export interface SessionLeaseRecord {
++  channelId: string;
++  nickname: string;
++  connectionId: string;
++  state: SessionLeaseState;
++  lastActiveAt: number;
++  idleAt: number | null;
++  disconnectedAt: number | null;
++  version: number;
++}
++
++export interface SessionLeaseView extends SessionLeaseRecord {
++  idleForSeconds: number | null;
++  disconnectedForSeconds: number | null;
++}
++
++export interface SessionLeaseClockOptions {
++  now?: number;
++}
++
++export interface TouchActivityOptions extends SessionLeaseClockOptions {
++  idleAfterSeconds?: number;
++  disconnectAfterSeconds?: number;
++}
++
++export interface SweepLeaseOptions extends SessionLeaseClockOptions {
++  idleAfterSeconds?: number;
++  disconnectAfterSeconds?: number;
++}
++
++export interface TouchActivitySuccess {
++  ok: true;
++  channelId: string;
++  nickname: string;
++  connectionId: string;
++  state: "active";
++  lastActiveAt: number;
++  version: number;
++}
++
++export interface SessionLeaseFailure {
++  ok: false;
++  reason: SessionLeaseFailureReason;
++  channelId?: string;
++  nickname?: string;
++}
++
++export type TouchActivityResult = TouchActivitySuccess | SessionLeaseFailure;
++
++export interface MarkStateSuccess {
++  ok: true;
++  channelId: string;
++  nickname: string;
++  connectionId: string;
++  state: SessionLeaseState;
++  version: number;
++}
++
++export type MarkStateResult = MarkStateSuccess | SessionLeaseFailure;
++
++export interface SessionLeaseSweepResult {
++  transitioned: number;
++  nicknames: string[];
++}
++
++export interface SessionLeaseStore {
++  getLease(channelId: string, nickname: string): Promise<SessionLeaseRecord | null>;
++  putLease(record: SessionLeaseRecord): Promise<void>;
++  deleteLease(channelId: string, nickname: string): Promise<void>;
++  listLeases(channelId?: string): Promise<SessionLeaseRecord[]>;
++  compareAndSetLease(
++    channelId: string,
++    nickname: string,
++    expectedVersion: number | null,
++    record: SessionLeaseRecord,
++  ): Promise<boolean>;
++}
++
++export function isSessionLeaseRecord(value: unknown): value is SessionLeaseRecord {
++  if (value === null || typeof value !== "object") {
++    return false;
++  }
++  const record = value as Partial<SessionLeaseRecord>;
++  const stateOk = record.state === "active" || record.state === "idle" || record.state === "disconnected";
++  return (
++    typeof record.channelId === "string" &&
++    record.channelId.length > 0 &&
++    typeof record.nickname === "string" &&
++    record.nickname.length > 0 &&
++    typeof record.connectionId === "string" &&
++    record.connectionId.length > 0 &&
++    stateOk &&
++    typeof record.lastActiveAt === "number" &&
++    Number.isFinite(record.lastActiveAt) &&
++    (record.idleAt === null || (typeof record.idleAt === "number" && Number.isFinite(record.idleAt))) &&
++    (record.disconnectedAt === null ||
++      (typeof record.disconnectedAt === "number" && Number.isFinite(record.disconnectedAt))) &&
++    typeof record.version === "number" &&
++    Number.isFinite(record.version)
++  );
++}
+diff --git a/packages/backend/src/services/session_lease_utils.ts b/packages/backend/src/services/session_lease_utils.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/session_lease_utils.ts
+@@ -0,0 +1,132 @@
++import { isValidNickname } from "#ours/shared/inputValidation.ts";
++import {
++  DEFAULT_DISCONNECT_AFTER_SECONDS,
++  DEFAULT_IDLE_AFTER_SECONDS,
++  MAX_DISCONNECT_AFTER_SECONDS,
++  MAX_IDLE_AFTER_SECONDS,
++  MIN_DISCONNECT_AFTER_SECONDS,
++  MIN_IDLE_AFTER_SECONDS,
++  type SessionLeaseFailure,
++  type SessionLeaseFailureReason,
++  type SessionLeaseRecord,
++  type SessionLeaseView,
++} from "#ours/backend/services/session_lease_types.ts";
++
++export function readSessionLeaseClock(now?: number): number {
++  if (typeof now === "number" && Number.isFinite(now)) {
++    return Math.trunc(now);
++  }
++  return Date.now();
++}
++
++export function clampIdleAfterSeconds(seconds?: number): number {
++  const raw =
++    typeof seconds === "number" && Number.isFinite(seconds) ? seconds : DEFAULT_IDLE_AFTER_SECONDS;
++  return Math.min(MAX_IDLE_AFTER_SECONDS, Math.max(MIN_IDLE_AFTER_SECONDS, Math.trunc(raw)));
++}
++
++export function clampDisconnectAfterSeconds(seconds?: number): number {
++  const raw =
++    typeof seconds === "number" && Number.isFinite(seconds) ? seconds : DEFAULT_DISCONNECT_AFTER_SECONDS;
++  return Math.min(MAX_DISCONNECT_AFTER_SECONDS, Math.max(MIN_DISCONNECT_AFTER_SECONDS, Math.trunc(raw)));
++}
++
++export function normalizeChannelId(channelId: string): string | null {
++  if (typeof channelId !== "string") {
++    return null;
++  }
++  const trimmed = channelId.trim();
++  return trimmed.length > 0 ? trimmed : null;
++}
++
++export function normalizeLeaseNickname(nickname: string): string | null {
++  if (typeof nickname !== "string") {
++    return null;
++  }
++  const trimmed = nickname.trim();
++  if (!isValidNickname(trimmed)) {
++    return null;
++  }
++  return trimmed.normalize("NFC").toLowerCase();
++}
++
++export function normalizeConnectionId(connectionId: string): string | null {
++  if (typeof connectionId !== "string") {
++    return null;
++  }
++  const trimmed = connectionId.trim();
++  return trimmed.length > 0 ? trimmed : null;
++}
++
++export function sessionLeaseFailure(
++  reason: SessionLeaseFailureReason,
++  extra: Omit<SessionLeaseFailure, "ok" | "reason"> = {},
++): SessionLeaseFailure {
++  return { ok: false, reason, ...extra };
++}
++
++export function toSessionLeaseView(record: SessionLeaseRecord, now: number): SessionLeaseView {
++  const idleForSeconds =
++    record.idleAt === null ? null : Math.max(0, Math.floor((now - record.idleAt) / 1000));
++  const disconnectedForSeconds =
++    record.disconnectedAt === null
++      ? null
++      : Math.max(0, Math.floor((now - record.disconnectedAt) / 1000));
++  return {
++    channelId: record.channelId,
++    nickname: record.nickname,
++    connectionId: record.connectionId,
++    state: record.state,
++    lastActiveAt: record.lastActiveAt,
++    idleAt: record.idleAt,
++    disconnectedAt: record.disconnectedAt,
++    version: record.version,
++    idleForSeconds,
++    disconnectedForSeconds,
++  };
++}
++
++export function sortLeaseViews(views: SessionLeaseView[]): SessionLeaseView[] {
++  return [...views].sort((left, right) => {
++    const channelOrder = left.channelId.localeCompare(right.channelId);
++    if (channelOrder !== 0) {
++      return channelOrder;
++    }
++    return left.nickname.localeCompare(right.nickname);
++  });
++}
++
++export function uniqueSortedIds(ids: Iterable<string>): string[] {
++  return [...new Set([...ids].filter((id) => id.length > 0))].sort((left, right) => left.localeCompare(right));
++}
++
++export function cloneLease(record: SessionLeaseRecord): SessionLeaseRecord {
++  return {
++    channelId: record.channelId,
++    nickname: record.nickname,
++    connectionId: record.connectionId,
++    state: record.state,
++    lastActiveAt: record.lastActiveAt,
++    idleAt: record.idleAt,
++    disconnectedAt: record.disconnectedAt,
++    version: record.version,
++  };
++}
++
++export function shouldMarkIdle(record: SessionLeaseRecord, now: number, idleAfterSeconds: number): boolean {
++  if (record.state !== "active") {
++    return false;
++  }
++  return now - record.lastActiveAt >= idleAfterSeconds * 1000;
++}
++
++export function shouldMarkDisconnected(
++  record: SessionLeaseRecord,
++  now: number,
++  disconnectAfterSeconds: number,
++): boolean {
++  if (record.state !== "idle" || record.idleAt === null) {
++    return false;
++  }
++  return now - record.idleAt >= disconnectAfterSeconds * 1000;
++}
+diff --git a/packages/backend/src/services/session_lease_store.ts b/packages/backend/src/services/session_lease_store.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/session_lease_store.ts
+@@ -0,0 +1,72 @@
++import {
++  isSessionLeaseRecord,
++  type SessionLeaseRecord,
++  type SessionLeaseStore,
++} from "#ours/backend/services/session_lease_types.ts";
++import { cloneLease } from "#ours/backend/services/session_lease_utils.ts";
++
++const leaseKey = (channelId: string, nickname: string) => `${channelId}\u0000${nickname}`;
++
++export class MemorySessionLeaseStore implements SessionLeaseStore {
++  private readonly records = new Map<string, SessionLeaseRecord>();
++
++  async getLease(channelId: string, nickname: string): Promise<SessionLeaseRecord | null> {
++    const record = this.records.get(leaseKey(channelId, nickname));
++    return record ? cloneLease(record) : null;
++  }
++
++  async putLease(record: SessionLeaseRecord): Promise<void> {
++    if (!isSessionLeaseRecord(record)) {
++      return;
++    }
++    this.records.set(leaseKey(record.channelId, record.nickname), cloneLease(record));
++  }
++
++  async deleteLease(channelId: string, nickname: string): Promise<void> {
++    this.records.delete(leaseKey(channelId, nickname));
++  }
++
++  async listLeases(channelId?: string): Promise<SessionLeaseRecord[]> {
++    const rows = [...this.records.values()].map(cloneLease);
++    if (channelId === undefined) {
++      return rows;
++    }
++    return rows.filter((record) => record.channelId === channelId);
++  }
++
++  async compareAndSetLease(
++    channelId: string,
++    nickname: string,
++    expectedVersion: number | null,
++    record: SessionLeaseRecord,
++  ): Promise<boolean> {
++    if (!isSessionLeaseRecord(record) || record.channelId !== channelId || record.nickname !== nickname) {
++      return false;
++    }
++
++    const key = leaseKey(channelId, nickname);
++    const current = this.records.get(key);
++    if (expectedVersion === null) {
++      if (current) {
++        return false;
++      }
++    } else if (!current || current.version !== expectedVersion) {
++      return false;
++    }
++
++    this.records.set(key, cloneLease(record));
++    return true;
++  }
++
++  clear(): void {
++    this.records.clear();
++  }
++
++  size(): number {
++    return this.records.size;
++  }
++}
++
++export function createMemorySessionLeaseStore(): MemorySessionLeaseStore {
++  return new MemorySessionLeaseStore();
++}
+diff --git a/packages/backend/src/services/session_lease_policy.ts b/packages/backend/src/services/session_lease_policy.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/session_lease_policy.ts
+@@ -0,0 +1,36 @@
++import {
++  DEFAULT_DISCONNECT_AFTER_SECONDS,
++  DEFAULT_IDLE_AFTER_SECONDS,
++  MAX_DISCONNECT_AFTER_SECONDS,
++  MAX_IDLE_AFTER_SECONDS,
++  MIN_DISCONNECT_AFTER_SECONDS,
++  MIN_IDLE_AFTER_SECONDS,
++} from "#ours/backend/services/session_lease_types.ts";
++
++export interface SessionLeaseTimingPolicy {
++  defaultIdleAfterSeconds: number;
++  minIdleAfterSeconds: number;
++  maxIdleAfterSeconds: number;
++  defaultDisconnectAfterSeconds: number;
++  minDisconnectAfterSeconds: number;
++  maxDisconnectAfterSeconds: number;
++}
++
++export const DEFAULT_SESSION_LEASE_TIMING_POLICY: SessionLeaseTimingPolicy = {
++  defaultIdleAfterSeconds: DEFAULT_IDLE_AFTER_SECONDS,
++  minIdleAfterSeconds: MIN_IDLE_AFTER_SECONDS,
++  maxIdleAfterSeconds: MAX_IDLE_AFTER_SECONDS,
++  defaultDisconnectAfterSeconds: DEFAULT_DISCONNECT_AFTER_SECONDS,
++  minDisconnectAfterSeconds: MIN_DISCONNECT_AFTER_SECONDS,
++  maxDisconnectAfterSeconds: MAX_DISCONNECT_AFTER_SECONDS,
++};
++
++export function describeSessionLeasePolicy(
++  policy: SessionLeaseTimingPolicy = DEFAULT_SESSION_LEASE_TIMING_POLICY,
++): string {
++  return `idle after ${policy.minIdleAfterSeconds}-${policy.maxIdleAfterSeconds}s (default ${policy.defaultIdleAfterSeconds}s); disconnect after ${policy.minDisconnectAfterSeconds}-${policy.maxDisconnectAfterSeconds}s (default ${policy.defaultDisconnectAfterSeconds}s)`;
++}
++
++export function nextLeaseVersion(currentVersion: number): number {
++  return currentVersion + 1;
++}
+diff --git a/packages/backend/src/services/session_lease_service.ts b/packages/backend/src/services/session_lease_service.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/session_lease_service.ts
+@@ -0,0 +1,394 @@
++import { createMemorySessionLeaseStore } from "#ours/backend/services/session_lease_store.ts";
++import { nextLeaseVersion } from "#ours/backend/services/session_lease_policy.ts";
++import type {
++  MarkStateResult,
++  SessionLeaseClockOptions,
++  SessionLeaseRecord,
++  SessionLeaseStore,
++  SessionLeaseSweepResult,
++  SessionLeaseView,
++  SweepLeaseOptions,
++  TouchActivityOptions,
++  TouchActivityResult,
++} from "#ours/backend/services/session_lease_types.ts";
++import {
++  clampDisconnectAfterSeconds,
++  clampIdleAfterSeconds,
++  normalizeChannelId,
++  normalizeConnectionId,
++  normalizeLeaseNickname,
++  readSessionLeaseClock,
++  sessionLeaseFailure,
++  shouldMarkDisconnected,
++  shouldMarkIdle,
++  sortLeaseViews,
++  toSessionLeaseView,
++  uniqueSortedIds,
++} from "#ours/backend/services/session_lease_utils.ts";
++
++export class SessionLeaseService {
++  private readonly store: SessionLeaseStore;
++
++  constructor(store: SessionLeaseStore = createMemorySessionLeaseStore()) {
++    this.store = store;
++  }
++
++  async touchActivity(
++    channelId: string,
++    nickname: string,
++    connectionId: string,
++    options: TouchActivityOptions = {},
++  ): Promise<TouchActivityResult> {
++    const channel = normalizeChannelId(channelId);
++    if (!channel) {
++      return sessionLeaseFailure("invalid_channel");
++    }
++
++    const user = normalizeLeaseNickname(nickname);
++    if (!user) {
++      return sessionLeaseFailure("invalid_nickname", { channelId: channel });
++    }
++
++    const connection = normalizeConnectionId(connectionId);
++    if (!connection) {
++      return sessionLeaseFailure("invalid_connection", { channelId: channel, nickname: user });
++    }
++
++    const now = readSessionLeaseClock(options.now);
++    const current = await this.store.getLease(channel, user);
++
++    const next: SessionLeaseRecord = {
++      channelId: channel,
++      nickname: user,
++      connectionId: connection,
++      state: "active",
++      lastActiveAt: now,
++      idleAt: null,
++      disconnectedAt: null,
++      version: current ? nextLeaseVersion(current.version) : 1,
++    };
++
++    const expectedVersion = current ? current.version : null;
++    const swapped = await this.store.compareAndSetLease(channel, user, expectedVersion, next);
++    if (!swapped) {
++      return this.touchActivity(channelId, nickname, connectionId, options);
++    }
++
++    return {
++      ok: true,
++      channelId: channel,
++      nickname: user,
++      connectionId: connection,
++      state: "active",
++      lastActiveAt: now,
++      version: next.version,
++    };
++  }
++
++  async markIdle(
++    channelId: string,
++    nickname: string,
++    options: SessionLeaseClockOptions = {},
++  ): Promise<MarkStateResult> {
++    const channel = normalizeChannelId(channelId);
++    if (!channel) {
++      return sessionLeaseFailure("invalid_channel");
++    }
++
++    const user = normalizeLeaseNickname(nickname);
++    if (!user) {
++      return sessionLeaseFailure("invalid_nickname", { channelId: channel });
++    }
++
++    const now = readSessionLeaseClock(options.now);
++    const current = await this.store.getLease(channel, user);
++    if (!current) {
++      return sessionLeaseFailure("not_found", { channelId: channel, nickname: user });
++    }
++
++    if (current.state === "idle") {
++      return {
++        ok: true,
++        channelId: channel,
++        nickname: user,
++        connectionId: current.connectionId,
++        state: "idle",
++        version: current.version,
++      };
++    }
++
++    if (current.state === "disconnected") {
++      return sessionLeaseFailure("not_found", { channelId: channel, nickname: user });
++    }
++
++    const next: SessionLeaseRecord = {
++      ...current,
++      state: "idle",
++      idleAt: now,
++      disconnectedAt: null,
++      version: nextLeaseVersion(current.version),
++    };
++
++    const swapped = await this.store.compareAndSetLease(channel, user, current.version, next);
++    if (!swapped) {
++      return this.markIdle(channelId, nickname, options);
++    }
++
++    return {
++      ok: true,
++      channelId: channel,
++      nickname: user,
++      connectionId: current.connectionId,
++      state: "idle",
++      version: next.version,
++    };
++  }
++
++  async markDisconnected(
++    channelId: string,
++    nickname: string,
++    options: SessionLeaseClockOptions = {},
++  ): Promise<MarkStateResult> {
++    const channel = normalizeChannelId(channelId);
++    if (!channel) {
++      return sessionLeaseFailure("invalid_channel");
++    }
++
++    const user = normalizeLeaseNickname(nickname);
++    if (!user) {
++      return sessionLeaseFailure("invalid_nickname", { channelId: channel });
++    }
++
++    const now = readSessionLeaseClock(options.now);
++    const current = await this.store.getLease(channel, user);
++    if (!current) {
++      return sessionLeaseFailure("not_found", { channelId: channel, nickname: user });
++    }
++
++    if (current.state === "disconnected") {
++      return {
++        ok: true,
++        channelId: channel,
++        nickname: user,
++        connectionId: current.connectionId,
++        state: "disconnected",
++        version: current.version,
++      };
++    }
++
++    const next: SessionLeaseRecord = {
++      ...current,
++      state: "disconnected",
++      idleAt: current.idleAt ?? now,
++      disconnectedAt: now,
++      version: nextLeaseVersion(current.version),
++    };
++
++    const swapped = await this.store.compareAndSetLease(channel, user, current.version, next);
++    if (!swapped) {
++      return this.markDisconnected(channelId, nickname, options);
++    }
++
++    return {
++      ok: true,
++      channelId: channel,
++      nickname: user,
++      connectionId: current.connectionId,
++      state: "disconnected",
++      version: next.version,
++    };
++  }
++
++  async getLease(
++    channelId: string,
++    nickname: string,
++    options: SessionLeaseClockOptions = {},
++  ): Promise<SessionLeaseView | null> {
++    const channel = normalizeChannelId(channelId);
++    const user = normalizeLeaseNickname(nickname);
++    if (!channel || !user) {
++      return null;
++    }
++    const now = readSessionLeaseClock(options.now);
++    const record = await this.store.getLease(channel, user);
++    return record ? toSessionLeaseView(record, now) : null;
++  }
++
++  async listChannelLeases(channelId: string, options: SessionLeaseClockOptions = {}): Promise<SessionLeaseView[]> {
++    const channel = normalizeChannelId(channelId);
++    if (!channel) {
++      return [];
++    }
++    const now = readSessionLeaseClock(options.now);
++    const views = (await this.store.listLeases(channel)).map((record) => toSessionLeaseView(record, now));
++    return sortLeaseViews(views);
++  }
++
++  async listIdleNicknames(channelId: string, options: SessionLeaseClockOptions = {}): Promise<string[]> {
++    const channel = normalizeChannelId(channelId);
++    if (!channel) {
++      return [];
++    }
++    const nicknames: string[] = [];
++    for (const record of await this.store.listLeases(channel)) {
++      if (record.state === "idle") {
++        nicknames.push(record.nickname);
++      }
++    }
++    return uniqueSortedIds(nicknames);
++  }
++
++  async sweepIdleLeases(
++    channelId?: string,
++    options: SweepLeaseOptions = {},
++  ): Promise<SessionLeaseSweepResult> {
++    const now = readSessionLeaseClock(options.now);
++    const idleAfter = clampIdleAfterSeconds(options.idleAfterSeconds);
++    const channel = channelId === undefined ? undefined : normalizeChannelId(channelId);
++    if (channelId !== undefined && !channel) {
++      return { transitioned: 0, nicknames: [] };
++    }
++
++    const nicknames: string[] = [];
++    let transitioned = 0;
++
++    for (const record of await this.store.listLeases(channel)) {
++      if (!shouldMarkIdle(record, now, idleAfter)) {
++        continue;
++      }
++      const next: SessionLeaseRecord = {
++        ...record,
++        state: "idle",
++        idleAt: now,
++        disconnectedAt: null,
++        version: nextLeaseVersion(record.version),
++      };
++      const swapped = await this.store.compareAndSetLease(
++        record.channelId,
++        record.nickname,
++        record.version,
++        next,
++      );
++      if (!swapped) {
++        continue;
++      }
++      transitioned += 1;
++      nicknames.push(record.nickname);
++    }
++
++    return { transitioned, nicknames: uniqueSortedIds(nicknames) };
++  }
++
++  async sweepDisconnectedLeases(
++    channelId?: string,
++    options: SweepLeaseOptions = {},
++  ): Promise<SessionLeaseSweepResult> {
++    const now = readSessionLeaseClock(options.now);
++    const disconnectAfter = clampDisconnectAfterSeconds(options.disconnectAfterSeconds);
++    const channel = channelId === undefined ? undefined : normalizeChannelId(channelId);
++    if (channelId !== undefined && !channel) {
++      return { transitioned: 0, nicknames: [] };
++    }
++
++    const nicknames: string[] = [];
++    let transitioned = 0;
++
++    for (const record of await this.store.listLeases(channel)) {
++      if (!shouldMarkDisconnected(record, now, disconnectAfter)) {
++        continue;
++      }
++      const next: SessionLeaseRecord = {
++        ...record,
++        state: "disconnected",
++        disconnectedAt: now,
++        version: nextLeaseVersion(record.version),
++      };
++      const swapped = await this.store.compareAndSetLease(
++        record.channelId,
++        record.nickname,
++        record.version,
++        next,
++      );
++      if (!swapped) {
++        continue;
++      }
++      transitioned += 1;
++      nicknames.push(record.nickname);
++    }
++
++    return { transitioned, nicknames: uniqueSortedIds(nicknames) };
++  }
++}
++
++export function createSessionLeaseService(store?: SessionLeaseStore): SessionLeaseService {
++  return new SessionLeaseService(store ?? createMemorySessionLeaseStore());
++}
++
++export async function touchActivity(
++  channelId: string,
++  nickname: string,
++  connectionId: string,
++  options: TouchActivityOptions = {},
++  store?: SessionLeaseStore,
++): Promise<TouchActivityResult> {
++  return createSessionLeaseService(store).touchActivity(channelId, nickname, connectionId, options);
++}
++
++export async function markIdle(
++  channelId: string,
++  nickname: string,
++  options: SessionLeaseClockOptions = {},
++  store?: SessionLeaseStore,
++): Promise<MarkStateResult> {
++  return createSessionLeaseService(store).markIdle(channelId, nickname, options);
++}
++
++export async function markDisconnected(
++  channelId: string,
++  nickname: string,
++  options: SessionLeaseClockOptions = {},
++  store?: SessionLeaseStore,
++): Promise<MarkStateResult> {
++  return createSessionLeaseService(store).markDisconnected(channelId, nickname, options);
++}
++
++export async function getLease(
++  channelId: string,
++  nickname: string,
++  options: SessionLeaseClockOptions = {},
++  store?: SessionLeaseStore,
++): Promise<SessionLeaseView | null> {
++  return createSessionLeaseService(store).getLease(channelId, nickname, options);
++}
++
++export async function listChannelLeases(
++  channelId: string,
++  options: SessionLeaseClockOptions = {},
++  store?: SessionLeaseStore,
++): Promise<SessionLeaseView[]> {
++  return createSessionLeaseService(store).listChannelLeases(channelId, options);
++}
++
++export async function listIdleNicknames(
++  channelId: string,
++  options: SessionLeaseClockOptions = {},
++  store?: SessionLeaseStore,
++): Promise<string[]> {
++  return createSessionLeaseService(store).listIdleNicknames(channelId, options);
++}
++
++export async function sweepIdleLeases(
++  channelId?: string,
++  options: SweepLeaseOptions = {},
++  store?: SessionLeaseStore,
++): Promise<SessionLeaseSweepResult> {
++  return createSessionLeaseService(store).sweepIdleLeases(channelId, options);
++}
++
++export async function sweepDisconnectedLeases(
++  channelId?: string,
++  options: SweepLeaseOptions = {},
++  store?: SessionLeaseStore,
++): Promise<SessionLeaseSweepResult> {
++  return createSessionLeaseService(store).sweepDisconnectedLeases(channelId, options);
++}
+diff --git a/packages/backend/src/services/session_leases.ts b/packages/backend/src/services/session_leases.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/session_leases.ts
+@@ -0,0 +1,64 @@
++export {
++  SessionLeaseService,
++  createSessionLeaseService,
++  getLease,
++  listChannelLeases,
++  listIdleNicknames,
++  markDisconnected,
++  markIdle,
++  sweepDisconnectedLeases,
++  sweepIdleLeases,
++  touchActivity,
++} from "#ours/backend/services/session_lease_service.ts";
++
++export {
++  MemorySessionLeaseStore,
++  createMemorySessionLeaseStore,
++} from "#ours/backend/services/session_lease_store.ts";
++
++export {
++  DEFAULT_DISCONNECT_AFTER_SECONDS,
++  DEFAULT_IDLE_AFTER_SECONDS,
++  MAX_DISCONNECT_AFTER_SECONDS,
++  MAX_IDLE_AFTER_SECONDS,
++  MIN_DISCONNECT_AFTER_SECONDS,
++  MIN_IDLE_AFTER_SECONDS,
++  SESSION_LEASE_FAILURE_REASONS,
++  SESSION_LEASE_STATES,
++  isSessionLeaseRecord,
++  type MarkStateResult,
++  type SessionLeaseClockOptions,
++  type SessionLeaseFailure,
++  type SessionLeaseFailureReason,
++  type SessionLeaseRecord,
++  type SessionLeaseState,
++  type SessionLeaseStore,
++  type SessionLeaseSweepResult,
++  type SessionLeaseView,
++  type SweepLeaseOptions,
++  type TouchActivityOptions,
++  type TouchActivityResult,
++} from "#ours/backend/services/session_lease_types.ts";
++
++export {
++  DEFAULT_SESSION_LEASE_TIMING_POLICY,
++  describeSessionLeasePolicy,
++  nextLeaseVersion,
++  type SessionLeaseTimingPolicy,
++} from "#ours/backend/services/session_lease_policy.ts";
++
++export {
++  clampDisconnectAfterSeconds,
++  clampIdleAfterSeconds,
++  cloneLease,
++  normalizeChannelId,
++  normalizeConnectionId,
++  normalizeLeaseNickname,
++  readSessionLeaseClock,
++  sessionLeaseFailure,
++  shouldMarkDisconnected,
++  shouldMarkIdle,
++  sortLeaseViews,
++  toSessionLeaseView,
++  uniqueSortedIds,
++} from "#ours/backend/services/session_lease_utils.ts";

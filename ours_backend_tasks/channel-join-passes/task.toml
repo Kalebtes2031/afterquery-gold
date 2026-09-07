@@ -1,0 +1,38 @@
+schema_version = "1.1"
+artifacts = ["/logs/artifacts/model.patch"]
+
+[task]
+name = "ours/channel-join-passes"
+
+[metadata]
+task_id = "channel-join-passes"
+display_title = "Channel Join Passes"
+display_description = "Issue one-time channel admit passes, consume them once, revoke by issuer, and sweep expired unused passes."
+category = "enhancement"
+language = "typescript"
+repository_url = "https://github.com/dawit2119/ours_backend"
+base_commit_hash = "519bfd8ee87e3aef50ed6584a364ef081f398d1c"
+
+[agent]
+timeout_sec = 5400
+
+[verifier]
+environment_mode = "separate"
+timeout_sec = 1800
+
+[verifier.environment]
+build_timeout_sec = 1800
+cpus = 2
+memory_mb = 8192
+storage_mb = 20480
+allow_internet = false
+
+[environment]
+build_timeout_sec = 1800
+docker_image = "us-docker.pkg.dev/afterquery-compute/compute-images/gold-repo-ours-backend-jnkmji:v1"
+os = "linux"
+cpus = 2
+memory_mb = 8192
+storage_mb = 20480
+gpus = 0
+allow_internet = false

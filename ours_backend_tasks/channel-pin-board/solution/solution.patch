@@ -1,0 +1,739 @@
+diff --git a/packages/backend/src/services/pin_types.ts b/packages/backend/src/services/pin_types.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/pin_types.ts
+@@ -0,0 +1,131 @@
++export const MAX_CHANNEL_PINS = 10;
++
++export const PIN_STATUSES = ["pinned", "refreshed"] as const;
++export type PinStatus = (typeof PIN_STATUSES)[number];
++
++export const PIN_FAILURE_REASONS = [
++  "invalid_channel",
++  "invalid_message",
++  "invalid_actor",
++  "pin_limit",
++  "not_found",
++  "invalid_order",
++  "version_conflict",
++] as const;
++export type PinFailureReason = (typeof PIN_FAILURE_REASONS)[number];
++
++export interface ChannelPinEntry {
++  messageId: string;
++  pinnedBy: string;
++  pinnedAt: number;
++  note?: string;
++}
++
++export interface ChannelPinBoardRecord {
++  channelId: string;
++  pins: ChannelPinEntry[];
++  version: number;
++}
++
++export interface ChannelPinView extends ChannelPinEntry {
++  position: number;
++}
++
++export interface PinClockOptions {
++  now?: number;
++}
++
++export interface PinMessageOptions extends PinClockOptions {
++  note?: string;
++}
++
++export interface PinSuccess {
++  ok: true;
++  status: PinStatus;
++  channelId: string;
++  messageId: string;
++  pinnedBy: string;
++  pinnedAt: number;
++  position: number;
++  version: number;
++  note?: string;
++}
++
++export interface PinFailure {
++  ok: false;
++  reason: PinFailureReason;
++  channelId?: string;
++  messageId?: string;
++}
++
++export type PinMessageResult = PinSuccess | PinFailure;
++
++export interface UnpinSuccess {
++  ok: true;
++  channelId: string;
++  messageId: string;
++  unpinned: true;
++  version: number;
++}
++
++export type UnpinMessageResult = UnpinSuccess | PinFailure;
++
++export interface ReorderPinsSuccess {
++  ok: true;
++  channelId: string;
++  messageIds: string[];
++  version: number;
++}
++
++export type ReorderPinsResult = ReorderPinsSuccess | PinFailure;
++
++export interface ClearPinsSuccess {
++  ok: true;
++  channelId: string;
++  cleared: number;
++  version: number;
++}
++
++export type ClearPinsResult = ClearPinsSuccess | PinFailure;
++
++export interface ChannelPinStore {
++  getBoard(channelId: string): Promise<ChannelPinBoardRecord | null>;
++  putBoard(board: ChannelPinBoardRecord): Promise<void>;
++  compareAndSetBoard(
++    channelId: string,
++    expectedVersion: number | null,
++    board: ChannelPinBoardRecord,
++  ): Promise<boolean>;
++}
++
++export function isChannelPinEntry(value: unknown): value is ChannelPinEntry {
++  if (value === null || typeof value !== "object") {
++    return false;
++  }
++  const entry = value as Partial<ChannelPinEntry>;
++  const noteOk = entry.note === undefined || (typeof entry.note === "string" && entry.note.length > 0);
++  return (
++    typeof entry.messageId === "string" &&
++    entry.messageId.length > 0 &&
++    typeof entry.pinnedBy === "string" &&
++    entry.pinnedBy.length > 0 &&
++    typeof entry.pinnedAt === "number" &&
++    Number.isFinite(entry.pinnedAt) &&
++    noteOk
++  );
++}
++
++export function isChannelPinBoardRecord(value: unknown): value is ChannelPinBoardRecord {
++  if (value === null || typeof value !== "object") {
++    return false;
++  }
++  const board = value as Partial<ChannelPinBoardRecord>;
++  return (
++    typeof board.channelId === "string" &&
++    board.channelId.length > 0 &&
++    typeof board.version === "number" &&
++    Number.isFinite(board.version) &&
++    Array.isArray(board.pins) &&
++    board.pins.every(isChannelPinEntry)
++  );
++}
+diff --git a/packages/backend/src/services/pin_utils.ts b/packages/backend/src/services/pin_utils.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/pin_utils.ts
+@@ -0,0 +1,111 @@
++import { MAX_CHANNEL_PINS, type ChannelPinBoardRecord, type ChannelPinEntry, type ChannelPinView, type PinFailure, type PinFailureReason } from "#ours/backend/services/pin_types.ts";
++
++export function readPinClock(now?: number): number {
++  if (typeof now === "number" && Number.isFinite(now)) {
++    return Math.trunc(now);
++  }
++  return Date.now();
++}
++
++export function normalizeChannelId(channelId: string): string | null {
++  if (typeof channelId !== "string") {
++    return null;
++  }
++  const trimmed = channelId.trim();
++  return trimmed.length > 0 ? trimmed : null;
++}
++
++export function normalizeMessageId(messageId: string): string | null {
++  if (typeof messageId !== "string") {
++    return null;
++  }
++  const trimmed = messageId.trim();
++  return trimmed.length > 0 ? trimmed : null;
++}
++
++export function normalizePinnedBy(pinnedBy: string): string | null {
++  if (typeof pinnedBy !== "string") {
++    return null;
++  }
++  const trimmed = pinnedBy.trim();
++  return trimmed.length > 0 ? trimmed : null;
++}
++
++export function normalizePinNote(note?: string): string | undefined {
++  if (typeof note !== "string") {
++    return undefined;
++  }
++  const trimmed = note.trim();
++  if (trimmed.length === 0) {
++    return undefined;
++  }
++  return trimmed.slice(0, 120);
++}
++
++export function emptyBoard(channelId: string, version = 0): ChannelPinBoardRecord {
++  return { channelId, pins: [], version };
++}
++
++export function clonePinEntry(entry: ChannelPinEntry): ChannelPinEntry {
++  const copy: ChannelPinEntry = {
++    messageId: entry.messageId,
++    pinnedBy: entry.pinnedBy,
++    pinnedAt: entry.pinnedAt,
++  };
++  if (entry.note !== undefined) {
++    copy.note = entry.note;
++  }
++  return copy;
++}
++
++export function cloneBoard(board: ChannelPinBoardRecord): ChannelPinBoardRecord {
++  return {
++    channelId: board.channelId,
++    version: board.version,
++    pins: board.pins.map(clonePinEntry),
++  };
++}
++
++export function toPinViews(board: ChannelPinBoardRecord): ChannelPinView[] {
++  return board.pins.map((entry, index) => ({
++    ...clonePinEntry(entry),
++    position: index,
++  }));
++}
++
++export function pinFailure(
++  reason: PinFailureReason,
++  extra: Omit<PinFailure, "ok" | "reason"> = {},
++): PinFailure {
++  return { ok: false, reason, ...extra };
++}
++
++export function findPinIndex(board: ChannelPinBoardRecord, messageId: string): number {
++  return board.pins.findIndex((entry) => entry.messageId === messageId);
++}
++
++export function isExactPermutation(currentIds: string[], nextIds: string[]): boolean {
++  if (currentIds.length !== nextIds.length) {
++    return false;
++  }
++  const counts = new Map<string, number>();
++  for (const id of currentIds) {
++    counts.set(id, (counts.get(id) ?? 0) + 1);
++  }
++  for (const id of nextIds) {
++    const left = counts.get(id);
++    if (!left) {
++      return false;
++    }
++    if (left === 1) {
++      counts.delete(id);
++    } else {
++      counts.set(id, left - 1);
++    }
++  }
++  return counts.size === 0;
++}
++
++export function atPinLimit(board: ChannelPinBoardRecord): boolean {
++  return board.pins.length >= MAX_CHANNEL_PINS;
++}
+diff --git a/packages/backend/src/services/pin_store.ts b/packages/backend/src/services/pin_store.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/pin_store.ts
+@@ -0,0 +1,56 @@
++import {
++  isChannelPinBoardRecord,
++  type ChannelPinBoardRecord,
++  type ChannelPinStore,
++} from "#ours/backend/services/pin_types.ts";
++import { cloneBoard } from "#ours/backend/services/pin_utils.ts";
++
++export class MemoryChannelPinStore implements ChannelPinStore {
++  private readonly boards = new Map<string, ChannelPinBoardRecord>();
++
++  async getBoard(channelId: string): Promise<ChannelPinBoardRecord | null> {
++    const board = this.boards.get(channelId);
++    return board ? cloneBoard(board) : null;
++  }
++
++  async putBoard(board: ChannelPinBoardRecord): Promise<void> {
++    if (!isChannelPinBoardRecord(board)) {
++      return;
++    }
++    this.boards.set(board.channelId, cloneBoard(board));
++  }
++
++  async compareAndSetBoard(
++    channelId: string,
++    expectedVersion: number | null,
++    board: ChannelPinBoardRecord,
++  ): Promise<boolean> {
++    if (!isChannelPinBoardRecord(board) || board.channelId !== channelId) {
++      return false;
++    }
++
++    const current = this.boards.get(channelId);
++    if (expectedVersion === null) {
++      if (current) {
++        return false;
++      }
++    } else if (!current || current.version !== expectedVersion) {
++      return false;
++    }
++
++    this.boards.set(channelId, cloneBoard(board));
++    return true;
++  }
++
++  clear(): void {
++    this.boards.clear();
++  }
++
++  size(): number {
++    return this.boards.size;
++  }
++}
++
++export function createMemoryChannelPinStore(): MemoryChannelPinStore {
++  return new MemoryChannelPinStore();
++}
+diff --git a/packages/backend/src/services/pin_policy.ts b/packages/backend/src/services/pin_policy.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/pin_policy.ts
+@@ -0,0 +1,23 @@
++import { MAX_CHANNEL_PINS } from "#ours/backend/services/pin_types.ts";
++
++export interface PinBoardPolicy {
++  maxPins: number;
++  maxNoteLength: number;
++}
++
++export const DEFAULT_PIN_BOARD_POLICY: PinBoardPolicy = {
++  maxPins: MAX_CHANNEL_PINS,
++  maxNoteLength: 120,
++};
++
++export function describePinPolicy(policy: PinBoardPolicy = DEFAULT_PIN_BOARD_POLICY): string {
++  return `max ${policy.maxPins} pins per channel; note <= ${policy.maxNoteLength}`;
++}
++
++export function canAcceptNewPin(currentCount: number, policy: PinBoardPolicy = DEFAULT_PIN_BOARD_POLICY): boolean {
++  return currentCount < policy.maxPins;
++}
++
++export function nextBoardVersion(currentVersion: number): number {
++  return currentVersion + 1;
++}
+diff --git a/packages/backend/src/services/pin_service.ts b/packages/backend/src/services/pin_service.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/pin_service.ts
+@@ -0,0 +1,322 @@
++import { createMemoryChannelPinStore } from "#ours/backend/services/pin_store.ts";
++import type {
++  ChannelPinBoardRecord,
++  ChannelPinEntry,
++  ChannelPinStore,
++  ChannelPinView,
++  ClearPinsResult,
++  PinClockOptions,
++  PinMessageOptions,
++  PinMessageResult,
++  ReorderPinsResult,
++  UnpinMessageResult,
++} from "#ours/backend/services/pin_types.ts";
++import {
++  atPinLimit,
++  emptyBoard,
++  findPinIndex,
++  isExactPermutation,
++  normalizeChannelId,
++  normalizeMessageId,
++  normalizePinNote,
++  normalizePinnedBy,
++  pinFailure,
++  readPinClock,
++  toPinViews,
++} from "#ours/backend/services/pin_utils.ts";
++import { nextBoardVersion } from "#ours/backend/services/pin_policy.ts";
++
++export class ChannelPinBoard {
++  private readonly store: ChannelPinStore;
++
++  constructor(store: ChannelPinStore = createMemoryChannelPinStore()) {
++    this.store = store;
++  }
++
++  private async loadBoard(channel: string): Promise<{
++    stored: ChannelPinBoardRecord | null;
++    current: ChannelPinBoardRecord;
++    expectedVersion: number | null;
++  }> {
++    const stored = await this.store.getBoard(channel);
++    if (stored) {
++      return { stored, current: stored, expectedVersion: stored.version };
++    }
++    return { stored: null, current: emptyBoard(channel, 0), expectedVersion: null };
++  }
++
++  async pinMessage(
++    channelId: string,
++    messageId: string,
++    pinnedBy: string,
++    options: PinMessageOptions = {},
++  ): Promise<PinMessageResult> {
++    const channel = normalizeChannelId(channelId);
++    if (!channel) {
++      return pinFailure("invalid_channel");
++    }
++
++    const message = normalizeMessageId(messageId);
++    if (!message) {
++      return pinFailure("invalid_message", { channelId: channel });
++    }
++
++    const actor = normalizePinnedBy(pinnedBy);
++    if (!actor) {
++      return pinFailure("invalid_actor", { channelId: channel, messageId: message });
++    }
++
++    const now = readPinClock(options.now);
++    const note = normalizePinNote(options.note);
++    const { current, expectedVersion } = await this.loadBoard(channel);
++    const existingIndex = findPinIndex(current, message);
++
++    const entry: ChannelPinEntry = {
++      messageId: message,
++      pinnedBy: actor,
++      pinnedAt: now,
++    };
++    if (note !== undefined) {
++      entry.note = note;
++    }
++
++    if (existingIndex >= 0) {
++      const next: ChannelPinBoardRecord = {
++        channelId: channel,
++        pins: current.pins.map((pin, index) => (index === existingIndex ? entry : pin)),
++        version: nextBoardVersion(current.version),
++      };
++      const swapped = await this.store.compareAndSetBoard(channel, expectedVersion, next);
++      if (!swapped) {
++        return this.pinMessage(channelId, messageId, pinnedBy, options);
++      }
++      return {
++        ok: true,
++        status: "refreshed",
++        channelId: channel,
++        messageId: message,
++        pinnedBy: actor,
++        pinnedAt: now,
++        position: existingIndex,
++        version: next.version,
++        ...(note !== undefined ? { note } : {}),
++      };
++    }
++
++    if (atPinLimit(current)) {
++      return pinFailure("pin_limit", { channelId: channel, messageId: message });
++    }
++
++    const next: ChannelPinBoardRecord = {
++      channelId: channel,
++      pins: [...current.pins, entry],
++      version: nextBoardVersion(current.version),
++    };
++
++    const created = await this.store.compareAndSetBoard(channel, expectedVersion, next);
++    if (!created) {
++      return this.pinMessage(channelId, messageId, pinnedBy, options);
++    }
++
++    return {
++      ok: true,
++      status: "pinned",
++      channelId: channel,
++      messageId: message,
++      pinnedBy: actor,
++      pinnedAt: now,
++      position: next.pins.length - 1,
++      version: next.version,
++      ...(note !== undefined ? { note } : {}),
++    };
++  }
++
++  async unpinMessage(
++    channelId: string,
++    messageId: string,
++    options: PinClockOptions = {},
++  ): Promise<UnpinMessageResult> {
++    const channel = normalizeChannelId(channelId);
++    if (!channel) {
++      return pinFailure("invalid_channel");
++    }
++
++    const message = normalizeMessageId(messageId);
++    if (!message) {
++      return pinFailure("invalid_message", { channelId: channel });
++    }
++
++    void options;
++    const current = await this.store.getBoard(channel);
++    if (!current) {
++      return pinFailure("not_found", { channelId: channel, messageId: message });
++    }
++
++    const index = findPinIndex(current, message);
++    if (index < 0) {
++      return pinFailure("not_found", { channelId: channel, messageId: message });
++    }
++
++    const next: ChannelPinBoardRecord = {
++      channelId: channel,
++      pins: current.pins.filter((_, i) => i !== index),
++      version: nextBoardVersion(current.version),
++    };
++
++    const swapped = await this.store.compareAndSetBoard(channel, current.version, next);
++    if (!swapped) {
++      return this.unpinMessage(channelId, messageId, options);
++    }
++
++    return {
++      ok: true,
++      channelId: channel,
++      messageId: message,
++      unpinned: true,
++      version: next.version,
++    };
++  }
++
++  async reorderPins(
++    channelId: string,
++    messageIds: string[],
++    options: PinClockOptions = {},
++  ): Promise<ReorderPinsResult> {
++    const channel = normalizeChannelId(channelId);
++    if (!channel) {
++      return pinFailure("invalid_channel");
++    }
++
++    void options;
++    const current = await this.store.getBoard(channel);
++    if (!current) {
++      return pinFailure("not_found", { channelId: channel });
++    }
++
++    const currentIds = current.pins.map((pin) => pin.messageId);
++    const normalizedIds = messageIds.map((id) => (typeof id === "string" ? id.trim() : ""));
++    if (normalizedIds.some((id) => id.length === 0) || !isExactPermutation(currentIds, normalizedIds)) {
++      return pinFailure("invalid_order", { channelId: channel });
++    }
++
++    const byId = new Map(current.pins.map((pin) => [pin.messageId, pin]));
++    const next: ChannelPinBoardRecord = {
++      channelId: channel,
++      pins: normalizedIds.map((id) => byId.get(id)!),
++      version: nextBoardVersion(current.version),
++    };
++
++    const swapped = await this.store.compareAndSetBoard(channel, current.version, next);
++    if (!swapped) {
++      return this.reorderPins(channelId, messageIds, options);
++    }
++
++    return {
++      ok: true,
++      channelId: channel,
++      messageIds: normalizedIds,
++      version: next.version,
++    };
++  }
++
++  async listPins(channelId: string): Promise<ChannelPinView[]> {
++    const channel = normalizeChannelId(channelId);
++    if (!channel) {
++      return [];
++    }
++    const board = await this.store.getBoard(channel);
++    return board ? toPinViews(board) : [];
++  }
++
++  async getPin(channelId: string, messageId: string): Promise<ChannelPinView | null> {
++    const channel = normalizeChannelId(channelId);
++    const message = normalizeMessageId(messageId);
++    if (!channel || !message) {
++      return null;
++    }
++    const board = await this.store.getBoard(channel);
++    if (!board) {
++      return null;
++    }
++    const index = findPinIndex(board, message);
++    if (index < 0) {
++      return null;
++    }
++    const entry = board.pins[index]!;
++    return { ...entry, position: index };
++  }
++
++  async clearPins(channelId: string, options: PinClockOptions = {}): Promise<ClearPinsResult> {
++    const channel = normalizeChannelId(channelId);
++    if (!channel) {
++      return pinFailure("invalid_channel");
++    }
++
++    void options;
++    const current = await this.store.getBoard(channel);
++    if (!current) {
++      return { ok: true, channelId: channel, cleared: 0, version: 0 };
++    }
++
++    const cleared = current.pins.length;
++    const next = emptyBoard(channel, nextBoardVersion(current.version));
++    const swapped = await this.store.compareAndSetBoard(channel, current.version, next);
++    if (!swapped) {
++      return this.clearPins(channelId, options);
++    }
++
++    return { ok: true, channelId: channel, cleared, version: next.version };
++  }
++}
++
++export function createChannelPinBoard(store?: ChannelPinStore): ChannelPinBoard {
++  return new ChannelPinBoard(store ?? createMemoryChannelPinStore());
++}
++
++export async function pinMessage(
++  channelId: string,
++  messageId: string,
++  pinnedBy: string,
++  options: PinMessageOptions = {},
++  store?: ChannelPinStore,
++): Promise<PinMessageResult> {
++  return createChannelPinBoard(store).pinMessage(channelId, messageId, pinnedBy, options);
++}
++
++export async function unpinMessage(
++  channelId: string,
++  messageId: string,
++  options: PinClockOptions = {},
++  store?: ChannelPinStore,
++): Promise<UnpinMessageResult> {
++  return createChannelPinBoard(store).unpinMessage(channelId, messageId, options);
++}
++
++export async function reorderPins(
++  channelId: string,
++  messageIds: string[],
++  options: PinClockOptions = {},
++  store?: ChannelPinStore,
++): Promise<ReorderPinsResult> {
++  return createChannelPinBoard(store).reorderPins(channelId, messageIds, options);
++}
++
++export async function listPins(channelId: string, store?: ChannelPinStore): Promise<ChannelPinView[]> {
++  return createChannelPinBoard(store).listPins(channelId);
++}
++
++export async function getPin(
++  channelId: string,
++  messageId: string,
++  store?: ChannelPinStore,
++): Promise<ChannelPinView | null> {
++  return createChannelPinBoard(store).getPin(channelId, messageId);
++}
++
++export async function clearPins(
++  channelId: string,
++  options: PinClockOptions = {},
++  store?: ChannelPinStore,
++): Promise<ClearPinsResult> {
++  return createChannelPinBoard(store).clearPins(channelId, options);
++}
+diff --git a/packages/backend/src/services/pins.ts b/packages/backend/src/services/pins.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/pins.ts
+@@ -0,0 +1,60 @@
++export {
++  ChannelPinBoard,
++  clearPins,
++  createChannelPinBoard,
++  getPin,
++  listPins,
++  pinMessage,
++  reorderPins,
++  unpinMessage,
++} from "#ours/backend/services/pin_service.ts";
++
++export {
++  MemoryChannelPinStore,
++  createMemoryChannelPinStore,
++} from "#ours/backend/services/pin_store.ts";
++
++export {
++  MAX_CHANNEL_PINS,
++  PIN_FAILURE_REASONS,
++  PIN_STATUSES,
++  isChannelPinBoardRecord,
++  isChannelPinEntry,
++  type ChannelPinBoardRecord,
++  type ChannelPinEntry,
++  type ChannelPinStore,
++  type ChannelPinView,
++  type ClearPinsResult,
++  type PinClockOptions,
++  type PinFailure,
++  type PinFailureReason,
++  type PinMessageOptions,
++  type PinMessageResult,
++  type PinSuccess,
++  type ReorderPinsResult,
++  type UnpinMessageResult,
++} from "#ours/backend/services/pin_types.ts";
++
++export {
++  DEFAULT_PIN_BOARD_POLICY,
++  canAcceptNewPin,
++  describePinPolicy,
++  nextBoardVersion,
++  type PinBoardPolicy,
++} from "#ours/backend/services/pin_policy.ts";
++
++export {
++  atPinLimit,
++  cloneBoard,
++  clonePinEntry,
++  emptyBoard,
++  findPinIndex,
++  isExactPermutation,
++  normalizeChannelId,
++  normalizeMessageId,
++  normalizePinNote,
++  normalizePinnedBy,
++  pinFailure,
++  readPinClock,
++  toPinViews,
++} from "#ours/backend/services/pin_utils.ts";

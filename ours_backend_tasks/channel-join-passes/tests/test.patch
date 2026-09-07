@@ -1,0 +1,800 @@
+diff --git a/packages/backend/src/gold_tests/join_pass_issue.test.ts b/packages/backend/src/gold_tests/join_pass_issue.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/join_pass_issue.test.ts
+@@ -0,0 +1,128 @@
++import { describe, expect, it } from "vitest";
++import {
++  DEFAULT_JOIN_PASS_TTL_SECONDS,
++  MAX_JOIN_PASS_TTL_SECONDS,
++  MIN_JOIN_PASS_TTL_SECONDS,
++  JoinPassService,
++  MemoryJoinPassStore,
++  issueJoinPass,
++  isValidPassIdShape,
++} from "#ours/backend/services/join_passes.ts";
++
++const NOW = 1_700_000_000_000;
++
++const service = () => new JoinPassService(new MemoryJoinPassStore());
++
++describe("Join pass issue", () => {
++  it("issues a pass with the default ttl", async () => {
++    const result = await service().issueJoinPass("room-1", "host-1", {
++      now: NOW,
++      createPassId: () => "pass_0123456789abcdef",
++    });
++    expect(result).toEqual({
++      ok: true,
++      passId: "pass_0123456789abcdef",
++      channelId: "room-1",
++      issuerId: "host-1",
++      createdAt: NOW,
++      expiresAt: NOW + DEFAULT_JOIN_PASS_TTL_SECONDS * 1000,
++      remainingSeconds: DEFAULT_JOIN_PASS_TTL_SECONDS,
++    });
++  });
++
++  it("keeps channel id case and trims issuer id", async () => {
++    const result = await service().issueJoinPass("  Room:West  ", "  Host-1  ", {
++      now: NOW,
++      createPassId: () => "pass_aaaaaaaaaaaaaaaa",
++    });
++    expect(result).toMatchObject({ ok: true, channelId: "Room:West", issuerId: "Host-1" });
++  });
++
++  it("uses the default ttl when the requested ttl is not finite", async () => {
++    const result = await service().issueJoinPass("room-1", "host-1", {
++      now: NOW,
++      ttlSeconds: Number.NaN,
++      createPassId: () => "pass_bbbbbbbbbbbbbbbb",
++    });
++    expect(result).toMatchObject({ remainingSeconds: DEFAULT_JOIN_PASS_TTL_SECONDS });
++  });
++
++  it("truncates a fractional ttl before clamping", async () => {
++    const result = await service().issueJoinPass("room-1", "host-1", {
++      now: NOW,
++      ttlSeconds: 45.9,
++      createPassId: () => "pass_cccccccccccccccc",
++    });
++    expect(result).toMatchObject({ remainingSeconds: 45 });
++  });
++
++  it("clamps a ttl below the minimum to thirty seconds", async () => {
++    const result = await service().issueJoinPass("room-1", "host-1", {
++      now: NOW,
++      ttlSeconds: 5,
++      createPassId: () => "pass_dddddddddddddddd",
++    });
++    expect(result).toMatchObject({ remainingSeconds: MIN_JOIN_PASS_TTL_SECONDS });
++  });
++
++  it("clamps a ttl above the maximum to six hundred seconds", async () => {
++    const result = await service().issueJoinPass("room-1", "host-1", {
++      now: NOW,
++      ttlSeconds: 9_000,
++      createPassId: () => "pass_eeeeeeeeeeeeeeee",
++    });
++    expect(result).toMatchObject({ remainingSeconds: MAX_JOIN_PASS_TTL_SECONDS });
++  });
++
++  it("creates a pass id shaped like pass_ plus sixteen hex digits by default", async () => {
++    const result = await service().issueJoinPass("room-1", "host-1", { now: NOW });
++    expect(result.ok).toBe(true);
++    if (result.ok) {
++      expect(isValidPassIdShape(result.passId)).toBe(true);
++    }
++  });
++
++  it("stores an optional trimmed note", async () => {
++    const result = await service().issueJoinPass("room-1", "host-1", {
++      now: NOW,
++      note: "  guest seat  ",
++      createPassId: () => "pass_ffffffffffffffff",
++    });
++    expect(result).toMatchObject({ note: "guest seat" });
++  });
++
++  it("rejects an empty channel id", async () => {
++    await expect(service().issueJoinPass("   ", "host-1", { now: NOW })).resolves.toEqual({
++      ok: false,
++      reason: "invalid_channel",
++    });
++  });
++
++  it("rejects a blank issuer id", async () => {
++    await expect(service().issueJoinPass("room-1", "  ", { now: NOW })).resolves.toEqual({
++      ok: false,
++      reason: "invalid_issuer",
++      channelId: "room-1",
++    });
++  });
++
++  it("supports the issueJoinPass convenience function", async () => {
++    const store = new MemoryJoinPassStore();
++    const result = await issueJoinPass(
++      "room-1",
++      "host-1",
++      { now: NOW, createPassId: () => "pass_1111111111111111" },
++      store,
++    );
++    expect(result).toMatchObject({ ok: true, passId: "pass_1111111111111111" });
++  });
++
++  it("clamps a negative ttl up to thirty seconds", async () => {
++    const result = await service().issueJoinPass("room-1", "host-1", {
++      now: NOW,
++      ttlSeconds: -20,
++      createPassId: () => "pass_2222222222222222",
++    });
++    expect(result).toMatchObject({ remainingSeconds: MIN_JOIN_PASS_TTL_SECONDS });
++  });
++});
+diff --git a/packages/backend/src/gold_tests/join_pass_consume_revoke.test.ts b/packages/backend/src/gold_tests/join_pass_consume_revoke.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/join_pass_consume_revoke.test.ts
+@@ -0,0 +1,162 @@
++import { describe, expect, it } from "vitest";
++import {
++  JoinPassService,
++  MemoryJoinPassStore,
++  consumeJoinPass,
++  getJoinPass,
++  revokeJoinPass,
++} from "#ours/backend/services/join_passes.ts";
++
++const NOW = 1_700_000_000_000;
++
++const service = () => new JoinPassService(new MemoryJoinPassStore());
++
++async function issue(
++  passes: JoinPassService,
++  passId = "pass_0123456789abcdef",
++  ttlSeconds = 120,
++) {
++  return passes.issueJoinPass("room-1", "host-1", {
++    now: NOW,
++    ttlSeconds,
++    createPassId: () => passId,
++  });
++}
++
++describe("Join pass consume and revoke", () => {
++  it("consumes a live pass exactly once", async () => {
++    const passes = service();
++    await issue(passes);
++    await expect(passes.consumeJoinPass("pass_0123456789abcdef", "guest-1", { now: NOW + 1_000 })).resolves.toEqual({
++      ok: true,
++      passId: "pass_0123456789abcdef",
++      channelId: "room-1",
++      consumedBy: "guest-1",
++      consumedAt: NOW + 1_000,
++    });
++    await expect(passes.consumeJoinPass("pass_0123456789abcdef", "guest-2", { now: NOW + 2_000 })).resolves.toEqual({
++      ok: false,
++      reason: "already_consumed",
++      passId: "pass_0123456789abcdef",
++      channelId: "room-1",
++    });
++  });
++
++  it("reports not_found for a missing pass", async () => {
++    await expect(service().consumeJoinPass("pass_missingmissing", "guest-1", { now: NOW })).resolves.toEqual({
++      ok: false,
++      reason: "not_found",
++      passId: "pass_missingmissing",
++    });
++  });
++
++  it("reports expired when consuming after the ttl", async () => {
++    const passes = service();
++    await issue(passes, "pass_aaaaaaaaaaaaaaaa", 30);
++    await expect(
++      passes.consumeJoinPass("pass_aaaaaaaaaaaaaaaa", "guest-1", { now: NOW + 30_000 }),
++    ).resolves.toEqual({
++      ok: false,
++      reason: "expired",
++      passId: "pass_aaaaaaaaaaaaaaaa",
++      channelId: "room-1",
++    });
++  });
++
++  it("lets only the issuer revoke a live pass", async () => {
++    const passes = service();
++    await issue(passes);
++    await expect(passes.revokeJoinPass("pass_0123456789abcdef", "other", { now: NOW + 1 })).resolves.toEqual({
++      ok: false,
++      reason: "issuer_mismatch",
++      passId: "pass_0123456789abcdef",
++      channelId: "room-1",
++    });
++    await expect(passes.revokeJoinPass("pass_0123456789abcdef", "host-1", { now: NOW + 1 })).resolves.toEqual({
++      ok: true,
++      passId: "pass_0123456789abcdef",
++      channelId: "room-1",
++      revoked: true,
++    });
++  });
++
++  it("does not allow consume after revoke", async () => {
++    const passes = service();
++    await issue(passes);
++    await passes.revokeJoinPass("pass_0123456789abcdef", "host-1", { now: NOW + 1 });
++    await expect(passes.consumeJoinPass("pass_0123456789abcdef", "guest-1", { now: NOW + 2 })).resolves.toEqual({
++      ok: false,
++      reason: "not_found",
++      passId: "pass_0123456789abcdef",
++      channelId: "room-1",
++    });
++  });
++
++  it("rejects consume for invalid pass or consumer", async () => {
++    const passes = service();
++    await expect(passes.consumeJoinPass("  ", "guest-1")).resolves.toEqual({
++      ok: false,
++      reason: "invalid_pass",
++    });
++    await expect(passes.consumeJoinPass("pass_0123456789abcdef", " ")).resolves.toEqual({
++      ok: false,
++      reason: "invalid_consumer",
++      passId: "pass_0123456789abcdef",
++    });
++  });
++
++  it("rejects revoke for invalid pass or issuer", async () => {
++    const passes = service();
++    await expect(passes.revokeJoinPass("  ", "host-1")).resolves.toEqual({
++      ok: false,
++      reason: "invalid_pass",
++    });
++    await expect(passes.revokeJoinPass("pass_0123456789abcdef", " ")).resolves.toEqual({
++      ok: false,
++      reason: "invalid_issuer",
++      passId: "pass_0123456789abcdef",
++    });
++  });
++
++  it("returns the public view from getJoinPass", async () => {
++    const passes = service();
++    await issue(passes);
++    await expect(passes.getJoinPass("pass_0123456789abcdef", { now: NOW + 5_000 })).resolves.toMatchObject({
++      passId: "pass_0123456789abcdef",
++      status: "issued",
++      remainingSeconds: 115,
++    });
++  });
++
++  it("marks a consumed pass in getJoinPass", async () => {
++    const passes = service();
++    await issue(passes);
++    await passes.consumeJoinPass("pass_0123456789abcdef", "guest-1", { now: NOW + 1_000 });
++    await expect(passes.getJoinPass("pass_0123456789abcdef", { now: NOW + 2_000 })).resolves.toMatchObject({
++      status: "consumed",
++      consumedBy: "guest-1",
++    });
++  });
++
++  it("supports the consume revoke and get convenience functions", async () => {
++    const store = new MemoryJoinPassStore();
++    const passes = new JoinPassService(store);
++    await passes.issueJoinPass("room-1", "host-1", {
++      now: NOW,
++      createPassId: () => "pass_cccccccccccccccc",
++    });
++    await expect(getJoinPass("pass_cccccccccccccccc", { now: NOW }, store)).resolves.toMatchObject({
++      status: "issued",
++    });
++    await expect(consumeJoinPass("pass_cccccccccccccccc", "guest-1", { now: NOW + 1 }, store)).resolves.toMatchObject({
++      ok: true,
++    });
++    await passes.issueJoinPass("room-1", "host-1", {
++      now: NOW,
++      createPassId: () => "pass_dddddddddddddddd",
++    });
++    await expect(revokeJoinPass("pass_dddddddddddddddd", "host-1", { now: NOW + 1 }, store)).resolves.toMatchObject({
++      revoked: true,
++    });
++  });
++});
+diff --git a/packages/backend/src/gold_tests/join_pass_list_and_sweep.test.ts b/packages/backend/src/gold_tests/join_pass_list_and_sweep.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/join_pass_list_and_sweep.test.ts
+@@ -0,0 +1,151 @@
++import { describe, expect, it } from "vitest";
++import {
++  JoinPassService,
++  MemoryJoinPassStore,
++  listJoinPasses,
++  sweepExpiredJoinPasses,
++} from "#ours/backend/services/join_passes.ts";
++
++const NOW = 1_700_000_000_000;
++
++const service = () => new JoinPassService(new MemoryJoinPassStore());
++
++describe("Join pass lists and sweep", () => {
++  it("lists passes for a channel sorted by pass id", async () => {
++    const passes = service();
++    await passes.issueJoinPass("room-1", "host-1", {
++      now: NOW,
++      createPassId: () => "pass_bbbbbbbbbbbbbbbb",
++    });
++    await passes.issueJoinPass("room-1", "host-1", {
++      now: NOW,
++      createPassId: () => "pass_aaaaaaaaaaaaaaaa",
++    });
++    const listed = await passes.listJoinPasses("room-1", { now: NOW });
++    expect(listed.map((row) => row.passId)).toEqual(["pass_aaaaaaaaaaaaaaaa", "pass_bbbbbbbbbbbbbbbb"]);
++  });
++
++  it("returns an empty list for an invalid channel id", async () => {
++    await expect(service().listJoinPasses("   ", { now: NOW })).resolves.toEqual([]);
++  });
++
++  it("includes consumed and revoked rows in the channel list", async () => {
++    const passes = service();
++    await passes.issueJoinPass("room-1", "host-1", {
++      now: NOW,
++      createPassId: () => "pass_aaaaaaaaaaaaaaaa",
++    });
++    await passes.issueJoinPass("room-1", "host-1", {
++      now: NOW,
++      createPassId: () => "pass_bbbbbbbbbbbbbbbb",
++    });
++    await passes.consumeJoinPass("pass_aaaaaaaaaaaaaaaa", "guest-1", { now: NOW + 1 });
++    await passes.revokeJoinPass("pass_bbbbbbbbbbbbbbbb", "host-1", { now: NOW + 1 });
++    const listed = await passes.listJoinPasses("room-1", { now: NOW + 2 });
++    expect(listed.map((row) => row.status)).toEqual(["consumed", "revoked"]);
++  });
++
++  it("sweeps only expired unconsumed unreoked passes", async () => {
++    const passes = service();
++    await passes.issueJoinPass("room-1", "host-1", {
++      now: NOW,
++      ttlSeconds: 30,
++      createPassId: () => "pass_aaaaaaaaaaaaaaaa",
++    });
++    await passes.issueJoinPass("room-1", "host-1", {
++      now: NOW,
++      ttlSeconds: 120,
++      createPassId: () => "pass_bbbbbbbbbbbbbbbb",
++    });
++    await passes.issueJoinPass("room-1", "host-1", {
++      now: NOW,
++      ttlSeconds: 30,
++      createPassId: () => "pass_cccccccccccccccc",
++    });
++    await passes.consumeJoinPass("pass_cccccccccccccccc", "guest-1", { now: NOW + 1 });
++    await expect(passes.sweepExpiredJoinPasses("room-1", { now: NOW + 30_000 })).resolves.toEqual({
++      removed: 1,
++      passIds: ["pass_aaaaaaaaaaaaaaaa"],
++    });
++    await expect(passes.getJoinPass("pass_bbbbbbbbbbbbbbbb", { now: NOW + 30_000 })).resolves.toMatchObject({
++      status: "issued",
++    });
++    await expect(passes.getJoinPass("pass_cccccccccccccccc", { now: NOW + 30_000 })).resolves.toMatchObject({
++      status: "consumed",
++    });
++  });
++
++  it("sweeps across every channel when no channel is given", async () => {
++    const passes = service();
++    await passes.issueJoinPass("room-b", "host-1", {
++      now: NOW,
++      ttlSeconds: 30,
++      createPassId: () => "pass_bbbbbbbbbbbbbbbb",
++    });
++    await passes.issueJoinPass("room-a", "host-1", {
++      now: NOW,
++      ttlSeconds: 30,
++      createPassId: () => "pass_aaaaaaaaaaaaaaaa",
++    });
++    await expect(passes.sweepExpiredJoinPasses(undefined, { now: NOW + 30_000 })).resolves.toEqual({
++      removed: 2,
++      passIds: ["pass_aaaaaaaaaaaaaaaa", "pass_bbbbbbbbbbbbbbbb"],
++    });
++  });
++
++  it("returns a zero sweep for an invalid channel selection", async () => {
++    await expect(service().sweepExpiredJoinPasses("  ", { now: NOW })).resolves.toEqual({
++      removed: 0,
++      passIds: [],
++    });
++  });
++
++  it("floors remaining time and never goes negative", async () => {
++    const passes = service();
++    await passes.issueJoinPass("room-1", "host-1", {
++      now: NOW,
++      ttlSeconds: 30,
++      createPassId: () => "pass_aaaaaaaaaaaaaaaa",
++    });
++    const view = await passes.getJoinPass("pass_aaaaaaaaaaaaaaaa", { now: NOW + 29_400 });
++    expect(view?.remainingSeconds).toBe(0);
++  });
++
++  it("supports the list and sweep convenience functions", async () => {
++    const store = new MemoryJoinPassStore();
++    const passes = new JoinPassService(store);
++    await passes.issueJoinPass("room-1", "host-1", {
++      now: NOW,
++      createPassId: () => "pass_aaaaaaaaaaaaaaaa",
++    });
++    await expect(listJoinPasses("room-1", { now: NOW }, store)).resolves.toHaveLength(1);
++    await expect(sweepExpiredJoinPasses("room-1", { now: NOW }, store)).resolves.toEqual({
++      removed: 0,
++      passIds: [],
++    });
++  });
++
++  it("does not list passes from another channel", async () => {
++    const passes = service();
++    await passes.issueJoinPass("room-1", "host-1", {
++      now: NOW,
++      createPassId: () => "pass_aaaaaaaaaaaaaaaa",
++    });
++    await passes.issueJoinPass("room-2", "host-1", {
++      now: NOW,
++      createPassId: () => "pass_bbbbbbbbbbbbbbbb",
++    });
++    await expect(passes.listJoinPasses("room-1", { now: NOW })).resolves.toHaveLength(1);
++  });
++
++  it("keeps a live pass after a sweep that finds nothing expired", async () => {
++    const passes = service();
++    await passes.issueJoinPass("room-1", "host-1", {
++      now: NOW,
++      ttlSeconds: 120,
++      createPassId: () => "pass_aaaaaaaaaaaaaaaa",
++    });
++    await passes.sweepExpiredJoinPasses("room-1", { now: NOW + 10_000 });
++    await expect(passes.listJoinPasses("room-1", { now: NOW + 10_000 })).resolves.toHaveLength(1);
++  });
++});
+diff --git a/packages/backend/src/gold_tests/join_pass_edge_behavior.test.ts b/packages/backend/src/gold_tests/join_pass_edge_behavior.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/join_pass_edge_behavior.test.ts
+@@ -0,0 +1,106 @@
++import { describe, expect, it } from "vitest";
++import {
++  JoinPassService,
++  MemoryJoinPassStore,
++  createJoinPassService,
++} from "#ours/backend/services/join_passes.ts";
++
++const NOW = 1_700_000_000_000;
++
++describe("Join pass extra edges", () => {
++  it("keeps colons inside a trimmed channel id", async () => {
++    const passes = createJoinPassService(new MemoryJoinPassStore());
++    const result = await passes.issueJoinPass("  team:west  ", "host-1", {
++      now: NOW,
++      createPassId: () => "pass_aaaaaaaaaaaaaaaa",
++    });
++    expect(result).toMatchObject({ ok: true, channelId: "team:west" });
++  });
++
++  it("trims a note before storing it", async () => {
++    const passes = createJoinPassService(new MemoryJoinPassStore());
++    const result = await passes.issueJoinPass("room-1", "host-1", {
++      now: NOW,
++      note: "  vip  ",
++      createPassId: () => "pass_bbbbbbbbbbbbbbbb",
++    });
++    expect(result).toMatchObject({ note: "vip" });
++  });
++
++  it("drops a blank note", async () => {
++    const passes = createJoinPassService(new MemoryJoinPassStore());
++    const result = await passes.issueJoinPass("room-1", "host-1", {
++      now: NOW,
++      note: "   ",
++      createPassId: () => "pass_cccccccccccccccc",
++    });
++    expect(result.ok).toBe(true);
++    expect(result).not.toHaveProperty("note");
++  });
++
++  it("reports expired when revoking after the ttl", async () => {
++    const passes = createJoinPassService(new MemoryJoinPassStore());
++    await passes.issueJoinPass("room-1", "host-1", {
++      now: NOW,
++      ttlSeconds: 30,
++      createPassId: () => "pass_dddddddddddddddd",
++    });
++    await expect(
++      passes.revokeJoinPass("pass_dddddddddddddddd", "host-1", { now: NOW + 30_000 }),
++    ).resolves.toMatchObject({ reason: "expired" });
++  });
++
++  it("reports already_consumed when revoking a consumed pass", async () => {
++    const passes = createJoinPassService(new MemoryJoinPassStore());
++    await passes.issueJoinPass("room-1", "host-1", {
++      now: NOW,
++      createPassId: () => "pass_eeeeeeeeeeeeeeee",
++    });
++    await passes.consumeJoinPass("pass_eeeeeeeeeeeeeeee", "guest-1", { now: NOW + 1 });
++    await expect(
++      passes.revokeJoinPass("pass_eeeeeeeeeeeeeeee", "host-1", { now: NOW + 2 }),
++    ).resolves.toMatchObject({ reason: "already_consumed" });
++  });
++
++  it("returns null from getJoinPass for an invalid pass id", async () => {
++    const passes = createJoinPassService(new MemoryJoinPassStore());
++    await expect(passes.getJoinPass("  ", { now: NOW })).resolves.toBeNull();
++  });
++
++  it("lets exactly one consumer win when two consume the same pass", async () => {
++    const store = new MemoryJoinPassStore();
++    const passes = createJoinPassService(store);
++    await passes.issueJoinPass("room-1", "host-1", {
++      now: NOW,
++      createPassId: () => "pass_ffffffffffffffff",
++    });
++    const first = passes.consumeJoinPass("pass_ffffffffffffffff", "guest-a", { now: NOW + 1 });
++    const second = passes.consumeJoinPass("pass_ffffffffffffffff", "guest-b", { now: NOW + 1 });
++    const results = await Promise.all([first, second]);
++    const winners = results.filter((row) => row.ok);
++    const losers = results.filter((row) => !row.ok);
++    expect(winners).toHaveLength(1);
++    expect(losers).toHaveLength(1);
++    expect(losers[0]).toMatchObject({ reason: "already_consumed" });
++  });
++
++  it("can construct the service through createJoinPassService", async () => {
++    const store = new MemoryJoinPassStore();
++    const passes = createJoinPassService(store);
++    expect(passes).toBeInstanceOf(JoinPassService);
++    await expect(passes.listJoinPasses("room-1", { now: NOW })).resolves.toEqual([]);
++  });
++
++  it("marks status expired in getJoinPass after the ttl without sweeping", async () => {
++    const passes = createJoinPassService(new MemoryJoinPassStore());
++    await passes.issueJoinPass("room-1", "host-1", {
++      now: NOW,
++      ttlSeconds: 30,
++      createPassId: () => "pass_9999999999999999",
++    });
++    await expect(passes.getJoinPass("pass_9999999999999999", { now: NOW + 30_000 })).resolves.toMatchObject({
++      status: "expired",
++      remainingSeconds: 0,
++    });
++  });
++});
+diff --git a/packages/backend/src/gold_tests/p2p_constants_compat.test.ts b/packages/backend/src/gold_tests/p2p_constants_compat.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/p2p_constants_compat.test.ts
+@@ -0,0 +1,32 @@
++import { describe, expect, it } from "vitest";
++import { CHAT_CHANNEL_ROLES, CHAT_REACTIONS, CHAT_USER_TYPES } from "#ours/backend/constants/index.ts";
++
++describe("Existing chat constants", () => {
++  it("keeps HEART mapped to HEART", () => expect(CHAT_REACTIONS.HEART).toBe("HEART"));
++  it("keeps HANDS_UP mapped to HANDS_UP", () => expect(CHAT_REACTIONS.HANDS_UP).toBe("HANDS_UP"));
++  it("keeps FIRE mapped to FIRE", () => expect(CHAT_REACTIONS.FIRE).toBe("FIRE"));
++  it("keeps MUSIC mapped to MUSIC", () => expect(CHAT_REACTIONS.MUSIC).toBe("MUSIC"));
++  it("keeps SURPRISED mapped to SURPRISED", () => expect(CHAT_REACTIONS.SURPRISED).toBe("SURPRISED"));
++  it("keeps exactly five supported reaction keys", () => {
++    expect(Object.keys(CHAT_REACTIONS).sort()).toEqual(["FIRE", "HANDS_UP", "HEART", "MUSIC", "SURPRISED"]);
++  });
++  it("keeps reaction values unique", () => expect(new Set(Object.values(CHAT_REACTIONS)).size).toBe(5));
++  it("keeps TEMPORARY mapped to temporary", () => expect(CHAT_USER_TYPES.TEMPORARY).toBe("temporary"));
++  it("keeps REGULAR mapped to regular", () => expect(CHAT_USER_TYPES.REGULAR).toBe("regular"));
++  it("keeps ARTIST mapped to artist", () => expect(CHAT_USER_TYPES.ARTIST).toBe("artist"));
++  it("keeps ADMIN mapped to admin", () => expect(CHAT_USER_TYPES.ADMIN).toBe("admin"));
++  it("keeps MODERATOR mapped to moderator", () => expect(CHAT_USER_TYPES.MODERATOR).toBe("moderator"));
++  it("keeps ANONYMOUS mapped to anonymous", () => expect(CHAT_USER_TYPES.ANONYMOUS).toBe("anonymous"));
++  it("keeps exactly six user types", () => expect(Object.keys(CHAT_USER_TYPES)).toHaveLength(6));
++  it("keeps user type values unique", () => expect(new Set(Object.values(CHAT_USER_TYPES)).size).toBe(6));
++  it("keeps every user type value lowercase", () => {
++    expect(Object.values(CHAT_USER_TYPES).every((value) => value === value.toLowerCase())).toBe(true);
++  });
++  it("keeps OWNER mapped to owner", () => expect(CHAT_CHANNEL_ROLES.OWNER).toBe("owner"));
++  it("keeps VIEWER mapped to viewer", () => expect(CHAT_CHANNEL_ROLES.VIEWER).toBe("viewer"));
++  it("keeps exactly two channel roles", () => expect(Object.keys(CHAT_CHANNEL_ROLES)).toHaveLength(2));
++  it("keeps channel role values unique", () => expect(new Set(Object.values(CHAT_CHANNEL_ROLES)).size).toBe(2));
++  it("keeps channel role keys uppercase", () => {
++    expect(Object.keys(CHAT_CHANNEL_ROLES).every((key) => key === key.toUpperCase())).toBe(true);
++  });
++});
+diff --git a/packages/backend/src/gold_tests/p2p_input_validation_compat.test.ts b/packages/backend/src/gold_tests/p2p_input_validation_compat.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/p2p_input_validation_compat.test.ts
+@@ -0,0 +1,87 @@
++import { describe, expect, it } from "vitest";
++import { invalidNicknameMessage, isValidNickname } from "#ours/shared/inputValidation.ts";
++
++describe("isValidNickname", () => {
++  it("accepts a three character latin nickname", () => {
++    expect(isValidNickname("abc")).toBe(true);
++  });
++
++  it("accepts exactly twenty four characters", () => {
++    expect(isValidNickname("a".repeat(24))).toBe(true);
++  });
++
++  it("rejects two character nicknames", () => {
++    expect(isValidNickname("ab")).toBe(false);
++  });
++
++  it("rejects twenty five character nicknames", () => {
++    expect(isValidNickname("a".repeat(25))).toBe(false);
++  });
++
++  it("rejects the empty string", () => {
++    expect(isValidNickname("")).toBe(false);
++  });
++
++  it("accepts digits", () => {
++    expect(isValidNickname("user123")).toBe(true);
++  });
++
++  it("accepts non-latin letters", () => {
++    expect(isValidNickname("日本語")).toBe(true);
++  });
++
++  it("accepts accented letters", () => {
++    expect(isValidNickname("José")).toBe(true);
++  });
++
++  it("normalizes decomposed combining marks before validating", () => {
++    expect(isValidNickname("éric")).toBe(true);
++  });
++
++  it("accepts the period character", () => {
++    expect(isValidNickname("a.b.c")).toBe(true);
++  });
++
++  it("accepts the underscore character", () => {
++    expect(isValidNickname("a_b_c")).toBe(true);
++  });
++
++  it("accepts the hyphen character", () => {
++    expect(isValidNickname("a-b-c")).toBe(true);
++  });
++
++  it("rejects spaces", () => {
++    expect(isValidNickname("a b c")).toBe(false);
++  });
++
++  it("rejects emoji", () => {
++    expect(isValidNickname("abc\u{1f600}")).toBe(false);
++  });
++
++  it("rejects punctuation such as exclamation marks", () => {
++    expect(isValidNickname("abc!")).toBe(false);
++  });
++
++  it("rejects the at sign", () => {
++    expect(isValidNickname("a@bc")).toBe(false);
++  });
++
++  it("rejects forward slashes", () => {
++    expect(isValidNickname("a/bc")).toBe(false);
++  });
++
++  it("rejects leading and trailing whitespace around a valid core", () => {
++    expect(isValidNickname(" abc ")).toBe(false);
++  });
++});
++
++describe("invalidNicknameMessage", () => {
++  it("is a non-empty string", () => {
++    expect(typeof invalidNicknameMessage).toBe("string");
++    expect(invalidNicknameMessage.length).toBeGreaterThan(0);
++  });
++
++  it("mentions the allowed length range", () => {
++    expect(invalidNicknameMessage).toContain("3-24");
++  });
++});
+diff --git a/packages/backend/src/gold_tests/p2p_env_utils_compat.test.ts b/packages/backend/src/gold_tests/p2p_env_utils_compat.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/p2p_env_utils_compat.test.ts
+@@ -0,0 +1,56 @@
++import { beforeEach, describe, expect, it } from "vitest";
++import { checkEnvVar } from "#ours/backend/utils/env_utils.ts";
++
++const KEY = "OURS_TEST_ENV_UTILS_KEY";
++
++describe("checkEnvVar", () => {
++  beforeEach(() => {
++    delete process.env[KEY];
++  });
++
++  it("returns the raw value when the variable is set", () => {
++    process.env[KEY] = "hello";
++    expect(checkEnvVar(KEY)).toBe("hello");
++  });
++
++  it("returns values that contain spaces unchanged", () => {
++    process.env[KEY] = "  spaced value  ";
++    expect(checkEnvVar(KEY)).toBe("  spaced value  ");
++  });
++
++  it("returns numeric-looking values as strings", () => {
++    process.env[KEY] = "4000";
++    expect(checkEnvVar(KEY)).toBe("4000");
++  });
++
++  it("returns the default when the variable is missing", () => {
++    expect(checkEnvVar(KEY, "fallback")).toBe("fallback");
++  });
++
++  it("returns the default when the variable is an empty string", () => {
++    process.env[KEY] = "";
++    expect(checkEnvVar(KEY, "fallback")).toBe("fallback");
++  });
++
++  it("returns an empty-string default rather than throwing", () => {
++    expect(checkEnvVar(KEY, "")).toBe("");
++  });
++
++  it("prefers the real value over the default when both exist", () => {
++    process.env[KEY] = "real";
++    expect(checkEnvVar(KEY, "fallback")).toBe("real");
++  });
++
++  it("throws when the variable is missing and no default is given", () => {
++    expect(() => checkEnvVar(KEY)).toThrow(`process.env.${KEY} is not set`);
++  });
++
++  it("throws when the variable is an empty string and no default is given", () => {
++    process.env[KEY] = "";
++    expect(() => checkEnvVar(KEY)).toThrow(`process.env.${KEY} is not set`);
++  });
++
++  it("throws an Error instance", () => {
++    expect(() => checkEnvVar(KEY)).toThrow(Error);
++  });
++});
+diff --git a/packages/backend/src/gold_tests/p2p_gif_compat.test.ts b/packages/backend/src/gold_tests/p2p_gif_compat.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/p2p_gif_compat.test.ts
+@@ -0,0 +1,30 @@
++import { describe, expect, it } from "vitest";
++import { resolveGifByUrl } from "#ours/backend/services/gif_service.ts";
++
++describe("resolveGifByUrl", () => {
++  it("throws for an unsupported provider host", async () => {
++    await expect(resolveGifByUrl("https://example.com/cat.gif")).rejects.toThrow("Unsupported GIF provider");
++  });
++
++  it("throws for a malformed url", async () => {
++    await expect(resolveGifByUrl("not-a-url")).rejects.toThrow();
++  });
++
++  it("throws when a Giphy page url has no extractable id", async () => {
++    await expect(resolveGifByUrl("https://giphy.com/")).rejects.toThrow("Unable to extract Giphy id");
++  });
++
++  it("resolves a direct Giphy .gif url without a network call", async () => {
++    await expect(resolveGifByUrl("https://media.giphy.com/media/abc123/giphy.gif")).resolves.toMatchObject({
++      provider: "giphy",
++      url: "https://media.giphy.com/media/abc123/giphy.gif",
++    });
++  });
++
++  it("resolves a direct Tenor .gif url without a network call", async () => {
++    await expect(resolveGifByUrl("https://media.tenor.com/xyz987.gif")).resolves.toMatchObject({
++      provider: "tenor",
++      url: "https://media.tenor.com/xyz987.gif",
++    });
++  });
++});

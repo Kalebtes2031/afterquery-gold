@@ -1,0 +1,826 @@
+diff --git a/packages/backend/src/services/mute_types.ts b/packages/backend/src/services/mute_types.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/mute_types.ts
+@@ -0,0 +1,127 @@
++export const MIN_MUTE_SECONDS = 10;
++export const MAX_MUTE_SECONDS = 86_400;
++export const MAX_MUTE_REASON_LENGTH = 80;
++
++export const MUTE_APPLY_STATUSES = ["applied", "extended", "kept"] as const;
++export type MuteApplyStatus = (typeof MUTE_APPLY_STATUSES)[number];
++
++export const MUTE_FAILURE_REASONS = [
++  "invalid_channel",
++  "invalid_nickname",
++  "invalid_moderator",
++  "not_found",
++] as const;
++export type MuteFailureReason = (typeof MUTE_FAILURE_REASONS)[number];
++
++export interface ChannelMuteRecord {
++  channelId: string;
++  nickname: string;
++  moderatorId: string;
++  /** null means a permanent mute */
++  expiresAt: number | null;
++  mutedAt: number;
++  reason?: string;
++}
++
++export interface ChannelMuteView {
++  channelId: string;
++  nickname: string;
++  moderatorId: string;
++  expiresAt: number | null;
++  mutedAt: number;
++  remainingSeconds: number | null;
++  permanent: boolean;
++  expired: boolean;
++  reason?: string;
++}
++
++export interface MuteClockOptions {
++  now?: number;
++}
++
++export interface MuteUserOptions extends MuteClockOptions {
++  durationSeconds?: number;
++  reason?: string;
++}
++
++export interface ListChannelMutesOptions extends MuteClockOptions {
++  includeExpired?: boolean;
++}
++
++export interface MuteSuccess {
++  ok: true;
++  status: MuteApplyStatus;
++  channelId: string;
++  nickname: string;
++  moderatorId: string;
++  expiresAt: number | null;
++  remainingSeconds: number | null;
++  permanent: boolean;
++  reason?: string;
++}
++
++export interface MuteFailure {
++  ok: false;
++  reason: MuteFailureReason;
++  channelId?: string;
++  nickname?: string;
++}
++
++export type MuteUserResult = MuteSuccess | MuteFailure;
++
++export interface UnmuteSuccess {
++  ok: true;
++  channelId: string;
++  nickname: string;
++  unmuted: true;
++}
++
++export type UnmuteUserResult = UnmuteSuccess | MuteFailure;
++
++export interface MutedLookup {
++  muted: boolean;
++  remainingSeconds: number | null;
++  permanent: boolean;
++  record?: ChannelMuteView;
++}
++
++export interface MuteSweepResult {
++  removed: number;
++  channelIds: string[];
++}
++
++export interface ChannelMuteStore {
++  getMute(channelId: string, nickname: string): Promise<ChannelMuteRecord | null>;
++  putMute(record: ChannelMuteRecord): Promise<void>;
++  deleteMute(channelId: string, nickname: string): Promise<void>;
++  listMutes(channelId?: string): Promise<ChannelMuteRecord[]>;
++  compareAndSetMute(
++    channelId: string,
++    nickname: string,
++    expectedMutedAt: number | null,
++    record: ChannelMuteRecord,
++  ): Promise<boolean>;
++}
++
++export function isChannelMuteRecord(value: unknown): value is ChannelMuteRecord {
++  if (value === null || typeof value !== "object") {
++    return false;
++  }
++
++  const record = value as Partial<ChannelMuteRecord>;
++  const reasonOk = record.reason === undefined || (typeof record.reason === "string" && record.reason.length > 0);
++  const expiresOk =
++    record.expiresAt === null || (typeof record.expiresAt === "number" && Number.isFinite(record.expiresAt));
++  return (
++    typeof record.channelId === "string" &&
++    record.channelId.length > 0 &&
++    typeof record.nickname === "string" &&
++    record.nickname.length > 0 &&
++    typeof record.moderatorId === "string" &&
++    record.moderatorId.length > 0 &&
++    typeof record.mutedAt === "number" &&
++    Number.isFinite(record.mutedAt) &&
++    expiresOk &&
++    reasonOk
++  );
++}
+diff --git a/packages/backend/src/services/mute_utils.ts b/packages/backend/src/services/mute_utils.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/mute_utils.ts
+@@ -0,0 +1,134 @@
++import { isValidNickname } from "#ours/shared/inputValidation.ts";
++import {
++  MAX_MUTE_REASON_LENGTH,
++  MAX_MUTE_SECONDS,
++  MIN_MUTE_SECONDS,
++  type ChannelMuteRecord,
++  type ChannelMuteView,
++  type MuteFailure,
++  type MuteFailureReason,
++} from "#ours/backend/services/mute_types.ts";
++
++export function readMuteClock(now?: number): number {
++  if (typeof now === "number" && Number.isFinite(now)) {
++    return Math.trunc(now);
++  }
++  return Date.now();
++}
++
++export function isPermanentMute(record: ChannelMuteRecord): boolean {
++  return record.expiresAt === null;
++}
++
++export function isMuteExpired(record: ChannelMuteRecord, now: number): boolean {
++  if (record.expiresAt === null) {
++    return false;
++  }
++  return record.expiresAt <= now;
++}
++
++export function muteRemainingSeconds(expiresAt: number | null, now: number): number | null {
++  if (expiresAt === null) {
++    return null;
++  }
++  return Math.max(0, Math.floor((expiresAt - now) / 1000));
++}
++
++/** Missing or non-finite duration means permanent (null). Finite values are truncated and clamped. */
++export function resolveMuteExpiry(now: number, durationSeconds?: number): number | null {
++  if (typeof durationSeconds !== "number" || !Number.isFinite(durationSeconds)) {
++    return null;
++  }
++  const seconds = Math.min(MAX_MUTE_SECONDS, Math.max(MIN_MUTE_SECONDS, Math.trunc(durationSeconds)));
++  return now + seconds * 1000;
++}
++
++export function normalizeChannelId(channelId: string): string | null {
++  if (typeof channelId !== "string") {
++    return null;
++  }
++  const trimmed = channelId.trim();
++  return trimmed.length > 0 ? trimmed : null;
++}
++
++export function normalizeMuteNickname(nickname: string): string | null {
++  if (typeof nickname !== "string") {
++    return null;
++  }
++  const trimmed = nickname.trim();
++  if (!isValidNickname(trimmed)) {
++    return null;
++  }
++  return trimmed.normalize("NFC").toLowerCase();
++}
++
++export function normalizeModeratorId(moderatorId: string): string | null {
++  if (typeof moderatorId !== "string") {
++    return null;
++  }
++  const trimmed = moderatorId.trim();
++  return trimmed.length > 0 ? trimmed : null;
++}
++
++export function normalizeMuteReason(reason?: string): string | undefined {
++  if (typeof reason !== "string") {
++    return undefined;
++  }
++  const trimmed = reason.trim();
++  if (trimmed.length === 0) {
++    return undefined;
++  }
++  return trimmed.slice(0, MAX_MUTE_REASON_LENGTH);
++}
++
++export function toMuteView(record: ChannelMuteRecord, now: number): ChannelMuteView {
++  const permanent = isPermanentMute(record);
++  const expired = isMuteExpired(record, now);
++  const view: ChannelMuteView = {
++    channelId: record.channelId,
++    nickname: record.nickname,
++    moderatorId: record.moderatorId,
++    expiresAt: record.expiresAt,
++    mutedAt: record.mutedAt,
++    remainingSeconds: muteRemainingSeconds(record.expiresAt, now),
++    permanent,
++    expired,
++  };
++  if (record.reason !== undefined) {
++    view.reason = record.reason;
++  }
++  return view;
++}
++
++export function muteFailure(
++  reason: MuteFailureReason,
++  extra: Omit<MuteFailure, "ok" | "reason"> = {},
++): MuteFailure {
++  return { ok: false, reason, ...extra };
++}
++
++export function sortMuteViews(views: ChannelMuteView[]): ChannelMuteView[] {
++  return [...views].sort((left, right) => {
++    const channelOrder = left.channelId.localeCompare(right.channelId);
++    if (channelOrder !== 0) {
++      return channelOrder;
++    }
++    return left.nickname.localeCompare(right.nickname);
++  });
++}
++
++export function uniqueSortedIds(ids: Iterable<string>): string[] {
++  return [...new Set([...ids].filter((id) => id.length > 0))].sort((left, right) => left.localeCompare(right));
++}
++
++export function liveMute(record: ChannelMuteRecord | null, now: number): ChannelMuteRecord | null {
++  if (!record || isMuteExpired(record, now)) {
++    return null;
++  }
++  return record;
++}
++
++/** Effective ranking for extend comparisons: permanent outranks any timed expiry. */
++export function muteEffectiveExpiry(record: ChannelMuteRecord): number {
++  return record.expiresAt === null ? Number.POSITIVE_INFINITY : record.expiresAt;
++}
+diff --git a/packages/backend/src/services/mute_store.ts b/packages/backend/src/services/mute_store.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/mute_store.ts
+@@ -0,0 +1,85 @@
++import {
++  isChannelMuteRecord,
++  type ChannelMuteRecord,
++  type ChannelMuteStore,
++} from "#ours/backend/services/mute_types.ts";
++
++const muteKey = (channelId: string, nickname: string) => `${channelId}\u0000${nickname}`;
++
++const cloneMute = (record: ChannelMuteRecord): ChannelMuteRecord => {
++  const copy: ChannelMuteRecord = {
++    channelId: record.channelId,
++    nickname: record.nickname,
++    moderatorId: record.moderatorId,
++    expiresAt: record.expiresAt,
++    mutedAt: record.mutedAt,
++  };
++  if (record.reason !== undefined) {
++    copy.reason = record.reason;
++  }
++  return copy;
++};
++
++export class MemoryChannelMuteStore implements ChannelMuteStore {
++  private readonly records = new Map<string, ChannelMuteRecord>();
++
++  async getMute(channelId: string, nickname: string): Promise<ChannelMuteRecord | null> {
++    const record = this.records.get(muteKey(channelId, nickname));
++    return record ? cloneMute(record) : null;
++  }
++
++  async putMute(record: ChannelMuteRecord): Promise<void> {
++    if (!isChannelMuteRecord(record)) {
++      return;
++    }
++    this.records.set(muteKey(record.channelId, record.nickname), cloneMute(record));
++  }
++
++  async deleteMute(channelId: string, nickname: string): Promise<void> {
++    this.records.delete(muteKey(channelId, nickname));
++  }
++
++  async listMutes(channelId?: string): Promise<ChannelMuteRecord[]> {
++    const rows = [...this.records.values()].map(cloneMute);
++    if (channelId === undefined) {
++      return rows;
++    }
++    return rows.filter((record) => record.channelId === channelId);
++  }
++
++  async compareAndSetMute(
++    channelId: string,
++    nickname: string,
++    expectedMutedAt: number | null,
++    record: ChannelMuteRecord,
++  ): Promise<boolean> {
++    if (!isChannelMuteRecord(record) || record.channelId !== channelId || record.nickname !== nickname) {
++      return false;
++    }
++
++    const key = muteKey(channelId, nickname);
++    const current = this.records.get(key);
++    if (expectedMutedAt === null) {
++      if (current) {
++        return false;
++      }
++    } else if (!current || current.mutedAt !== expectedMutedAt) {
++      return false;
++    }
++
++    this.records.set(key, cloneMute(record));
++    return true;
++  }
++
++  clear(): void {
++    this.records.clear();
++  }
++
++  size(): number {
++    return this.records.size;
++  }
++}
++
++export function createMemoryChannelMuteStore(): MemoryChannelMuteStore {
++  return new MemoryChannelMuteStore();
++}
+diff --git a/packages/backend/src/services/mute_policy.ts b/packages/backend/src/services/mute_policy.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/mute_policy.ts
+@@ -0,0 +1,35 @@
++import {
++  MAX_MUTE_REASON_LENGTH,
++  MAX_MUTE_SECONDS,
++  MIN_MUTE_SECONDS,
++  type ChannelMuteRecord,
++} from "#ours/backend/services/mute_types.ts";
++import { muteEffectiveExpiry } from "#ours/backend/services/mute_utils.ts";
++
++export interface MuteDurationPolicy {
++  minSeconds: number;
++  maxSeconds: number;
++  maxReasonLength: number;
++}
++
++export const DEFAULT_MUTE_DURATION_POLICY: MuteDurationPolicy = {
++  minSeconds: MIN_MUTE_SECONDS,
++  maxSeconds: MAX_MUTE_SECONDS,
++  maxReasonLength: MAX_MUTE_REASON_LENGTH,
++};
++
++export function resolveTimedMuteSeconds(
++  durationSeconds: number,
++  policy: MuteDurationPolicy = DEFAULT_MUTE_DURATION_POLICY,
++): number {
++  return Math.min(policy.maxSeconds, Math.max(policy.minSeconds, Math.trunc(durationSeconds)));
++}
++
++export function shouldExtendMute(current: ChannelMuteRecord, nextExpiresAt: number | null): boolean {
++  const nextRank = nextExpiresAt === null ? Number.POSITIVE_INFINITY : nextExpiresAt;
++  return nextRank > muteEffectiveExpiry(current);
++}
++
++export function describeMutePolicy(policy: MuteDurationPolicy = DEFAULT_MUTE_DURATION_POLICY): string {
++  return `mute timed ${policy.minSeconds}-${policy.maxSeconds}s or permanent; reason <= ${policy.maxReasonLength}`;
++}
+diff --git a/packages/backend/src/services/mute_service.ts b/packages/backend/src/services/mute_service.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/mute_service.ts
+@@ -0,0 +1,344 @@
++import { createMemoryChannelMuteStore } from "#ours/backend/services/mute_store.ts";
++import type {
++  ChannelMuteRecord,
++  ChannelMuteStore,
++  ChannelMuteView,
++  ListChannelMutesOptions,
++  MuteClockOptions,
++  MuteSweepResult,
++  MuteUserOptions,
++  MuteUserResult,
++  MutedLookup,
++  UnmuteUserResult,
++} from "#ours/backend/services/mute_types.ts";
++import {
++  liveMute,
++  muteEffectiveExpiry,
++  muteFailure,
++  muteRemainingSeconds,
++  normalizeChannelId,
++  normalizeModeratorId,
++  normalizeMuteNickname,
++  normalizeMuteReason,
++  readMuteClock,
++  resolveMuteExpiry,
++  sortMuteViews,
++  toMuteView,
++  uniqueSortedIds,
++} from "#ours/backend/services/mute_utils.ts";
++
++export class ChannelMuteLedger {
++  private readonly store: ChannelMuteStore;
++
++  constructor(store: ChannelMuteStore = createMemoryChannelMuteStore()) {
++    this.store = store;
++  }
++
++  async muteUser(
++    channelId: string,
++    nickname: string,
++    moderatorId: string,
++    options: MuteUserOptions = {},
++  ): Promise<MuteUserResult> {
++    const channel = normalizeChannelId(channelId);
++    if (!channel) {
++      return muteFailure("invalid_channel");
++    }
++
++    const user = normalizeMuteNickname(nickname);
++    if (!user) {
++      return muteFailure("invalid_nickname", { channelId: channel });
++    }
++
++    const moderator = normalizeModeratorId(moderatorId);
++    if (!moderator) {
++      return muteFailure("invalid_moderator", { channelId: channel, nickname: user });
++    }
++
++    const now = readMuteClock(options.now);
++    const expiresAt = resolveMuteExpiry(now, options.durationSeconds);
++    const reason = normalizeMuteReason(options.reason);
++    const current = await this.store.getMute(channel, user);
++    const live = liveMute(current, now);
++
++    const next: ChannelMuteRecord = {
++      channelId: channel,
++      nickname: user,
++      moderatorId: moderator,
++      expiresAt,
++      mutedAt: now,
++    };
++    if (reason !== undefined) {
++      next.reason = reason;
++    }
++
++    if (live) {
++      const nextRank = expiresAt === null ? Number.POSITIVE_INFINITY : expiresAt;
++      if (nextRank > muteEffectiveExpiry(live)) {
++        const swapped = await this.store.compareAndSetMute(channel, user, live.mutedAt, next);
++        if (!swapped) {
++          return this.muteUser(channelId, nickname, moderatorId, options);
++        }
++        return {
++          ok: true,
++          status: "extended",
++          channelId: channel,
++          nickname: user,
++          moderatorId: moderator,
++          expiresAt,
++          remainingSeconds: muteRemainingSeconds(expiresAt, now),
++          permanent: expiresAt === null,
++          ...(reason !== undefined ? { reason } : {}),
++        };
++      }
++
++      return {
++        ok: true,
++        status: "kept",
++        channelId: live.channelId,
++        nickname: live.nickname,
++        moderatorId: live.moderatorId,
++        expiresAt: live.expiresAt,
++        remainingSeconds: muteRemainingSeconds(live.expiresAt, now),
++        permanent: live.expiresAt === null,
++        ...(live.reason !== undefined ? { reason: live.reason } : {}),
++      };
++    }
++
++    if (current && !live) {
++      await this.store.deleteMute(channel, user);
++    }
++
++    const created = await this.store.compareAndSetMute(channel, user, null, next);
++    if (!created) {
++      return this.muteUser(channelId, nickname, moderatorId, options);
++    }
++
++    return {
++      ok: true,
++      status: "applied",
++      channelId: channel,
++      nickname: user,
++      moderatorId: moderator,
++      expiresAt,
++      remainingSeconds: muteRemainingSeconds(expiresAt, now),
++      permanent: expiresAt === null,
++      ...(reason !== undefined ? { reason } : {}),
++    };
++  }
++
++  async unmuteUser(
++    channelId: string,
++    nickname: string,
++    moderatorId: string,
++    options: MuteClockOptions = {},
++  ): Promise<UnmuteUserResult> {
++    const channel = normalizeChannelId(channelId);
++    if (!channel) {
++      return muteFailure("invalid_channel");
++    }
++
++    const user = normalizeMuteNickname(nickname);
++    if (!user) {
++      return muteFailure("invalid_nickname", { channelId: channel });
++    }
++
++    const moderator = normalizeModeratorId(moderatorId);
++    if (!moderator) {
++      return muteFailure("invalid_moderator", { channelId: channel, nickname: user });
++    }
++
++    const now = readMuteClock(options.now);
++    const current = await this.store.getMute(channel, user);
++    if (!current) {
++      return muteFailure("not_found", { channelId: channel, nickname: user });
++    }
++    if (liveMute(current, now) === null) {
++      await this.store.deleteMute(channel, user);
++      return muteFailure("not_found", { channelId: channel, nickname: user });
++    }
++
++    await this.store.deleteMute(channel, user);
++    return { ok: true, channelId: channel, nickname: user, unmuted: true };
++  }
++
++  async isMuted(channelId: string, nickname: string, options: MuteClockOptions = {}): Promise<MutedLookup> {
++    const view = await this.getMute(channelId, nickname, options);
++    if (!view || view.expired) {
++      return { muted: false, remainingSeconds: 0, permanent: false };
++    }
++    return {
++      muted: true,
++      remainingSeconds: view.remainingSeconds,
++      permanent: view.permanent,
++      record: view,
++    };
++  }
++
++  async getMute(
++    channelId: string,
++    nickname: string,
++    options: MuteClockOptions = {},
++  ): Promise<ChannelMuteView | null> {
++    const channel = normalizeChannelId(channelId);
++    const user = normalizeMuteNickname(nickname);
++    if (!channel || !user) {
++      return null;
++    }
++
++    const now = readMuteClock(options.now);
++    const live = liveMute(await this.store.getMute(channel, user), now);
++    return live ? toMuteView(live, now) : null;
++  }
++
++  async listChannelMutes(
++    channelId: string,
++    options: ListChannelMutesOptions = {},
++  ): Promise<ChannelMuteView[]> {
++    const channel = normalizeChannelId(channelId);
++    if (!channel) {
++      return [];
++    }
++
++    const now = readMuteClock(options.now);
++    const includeExpired = options.includeExpired === true;
++    const views: ChannelMuteView[] = [];
++
++    for (const record of await this.store.listMutes(channel)) {
++      const view = toMuteView(record, now);
++      if (view.expired && !includeExpired) {
++        continue;
++      }
++      views.push(view);
++    }
++
++    return sortMuteViews(views);
++  }
++
++  async listMutedChannels(options: MuteClockOptions = {}): Promise<string[]> {
++    const now = readMuteClock(options.now);
++    const channelIds: string[] = [];
++
++    for (const record of await this.store.listMutes()) {
++      if (liveMute(record, now)) {
++        channelIds.push(record.channelId);
++      }
++    }
++
++    return uniqueSortedIds(channelIds);
++  }
++
++  async countActiveMutes(channelId?: string, options: MuteClockOptions = {}): Promise<number> {
++    const now = readMuteClock(options.now);
++    const channel = channelId === undefined ? undefined : normalizeChannelId(channelId);
++    if (channelId !== undefined && !channel) {
++      return 0;
++    }
++
++    let count = 0;
++    for (const record of await this.store.listMutes(channel)) {
++      if (liveMute(record, now)) {
++        count += 1;
++      }
++    }
++    return count;
++  }
++
++  async sweepExpiredMutes(channelId?: string, options: MuteClockOptions = {}): Promise<MuteSweepResult> {
++    const now = readMuteClock(options.now);
++    const channel = channelId === undefined ? undefined : normalizeChannelId(channelId);
++    if (channelId !== undefined && !channel) {
++      return { removed: 0, channelIds: [] };
++    }
++
++    const removedChannels: string[] = [];
++    let removed = 0;
++
++    for (const record of await this.store.listMutes(channel)) {
++      if (record.expiresAt === null) {
++        continue;
++      }
++      if (record.expiresAt > now) {
++        continue;
++      }
++      await this.store.deleteMute(record.channelId, record.nickname);
++      removed += 1;
++      removedChannels.push(record.channelId);
++    }
++
++    return { removed, channelIds: uniqueSortedIds(removedChannels) };
++  }
++}
++
++export function createChannelMuteLedger(store?: ChannelMuteStore): ChannelMuteLedger {
++  return new ChannelMuteLedger(store ?? createMemoryChannelMuteStore());
++}
++
++export async function muteUser(
++  channelId: string,
++  nickname: string,
++  moderatorId: string,
++  options: MuteUserOptions = {},
++  store?: ChannelMuteStore,
++): Promise<MuteUserResult> {
++  return createChannelMuteLedger(store).muteUser(channelId, nickname, moderatorId, options);
++}
++
++export async function unmuteUser(
++  channelId: string,
++  nickname: string,
++  moderatorId: string,
++  options: MuteClockOptions = {},
++  store?: ChannelMuteStore,
++): Promise<UnmuteUserResult> {
++  return createChannelMuteLedger(store).unmuteUser(channelId, nickname, moderatorId, options);
++}
++
++export async function isMuted(
++  channelId: string,
++  nickname: string,
++  options: MuteClockOptions = {},
++  store?: ChannelMuteStore,
++): Promise<MutedLookup> {
++  return createChannelMuteLedger(store).isMuted(channelId, nickname, options);
++}
++
++export async function getMute(
++  channelId: string,
++  nickname: string,
++  options: MuteClockOptions = {},
++  store?: ChannelMuteStore,
++): Promise<ChannelMuteView | null> {
++  return createChannelMuteLedger(store).getMute(channelId, nickname, options);
++}
++
++export async function listChannelMutes(
++  channelId: string,
++  options: ListChannelMutesOptions = {},
++  store?: ChannelMuteStore,
++): Promise<ChannelMuteView[]> {
++  return createChannelMuteLedger(store).listChannelMutes(channelId, options);
++}
++
++export async function listMutedChannels(
++  options: MuteClockOptions = {},
++  store?: ChannelMuteStore,
++): Promise<string[]> {
++  return createChannelMuteLedger(store).listMutedChannels(options);
++}
++
++export async function countActiveMutes(
++  channelId?: string,
++  options: MuteClockOptions = {},
++  store?: ChannelMuteStore,
++): Promise<number> {
++  return createChannelMuteLedger(store).countActiveMutes(channelId, options);
++}
++
++export async function sweepExpiredMutes(
++  channelId?: string,
++  options: MuteClockOptions = {},
++  store?: ChannelMuteStore,
++): Promise<MuteSweepResult> {
++  return createChannelMuteLedger(store).sweepExpiredMutes(channelId, options);
++}
+diff --git a/packages/backend/src/services/mutes.ts b/packages/backend/src/services/mutes.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/mutes.ts
+@@ -0,0 +1,65 @@
++export {
++  ChannelMuteLedger,
++  countActiveMutes,
++  createChannelMuteLedger,
++  getMute,
++  isMuted,
++  listChannelMutes,
++  listMutedChannels,
++  muteUser,
++  sweepExpiredMutes,
++  unmuteUser,
++} from "#ours/backend/services/mute_service.ts";
++
++export {
++  MemoryChannelMuteStore,
++  createMemoryChannelMuteStore,
++} from "#ours/backend/services/mute_store.ts";
++
++export {
++  MAX_MUTE_REASON_LENGTH,
++  MAX_MUTE_SECONDS,
++  MIN_MUTE_SECONDS,
++  MUTE_APPLY_STATUSES,
++  MUTE_FAILURE_REASONS,
++  isChannelMuteRecord,
++  type ChannelMuteRecord,
++  type ChannelMuteStore,
++  type ChannelMuteView,
++  type ListChannelMutesOptions,
++  type MuteClockOptions,
++  type MuteFailure,
++  type MuteFailureReason,
++  type MuteSuccess,
++  type MuteSweepResult,
++  type MuteUserOptions,
++  type MuteUserResult,
++  type MutedLookup,
++  type UnmuteUserResult,
++} from "#ours/backend/services/mute_types.ts";
++
++export {
++  DEFAULT_MUTE_DURATION_POLICY,
++  describeMutePolicy,
++  resolveTimedMuteSeconds,
++  shouldExtendMute,
++  type MuteDurationPolicy,
++} from "#ours/backend/services/mute_policy.ts";
++
++export {
++  isMuteExpired,
++  isPermanentMute,
++  liveMute,
++  muteEffectiveExpiry,
++  muteFailure,
++  muteRemainingSeconds,
++  normalizeChannelId,
++  normalizeModeratorId,
++  normalizeMuteNickname,
++  normalizeMuteReason,
++  readMuteClock,
++  resolveMuteExpiry,
++  sortMuteViews,
++  toMuteView,
++  uniqueSortedIds,
++} from "#ours/backend/services/mute_utils.ts";

@@ -1,0 +1,717 @@
+diff --git a/packages/backend/src/gold_tests/pin_apply_behavior.test.ts b/packages/backend/src/gold_tests/pin_apply_behavior.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/pin_apply_behavior.test.ts
+@@ -0,0 +1,138 @@
++import { describe, expect, it } from "vitest";
++import {
++  MAX_CHANNEL_PINS,
++  ChannelPinBoard,
++  MemoryChannelPinStore,
++  pinMessage,
++} from "#ours/backend/services/pins.ts";
++
++const NOW = 1_700_000_000_000;
++
++const board = () => new ChannelPinBoard(new MemoryChannelPinStore());
++
++describe("Channel pin apply", () => {
++  it("pins a new message at the end of the board", async () => {
++    const result = await board().pinMessage("room-1", "msg-1", "mod-1", { now: NOW });
++    expect(result).toEqual({
++      ok: true,
++      status: "pinned",
++      channelId: "room-1",
++      messageId: "msg-1",
++      pinnedBy: "mod-1",
++      pinnedAt: NOW,
++      position: 0,
++      version: 1,
++    });
++  });
++
++  it("trims message and actor ids while keeping message id case", async () => {
++    const pins = board();
++    const result = await pins.pinMessage("  Room:West  ", "  MsgABC  ", "  Mod-1  ", { now: NOW });
++    expect(result).toMatchObject({
++      ok: true,
++      channelId: "Room:West",
++      messageId: "MsgABC",
++      pinnedBy: "Mod-1",
++    });
++  });
++
++  it("refreshes an already pinned message in place", async () => {
++    const pins = board();
++    await pins.pinMessage("room-1", "msg-1", "mod-1", { now: NOW });
++    await pins.pinMessage("room-1", "msg-2", "mod-1", { now: NOW + 1 });
++    const result = await pins.pinMessage("room-1", "msg-1", "mod-2", {
++      now: NOW + 5_000,
++      note: "bump",
++    });
++    expect(result).toEqual({
++      ok: true,
++      status: "refreshed",
++      channelId: "room-1",
++      messageId: "msg-1",
++      pinnedBy: "mod-2",
++      pinnedAt: NOW + 5_000,
++      position: 0,
++      version: 3,
++      note: "bump",
++    });
++  });
++
++  it("rejects a pin when the channel already has ten pins", async () => {
++    const pins = board();
++    for (let i = 0; i < MAX_CHANNEL_PINS; i += 1) {
++      await pins.pinMessage("room-1", `msg-${i}`, "mod-1", { now: NOW + i });
++    }
++    await expect(pins.pinMessage("room-1", "msg-overflow", "mod-1", { now: NOW + 100 })).resolves.toEqual({
++      ok: false,
++      reason: "pin_limit",
++      channelId: "room-1",
++      messageId: "msg-overflow",
++    });
++  });
++
++  it("allows refreshing when the board is already at the pin limit", async () => {
++    const pins = board();
++    for (let i = 0; i < MAX_CHANNEL_PINS; i += 1) {
++      await pins.pinMessage("room-1", `msg-${i}`, "mod-1", { now: NOW + i });
++    }
++    const result = await pins.pinMessage("room-1", "msg-0", "mod-9", { now: NOW + 50 });
++    expect(result).toMatchObject({ ok: true, status: "refreshed", position: 0, pinnedBy: "mod-9" });
++  });
++
++  it("assigns increasing positions as messages are pinned", async () => {
++    const pins = board();
++    const first = await pins.pinMessage("room-1", "a", "mod-1", { now: NOW });
++    const second = await pins.pinMessage("room-1", "b", "mod-1", { now: NOW + 1 });
++    const third = await pins.pinMessage("room-1", "c", "mod-1", { now: NOW + 2 });
++    expect(first).toMatchObject({ position: 0 });
++    expect(second).toMatchObject({ position: 1 });
++    expect(third).toMatchObject({ position: 2 });
++  });
++
++  it("drops a blank note and trims a long note", async () => {
++    const pins = board();
++    const blank = await pins.pinMessage("room-1", "msg-1", "mod-1", { now: NOW, note: "   " });
++    const long = await pins.pinMessage("room-1", "msg-2", "mod-1", { now: NOW, note: "n".repeat(200) });
++    expect(blank.ok).toBe(true);
++    expect(blank).not.toHaveProperty("note");
++    expect(long).toMatchObject({ note: "n".repeat(120) });
++  });
++
++  it("rejects an empty channel id", async () => {
++    await expect(board().pinMessage("   ", "msg-1", "mod-1", { now: NOW })).resolves.toEqual({
++      ok: false,
++      reason: "invalid_channel",
++    });
++  });
++
++  it("rejects a blank message id", async () => {
++    await expect(board().pinMessage("room-1", "  ", "mod-1", { now: NOW })).resolves.toEqual({
++      ok: false,
++      reason: "invalid_message",
++      channelId: "room-1",
++    });
++  });
++
++  it("rejects a blank pinnedBy actor", async () => {
++    await expect(board().pinMessage("room-1", "msg-1", "  ", { now: NOW })).resolves.toEqual({
++      ok: false,
++      reason: "invalid_actor",
++      channelId: "room-1",
++      messageId: "msg-1",
++    });
++  });
++
++  it("supports the pinMessage convenience function", async () => {
++    const store = new MemoryChannelPinStore();
++    const result = await pinMessage("room-1", "msg-1", "mod-1", { now: NOW }, store);
++    expect(result).toMatchObject({ ok: true, status: "pinned" });
++  });
++
++  it("bumps the board version on each successful pin", async () => {
++    const pins = board();
++    const first = await pins.pinMessage("room-1", "msg-1", "mod-1", { now: NOW });
++    const second = await pins.pinMessage("room-1", "msg-2", "mod-1", { now: NOW + 1 });
++    expect(first).toMatchObject({ version: 1 });
++    expect(second).toMatchObject({ version: 2 });
++  });
++});
+diff --git a/packages/backend/src/gold_tests/pin_unpin_and_lookup.test.ts b/packages/backend/src/gold_tests/pin_unpin_and_lookup.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/pin_unpin_and_lookup.test.ts
+@@ -0,0 +1,117 @@
++import { describe, expect, it } from "vitest";
++import {
++  ChannelPinBoard,
++  MemoryChannelPinStore,
++  getPin,
++  listPins,
++  unpinMessage,
++} from "#ours/backend/services/pins.ts";
++
++const NOW = 1_700_000_000_000;
++
++const board = () => new ChannelPinBoard(new MemoryChannelPinStore());
++
++describe("Channel pin unpin and lookup", () => {
++  it("unpins an existing message and shifts later positions", async () => {
++    const pins = board();
++    await pins.pinMessage("room-1", "msg-1", "mod-1", { now: NOW });
++    await pins.pinMessage("room-1", "msg-2", "mod-1", { now: NOW + 1 });
++    await pins.pinMessage("room-1", "msg-3", "mod-1", { now: NOW + 2 });
++    await expect(pins.unpinMessage("room-1", "msg-2")).resolves.toEqual({
++      ok: true,
++      channelId: "room-1",
++      messageId: "msg-2",
++      unpinned: true,
++      version: 4,
++    });
++    const listed = await pins.listPins("room-1");
++    expect(listed.map((row) => row.messageId)).toEqual(["msg-1", "msg-3"]);
++    expect(listed.map((row) => row.position)).toEqual([0, 1]);
++  });
++
++  it("reports not_found when unpinning a missing message", async () => {
++    const pins = board();
++    await pins.pinMessage("room-1", "msg-1", "mod-1", { now: NOW });
++    await expect(pins.unpinMessage("room-1", "missing")).resolves.toEqual({
++      ok: false,
++      reason: "not_found",
++      channelId: "room-1",
++      messageId: "missing",
++    });
++  });
++
++  it("reports not_found when unpinning from an empty channel", async () => {
++    await expect(board().unpinMessage("room-1", "msg-1")).resolves.toEqual({
++      ok: false,
++      reason: "not_found",
++      channelId: "room-1",
++      messageId: "msg-1",
++    });
++  });
++
++  it("rejects unpin for invalid channel or message", async () => {
++    const pins = board();
++    await expect(pins.unpinMessage("  ", "msg-1")).resolves.toEqual({
++      ok: false,
++      reason: "invalid_channel",
++    });
++    await expect(pins.unpinMessage("room-1", " ")).resolves.toEqual({
++      ok: false,
++      reason: "invalid_message",
++      channelId: "room-1",
++    });
++  });
++
++  it("returns a pin view with position from getPin", async () => {
++    const pins = board();
++    await pins.pinMessage("room-1", "msg-1", "mod-1", { now: NOW });
++    await pins.pinMessage("room-1", "msg-2", "mod-1", { now: NOW + 1, note: "keep" });
++    await expect(pins.getPin("room-1", "msg-2")).resolves.toEqual({
++      messageId: "msg-2",
++      pinnedBy: "mod-1",
++      pinnedAt: NOW + 1,
++      note: "keep",
++      position: 1,
++    });
++  });
++
++  it("returns null from getPin for missing or invalid input", async () => {
++    const pins = board();
++    await pins.pinMessage("room-1", "msg-1", "mod-1", { now: NOW });
++    await expect(pins.getPin("room-1", "missing")).resolves.toBeNull();
++    await expect(pins.getPin("  ", "msg-1")).resolves.toBeNull();
++    await expect(pins.getPin("room-1", " ")).resolves.toBeNull();
++  });
++
++  it("lists pins in board order", async () => {
++    const pins = board();
++    await pins.pinMessage("room-1", "z", "mod-1", { now: NOW });
++    await pins.pinMessage("room-1", "a", "mod-1", { now: NOW + 1 });
++    await expect(pins.listPins("room-1")).resolves.toMatchObject([
++      { messageId: "z", position: 0 },
++      { messageId: "a", position: 1 },
++    ]);
++  });
++
++  it("returns an empty list for an invalid channel id", async () => {
++    await expect(board().listPins("   ")).resolves.toEqual([]);
++  });
++
++  it("supports the lookup convenience functions", async () => {
++    const store = new MemoryChannelPinStore();
++    const pins = new ChannelPinBoard(store);
++    await pins.pinMessage("room-1", "msg-1", "mod-1", { now: NOW });
++    await expect(listPins("room-1", store)).resolves.toHaveLength(1);
++    await expect(getPin("room-1", "msg-1", store)).resolves.toMatchObject({ messageId: "msg-1" });
++    await expect(unpinMessage("room-1", "msg-1", {}, store)).resolves.toMatchObject({ unpinned: true });
++  });
++
++  it("keeps channel id case with colons when looking up pins", async () => {
++    const pins = board();
++    await pins.pinMessage("team:west", "Msg-1", "mod-1", { now: NOW });
++    await expect(pins.getPin("  team:west  ", "Msg-1")).resolves.toMatchObject({
++      messageId: "Msg-1",
++      position: 0,
++    });
++  });
++});
+diff --git a/packages/backend/src/gold_tests/pin_reorder_and_clear.test.ts b/packages/backend/src/gold_tests/pin_reorder_and_clear.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/pin_reorder_and_clear.test.ts
+@@ -0,0 +1,127 @@
++import { describe, expect, it } from "vitest";
++import {
++  ChannelPinBoard,
++  MemoryChannelPinStore,
++  clearPins,
++  reorderPins,
++} from "#ours/backend/services/pins.ts";
++
++const NOW = 1_700_000_000_000;
++
++const board = () => new ChannelPinBoard(new MemoryChannelPinStore());
++
++describe("Channel pin reorder and clear", () => {
++  it("reorders pins when given an exact permutation", async () => {
++    const pins = board();
++    await pins.pinMessage("room-1", "a", "mod-1", { now: NOW });
++    await pins.pinMessage("room-1", "b", "mod-1", { now: NOW + 1 });
++    await pins.pinMessage("room-1", "c", "mod-1", { now: NOW + 2 });
++    await expect(pins.reorderPins("room-1", ["c", "a", "b"])).resolves.toEqual({
++      ok: true,
++      channelId: "room-1",
++      messageIds: ["c", "a", "b"],
++      version: 4,
++    });
++    await expect(pins.listPins("room-1")).resolves.toMatchObject([
++      { messageId: "c", position: 0 },
++      { messageId: "a", position: 1 },
++      { messageId: "b", position: 2 },
++    ]);
++  });
++
++  it("rejects reorder when the list is missing an id", async () => {
++    const pins = board();
++    await pins.pinMessage("room-1", "a", "mod-1", { now: NOW });
++    await pins.pinMessage("room-1", "b", "mod-1", { now: NOW + 1 });
++    await expect(pins.reorderPins("room-1", ["a"])).resolves.toEqual({
++      ok: false,
++      reason: "invalid_order",
++      channelId: "room-1",
++    });
++  });
++
++  it("rejects reorder when the list includes an unknown id", async () => {
++    const pins = board();
++    await pins.pinMessage("room-1", "a", "mod-1", { now: NOW });
++    await pins.pinMessage("room-1", "b", "mod-1", { now: NOW + 1 });
++    await expect(pins.reorderPins("room-1", ["a", "x"])).resolves.toEqual({
++      ok: false,
++      reason: "invalid_order",
++      channelId: "room-1",
++    });
++  });
++
++  it("rejects reorder when the list duplicates an id", async () => {
++    const pins = board();
++    await pins.pinMessage("room-1", "a", "mod-1", { now: NOW });
++    await pins.pinMessage("room-1", "b", "mod-1", { now: NOW + 1 });
++    await expect(pins.reorderPins("room-1", ["a", "a"])).resolves.toEqual({
++      ok: false,
++      reason: "invalid_order",
++      channelId: "room-1",
++    });
++  });
++
++  it("rejects reorder for an empty channel board", async () => {
++    await expect(board().reorderPins("room-1", [])).resolves.toEqual({
++      ok: false,
++      reason: "not_found",
++      channelId: "room-1",
++    });
++  });
++
++  it("rejects reorder for an invalid channel id", async () => {
++    await expect(board().reorderPins("  ", ["a"])).resolves.toEqual({
++      ok: false,
++      reason: "invalid_channel",
++    });
++  });
++
++  it("trims message ids before validating a reorder permutation", async () => {
++    const pins = board();
++    await pins.pinMessage("room-1", "a", "mod-1", { now: NOW });
++    await pins.pinMessage("room-1", "b", "mod-1", { now: NOW + 1 });
++    await expect(pins.reorderPins("room-1", ["  b  ", " a "])).resolves.toMatchObject({
++      ok: true,
++      messageIds: ["b", "a"],
++    });
++  });
++
++  it("clears every pin on a channel and reports the count", async () => {
++    const pins = board();
++    await pins.pinMessage("room-1", "a", "mod-1", { now: NOW });
++    await pins.pinMessage("room-1", "b", "mod-1", { now: NOW + 1 });
++    await expect(pins.clearPins("room-1")).resolves.toEqual({
++      ok: true,
++      channelId: "room-1",
++      cleared: 2,
++      version: 3,
++    });
++    await expect(pins.listPins("room-1")).resolves.toEqual([]);
++  });
++
++  it("clears an empty channel without error", async () => {
++    await expect(board().clearPins("room-1")).resolves.toEqual({
++      ok: true,
++      channelId: "room-1",
++      cleared: 0,
++      version: 0,
++    });
++  });
++
++  it("rejects clear for an invalid channel id", async () => {
++    await expect(board().clearPins("   ")).resolves.toEqual({
++      ok: false,
++      reason: "invalid_channel",
++    });
++  });
++
++  it("supports the reorder and clear convenience functions", async () => {
++    const store = new MemoryChannelPinStore();
++    const pins = new ChannelPinBoard(store);
++    await pins.pinMessage("room-1", "a", "mod-1", { now: NOW });
++    await pins.pinMessage("room-1", "b", "mod-1", { now: NOW + 1 });
++    await expect(reorderPins("room-1", ["b", "a"], {}, store)).resolves.toMatchObject({ ok: true });
++    await expect(clearPins("room-1", {}, store)).resolves.toMatchObject({ cleared: 2 });
++  });
++});
+diff --git a/packages/backend/src/gold_tests/pin_edge_behavior.test.ts b/packages/backend/src/gold_tests/pin_edge_behavior.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/pin_edge_behavior.test.ts
+@@ -0,0 +1,82 @@
++import { describe, expect, it } from "vitest";
++import {
++  ChannelPinBoard,
++  MemoryChannelPinStore,
++  createChannelPinBoard,
++} from "#ours/backend/services/pins.ts";
++
++const NOW = 1_700_000_000_000;
++
++describe("Channel pin extra edges", () => {
++  it("keeps colons inside a trimmed channel id", async () => {
++    const pins = createChannelPinBoard(new MemoryChannelPinStore());
++    const result = await pins.pinMessage("  team:west  ", "msg-1", "mod-1", { now: NOW });
++    expect(result).toMatchObject({ ok: true, channelId: "team:west" });
++  });
++
++  it("trims a note before storing it", async () => {
++    const pins = createChannelPinBoard(new MemoryChannelPinStore());
++    const result = await pins.pinMessage("room-1", "msg-1", "mod-1", {
++      now: NOW,
++      note: "  highlight  ",
++    });
++    expect(result).toMatchObject({ note: "highlight" });
++  });
++
++  it("can pin again after clearing the board", async () => {
++    const pins = createChannelPinBoard(new MemoryChannelPinStore());
++    await pins.pinMessage("room-1", "msg-1", "mod-1", { now: NOW });
++    await pins.clearPins("room-1");
++    const result = await pins.pinMessage("room-1", "msg-2", "mod-1", { now: NOW + 10 });
++    expect(result).toMatchObject({ ok: true, status: "pinned", position: 0 });
++  });
++
++  it("can pin again after unpinning the only message", async () => {
++    const pins = createChannelPinBoard(new MemoryChannelPinStore());
++    await pins.pinMessage("room-1", "msg-1", "mod-1", { now: NOW });
++    await pins.unpinMessage("room-1", "msg-1");
++    const result = await pins.pinMessage("room-1", "msg-1", "mod-2", { now: NOW + 5 });
++    expect(result).toMatchObject({ ok: true, status: "pinned", pinnedBy: "mod-2", position: 0 });
++  });
++
++  it("preserves message id case across refresh", async () => {
++    const pins = createChannelPinBoard(new MemoryChannelPinStore());
++    await pins.pinMessage("room-1", "MsgCase", "mod-1", { now: NOW });
++    const result = await pins.pinMessage("room-1", "  MsgCase  ", "mod-2", { now: NOW + 1 });
++    expect(result).toMatchObject({ status: "refreshed", messageId: "MsgCase" });
++  });
++
++  it("returns an empty list after every pin is unpinned", async () => {
++    const pins = createChannelPinBoard(new MemoryChannelPinStore());
++    await pins.pinMessage("room-1", "a", "mod-1", { now: NOW });
++    await pins.pinMessage("room-1", "b", "mod-1", { now: NOW + 1 });
++    await pins.unpinMessage("room-1", "a");
++    await pins.unpinMessage("room-1", "b");
++    await expect(pins.listPins("room-1")).resolves.toEqual([]);
++  });
++
++  it("accepts a single-item reorder as a no-op permutation", async () => {
++    const pins = createChannelPinBoard(new MemoryChannelPinStore());
++    await pins.pinMessage("room-1", "only", "mod-1", { now: NOW });
++    await expect(pins.reorderPins("room-1", ["only"])).resolves.toMatchObject({
++      ok: true,
++      messageIds: ["only"],
++    });
++  });
++
++  it("can construct the board through createChannelPinBoard", async () => {
++    const store = new MemoryChannelPinStore();
++    const pins = createChannelPinBoard(store);
++    expect(pins).toBeInstanceOf(ChannelPinBoard);
++    await expect(pins.listPins("room-1")).resolves.toEqual([]);
++  });
++
++  it("rejects a reorder that includes blank message ids", async () => {
++    const pins = createChannelPinBoard(new MemoryChannelPinStore());
++    await pins.pinMessage("room-1", "a", "mod-1", { now: NOW });
++    await pins.pinMessage("room-1", "b", "mod-1", { now: NOW + 1 });
++    await expect(pins.reorderPins("room-1", ["a", "  "])).resolves.toMatchObject({
++      reason: "invalid_order",
++    });
++  });
++});
+diff --git a/packages/backend/src/gold_tests/p2p_constants_compat.test.ts b/packages/backend/src/gold_tests/p2p_constants_compat.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/p2p_constants_compat.test.ts
+@@ -0,0 +1,32 @@
++import { describe, expect, it } from "vitest";
++import { CHAT_CHANNEL_ROLES, CHAT_REACTIONS, CHAT_USER_TYPES } from "#ours/backend/constants/index.ts";
++
++describe("Existing chat constants", () => {
++  it("keeps HEART mapped to HEART", () => expect(CHAT_REACTIONS.HEART).toBe("HEART"));
++  it("keeps HANDS_UP mapped to HANDS_UP", () => expect(CHAT_REACTIONS.HANDS_UP).toBe("HANDS_UP"));
++  it("keeps FIRE mapped to FIRE", () => expect(CHAT_REACTIONS.FIRE).toBe("FIRE"));
++  it("keeps MUSIC mapped to MUSIC", () => expect(CHAT_REACTIONS.MUSIC).toBe("MUSIC"));
++  it("keeps SURPRISED mapped to SURPRISED", () => expect(CHAT_REACTIONS.SURPRISED).toBe("SURPRISED"));
++  it("keeps exactly five supported reaction keys", () => {
++    expect(Object.keys(CHAT_REACTIONS).sort()).toEqual(["FIRE", "HANDS_UP", "HEART", "MUSIC", "SURPRISED"]);
++  });
++  it("keeps reaction values unique", () => expect(new Set(Object.values(CHAT_REACTIONS)).size).toBe(5));
++  it("keeps TEMPORARY mapped to temporary", () => expect(CHAT_USER_TYPES.TEMPORARY).toBe("temporary"));
++  it("keeps REGULAR mapped to regular", () => expect(CHAT_USER_TYPES.REGULAR).toBe("regular"));
++  it("keeps ARTIST mapped to artist", () => expect(CHAT_USER_TYPES.ARTIST).toBe("artist"));
++  it("keeps ADMIN mapped to admin", () => expect(CHAT_USER_TYPES.ADMIN).toBe("admin"));
++  it("keeps MODERATOR mapped to moderator", () => expect(CHAT_USER_TYPES.MODERATOR).toBe("moderator"));
++  it("keeps ANONYMOUS mapped to anonymous", () => expect(CHAT_USER_TYPES.ANONYMOUS).toBe("anonymous"));
++  it("keeps exactly six user types", () => expect(Object.keys(CHAT_USER_TYPES)).toHaveLength(6));
++  it("keeps user type values unique", () => expect(new Set(Object.values(CHAT_USER_TYPES)).size).toBe(6));
++  it("keeps every user type value lowercase", () => {
++    expect(Object.values(CHAT_USER_TYPES).every((value) => value === value.toLowerCase())).toBe(true);
++  });
++  it("keeps OWNER mapped to owner", () => expect(CHAT_CHANNEL_ROLES.OWNER).toBe("owner"));
++  it("keeps VIEWER mapped to viewer", () => expect(CHAT_CHANNEL_ROLES.VIEWER).toBe("viewer"));
++  it("keeps exactly two channel roles", () => expect(Object.keys(CHAT_CHANNEL_ROLES)).toHaveLength(2));
++  it("keeps channel role values unique", () => expect(new Set(Object.values(CHAT_CHANNEL_ROLES)).size).toBe(2));
++  it("keeps channel role keys uppercase", () => {
++    expect(Object.keys(CHAT_CHANNEL_ROLES).every((key) => key === key.toUpperCase())).toBe(true);
++  });
++});
+diff --git a/packages/backend/src/gold_tests/p2p_input_validation_compat.test.ts b/packages/backend/src/gold_tests/p2p_input_validation_compat.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/p2p_input_validation_compat.test.ts
+@@ -0,0 +1,87 @@
++import { describe, expect, it } from "vitest";
++import { invalidNicknameMessage, isValidNickname } from "#ours/shared/inputValidation.ts";
++
++describe("isValidNickname", () => {
++  it("accepts a three character latin nickname", () => {
++    expect(isValidNickname("abc")).toBe(true);
++  });
++
++  it("accepts exactly twenty four characters", () => {
++    expect(isValidNickname("a".repeat(24))).toBe(true);
++  });
++
++  it("rejects two character nicknames", () => {
++    expect(isValidNickname("ab")).toBe(false);
++  });
++
++  it("rejects twenty five character nicknames", () => {
++    expect(isValidNickname("a".repeat(25))).toBe(false);
++  });
++
++  it("rejects the empty string", () => {
++    expect(isValidNickname("")).toBe(false);
++  });
++
++  it("accepts digits", () => {
++    expect(isValidNickname("user123")).toBe(true);
++  });
++
++  it("accepts non-latin letters", () => {
++    expect(isValidNickname("日本語")).toBe(true);
++  });
++
++  it("accepts accented letters", () => {
++    expect(isValidNickname("José")).toBe(true);
++  });
++
++  it("normalizes decomposed combining marks before validating", () => {
++    expect(isValidNickname("éric")).toBe(true);
++  });
++
++  it("accepts the period character", () => {
++    expect(isValidNickname("a.b.c")).toBe(true);
++  });
++
++  it("accepts the underscore character", () => {
++    expect(isValidNickname("a_b_c")).toBe(true);
++  });
++
++  it("accepts the hyphen character", () => {
++    expect(isValidNickname("a-b-c")).toBe(true);
++  });
++
++  it("rejects spaces", () => {
++    expect(isValidNickname("a b c")).toBe(false);
++  });
++
++  it("rejects emoji", () => {
++    expect(isValidNickname("abc\u{1f600}")).toBe(false);
++  });
++
++  it("rejects punctuation such as exclamation marks", () => {
++    expect(isValidNickname("abc!")).toBe(false);
++  });
++
++  it("rejects the at sign", () => {
++    expect(isValidNickname("a@bc")).toBe(false);
++  });
++
++  it("rejects forward slashes", () => {
++    expect(isValidNickname("a/bc")).toBe(false);
++  });
++
++  it("rejects leading and trailing whitespace around a valid core", () => {
++    expect(isValidNickname(" abc ")).toBe(false);
++  });
++});
++
++describe("invalidNicknameMessage", () => {
++  it("is a non-empty string", () => {
++    expect(typeof invalidNicknameMessage).toBe("string");
++    expect(invalidNicknameMessage.length).toBeGreaterThan(0);
++  });
++
++  it("mentions the allowed length range", () => {
++    expect(invalidNicknameMessage).toContain("3-24");
++  });
++});
+diff --git a/packages/backend/src/gold_tests/p2p_env_utils_compat.test.ts b/packages/backend/src/gold_tests/p2p_env_utils_compat.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/p2p_env_utils_compat.test.ts
+@@ -0,0 +1,56 @@
++import { beforeEach, describe, expect, it } from "vitest";
++import { checkEnvVar } from "#ours/backend/utils/env_utils.ts";
++
++const KEY = "OURS_TEST_ENV_UTILS_KEY";
++
++describe("checkEnvVar", () => {
++  beforeEach(() => {
++    delete process.env[KEY];
++  });
++
++  it("returns the raw value when the variable is set", () => {
++    process.env[KEY] = "hello";
++    expect(checkEnvVar(KEY)).toBe("hello");
++  });
++
++  it("returns values that contain spaces unchanged", () => {
++    process.env[KEY] = "  spaced value  ";
++    expect(checkEnvVar(KEY)).toBe("  spaced value  ");
++  });
++
++  it("returns numeric-looking values as strings", () => {
++    process.env[KEY] = "4000";
++    expect(checkEnvVar(KEY)).toBe("4000");
++  });
++
++  it("returns the default when the variable is missing", () => {
++    expect(checkEnvVar(KEY, "fallback")).toBe("fallback");
++  });
++
++  it("returns the default when the variable is an empty string", () => {
++    process.env[KEY] = "";
++    expect(checkEnvVar(KEY, "fallback")).toBe("fallback");
++  });
++
++  it("returns an empty-string default rather than throwing", () => {
++    expect(checkEnvVar(KEY, "")).toBe("");
++  });
++
++  it("prefers the real value over the default when both exist", () => {
++    process.env[KEY] = "real";
++    expect(checkEnvVar(KEY, "fallback")).toBe("real");
++  });
++
++  it("throws when the variable is missing and no default is given", () => {
++    expect(() => checkEnvVar(KEY)).toThrow(`process.env.${KEY} is not set`);
++  });
++
++  it("throws when the variable is an empty string and no default is given", () => {
++    process.env[KEY] = "";
++    expect(() => checkEnvVar(KEY)).toThrow(`process.env.${KEY} is not set`);
++  });
++
++  it("throws an Error instance", () => {
++    expect(() => checkEnvVar(KEY)).toThrow(Error);
++  });
++});
+diff --git a/packages/backend/src/gold_tests/p2p_gif_compat.test.ts b/packages/backend/src/gold_tests/p2p_gif_compat.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/p2p_gif_compat.test.ts
+@@ -0,0 +1,30 @@
++import { describe, expect, it } from "vitest";
++import { resolveGifByUrl } from "#ours/backend/services/gif_service.ts";
++
++describe("resolveGifByUrl", () => {
++  it("throws for an unsupported provider host", async () => {
++    await expect(resolveGifByUrl("https://example.com/cat.gif")).rejects.toThrow("Unsupported GIF provider");
++  });
++
++  it("throws for a malformed url", async () => {
++    await expect(resolveGifByUrl("not-a-url")).rejects.toThrow();
++  });
++
++  it("throws when a Giphy page url has no extractable id", async () => {
++    await expect(resolveGifByUrl("https://giphy.com/")).rejects.toThrow("Unable to extract Giphy id");
++  });
++
++  it("resolves a direct Giphy .gif url without a network call", async () => {
++    await expect(resolveGifByUrl("https://media.giphy.com/media/abc123/giphy.gif")).resolves.toMatchObject({
++      provider: "giphy",
++      url: "https://media.giphy.com/media/abc123/giphy.gif",
++    });
++  });
++
++  it("resolves a direct Tenor .gif url without a network call", async () => {
++    await expect(resolveGifByUrl("https://media.tenor.com/xyz987.gif")).resolves.toMatchObject({
++      provider: "tenor",
++      url: "https://media.tenor.com/xyz987.gif",
++    });
++  });
++});
