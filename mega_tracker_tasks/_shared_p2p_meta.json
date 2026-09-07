@@ -1,0 +1,21 @@
+{
+  "files": [
+    "src/modules/accounts/domain/__tests__/Account.test.ts",
+    "src/modules/accounts/domain/__tests__/Account.getters.test.ts",
+    "src/modules/branches/domain/__tests__/Branch.test.ts",
+    "src/shared/infrastructure/pagination/__tests__/CursorPager.test.ts",
+    "src/modules/inventory/domain/__tests__/Product.test.ts",
+    "src/modules/finance/domain/__tests__/FinanceDomain.test.ts",
+    "src/modules/partners/domain/__tests__/Partner.test.ts",
+    "src/modules/sales/domain/__tests__/SaleOrder.test.ts",
+    "src/modules/purchases/domain/__tests__/PurchaseOrder.test.ts",
+    "src/modules/inventory/domain/__tests__/InventoryMovementService.test.ts",
+    "src/modules/inventory/domain/__tests__/Valuation.test.ts",
+    "src/modules/inventory/domain/__tests__/InventoryBalanceService.test.ts",
+    "src/modules/company/domain/__tests__/Company.test.ts",
+    "src/modules/employees/domain/__tests__/Employee.test.ts",
+    "src/modules/expenses/domain/__tests__/Expense.test.ts",
+    "src/modules/roles/domain/__tests__/RoleDomain.test.ts"
+  ],
+  "count": 57
+}

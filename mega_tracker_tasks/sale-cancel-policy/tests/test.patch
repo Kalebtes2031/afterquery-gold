@@ -1,0 +1,644 @@
+diff --git a/src/gold_tests/sale_cancel_evaluate.test.ts b/src/gold_tests/sale_cancel_evaluate.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/gold_tests/sale_cancel_evaluate.test.ts
+@@ -0,0 +1,167 @@
++import {
++  evaluateSaleCancel,
++  previewSaleCancelReversal,
++  SaleCancelPolicy,
++  SaleCancelOrderSnapshot,
++} from "../modules/sales/domain/SaleCancelPolicy";
++
++function baseOrder(over: Partial<SaleCancelOrderSnapshot> = {}): SaleCancelOrderSnapshot {
++  return {
++    orderId: "SO-1",
++    status: "OPEN",
++    items: [{ productId: "P1", qtyOrdered: 10, qtyShipped: 0 }],
++    payments: [],
++    shipments: [],
++    ...over,
++  };
++}
++
++describe("Sale cancel evaluate eligibility", () => {
++  it("allows cancel for OPEN with no shipments or payments", () => {
++    const result = evaluateSaleCancel(baseOrder());
++    expect(result.ok).toBe(true);
++    if (result.ok) {
++      expect(result.canCancel).toBe(true);
++      expect(result.inventoryReversals).toEqual([]);
++      expect(result.paymentReversalTotal).toBe(0);
++      expect(result.loanReversalTotal).toBe(0);
++    }
++  });
++
++  it("allows cancel for PARTIALLY_SHIPPED when inventory can reverse", () => {
++    const result = evaluateSaleCancel(
++      baseOrder({
++        status: "PARTIALLY_SHIPPED",
++        items: [{ productId: "P1", qtyOrdered: 10, qtyShipped: 3 }],
++        shipments: [{ qty: 3 }],
++      })
++    );
++    expect(result.ok).toBe(true);
++    if (result.ok) {
++      expect(result.canCancel).toBe(true);
++      expect(result.inventoryReversals).toEqual([{ productId: "P1", qty: 3 }]);
++      expect(result.reasons).toContain("inventory_reversal_required");
++    }
++  });
++
++  it("blocks CANCELLED orders", () => {
++    const result = evaluateSaleCancel(baseOrder({ status: "CANCELLED" }));
++    expect(result.ok).toBe(true);
++    if (result.ok) {
++      expect(result.canCancel).toBe(false);
++      expect(result.reasons).toContain("already_cancelled");
++    }
++  });
++
++  it("blocks COMPLETED orders", () => {
++    const result = evaluateSaleCancel(baseOrder({ status: "COMPLETED" }));
++    expect(result.ok).toBe(true);
++    if (result.ok) {
++      expect(result.canCancel).toBe(false);
++      expect(result.reasons).toContain("already_completed");
++    }
++  });
++
++  it("blocks SHIPPED orders", () => {
++    const result = evaluateSaleCancel(
++      baseOrder({
++        status: "SHIPPED",
++        items: [{ productId: "P1", qtyOrdered: 2, qtyShipped: 2 }],
++        shipments: [{ qty: 2 }],
++      })
++    );
++    expect(result.ok).toBe(true);
++    if (result.ok) {
++      expect(result.canCancel).toBe(false);
++      expect(result.reasons).toContain("fully_shipped");
++    }
++  });
++
++  it("returns invalid_order for empty orderId", () => {
++    expect(evaluateSaleCancel(baseOrder({ orderId: "  " }))).toEqual({
++      ok: false,
++      reason: "invalid_order",
++    });
++  });
++
++  it("returns invalid_order for unknown status", () => {
++    expect(evaluateSaleCancel(baseOrder({ status: "CLOSED" as any }))).toEqual({
++      ok: false,
++      reason: "invalid_order",
++    });
++  });
++
++  it("returns invalid_order when order is nullish", () => {
++    expect(evaluateSaleCancel(null as any)).toEqual({ ok: false, reason: "invalid_order" });
++  });
++
++  it("aggregates shipped qty per product across lines", () => {
++    const result = evaluateSaleCancel(
++      baseOrder({
++        status: "PARTIALLY_SHIPPED",
++        items: [
++          { productId: "P2", qtyOrdered: 5, qtyShipped: 2 },
++          { productId: "P1", qtyOrdered: 5, qtyShipped: 1 },
++          { productId: "P2", qtyOrdered: 3, qtyShipped: 1 },
++        ],
++        shipments: [{ qty: 2 }, { qty: 1 }, { qty: 1 }],
++      })
++    );
++    expect(result.ok).toBe(true);
++    if (result.ok) {
++      expect(result.inventoryReversals).toEqual([
++        { productId: "P1", qty: 1 },
++        { productId: "P2", qty: 3 },
++      ]);
++    }
++  });
++
++  it("sums payment and partner_loan totals separately", () => {
++    const result = evaluateSaleCancel(
++      baseOrder({
++        payments: [
++          { amount: 50, method: "cash" },
++          { amount: 25.5, method: "partner_loan" },
++          { amount: 10, method: "PARTNER_LOAN" },
++        ],
++      })
++    );
++    expect(result.ok).toBe(true);
++    if (result.ok) {
++      expect(result.paymentReversalTotal).toBe(85.5);
++      expect(result.loanReversalTotal).toBe(35.5);
++      expect(result.reasons).toContain("payment_reversal_required");
++      expect(result.reasons).toContain("loan_reversal_required");
++      expect(result.canCancel).toBe(true);
++    }
++  });
++});
++
++describe("Sale cancel preview idempotence", () => {
++  it("matches evaluate for the same snapshot", () => {
++    const order = baseOrder({
++      status: "PARTIALLY_SHIPPED",
++      items: [{ productId: "P9", qtyOrdered: 4, qtyShipped: 2 }],
++      shipments: [{ qty: 2 }],
++      payments: [{ amount: 12, method: "transfer" }],
++    });
++    expect(previewSaleCancelReversal(order)).toEqual(evaluateSaleCancel(order));
++  });
++
++  it("is stable across repeated calls", () => {
++    const order = baseOrder();
++    expect(previewSaleCancelReversal(order)).toEqual(previewSaleCancelReversal(order));
++  });
++
++  it("SaleCancelPolicy.evaluate delegates to evaluateSaleCancel", () => {
++    const policy = new SaleCancelPolicy();
++    const order = baseOrder();
++    expect(policy.evaluate(order)).toEqual(evaluateSaleCancel(order));
++  });
++
++  it("SaleCancelPolicy.previewReversal delegates to previewSaleCancelReversal", () => {
++    const policy = new SaleCancelPolicy();
++    const order = baseOrder({ payments: [{ amount: 1, method: "cash" }] });
++    expect(policy.previewReversal(order)).toEqual(previewSaleCancelReversal(order));
++  });
++});
+diff --git a/src/gold_tests/sale_cancel_reversal.test.ts b/src/gold_tests/sale_cancel_reversal.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/gold_tests/sale_cancel_reversal.test.ts
+@@ -0,0 +1,104 @@
++import {
++  aggregateInventoryReversals,
++  evaluateSaleCancel,
++  hasPositiveShipmentQty,
++  roundMoney,
++  sumLoanPaymentTotal,
++  sumPaymentTotal,
++  SaleCancelOrderSnapshot,
++} from "../modules/sales/domain/SaleCancelPolicy";
++
++describe("Sale cancel reversal helpers", () => {
++  it("detects positive shipment qty", () => {
++    expect(hasPositiveShipmentQty([{ qty: 0 }, { qty: 1 }])).toBe(true);
++    expect(hasPositiveShipmentQty([{ qty: 0 }])).toBe(false);
++    expect(hasPositiveShipmentQty([])).toBe(false);
++  });
++
++  it("skips blank product ids when aggregating", () => {
++    expect(
++      aggregateInventoryReversals([
++        { productId: "  ", qtyOrdered: 1, qtyShipped: 1 },
++        { productId: "A", qtyOrdered: 2, qtyShipped: 2 },
++      ])
++    ).toEqual([{ productId: "A", qty: 2 }]);
++  });
++
++  it("ignores non-positive shipped qty", () => {
++    expect(
++      aggregateInventoryReversals([
++        { productId: "A", qtyOrdered: 2, qtyShipped: 0 },
++        { productId: "B", qtyOrdered: 2, qtyShipped: -1 },
++      ])
++    ).toEqual([]);
++  });
++
++  it("rounds money to two decimals", () => {
++    expect(roundMoney(1.005)).toBe(1.01);
++    expect(sumPaymentTotal([{ amount: 1.005, method: "cash" }, { amount: 2.004, method: "cash" }])).toBe(3.01);
++  });
++
++  it("ignores non-finite payment amounts", () => {
++    expect(sumPaymentTotal([{ amount: Number.NaN, method: "cash" }, { amount: 4, method: "cash" }])).toBe(4);
++    expect(sumLoanPaymentTotal([{ amount: Infinity, method: "partner_loan" }])).toBe(0);
++  });
++
++  it("does not require inventory reversal when all shipment qtys are zero", () => {
++    const order: SaleCancelOrderSnapshot = {
++      orderId: "SO-Z",
++      status: "OPEN",
++      items: [{ productId: "P1", qtyOrdered: 5, qtyShipped: 0 }],
++      payments: [],
++      shipments: [{ qty: 0 }],
++    };
++    const result = evaluateSaleCancel(order);
++    expect(result.ok).toBe(true);
++    if (result.ok) {
++      expect(result.inventoryReversals).toEqual([]);
++      expect(result.reasons).not.toContain("inventory_reversal_required");
++    }
++  });
++
++  it("flags missing_shipped_item_qty when shipments positive but items have no shipped qty", () => {
++    const result = evaluateSaleCancel({
++      orderId: "SO-BAD",
++      status: "PARTIALLY_SHIPPED",
++      items: [{ productId: "P1", qtyOrdered: 5, qtyShipped: 0 }],
++      payments: [],
++      shipments: [{ qty: 2 }],
++    });
++    expect(result.ok).toBe(true);
++    if (result.ok) {
++      expect(result.canCancel).toBe(false);
++      expect(result.reasons).toContain("missing_shipped_item_qty");
++    }
++  });
++
++  it("trims product ids before aggregating", () => {
++    expect(
++      aggregateInventoryReversals([
++        { productId: "  PX  ", qtyOrdered: 3, qtyShipped: 1 },
++        { productId: "PX", qtyOrdered: 3, qtyShipped: 2 },
++      ])
++    ).toEqual([{ productId: "PX", qty: 3 }]);
++  });
++
++  it("keeps canCancel true for OPEN with payments that need reversal", () => {
++    const result = evaluateSaleCancel({
++      orderId: "SO-PAY",
++      status: "OPEN",
++      items: [{ productId: "P1", qtyOrdered: 1, qtyShipped: 0 }],
++      payments: [{ amount: 9, method: "cash" }],
++      shipments: [],
++    });
++    expect(result.ok).toBe(true);
++    if (result.ok) {
++      expect(result.canCancel).toBe(true);
++      expect(result.paymentReversalTotal).toBe(9);
++    }
++  });
++
++  it("treats negative payment amounts as zero contribution", () => {
++    expect(sumPaymentTotal([{ amount: -5, method: "cash" }, { amount: 3, method: "cash" }])).toBe(3);
++  });
++});
+diff --git a/src/gold_tests/sale_cancel_edges.test.ts b/src/gold_tests/sale_cancel_edges.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/gold_tests/sale_cancel_edges.test.ts
+@@ -0,0 +1,125 @@
++import {
++  BLOCKED_STATUSES,
++  CANCELABLE_STATUSES,
++  collectCancelBlockReasons,
++  evaluateSaleCancel,
++  isKnownStatus,
++  normalizeOrderId,
++  statusAllowsCancel,
++  validateOrderSnapshot,
++} from "../modules/sales/domain/SaleCancelPolicy";
++
++describe("Sale cancel edge validation", () => {
++  it("normalizeOrderId trims and rejects blanks", () => {
++    expect(normalizeOrderId("  a  ")).toBe("a");
++    expect(normalizeOrderId("")).toBeNull();
++    expect(normalizeOrderId(12 as any)).toBeNull();
++  });
++
++  it("isKnownStatus accepts only the five statuses", () => {
++    expect(isKnownStatus("OPEN")).toBe(true);
++    expect(isKnownStatus("PARTIALLY_SHIPPED")).toBe(true);
++    expect(isKnownStatus("SHIPPED")).toBe(true);
++    expect(isKnownStatus("CANCELLED")).toBe(true);
++    expect(isKnownStatus("COMPLETED")).toBe(true);
++    expect(isKnownStatus("CLOSED")).toBe(false);
++  });
++
++  it("statusAllowsCancel only for OPEN and PARTIALLY_SHIPPED", () => {
++    expect(statusAllowsCancel("OPEN")).toBe(true);
++    expect(statusAllowsCancel("PARTIALLY_SHIPPED")).toBe(true);
++    expect(statusAllowsCancel("SHIPPED")).toBe(false);
++    expect(statusAllowsCancel("CANCELLED")).toBe(false);
++    expect(statusAllowsCancel("COMPLETED")).toBe(false);
++  });
++
++  it("exposes cancelable and blocked status sets", () => {
++    expect(CANCELABLE_STATUSES.has("OPEN")).toBe(true);
++    expect(BLOCKED_STATUSES.has("COMPLETED")).toBe(true);
++  });
++
++  it("validateOrderSnapshot requires item/payment/shipment arrays", () => {
++    expect(
++      validateOrderSnapshot({
++        orderId: "X",
++        status: "OPEN",
++        items: null as any,
++        payments: [],
++        shipments: [],
++      })
++    ).toEqual({ ok: false, reason: "invalid_order" });
++  });
++
++  it("collectCancelBlockReasons covers blocked statuses", () => {
++    expect(collectCancelBlockReasons("CANCELLED")).toContain("already_cancelled");
++    expect(collectCancelBlockReasons("COMPLETED")).toContain("already_completed");
++    expect(collectCancelBlockReasons("SHIPPED")).toContain("fully_shipped");
++  });
++
++  it("rejects missing order object fields as invalid_order", () => {
++    expect(evaluateSaleCancel(undefined as any).ok).toBe(false);
++  });
++
++  it("reasons list is sorted uniquely", () => {
++    const result = evaluateSaleCancel({
++      orderId: "SO-R",
++      status: "PARTIALLY_SHIPPED",
++      items: [{ productId: "P1", qtyOrdered: 2, qtyShipped: 1 }],
++      payments: [
++        { amount: 1, method: "partner_loan" },
++        { amount: 2, method: "cash" },
++      ],
++      shipments: [{ qty: 1 }],
++    });
++    expect(result.ok).toBe(true);
++    if (result.ok) {
++      const sorted = [...result.reasons].sort((a, b) => a.localeCompare(b));
++      expect(result.reasons).toEqual(sorted);
++      expect(new Set(result.reasons).size).toBe(result.reasons.length);
++    }
++  });
++
++  it("OPEN with empty arrays is cancelable", () => {
++    const result = evaluateSaleCancel({
++      orderId: "empty",
++      status: "OPEN",
++      items: [],
++      payments: [],
++      shipments: [],
++    });
++    expect(result.ok).toBe(true);
++    if (result.ok) expect(result.canCancel).toBe(true);
++  });
++
++  it("invalid status string yields invalid_order not a success decision", () => {
++    const result = evaluateSaleCancel({
++      orderId: "SO-1",
++      status: "open" as any,
++      items: [],
++      payments: [],
++      shipments: [],
++    });
++    expect(result).toEqual({ ok: false, reason: "invalid_order" });
++  });
++});
++
++describe("Sale cancel concurrent preview safety", () => {
++  it("two parallel logical previews do not interfere", () => {
++    const a = evaluateSaleCancel({
++      orderId: "A",
++      status: "OPEN",
++      items: [],
++      payments: [{ amount: 5, method: "cash" }],
++      shipments: [],
++    });
++    const b = evaluateSaleCancel({
++      orderId: "B",
++      status: "CANCELLED",
++      items: [],
++      payments: [],
++      shipments: [],
++    });
++    expect(a.ok && a.canCancel).toBe(true);
++    expect(b.ok && b.canCancel).toBe(false);
++  });
++});
+diff --git a/src/gold_tests/sale_cancel_matrix.test.ts b/src/gold_tests/sale_cancel_matrix.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/gold_tests/sale_cancel_matrix.test.ts
+@@ -0,0 +1,224 @@
++import { evaluateSaleCancel } from "../modules/sales/domain/SaleCancelPolicy";
++
++describe("Sale cancel status matrix coverage", () => {
++  it("status matrix case 1 evaluates without throwing", () => {
++    const statuses = ["OPEN", "PARTIALLY_SHIPPED", "SHIPPED", "CANCELLED", "COMPLETED"] as const;
++    const status = statuses[0];
++    const result = evaluateSaleCancel({
++      orderId: "SO-1",
++      status,
++      items: [{ productId: "P1", qtyOrdered: 2, qtyShipped: 1 }],
++      payments: 1 % 2 === 0 ? [{ amount: 1.5, method: "cash" }] : [],
++      shipments: 1 % 3 === 0 ? [] : [{ qty: 1 }],
++    });
++    expect(result.ok === true || result.ok === false).toBe(true);
++  });
++  it("status matrix case 2 evaluates without throwing", () => {
++    const statuses = ["OPEN", "PARTIALLY_SHIPPED", "SHIPPED", "CANCELLED", "COMPLETED"] as const;
++    const status = statuses[1];
++    const result = evaluateSaleCancel({
++      orderId: "SO-2",
++      status,
++      items: [{ productId: "P2", qtyOrdered: 3, qtyShipped: 1 }],
++      payments: 2 % 2 === 0 ? [{ amount: 2.5, method: "cash" }] : [],
++      shipments: 2 % 3 === 0 ? [] : [{ qty: 1 }],
++    });
++    expect(result.ok === true || result.ok === false).toBe(true);
++  });
++  it("status matrix case 3 evaluates without throwing", () => {
++    const statuses = ["OPEN", "PARTIALLY_SHIPPED", "SHIPPED", "CANCELLED", "COMPLETED"] as const;
++    const status = statuses[2];
++    const result = evaluateSaleCancel({
++      orderId: "SO-3",
++      status,
++      items: [{ productId: "P3", qtyOrdered: 4, qtyShipped: 0 }],
++      payments: 3 % 2 === 0 ? [{ amount: 3.5, method: "cash" }] : [],
++      shipments: 3 % 3 === 0 ? [] : [{ qty: 1 }],
++    });
++    expect(result.ok === true || result.ok === false).toBe(true);
++  });
++  it("status matrix case 4 evaluates without throwing", () => {
++    const statuses = ["OPEN", "PARTIALLY_SHIPPED", "SHIPPED", "CANCELLED", "COMPLETED"] as const;
++    const status = statuses[3];
++    const result = evaluateSaleCancel({
++      orderId: "SO-4",
++      status,
++      items: [{ productId: "P4", qtyOrdered: 5, qtyShipped: 1 }],
++      payments: 4 % 2 === 0 ? [{ amount: 4.5, method: "cash" }] : [],
++      shipments: 4 % 3 === 0 ? [] : [{ qty: 1 }],
++    });
++    expect(result.ok === true || result.ok === false).toBe(true);
++  });
++  it("status matrix case 5 evaluates without throwing", () => {
++    const statuses = ["OPEN", "PARTIALLY_SHIPPED", "SHIPPED", "CANCELLED", "COMPLETED"] as const;
++    const status = statuses[4];
++    const result = evaluateSaleCancel({
++      orderId: "SO-5",
++      status,
++      items: [{ productId: "P5", qtyOrdered: 6, qtyShipped: 1 }],
++      payments: 5 % 2 === 0 ? [{ amount: 5.5, method: "cash" }] : [],
++      shipments: 5 % 3 === 0 ? [] : [{ qty: 1 }],
++    });
++    expect(result.ok === true || result.ok === false).toBe(true);
++  });
++  it("status matrix case 6 evaluates without throwing", () => {
++    const statuses = ["OPEN", "PARTIALLY_SHIPPED", "SHIPPED", "CANCELLED", "COMPLETED"] as const;
++    const status = statuses[0];
++    const result = evaluateSaleCancel({
++      orderId: "SO-6",
++      status,
++      items: [{ productId: "P6", qtyOrdered: 7, qtyShipped: 0 }],
++      payments: 6 % 2 === 0 ? [{ amount: 6.5, method: "cash" }] : [],
++      shipments: 6 % 3 === 0 ? [] : [{ qty: 1 }],
++    });
++    expect(result.ok === true || result.ok === false).toBe(true);
++  });
++  it("status matrix case 7 evaluates without throwing", () => {
++    const statuses = ["OPEN", "PARTIALLY_SHIPPED", "SHIPPED", "CANCELLED", "COMPLETED"] as const;
++    const status = statuses[1];
++    const result = evaluateSaleCancel({
++      orderId: "SO-7",
++      status,
++      items: [{ productId: "P7", qtyOrdered: 8, qtyShipped: 1 }],
++      payments: 7 % 2 === 0 ? [{ amount: 7.5, method: "cash" }] : [],
++      shipments: 7 % 3 === 0 ? [] : [{ qty: 1 }],
++    });
++    expect(result.ok === true || result.ok === false).toBe(true);
++  });
++  it("status matrix case 8 evaluates without throwing", () => {
++    const statuses = ["OPEN", "PARTIALLY_SHIPPED", "SHIPPED", "CANCELLED", "COMPLETED"] as const;
++    const status = statuses[2];
++    const result = evaluateSaleCancel({
++      orderId: "SO-8",
++      status,
++      items: [{ productId: "P8", qtyOrdered: 9, qtyShipped: 1 }],
++      payments: 8 % 2 === 0 ? [{ amount: 8.5, method: "cash" }] : [],
++      shipments: 8 % 3 === 0 ? [] : [{ qty: 1 }],
++    });
++    expect(result.ok === true || result.ok === false).toBe(true);
++  });
++  it("status matrix case 9 evaluates without throwing", () => {
++    const statuses = ["OPEN", "PARTIALLY_SHIPPED", "SHIPPED", "CANCELLED", "COMPLETED"] as const;
++    const status = statuses[3];
++    const result = evaluateSaleCancel({
++      orderId: "SO-9",
++      status,
++      items: [{ productId: "P9", qtyOrdered: 10, qtyShipped: 0 }],
++      payments: 9 % 2 === 0 ? [{ amount: 9.5, method: "cash" }] : [],
++      shipments: 9 % 3 === 0 ? [] : [{ qty: 1 }],
++    });
++    expect(result.ok === true || result.ok === false).toBe(true);
++  });
++  it("status matrix case 10 evaluates without throwing", () => {
++    const statuses = ["OPEN", "PARTIALLY_SHIPPED", "SHIPPED", "CANCELLED", "COMPLETED"] as const;
++    const status = statuses[4];
++    const result = evaluateSaleCancel({
++      orderId: "SO-10",
++      status,
++      items: [{ productId: "P10", qtyOrdered: 11, qtyShipped: 1 }],
++      payments: 10 % 2 === 0 ? [{ amount: 10.5, method: "cash" }] : [],
++      shipments: 10 % 3 === 0 ? [] : [{ qty: 1 }],
++    });
++    expect(result.ok === true || result.ok === false).toBe(true);
++  });
++  it("status matrix case 11 evaluates without throwing", () => {
++    const statuses = ["OPEN", "PARTIALLY_SHIPPED", "SHIPPED", "CANCELLED", "COMPLETED"] as const;
++    const status = statuses[0];
++    const result = evaluateSaleCancel({
++      orderId: "SO-11",
++      status,
++      items: [{ productId: "P11", qtyOrdered: 12, qtyShipped: 1 }],
++      payments: 11 % 2 === 0 ? [{ amount: 11.5, method: "cash" }] : [],
++      shipments: 11 % 3 === 0 ? [] : [{ qty: 1 }],
++    });
++    expect(result.ok === true || result.ok === false).toBe(true);
++  });
++  it("status matrix case 12 evaluates without throwing", () => {
++    const statuses = ["OPEN", "PARTIALLY_SHIPPED", "SHIPPED", "CANCELLED", "COMPLETED"] as const;
++    const status = statuses[1];
++    const result = evaluateSaleCancel({
++      orderId: "SO-12",
++      status,
++      items: [{ productId: "P12", qtyOrdered: 13, qtyShipped: 0 }],
++      payments: 12 % 2 === 0 ? [{ amount: 12.5, method: "cash" }] : [],
++      shipments: 12 % 3 === 0 ? [] : [{ qty: 1 }],
++    });
++    expect(result.ok === true || result.ok === false).toBe(true);
++  });
++});
++
++describe("Sale cancel barrel extras", () => {
++  it("ignores zero-amount payments in totals", () => {
++    const result = evaluateSaleCancel({
++      orderId: "SO-0",
++      status: "OPEN",
++      items: [],
++      payments: [{ amount: 0, method: "cash" }, { amount: 0, method: "partner_loan" }],
++      shipments: [],
++    });
++    expect(result.ok).toBe(true);
++    if (result.ok) {
++      expect(result.paymentReversalTotal).toBe(0);
++      expect(result.loanReversalTotal).toBe(0);
++    }
++  });
++
++  it("does not reverse inventory when shipments empty even if item qtyShipped set", () => {
++    const result = evaluateSaleCancel({
++      orderId: "SO-I",
++      status: "OPEN",
++      items: [{ productId: "P1", qtyOrdered: 5, qtyShipped: 2 }],
++      payments: [],
++      shipments: [],
++    });
++    expect(result.ok).toBe(true);
++    if (result.ok) {
++      expect(result.inventoryReversals).toEqual([]);
++      expect(result.reasons).not.toContain("inventory_reversal_required");
++    }
++  });
++
++  it("loan total is a subset of payment total", () => {
++    const result = evaluateSaleCancel({
++      orderId: "SO-L",
++      status: "OPEN",
++      items: [],
++      payments: [
++        { amount: 40, method: "cash" },
++        { amount: 10, method: "partner_loan" },
++      ],
++      shipments: [],
++    });
++    expect(result.ok).toBe(true);
++    if (result.ok) {
++      expect(result.loanReversalTotal).toBe(10);
++      expect(result.paymentReversalTotal).toBe(50);
++    }
++  });
++
++  it("returns invalid_order when payments is not an array", () => {
++    expect(
++      evaluateSaleCancel({
++        orderId: "SO-X",
++        status: "OPEN",
++        items: [],
++        payments: {} as any,
++        shipments: [],
++      })
++    ).toEqual({ ok: false, reason: "invalid_order" });
++  });
++
++  it("handles multiple shipment rows summing to positive", () => {
++    const result = evaluateSaleCancel({
++      orderId: "SO-M",
++      status: "PARTIALLY_SHIPPED",
++      items: [{ productId: "Z", qtyOrdered: 9, qtyShipped: 4 }],
++      payments: [],
++      shipments: [{ qty: 0 }, { qty: 4 }],
++    });
++    expect(result.ok).toBe(true);
++    if (result.ok) {
++      expect(result.inventoryReversals).toEqual([{ productId: "Z", qty: 4 }]);
++    }
++  });
++});

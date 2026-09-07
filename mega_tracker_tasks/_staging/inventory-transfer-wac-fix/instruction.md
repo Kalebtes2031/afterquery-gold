@@ -1,0 +1,9 @@
+Branch transfers currently skip WAC bookkeeping, so company average cost drifts after stock moves between branches. Add a pure transfer cost engine — no live DB — that models transfer legs correctly and can audit drift after mixed inventory operations.
+
+Public barrel: `src/modules/inventory/domain/TransferWacEngine.ts`. Export `TransferWacEngine`, `calculateTransferLegs`, `applyTransferWac`, `auditTransferWacDrift`, and the related types. Split into `TransferWacTypes.ts`, `TransferWacMath.ts`, `TransferWacAudit.ts`, plus a domain `index.ts` re-export if useful for consumers.
+
+A transfer moves `qty` from `sourceBranchId` to `destBranchId`. The source unit cost is the current WAC passed in on the request; the destination receives that same unit cost on its inbound leg. Successful results should expose both legs with before/after on-hand. For transfer-only moves, company WAC and company on-hand stay unchanged while both branch on-hand values update. Over-transfer (`qty` greater than source on-hand) returns `{ok:false, reason:"insufficient_stock"}`. Zero, negative, or non-finite qty returns `invalid_qty`. Blank product/branch ids, identical source/dest, or a negative unit cost returns `invalid_transfer`.
+
+`auditTransferWacDrift` replays mixed `POSITIVE|NEGATIVE|TRANSFER` ops from an initial company/branch snapshot and compares the expected company WAC and per-branch on-hand to the stored values. `POSITIVE` may change company WAC; `NEGATIVE` and `TRANSFER` must not. Emit issue codes `company_wac_drift`, `branch_onhand_mismatch`, and `missing_leg` when replay cannot produce a consistent result. Keep the whole module pure and deterministic so the regression is covered by Jest without Postgres or side effects.
+
+IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.

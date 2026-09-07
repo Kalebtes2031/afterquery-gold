@@ -1,0 +1,9 @@
+Partner loan balances are stored as many open legs from sales, purchases, expenses, and direct loans. Before we write settlement transactions we need a pure allocator that shows exactly how a payment would clear those legs, including overpay leftover that should stay unallocated.
+
+Barrel at `src/modules/finance/domain/LoanSettlementAllocator.ts`. Export `LoanSettlementAllocator`, `allocateSettlement`, `previewSettlement`, `listOpenLoanLegs`, and types. Supporting files for types, ordering, and math are expected and should stay free of infrastructure imports.
+
+Open legs look like `{legId, sourceType: SALE|PURCHASE|EXPENSE|DIRECT, principalRemaining, openedAt}`. Only legs with a non-empty leg id, positive remaining principal, finite openedAt, and a known source type count as open. `allocateSettlement(partnerId, amount, legs, options?)` clamps amount to a positive finite value at two decimal places. Strategy defaults to `fifo` — sort by `openedAt` ascending, then `legId`. Pass `strategy:"largest_first"` to clear the biggest principal first; ties still break on openedAt then legId. Unknown strategy values should fall back to fifo.
+
+Return `{ok:true, partnerId, strategy, amount, allocations[{legId, applied, remainingAfter}], leftover, fullySettledLegIds, settledAt}`. Overpay is allowed: leftover stays > 0 after every open leg is cleared. Applied plus leftover must equal the clamped amount. Invalid partner id, non-positive amount, or a non-array legs argument must fail with `invalid_partner`, `invalid_amount`, or `invalid_legs`. `previewSettlement` mirrors allocate and also returns `openLegsAfter` for legs that still have principal remaining. This is application math only — no repositories, SQL, or mutable process state.
+
+IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.

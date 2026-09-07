@@ -1,0 +1,516 @@
+diff --git a/src/modules/sales/domain/SaleCancelTypes.ts b/src/modules/sales/domain/SaleCancelTypes.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/modules/sales/domain/SaleCancelTypes.ts
+@@ -0,0 +1,63 @@
++export type SaleCancelStatus =
++  | "OPEN"
++  | "PARTIALLY_SHIPPED"
++  | "SHIPPED"
++  | "CANCELLED"
++  | "COMPLETED";
++
++export type SaleCancelPaymentMethod = "cash" | "transfer" | "partner_loan" | string;
++
++export interface SaleCancelItemSnapshot {
++  productId: string;
++  qtyOrdered: number;
++  qtyShipped: number;
++}
++
++export interface SaleCancelPaymentSnapshot {
++  amount: number;
++  method: SaleCancelPaymentMethod;
++}
++
++export interface SaleCancelShipmentSnapshot {
++  qty: number;
++}
++
++export interface SaleCancelOrderSnapshot {
++  orderId: string;
++  status: SaleCancelStatus;
++  items: SaleCancelItemSnapshot[];
++  payments: SaleCancelPaymentSnapshot[];
++  shipments: SaleCancelShipmentSnapshot[];
++}
++
++export interface InventoryReversalLine {
++  productId: string;
++  qty: number;
++}
++
++export interface SaleCancelSuccess {
++  ok: true;
++  canCancel: boolean;
++  reasons: string[];
++  inventoryReversals: InventoryReversalLine[];
++  paymentReversalTotal: number;
++  loanReversalTotal: number;
++}
++
++export interface SaleCancelFailure {
++  ok: false;
++  reason: "invalid_order";
++}
++
++export type SaleCancelDecision = SaleCancelSuccess | SaleCancelFailure;
++
++export const CANCELABLE_STATUSES: ReadonlySet<SaleCancelStatus> = new Set([
++  "OPEN",
++  "PARTIALLY_SHIPPED",
++]);
++
++export const BLOCKED_STATUSES: ReadonlySet<SaleCancelStatus> = new Set([
++  "SHIPPED",
++  "CANCELLED",
++  "COMPLETED",
++]);
+diff --git a/src/modules/sales/domain/SaleCancelRules.ts b/src/modules/sales/domain/SaleCancelRules.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/modules/sales/domain/SaleCancelRules.ts
+@@ -0,0 +1,82 @@
++import {
++  BLOCKED_STATUSES,
++  CANCELABLE_STATUSES,
++  SaleCancelOrderSnapshot,
++  SaleCancelStatus,
++} from "./SaleCancelTypes";
++
++export function normalizeOrderId(orderId: unknown): string | null {
++  if (typeof orderId !== "string") return null;
++  const trimmed = orderId.trim();
++  return trimmed.length > 0 ? trimmed : null;
++}
++
++export function isKnownStatus(status: unknown): status is SaleCancelStatus {
++  return (
++    status === "OPEN" ||
++    status === "PARTIALLY_SHIPPED" ||
++    status === "SHIPPED" ||
++    status === "CANCELLED" ||
++    status === "COMPLETED"
++  );
++}
++
++export function validateOrderSnapshot(
++  order: SaleCancelOrderSnapshot | null | undefined
++): { ok: true; orderId: string; status: SaleCancelStatus } | { ok: false; reason: "invalid_order" } {
++  if (!order || typeof order !== "object") {
++    return { ok: false, reason: "invalid_order" };
++  }
++  const orderId = normalizeOrderId(order.orderId);
++  if (!orderId) {
++    return { ok: false, reason: "invalid_order" };
++  }
++  if (!isKnownStatus(order.status)) {
++    return { ok: false, reason: "invalid_order" };
++  }
++  if (!Array.isArray(order.items) || !Array.isArray(order.payments) || !Array.isArray(order.shipments)) {
++    return { ok: false, reason: "invalid_order" };
++  }
++  return { ok: true, orderId, status: order.status };
++}
++
++export function statusAllowsCancel(status: SaleCancelStatus): boolean {
++  if (BLOCKED_STATUSES.has(status)) return false;
++  return CANCELABLE_STATUSES.has(status);
++}
++
++export function collectCancelBlockReasons(status: SaleCancelStatus): string[] {
++  const reasons: string[] = [];
++  if (status === "CANCELLED") reasons.push("already_cancelled");
++  if (status === "COMPLETED") reasons.push("already_completed");
++  if (status === "SHIPPED") reasons.push("fully_shipped");
++  if (!statusAllowsCancel(status) && reasons.length === 0) {
++    reasons.push("status_not_cancelable");
++  }
++  return reasons;
++}
++
++export function explainStatus(status: SaleCancelStatus): string {
++  switch (status) {
++    case "OPEN":
++      return "open and cancelable";
++    case "PARTIALLY_SHIPPED":
++      return "partially shipped; inventory reversal may be required";
++    case "SHIPPED":
++      return "fully shipped; cancel blocked";
++    case "CANCELLED":
++      return "already cancelled";
++    case "COMPLETED":
++      return "already completed";
++    default:
++      return "unknown";
++  }
++}
++
++export function isTerminalStatus(status: SaleCancelStatus): boolean {
++  return status === "CANCELLED" || status === "COMPLETED";
++}
++
++export function isShippedLike(status: SaleCancelStatus): boolean {
++  return status === "SHIPPED" || status === "PARTIALLY_SHIPPED";
++}
+diff --git a/src/modules/sales/domain/SaleCancelReversal.ts b/src/modules/sales/domain/SaleCancelReversal.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/modules/sales/domain/SaleCancelReversal.ts
+@@ -0,0 +1,82 @@
++import {
++  InventoryReversalLine,
++  SaleCancelItemSnapshot,
++  SaleCancelPaymentSnapshot,
++  SaleCancelShipmentSnapshot,
++} from "./SaleCancelTypes";
++
++export function hasPositiveShipmentQty(shipments: SaleCancelShipmentSnapshot[]): boolean {
++  return shipments.some((s) => Number(s?.qty) > 0);
++}
++
++export function aggregateInventoryReversals(
++  items: SaleCancelItemSnapshot[]
++): InventoryReversalLine[] {
++  const map = new Map<string, number>();
++  for (const item of items) {
++    if (!item || typeof item.productId !== "string") continue;
++    const productId = item.productId.trim();
++    if (!productId) continue;
++    const qty = Number(item.qtyShipped);
++    if (!Number.isFinite(qty) || qty <= 0) continue;
++    map.set(productId, (map.get(productId) ?? 0) + qty);
++  }
++  return [...map.entries()]
++    .map(([productId, qty]) => ({ productId, qty }))
++    .sort((a, b) => a.productId.localeCompare(b.productId));
++}
++
++export function sumPaymentTotal(payments: SaleCancelPaymentSnapshot[]): number {
++  let total = 0;
++  for (const payment of payments) {
++    const amount = Number(payment?.amount);
++    if (Number.isFinite(amount) && amount > 0) total += amount;
++  }
++  return roundMoney(total);
++}
++
++export function sumLoanPaymentTotal(payments: SaleCancelPaymentSnapshot[]): number {
++  let total = 0;
++  for (const payment of payments) {
++    if (String(payment?.method ?? "").toLowerCase() !== "partner_loan") continue;
++    const amount = Number(payment?.amount);
++    if (Number.isFinite(amount) && amount > 0) total += amount;
++  }
++  return roundMoney(total);
++}
++
++export function roundMoney(value: number): number {
++  return Math.round(value * 100) / 100;
++}
++
++export function inventoryReversalMap(items: SaleCancelItemSnapshot[]): Map<string, number> {
++  const lines = aggregateInventoryReversals(items);
++  return new Map(lines.map((line) => [line.productId, line.qty]));
++}
++
++export function paymentBreakdown(payments: SaleCancelPaymentSnapshot[]): {
++  cashLike: number;
++  loan: number;
++  other: number;
++} {
++  let cashLike = 0;
++  let loan = 0;
++  let other = 0;
++  for (const payment of payments) {
++    const amount = Number(payment?.amount);
++    if (!Number.isFinite(amount) || amount <= 0) continue;
++    const method = String(payment.method ?? "").toLowerCase();
++    if (method === "partner_loan") loan += amount;
++    else if (method === "cash" || method === "transfer") cashLike += amount;
++    else other += amount;
++  }
++  return {
++    cashLike: roundMoney(cashLike),
++    loan: roundMoney(loan),
++    other: roundMoney(other),
++  };
++}
++
++export function shipmentHasActivity(shipments: SaleCancelShipmentSnapshot[]): boolean {
++  return hasPositiveShipmentQty(shipments);
++}
+diff --git a/src/modules/sales/domain/SaleCancelPolicy.ts b/src/modules/sales/domain/SaleCancelPolicy.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/modules/sales/domain/SaleCancelPolicy.ts
+@@ -0,0 +1,228 @@
++import {
++  collectCancelBlockReasons,
++  statusAllowsCancel,
++  validateOrderSnapshot,
++} from "./SaleCancelRules";
++import {
++  aggregateInventoryReversals,
++  hasPositiveShipmentQty,
++  sumLoanPaymentTotal,
++  sumPaymentTotal,
++} from "./SaleCancelReversal";
++import {
++  InventoryReversalLine,
++  SaleCancelDecision,
++  SaleCancelOrderSnapshot,
++  SaleCancelSuccess,
++} from "./SaleCancelTypes";
++
++export type {
++  SaleCancelDecision,
++  SaleCancelOrderSnapshot,
++  SaleCancelStatus,
++  SaleCancelItemSnapshot,
++  SaleCancelPaymentSnapshot,
++  SaleCancelShipmentSnapshot,
++  InventoryReversalLine,
++  SaleCancelSuccess,
++  SaleCancelFailure,
++  SaleCancelPaymentMethod,
++} from "./SaleCancelTypes";
++
++export {
++  CANCELABLE_STATUSES,
++  BLOCKED_STATUSES,
++} from "./SaleCancelTypes";
++
++export {
++  normalizeOrderId,
++  isKnownStatus,
++  validateOrderSnapshot,
++  statusAllowsCancel,
++  collectCancelBlockReasons,
++} from "./SaleCancelRules";
++
++export {
++  hasPositiveShipmentQty,
++  aggregateInventoryReversals,
++  sumPaymentTotal,
++  sumLoanPaymentTotal,
++  roundMoney,
++} from "./SaleCancelReversal";
++
++/**
++ * Pure sale-cancel eligibility + reversal preview.
++ * Concurrent-safe and idempotent: no shared mutable state.
++ */
++export class SaleCancelPolicy {
++  evaluate(order: SaleCancelOrderSnapshot): SaleCancelDecision {
++    return evaluateSaleCancel(order);
++  }
++
++  previewReversal(order: SaleCancelOrderSnapshot): SaleCancelDecision {
++    return previewSaleCancelReversal(order);
++  }
++}
++
++export function evaluateSaleCancel(order: SaleCancelOrderSnapshot): SaleCancelDecision {
++  const validated = validateOrderSnapshot(order);
++  if (!validated.ok) return { ok: false, reason: "invalid_order" };
++
++  const reasons = collectCancelBlockReasons(validated.status);
++  const canCancelByStatus = statusAllowsCancel(validated.status) && reasons.length === 0;
++
++  const needsInventory = hasPositiveShipmentQty(order.shipments ?? []);
++  const inventoryReversals = needsInventory
++    ? aggregateInventoryReversals(order.items ?? [])
++    : [];
++
++  const paymentReversalTotal = sumPaymentTotal(order.payments ?? []);
++  const loanReversalTotal = sumLoanPaymentTotal(order.payments ?? []);
++
++  if (needsInventory && inventoryReversals.length === 0) {
++    reasons.push("missing_shipped_item_qty");
++  }
++  if (paymentReversalTotal > 0) reasons.push("payment_reversal_required");
++  if (loanReversalTotal > 0) reasons.push("loan_reversal_required");
++  if (needsInventory) reasons.push("inventory_reversal_required");
++
++  const blocking = reasons.filter((r) =>
++    r === "already_cancelled" ||
++    r === "already_completed" ||
++    r === "fully_shipped" ||
++    r === "status_not_cancelable" ||
++    r === "missing_shipped_item_qty"
++  );
++
++  const success: SaleCancelSuccess = {
++    ok: true,
++    canCancel: canCancelByStatus && blocking.length === 0,
++    reasons: uniqueSorted(reasons),
++    inventoryReversals,
++    paymentReversalTotal,
++    loanReversalTotal,
++  };
++  return success;
++}
++
++export function previewSaleCancelReversal(order: SaleCancelOrderSnapshot): SaleCancelDecision {
++  return evaluateSaleCancel(order);
++}
++
++function uniqueSorted(values: string[]): string[] {
++  return [...new Set(values)].sort((a, b) => a.localeCompare(b));
++}
++
++export const saleCancelPolicy = new SaleCancelPolicy();
++
++/** Summarize a decision for logs / UI without mutating it. */
++export function summarizeSaleCancelDecision(decision: SaleCancelDecision): string {
++  if (!decision.ok) return `fail:${decision.reason}`;
++  const inv = decision.inventoryReversals.map((r) => `${r.productId}:${r.qty}`).join(",");
++  return [
++    `canCancel=${decision.canCancel}`,
++    `reasons=${decision.reasons.join("|") || "-"}`,
++    `inv=[${inv}]`,
++    `pay=${decision.paymentReversalTotal}`,
++    `loan=${decision.loanReversalTotal}`,
++  ].join(";");
++}
++
++export function countInventoryReversalQty(decision: SaleCancelDecision): number {
++  if (!decision.ok) return 0;
++  return decision.inventoryReversals.reduce((sum, row) => sum + row.qty, 0);
++}
++
++export function hasLoanReversal(decision: SaleCancelDecision): boolean {
++  return decision.ok && decision.loanReversalTotal > 0;
++}
++
++export function hasPaymentReversal(decision: SaleCancelDecision): boolean {
++  return decision.ok && decision.paymentReversalTotal > 0;
++}
++
++export function isAdvisoryReason(reason: string): boolean {
++  return (
++    reason === "payment_reversal_required" ||
++    reason === "loan_reversal_required" ||
++    reason === "inventory_reversal_required"
++  );
++}
++
++export function partitionReasons(reasons: string[]): { blocking: string[]; advisory: string[] } {
++  const blocking: string[] = [];
++  const advisory: string[] = [];
++  for (const reason of reasons) {
++    if (isAdvisoryReason(reason)) advisory.push(reason);
++    else blocking.push(reason);
++  }
++  return { blocking, advisory };
++}
++
++export function assertCancelPreviewStable(
++  order: SaleCancelOrderSnapshot,
++  rounds = 3
++): SaleCancelDecision {
++  const first = previewSaleCancelReversal(order);
++  for (let i = 0; i < rounds; i += 1) {
++    const next = previewSaleCancelReversal(order);
++    if (JSON.stringify(next) !== JSON.stringify(first)) {
++      throw new Error("sale cancel preview is not stable");
++    }
++  }
++  return first;
++}
++
++export function mergeInventoryReversals(
++  left: InventoryReversalLine[],
++  right: InventoryReversalLine[]
++): InventoryReversalLine[] {
++  const map = new Map<string, number>();
++  for (const row of [...left, ...right]) {
++    map.set(row.productId, (map.get(row.productId) ?? 0) + row.qty);
++  }
++  return [...map.entries()]
++    .map(([productId, qty]) => ({ productId, qty }))
++    .sort((a, b) => a.productId.localeCompare(b.productId));
++}
++
++export function describeCancelability(decision: SaleCancelDecision): string {
++  if (!decision.ok) return "invalid";
++  if (decision.canCancel) return "cancelable";
++  return "blocked";
++}
++
++export function requireCancelable(decision: SaleCancelDecision): asserts decision is SaleCancelSuccess {
++  if (!decision.ok || !decision.canCancel) {
++    throw new Error("order is not cancelable");
++  }
++}
++
++export function paymentMethodsRequiringReversal(order: SaleCancelOrderSnapshot): string[] {
++  const methods = new Set<string>();
++  for (const payment of order.payments ?? []) {
++    const amount = Number(payment?.amount);
++    if (!Number.isFinite(amount) || amount <= 0) continue;
++    methods.add(String(payment.method ?? "unknown").toLowerCase());
++  }
++  return [...methods].sort((a, b) => a.localeCompare(b));
++}
++
++export function shipmentQtyTotal(order: SaleCancelOrderSnapshot): number {
++  return (order.shipments ?? []).reduce((sum, row) => {
++    const qty = Number(row?.qty);
++    return sum + (Number.isFinite(qty) && qty > 0 ? qty : 0);
++  }, 0);
++}
++
++export function itemShippedQtyTotal(order: SaleCancelOrderSnapshot): number {
++  return (order.items ?? []).reduce((sum, row) => {
++    const qty = Number(row?.qtyShipped);
++    return sum + (Number.isFinite(qty) && qty > 0 ? qty : 0);
++  }, 0);
++}
++
++export function previewNeedsAttention(decision: SaleCancelDecision): boolean {
++  if (!decision.ok) return true;
++  return !decision.canCancel || decision.reasons.length > 0;
++}
+diff --git a/src/modules/sales/domain/index.ts b/src/modules/sales/domain/index.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/modules/sales/domain/index.ts
+@@ -0,0 +1,31 @@
++export {
++  SaleCancelPolicy,
++  saleCancelPolicy,
++  evaluateSaleCancel,
++  previewSaleCancelReversal,
++  CANCELABLE_STATUSES,
++  BLOCKED_STATUSES,
++  normalizeOrderId,
++  isKnownStatus,
++  validateOrderSnapshot,
++  statusAllowsCancel,
++  collectCancelBlockReasons,
++  hasPositiveShipmentQty,
++  aggregateInventoryReversals,
++  sumPaymentTotal,
++  sumLoanPaymentTotal,
++  roundMoney,
++} from "./SaleCancelPolicy";
++
++export type {
++  SaleCancelDecision,
++  SaleCancelOrderSnapshot,
++  SaleCancelStatus,
++  SaleCancelItemSnapshot,
++  SaleCancelPaymentSnapshot,
++  SaleCancelShipmentSnapshot,
++  InventoryReversalLine,
++  SaleCancelSuccess,
++  SaleCancelFailure,
++  SaleCancelPaymentMethod,
++} from "./SaleCancelPolicy";

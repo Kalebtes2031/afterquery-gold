@@ -1,0 +1,538 @@
+diff --git a/src/shared/domain/fulfillment/FulfillmentTypes.ts b/src/shared/domain/fulfillment/FulfillmentTypes.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/shared/domain/fulfillment/FulfillmentTypes.ts
+@@ -0,0 +1,55 @@
++export type FulfillmentLineStatus = "UNFULFILLED" | "PARTIAL" | "FULFILLED";
++
++export interface FulfillmentLine {
++  lineId: string;
++  qtyOrdered: number;
++  qtyFulfilled: number;
++}
++
++export interface RemainingView {
++  lineId: string;
++  qtyOrdered: number;
++  qtyFulfilled: number;
++  remaining: number;
++  status: FulfillmentLineStatus;
++}
++
++export interface ValidateDeltaSuccess {
++  ok: true;
++  lineId: string;
++  delta: number;
++  remainingBefore: number;
++}
++
++export interface ValidateDeltaFailure {
++  ok: false;
++  reason: "invalid_delta" | "over_fulfill" | "invalid_line";
++  lineId?: string;
++}
++
++export type ValidateDeltaResult = ValidateDeltaSuccess | ValidateDeltaFailure;
++
++export interface ApplyFulfillmentSuccess {
++  ok: true;
++  line: FulfillmentLine;
++  status: FulfillmentLineStatus;
++  remaining: number;
++}
++
++export type ApplyFulfillmentResult = ApplyFulfillmentSuccess | ValidateDeltaFailure;
++
++export type FulfillmentIssueCode =
++  | "over_fulfilled"
++  | "negative_remaining"
++  | "status_mismatch";
++
++export interface FulfillmentIssue {
++  code: FulfillmentIssueCode;
++  lineId: string;
++  message: string;
++}
++
++export interface FulfillmentAuditResult {
++  ok: boolean;
++  issues: FulfillmentIssue[];
++}
+diff --git a/src/shared/domain/fulfillment/FulfillmentMath.ts b/src/shared/domain/fulfillment/FulfillmentMath.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/shared/domain/fulfillment/FulfillmentMath.ts
+@@ -0,0 +1,64 @@
++import {
++  FulfillmentLine,
++  FulfillmentLineStatus,
++  RemainingView,
++} from "./FulfillmentTypes";
++
++export function normalizeLineId(lineId: unknown): string | null {
++  if (typeof lineId !== "string") return null;
++  const trimmed = lineId.trim();
++  return trimmed.length > 0 ? trimmed : null;
++}
++
++export function asNonNegativeNumber(value: unknown): number | null {
++  const n = Number(value);
++  if (!Number.isFinite(n)) return null;
++  return n;
++}
++
++export function deriveStatus(qtyOrdered: number, qtyFulfilled: number): FulfillmentLineStatus {
++  if (qtyFulfilled <= 0) return "UNFULFILLED";
++  if (qtyFulfilled >= qtyOrdered) return "FULFILLED";
++  return "PARTIAL";
++}
++
++export function clampRemaining(qtyOrdered: number, qtyFulfilled: number): number {
++  const raw = qtyOrdered - qtyFulfilled;
++  return raw < 0 ? 0 : raw;
++}
++
++export function toRemainingView(line: FulfillmentLine): RemainingView | null {
++  const lineId = normalizeLineId(line?.lineId);
++  const qtyOrdered = asNonNegativeNumber(line?.qtyOrdered);
++  const qtyFulfilled = asNonNegativeNumber(line?.qtyFulfilled);
++  if (!lineId || qtyOrdered === null || qtyFulfilled === null) return null;
++  if (qtyOrdered < 0 || qtyFulfilled < 0) return null;
++  return {
++    lineId,
++    qtyOrdered,
++    qtyFulfilled,
++    remaining: clampRemaining(qtyOrdered, qtyFulfilled),
++    status: deriveStatus(qtyOrdered, qtyFulfilled),
++  };
++}
++
++export function formatRemainingView(view: RemainingView): string {
++  return `${view.lineId} ordered=${view.qtyOrdered} fulfilled=${view.qtyFulfilled} remaining=${view.remaining} status=${view.status}`;
++}
++
++export function isPartialView(view: RemainingView): boolean {
++  return view.status === "PARTIAL";
++}
++
++export function isUnfulfilledView(view: RemainingView): boolean {
++  return view.status === "UNFULFILLED";
++}
++
++export function isFulfilledView(view: RemainingView): boolean {
++  return view.status === "FULFILLED";
++}
++
++export function remainingPercent(view: RemainingView): number {
++  if (view.qtyOrdered <= 0) return 0;
++  return Math.round((view.remaining / view.qtyOrdered) * 10000) / 100;
++}
+diff --git a/src/shared/domain/fulfillment/FulfillmentAudit.ts b/src/shared/domain/fulfillment/FulfillmentAudit.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/shared/domain/fulfillment/FulfillmentAudit.ts
+@@ -0,0 +1,77 @@
++import { clampRemaining, deriveStatus, normalizeLineId, toRemainingView } from "./FulfillmentMath";
++import {
++  FulfillmentAuditResult,
++  FulfillmentIssue,
++  FulfillmentIssueCode,
++  FulfillmentLine,
++  FulfillmentLineStatus,
++} from "./FulfillmentTypes";
++
++export interface AuditableLine extends FulfillmentLine {
++  status?: FulfillmentLineStatus;
++}
++
++export function auditFulfillmentConsistency(lines: AuditableLine[]): FulfillmentAuditResult {
++  const issues: FulfillmentIssue[] = [];
++  if (!Array.isArray(lines)) {
++    return { ok: false, issues: [{ code: "status_mismatch", lineId: "", message: "lines not array" }] };
++  }
++
++  for (const line of lines) {
++    const view = toRemainingView(line);
++    const lineId = normalizeLineId(line?.lineId) ?? "";
++    if (!view) {
++      issues.push({ code: "status_mismatch", lineId, message: "invalid line" });
++      continue;
++    }
++    const rawRemaining = view.qtyOrdered - view.qtyFulfilled;
++    if (view.qtyFulfilled > view.qtyOrdered) {
++      issues.push({
++        code: "over_fulfilled",
++        lineId: view.lineId,
++        message: `fulfilled ${view.qtyFulfilled} > ordered ${view.qtyOrdered}`,
++      });
++    }
++    if (rawRemaining < 0) {
++      issues.push({
++        code: "negative_remaining",
++        lineId: view.lineId,
++        message: `raw remaining ${rawRemaining}`,
++      });
++    }
++    if (line.status != null) {
++      const expected = deriveStatus(view.qtyOrdered, Math.min(view.qtyFulfilled, view.qtyOrdered));
++      // For over-fulfilled lines, canonical status is still FULFILLED.
++      const canonical =
++        view.qtyFulfilled > view.qtyOrdered ? "FULFILLED" : deriveStatus(view.qtyOrdered, view.qtyFulfilled);
++      if (line.status !== canonical && line.status !== expected) {
++        issues.push({
++          code: "status_mismatch",
++          lineId: view.lineId,
++          message: `stored ${line.status} expected ${canonical}`,
++        });
++      }
++    }
++    // touch helpers so clamp is covered in audit path
++    void clampRemaining(view.qtyOrdered, view.qtyFulfilled);
++  }
++
++  return { ok: issues.length === 0, issues };
++}
++
++export function issuesForLine(result: FulfillmentAuditResult, lineId: string): FulfillmentIssue[] {
++  return result.issues.filter((issue) => issue.lineId === lineId);
++}
++
++export function hasAnyIssue(result: FulfillmentAuditResult, code: FulfillmentIssueCode): boolean {
++  return result.issues.some((issue) => issue.code === code);
++}
++
++export function summarizeAuditResult(result: FulfillmentAuditResult): string {
++  if (result.ok) return "ok";
++  return result.issues.map((i) => `${i.lineId}:${i.code}`).join(",");
++}
++
++export function emptyAuditResult(): FulfillmentAuditResult {
++  return { ok: true, issues: [] };
++}
+diff --git a/src/shared/domain/fulfillment/index.ts b/src/shared/domain/fulfillment/index.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/shared/domain/fulfillment/index.ts
+@@ -0,0 +1,24 @@
++export type {
++  FulfillmentLineStatus,
++  FulfillmentLine,
++  RemainingView,
++  ValidateDeltaSuccess,
++  ValidateDeltaFailure,
++  ValidateDeltaResult,
++  ApplyFulfillmentSuccess,
++  ApplyFulfillmentResult,
++  FulfillmentIssueCode,
++  FulfillmentIssue,
++  FulfillmentAuditResult,
++} from "./FulfillmentTypes";
++
++export {
++  normalizeLineId,
++  asNonNegativeNumber,
++  deriveStatus,
++  clampRemaining,
++  toRemainingView,
++} from "./FulfillmentMath";
++
++export { auditFulfillmentConsistency } from "./FulfillmentAudit";
++export type { AuditableLine } from "./FulfillmentAudit";
+diff --git a/src/modules/sales/domain/FulfillmentRemainingGuard.ts b/src/modules/sales/domain/FulfillmentRemainingGuard.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/modules/sales/domain/FulfillmentRemainingGuard.ts
+@@ -0,0 +1,257 @@
++import { auditFulfillmentConsistency } from "../../../shared/domain/fulfillment/FulfillmentAudit";
++import type { AuditableLine } from "../../../shared/domain/fulfillment/FulfillmentAudit";
++import {
++  deriveStatus,
++  normalizeLineId,
++  toRemainingView,
++} from "../../../shared/domain/fulfillment/FulfillmentMath";
++import {
++  ApplyFulfillmentResult,
++  ApplyFulfillmentSuccess,
++  FulfillmentAuditResult,
++  FulfillmentLine,
++  FulfillmentLineStatus,
++  RemainingView,
++  ValidateDeltaResult,
++} from "../../../shared/domain/fulfillment/FulfillmentTypes";
++
++export type {
++  FulfillmentLineStatus,
++  FulfillmentLine,
++  RemainingView,
++  ValidateDeltaResult,
++  ApplyFulfillmentResult,
++  FulfillmentIssueCode,
++  FulfillmentIssue,
++  FulfillmentAuditResult,
++} from "../../../shared/domain/fulfillment/FulfillmentTypes";
++
++export {
++  normalizeLineId,
++  asNonNegativeNumber,
++  deriveStatus,
++  clampRemaining,
++  toRemainingView,
++} from "../../../shared/domain/fulfillment/FulfillmentMath";
++
++export { auditFulfillmentConsistency } from "../../../shared/domain/fulfillment/FulfillmentAudit";
++export type { AuditableLine } from "../../../shared/domain/fulfillment/FulfillmentAudit";
++
++export class FulfillmentRemainingGuard {
++  computeRemaining(line: FulfillmentLine): RemainingView | null {
++    return computeRemaining(line);
++  }
++
++  validatePartialFulfillment(line: FulfillmentLine, delta: number): ValidateDeltaResult {
++    return validatePartialFulfillment(line, delta);
++  }
++
++  applyFulfillmentDelta(line: FulfillmentLine, delta: number): ApplyFulfillmentResult {
++    return applyFulfillmentDelta(line, delta);
++  }
++
++  audit(lines: AuditableLine[]): FulfillmentAuditResult {
++    return auditFulfillmentConsistency(lines);
++  }
++}
++
++export function computeRemaining(line: FulfillmentLine): RemainingView | null {
++  return toRemainingView(line);
++}
++
++export function validatePartialFulfillment(
++  line: FulfillmentLine,
++  delta: number
++): ValidateDeltaResult {
++  const view = toRemainingView(line);
++  if (!view) return { ok: false, reason: "invalid_line" };
++  const d = Number(delta);
++  if (!Number.isFinite(d) || d <= 0) {
++    return { ok: false, reason: "invalid_delta", lineId: view.lineId };
++  }
++  if (d > view.remaining) {
++    return { ok: false, reason: "over_fulfill", lineId: view.lineId };
++  }
++  return {
++    ok: true,
++    lineId: view.lineId,
++    delta: d,
++    remainingBefore: view.remaining,
++  };
++}
++
++export function applyFulfillmentDelta(
++  line: FulfillmentLine,
++  delta: number
++): ApplyFulfillmentResult {
++  const validated = validatePartialFulfillment(line, delta);
++  if (!validated.ok) return validated;
++  const qtyFulfilled = line.qtyFulfilled + validated.delta;
++  const status = deriveStatus(line.qtyOrdered, qtyFulfilled);
++  const remaining = Math.max(0, line.qtyOrdered - qtyFulfilled);
++  const success: ApplyFulfillmentSuccess = {
++    ok: true,
++    line: {
++      lineId: normalizeLineId(line.lineId) ?? line.lineId,
++      qtyOrdered: line.qtyOrdered,
++      qtyFulfilled,
++    },
++    status,
++    remaining,
++  };
++  return success;
++}
++
++export const fulfillmentRemainingGuard = new FulfillmentRemainingGuard();
++
++export function summarizeRemaining(view: RemainingView | null): string {
++  if (!view) return "invalid";
++  return `${view.lineId}:${view.status}:rem=${view.remaining}`;
++}
++
++export function isComplete(view: RemainingView | null): boolean {
++  return !!view && view.status === "FULFILLED" && view.remaining === 0;
++}
++
++export function canAcceptDelta(line: FulfillmentLine, delta: number): boolean {
++  return validatePartialFulfillment(line, delta).ok;
++}
++
++export function remainingAfterDelta(line: FulfillmentLine, delta: number): number | null {
++  const applied = applyFulfillmentDelta(line, delta);
++  if (!applied.ok) return null;
++  return applied.remaining;
++}
++
++export function statusAfterDelta(line: FulfillmentLine, delta: number): FulfillmentLineStatus | null {
++  const applied = applyFulfillmentDelta(line, delta);
++  if (!applied.ok) return null;
++  return applied.status;
++}
++
++export function auditCodes(result: FulfillmentAuditResult): string[] {
++  return [...new Set(result.issues.map((i) => i.code))].sort();
++}
++
++export function linesWithIssues(result: FulfillmentAuditResult): string[] {
++  return [...new Set(result.issues.map((i) => i.lineId))].sort();
++}
++
++export function assertNoIssues(result: FulfillmentAuditResult): void {
++  if (!result.ok || result.issues.length > 0) {
++    throw new Error(`fulfillment audit failed: ${auditCodes(result).join(",")}`);
++  }
++}
++
++export function buildLine(lineId: string, qtyOrdered: number, qtyFulfilled = 0): FulfillmentLine {
++  return { lineId, qtyOrdered, qtyFulfilled };
++}
++
++export function progressRatio(line: FulfillmentLine): number | null {
++  const view = computeRemaining(line);
++  if (!view || view.qtyOrdered <= 0) return null;
++  return Math.min(1, view.qtyFulfilled / view.qtyOrdered);
++}
++
++export function describeApply(result: ApplyFulfillmentResult): string {
++  if (!result.ok) return `fail:${result.reason}`;
++  return `ok:${result.status}:fulfilled=${result.line.qtyFulfilled}:rem=${result.remaining}`;
++}
++
++export function maxAcceptableDelta(line: FulfillmentLine): number {
++  const view = computeRemaining(line);
++  return view ? view.remaining : 0;
++}
++
++export function applyUntilFulfilled(line: FulfillmentLine, step: number): ApplyFulfillmentResult {
++  let current = { ...line };
++  let last: ApplyFulfillmentResult = { ok: false, reason: "invalid_delta" };
++  while (true) {
++    const view = computeRemaining(current);
++    if (!view || view.remaining <= 0) break;
++    const delta = Math.min(step, view.remaining);
++    last = applyFulfillmentDelta(current, delta);
++    if (!last.ok) return last;
++    current = last.line;
++    if (last.status === "FULFILLED") return last;
++  }
++  return last.ok
++    ? last
++    : {
++        ok: true,
++        line: current,
++        status: deriveStatus(current.qtyOrdered, current.qtyFulfilled),
++        remaining: Math.max(0, current.qtyOrdered - current.qtyFulfilled),
++      };
++}
++
++export function validateMany(
++  lines: FulfillmentLine[],
++  delta: number
++): Array<{ lineId: string; result: ValidateDeltaResult }> {
++  return lines.map((line) => ({
++    lineId: normalizeLineId(line.lineId) ?? String(line.lineId),
++    result: validatePartialFulfillment(line, delta),
++  }));
++}
++
++export function applyMany(
++  lines: FulfillmentLine[],
++  delta: number
++): Array<{ lineId: string; result: ApplyFulfillmentResult }> {
++  return lines.map((line) => ({
++    lineId: normalizeLineId(line.lineId) ?? String(line.lineId),
++    result: applyFulfillmentDelta(line, delta),
++  }));
++}
++
++export function countByStatus(lines: FulfillmentLine[]): Record<FulfillmentLineStatus, number> {
++  const counts: Record<FulfillmentLineStatus, number> = {
++    UNFULFILLED: 0,
++    PARTIAL: 0,
++    FULFILLED: 0,
++  };
++  for (const line of lines) {
++    const view = computeRemaining(line);
++    if (!view) continue;
++    counts[view.status] += 1;
++  }
++  return counts;
++}
++
++export function totalRemaining(lines: FulfillmentLine[]): number {
++  return lines.reduce((sum, line) => {
++    const view = computeRemaining(line);
++    return sum + (view ? view.remaining : 0);
++  }, 0);
++}
++
++export function totalOrdered(lines: FulfillmentLine[]): number {
++  return lines.reduce((sum, line) => sum + (Number(line.qtyOrdered) || 0), 0);
++}
++
++export function totalFulfilled(lines: FulfillmentLine[]): number {
++  return lines.reduce((sum, line) => sum + (Number(line.qtyFulfilled) || 0), 0);
++}
++
++export function findOverFulfilled(lines: FulfillmentLine[]): string[] {
++  return auditFulfillmentConsistency(lines).issues
++    .filter((i) => i.code === "over_fulfilled")
++    .map((i) => i.lineId);
++}
++
++export function sameLineIdentity(a: FulfillmentLine, b: FulfillmentLine): boolean {
++  return normalizeLineId(a.lineId) === normalizeLineId(b.lineId);
++}
++
++export function cloneLine(line: FulfillmentLine): FulfillmentLine {
++  return {
++    lineId: line.lineId,
++    qtyOrdered: line.qtyOrdered,
++    qtyFulfilled: line.qtyFulfilled,
++  };
++}
++
++export function withFulfilled(line: FulfillmentLine, qtyFulfilled: number): FulfillmentLine {
++  return { ...cloneLine(line), qtyFulfilled };
++}
+diff --git a/src/modules/sales/domain/index.ts b/src/modules/sales/domain/index.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/modules/sales/domain/index.ts
+@@ -0,0 +1,25 @@
++export {
++  FulfillmentRemainingGuard,
++  fulfillmentRemainingGuard,
++  computeRemaining,
++  validatePartialFulfillment,
++  applyFulfillmentDelta,
++  auditFulfillmentConsistency,
++  normalizeLineId,
++  asNonNegativeNumber,
++  deriveStatus,
++  clampRemaining,
++  toRemainingView,
++} from "./FulfillmentRemainingGuard";
++
++export type {
++  FulfillmentLineStatus,
++  FulfillmentLine,
++  RemainingView,
++  ValidateDeltaResult,
++  ApplyFulfillmentResult,
++  FulfillmentIssueCode,
++  FulfillmentIssue,
++  FulfillmentAuditResult,
++  AuditableLine,
++} from "./FulfillmentRemainingGuard";

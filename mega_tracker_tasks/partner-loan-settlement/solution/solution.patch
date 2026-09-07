@@ -1,0 +1,517 @@
+diff --git a/src/modules/finance/domain/LoanSettlementTypes.ts b/src/modules/finance/domain/LoanSettlementTypes.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/modules/finance/domain/LoanSettlementTypes.ts
+@@ -0,0 +1,43 @@
++export type LoanSourceType = "SALE" | "PURCHASE" | "EXPENSE" | "DIRECT";
++
++export type SettlementStrategy = "fifo" | "largest_first";
++
++export interface OpenLoanLeg {
++  legId: string;
++  sourceType: LoanSourceType;
++  principalRemaining: number;
++  openedAt: number;
++}
++
++export interface SettlementOptions {
++  strategy?: SettlementStrategy;
++  now?: number;
++}
++
++export interface SettlementAllocation {
++  legId: string;
++  applied: number;
++  remainingAfter: number;
++}
++
++export interface SettlementSuccess {
++  ok: true;
++  partnerId: string;
++  strategy: SettlementStrategy;
++  amount: number;
++  allocations: SettlementAllocation[];
++  leftover: number;
++  fullySettledLegIds: string[];
++  settledAt: number;
++}
++
++export interface SettlementFailure {
++  ok: false;
++  reason: "invalid_partner" | "invalid_amount" | "invalid_legs";
++}
++
++export type SettlementResult = SettlementSuccess | SettlementFailure;
++
++export interface LoanSettlementPreview extends SettlementSuccess {
++  openLegsAfter: OpenLoanLeg[];
++}
+diff --git a/src/modules/finance/domain/LoanSettlementOrdering.ts b/src/modules/finance/domain/LoanSettlementOrdering.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/modules/finance/domain/LoanSettlementOrdering.ts
+@@ -0,0 +1,80 @@
++import { LoanSourceType, OpenLoanLeg, SettlementStrategy } from "./LoanSettlementTypes";
++
++export function normalizePartnerId(partnerId: unknown): string | null {
++  if (typeof partnerId !== "string") return null;
++  const trimmed = partnerId.trim();
++  return trimmed.length > 0 ? trimmed : null;
++}
++
++export function clampPositiveAmount(amount: unknown): number | null {
++  const n = Number(amount);
++  if (!Number.isFinite(n) || n <= 0) return null;
++  return Math.round(n * 100) / 100;
++}
++
++export function isOpenLeg(leg: OpenLoanLeg | null | undefined): leg is OpenLoanLeg {
++  if (!leg || typeof leg !== "object") return false;
++  if (typeof leg.legId !== "string" || !leg.legId.trim()) return false;
++  if (!Number.isFinite(leg.principalRemaining) || leg.principalRemaining <= 0) return false;
++  if (!Number.isFinite(leg.openedAt)) return false;
++  const st = leg.sourceType;
++  return st === "SALE" || st === "PURCHASE" || st === "EXPENSE" || st === "DIRECT";
++}
++
++export function listOpenLoanLegs(legs: OpenLoanLeg[]): OpenLoanLeg[] {
++  return legs
++    .filter(isOpenLeg)
++    .map((leg) => ({
++      legId: leg.legId.trim(),
++      sourceType: leg.sourceType,
++      principalRemaining: Math.round(leg.principalRemaining * 100) / 100,
++      openedAt: leg.openedAt,
++    }));
++}
++
++export function orderLegsForStrategy(
++  legs: OpenLoanLeg[],
++  strategy: SettlementStrategy
++): OpenLoanLeg[] {
++  const copy = [...legs];
++  if (strategy === "largest_first") {
++    copy.sort((a, b) => {
++      if (b.principalRemaining !== a.principalRemaining) {
++        return b.principalRemaining - a.principalRemaining;
++      }
++      if (a.openedAt !== b.openedAt) return a.openedAt - b.openedAt;
++      return a.legId.localeCompare(b.legId);
++    });
++    return copy;
++  }
++  // fifo default: openedAt then legId
++  copy.sort((a, b) => {
++    if (a.openedAt !== b.openedAt) return a.openedAt - b.openedAt;
++    return a.legId.localeCompare(b.legId);
++  });
++  return copy;
++}
++
++export function sortLegsStable(legs: OpenLoanLeg[]): OpenLoanLeg[] {
++  return orderLegsForStrategy(listOpenLoanLegs(legs), "fifo");
++}
++
++export function uniqueLegIds(legs: OpenLoanLeg[]): string[] {
++  return [...new Set(listOpenLoanLegs(legs).map((l) => l.legId))].sort();
++}
++
++export function oldestOpenedAt(legs: OpenLoanLeg[]): number | null {
++  const listed = listOpenLoanLegs(legs);
++  if (listed.length === 0) return null;
++  return Math.min(...listed.map((l) => l.openedAt));
++}
++
++export function newestOpenedAt(legs: OpenLoanLeg[]): number | null {
++  const listed = listOpenLoanLegs(legs);
++  if (listed.length === 0) return null;
++  return Math.max(...listed.map((l) => l.openedAt));
++}
++
++export function filterBySource(legs: OpenLoanLeg[], sourceType: LoanSourceType): OpenLoanLeg[] {
++  return listOpenLoanLegs(legs).filter((leg) => leg.sourceType === sourceType);
++}
+diff --git a/src/modules/finance/domain/LoanSettlementMath.ts b/src/modules/finance/domain/LoanSettlementMath.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/modules/finance/domain/LoanSettlementMath.ts
+@@ -0,0 +1,58 @@
++import { orderLegsForStrategy, listOpenLoanLegs } from "./LoanSettlementOrdering";
++import {
++  OpenLoanLeg,
++  SettlementAllocation,
++  SettlementOptions,
++  SettlementStrategy,
++} from "./LoanSettlementTypes";
++
++export function resolveStrategy(options?: SettlementOptions): SettlementStrategy {
++  return options?.strategy === "largest_first" ? "largest_first" : "fifo";
++}
++
++export function resolveNow(options?: SettlementOptions): number {
++  const n = options?.now;
++  if (typeof n === "number" && Number.isFinite(n)) return n;
++  return Date.now();
++}
++
++export function distributeAmount(
++  legs: OpenLoanLeg[],
++  amount: number,
++  strategy: SettlementStrategy
++): { allocations: SettlementAllocation[]; leftover: number; fullySettledLegIds: string[] } {
++  const ordered = orderLegsForStrategy(listOpenLoanLegs(legs), strategy);
++  let remaining = amount;
++  const allocations: SettlementAllocation[] = [];
++  const fullySettledLegIds: string[] = [];
++
++  for (const leg of ordered) {
++    if (remaining <= 0) break;
++    const applied = Math.min(leg.principalRemaining, remaining);
++    const remainingAfter = Math.round((leg.principalRemaining - applied) * 100) / 100;
++    const appliedRounded = Math.round(applied * 100) / 100;
++    allocations.push({
++      legId: leg.legId,
++      applied: appliedRounded,
++      remainingAfter,
++    });
++    remaining = Math.round((remaining - appliedRounded) * 100) / 100;
++    if (remainingAfter === 0) fullySettledLegIds.push(leg.legId);
++  }
++
++  return {
++    allocations,
++    leftover: Math.max(0, remaining),
++    fullySettledLegIds,
++  };
++}
++
++export function amountFullyCovers(legs: OpenLoanLeg[], amount: number): boolean {
++  const open = listOpenLoanLegs(legs);
++  const total = open.reduce((sum, leg) => sum + leg.principalRemaining, 0);
++  return amount >= total;
++}
++
++export function simulateLeftover(legs: OpenLoanLeg[], amount: number, strategy: SettlementStrategy): number {
++  return distributeAmount(legs, amount, strategy).leftover;
++}
+diff --git a/src/modules/finance/domain/LoanSettlementAllocator.ts b/src/modules/finance/domain/LoanSettlementAllocator.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/modules/finance/domain/LoanSettlementAllocator.ts
+@@ -0,0 +1,280 @@
++import {
++  distributeAmount,
++  resolveNow,
++  resolveStrategy,
++} from "./LoanSettlementMath";
++import {
++  clampPositiveAmount,
++  listOpenLoanLegs,
++  normalizePartnerId,
++  orderLegsForStrategy,
++} from "./LoanSettlementOrdering";
++import {
++  LoanSettlementPreview,
++  OpenLoanLeg,
++  SettlementAllocation,
++  SettlementOptions,
++  SettlementResult,
++  SettlementStrategy,
++} from "./LoanSettlementTypes";
++
++export type {
++  LoanSourceType,
++  SettlementStrategy,
++  OpenLoanLeg,
++  SettlementOptions,
++  SettlementAllocation,
++  SettlementSuccess,
++  SettlementFailure,
++  SettlementResult,
++  LoanSettlementPreview,
++} from "./LoanSettlementTypes";
++
++export {
++  normalizePartnerId,
++  clampPositiveAmount,
++  isOpenLeg,
++  listOpenLoanLegs,
++  orderLegsForStrategy,
++} from "./LoanSettlementOrdering";
++
++export { resolveStrategy, resolveNow, distributeAmount } from "./LoanSettlementMath";
++
++export class LoanSettlementAllocator {
++  allocate(
++    partnerId: string,
++    amount: number,
++    legs: OpenLoanLeg[],
++    options?: SettlementOptions
++  ): SettlementResult {
++    return allocateSettlement(partnerId, amount, legs, options);
++  }
++
++  preview(
++    partnerId: string,
++    amount: number,
++    legs: OpenLoanLeg[],
++    options?: SettlementOptions
++  ): SettlementResult | LoanSettlementPreview {
++    return previewSettlement(partnerId, amount, legs, options);
++  }
++}
++
++export function allocateSettlement(
++  partnerId: string,
++  amount: number,
++  legs: OpenLoanLeg[],
++  options?: SettlementOptions
++): SettlementResult {
++  const pid = normalizePartnerId(partnerId);
++  if (!pid) return { ok: false, reason: "invalid_partner" };
++  const amt = clampPositiveAmount(amount);
++  if (amt === null) return { ok: false, reason: "invalid_amount" };
++  if (!Array.isArray(legs)) return { ok: false, reason: "invalid_legs" };
++
++  const strategy = resolveStrategy(options);
++  const settledAt = resolveNow(options);
++  const { allocations, leftover, fullySettledLegIds } = distributeAmount(legs, amt, strategy);
++
++  return {
++    ok: true,
++    partnerId: pid,
++    strategy,
++    amount: amt,
++    allocations,
++    leftover,
++    fullySettledLegIds,
++    settledAt,
++  };
++}
++
++export function previewSettlement(
++  partnerId: string,
++  amount: number,
++  legs: OpenLoanLeg[],
++  options?: SettlementOptions
++): SettlementResult | LoanSettlementPreview {
++  const allocated = allocateSettlement(partnerId, amount, legs, options);
++  if (!allocated.ok) return allocated;
++
++  const open = listOpenLoanLegs(legs);
++  const remainingById = new Map(open.map((l) => [l.legId, l.principalRemaining]));
++  for (const row of allocated.allocations) {
++    remainingById.set(row.legId, row.remainingAfter);
++  }
++  const openLegsAfter: OpenLoanLeg[] = open
++    .map((leg) => ({
++      ...leg,
++      principalRemaining: remainingById.get(leg.legId) ?? leg.principalRemaining,
++    }))
++    .filter((leg) => leg.principalRemaining > 0)
++    .map((leg) => ({
++      legId: leg.legId,
++      sourceType: leg.sourceType,
++      principalRemaining: leg.principalRemaining,
++      openedAt: leg.openedAt,
++    }));
++
++  return {
++    ...allocated,
++    openLegsAfter,
++  };
++}
++
++export const loanSettlementAllocator = new LoanSettlementAllocator();
++
++export function totalPrincipal(legs: OpenLoanLeg[]): number {
++  return listOpenLoanLegs(legs).reduce((sum, leg) => sum + leg.principalRemaining, 0);
++}
++
++export function summarizeSettlement(result: SettlementResult): string {
++  if (!result.ok) return `fail:${result.reason}`;
++  return `ok:applied=${result.allocations.length},leftover=${result.leftover},settled=${result.fullySettledLegIds.length}`;
++}
++
++export function appliedTotal(result: SettlementResult): number {
++  if (!result.ok) return 0;
++  return result.allocations.reduce((sum, row) => sum + row.applied, 0);
++}
++
++export function assertSettlementConserved(result: SettlementResult): void {
++  if (!result.ok) throw new Error("settlement failed");
++  const applied = appliedTotal(result);
++  const total = Math.round((applied + result.leftover) * 100) / 100;
++  if (total !== result.amount) {
++    throw new Error(`settlement not conserved: ${total} != ${result.amount}`);
++  }
++}
++
++export function remainingByLeg(result: SettlementResult): Record<string, number> {
++  if (!result.ok) return {};
++  const map: Record<string, number> = {};
++  for (const row of result.allocations) map[row.legId] = row.remainingAfter;
++  return map;
++}
++
++export function groupLegsBySource(legs: OpenLoanLeg[]): Record<string, OpenLoanLeg[]> {
++  const groups: Record<string, OpenLoanLeg[]> = {
++    SALE: [],
++    PURCHASE: [],
++    EXPENSE: [],
++    DIRECT: [],
++  };
++  for (const leg of listOpenLoanLegs(legs)) {
++    groups[leg.sourceType].push(leg);
++  }
++  return groups;
++}
++
++export function pickOldestLeg(legs: OpenLoanLeg[]): OpenLoanLeg | null {
++  const ordered = orderLegsForStrategy(listOpenLoanLegs(legs), "fifo");
++  return ordered[0] ?? null;
++}
++
++export function pickLargestLeg(legs: OpenLoanLeg[]): OpenLoanLeg | null {
++  const ordered = orderLegsForStrategy(listOpenLoanLegs(legs), "largest_first");
++  return ordered[0] ?? null;
++}
++
++export function settlementClearsAll(result: SettlementResult): boolean {
++  return result.ok && result.leftover >= 0 && result.allocations.every((a) => a.remainingAfter === 0 || true) && result.leftover === Math.max(0, result.amount - appliedTotal(result));
++}
++
++export function previewOpenCount(result: SettlementResult | LoanSettlementPreview): number {
++  if (!result.ok) return -1;
++  if ("openLegsAfter" in result) return result.openLegsAfter.length;
++  return result.allocations.filter((a) => a.remainingAfter > 0).length;
++}
++
++export function formatAllocation(row: SettlementAllocation): string {
++  return `${row.legId}:${row.applied}->${row.remainingAfter}`;
++}
++
++export function formatSettlementLines(result: SettlementResult): string[] {
++  if (!result.ok) return [result.reason];
++  return result.allocations.map(formatAllocation);
++}
++
++export function isFullySettled(result: SettlementResult, legId: string): boolean {
++  return result.ok && result.fullySettledLegIds.includes(legId);
++}
++
++export function allocateExact(
++  partnerId: string,
++  legs: OpenLoanLeg[],
++  options?: SettlementOptions
++): SettlementResult {
++  const total = totalPrincipal(legs);
++  if (total <= 0) return { ok: false, reason: "invalid_amount" };
++  return allocateSettlement(partnerId, total, legs, options);
++}
++
++export function allocatePartialPercent(
++  partnerId: string,
++  legs: OpenLoanLeg[],
++  percent: number,
++  options?: SettlementOptions
++): SettlementResult {
++  if (!Number.isFinite(percent) || percent <= 0 || percent > 100) {
++    return { ok: false, reason: "invalid_amount" };
++  }
++  const total = totalPrincipal(legs);
++  const amount = Math.round(((total * percent) / 100) * 100) / 100;
++  return allocateSettlement(partnerId, amount, legs, options);
++}
++
++export function settlementCoverageRatio(result: SettlementResult, legs: OpenLoanLeg[]): number {
++  if (!result.ok) return 0;
++  const total = totalPrincipal(legs);
++  if (total <= 0) return 0;
++  return Math.min(1, appliedTotal(result) / total);
++}
++
++export function unpaidLegsAfter(result: SettlementResult | LoanSettlementPreview): string[] {
++  if (!result.ok) return [];
++  if ("openLegsAfter" in result) return result.openLegsAfter.map((l) => l.legId);
++  return result.allocations.filter((a) => a.remainingAfter > 0).map((a) => a.legId);
++}
++
++export function compareStrategies(
++  partnerId: string,
++  amount: number,
++  legs: OpenLoanLeg[],
++  now: number
++): { fifo: SettlementResult; largest: SettlementResult } {
++  return {
++    fifo: allocateSettlement(partnerId, amount, legs, { strategy: "fifo", now }),
++    largest: allocateSettlement(partnerId, amount, legs, { strategy: "largest_first", now }),
++  };
++}
++
++export function firstAllocation(result: SettlementResult): SettlementAllocation | null {
++  if (!result.ok || result.allocations.length === 0) return null;
++  return result.allocations[0];
++}
++
++export function lastAllocation(result: SettlementResult): SettlementAllocation | null {
++  if (!result.ok || result.allocations.length === 0) return null;
++  return result.allocations[result.allocations.length - 1];
++}
++
++export function settledSourceTypes(result: SettlementResult, legs: OpenLoanLeg[]): string[] {
++  if (!result.ok) return [];
++  const byId = new Map(listOpenLoanLegs(legs).map((l) => [l.legId, l.sourceType]));
++  const types = new Set<string>();
++  for (const legId of result.fullySettledLegIds) {
++    const t = byId.get(legId);
++    if (t) types.add(t);
++  }
++  return [...types].sort();
++}
++
++export function describeStrategy(strategy: SettlementStrategy): string {
++  return strategy === "largest_first"
++    ? "clear largest principal first"
++    : "clear oldest open legs first";
++}
++
++export function normalizeLegsInput(legs: OpenLoanLeg[]): OpenLoanLeg[] {
++  return listOpenLoanLegs(legs).map((leg) => ({ ...leg }));
++}
+diff --git a/src/modules/finance/domain/index.ts b/src/modules/finance/domain/index.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/modules/finance/domain/index.ts
+@@ -0,0 +1,26 @@
++export {
++  LoanSettlementAllocator,
++  loanSettlementAllocator,
++  allocateSettlement,
++  previewSettlement,
++  listOpenLoanLegs,
++  normalizePartnerId,
++  clampPositiveAmount,
++  isOpenLeg,
++  orderLegsForStrategy,
++  resolveStrategy,
++  resolveNow,
++  distributeAmount,
++} from "./LoanSettlementAllocator";
++
++export type {
++  LoanSourceType,
++  SettlementStrategy,
++  OpenLoanLeg,
++  SettlementOptions,
++  SettlementAllocation,
++  SettlementSuccess,
++  SettlementFailure,
++  SettlementResult,
++  LoanSettlementPreview,
++} from "./LoanSettlementAllocator";

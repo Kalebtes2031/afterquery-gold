@@ -1,0 +1,523 @@
+diff --git a/src/modules/inventory/domain/TransferWacTypes.ts b/src/modules/inventory/domain/TransferWacTypes.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/modules/inventory/domain/TransferWacTypes.ts
+@@ -0,0 +1,83 @@
++export type TransferOpKind = "POSITIVE" | "NEGATIVE" | "TRANSFER";
++
++export interface BranchStockSnapshot {
++  branchId: string;
++  onHand: number;
++}
++
++export interface TransferRequest {
++  productId: string;
++  sourceBranchId: string;
++  destBranchId: string;
++  qty: number;
++  sourceOnHand: number;
++  destOnHand: number;
++  /** Current company / source unit cost (WAC). */
++  unitCost: number;
++  companyWac: number;
++  companyOnHand: number;
++}
++
++export interface TransferLeg {
++  branchId: string;
++  qtyDelta: number;
++  unitCost: number;
++  onHandBefore: number;
++  onHandAfter: number;
++}
++
++export interface TransferWacSuccess {
++  ok: true;
++  legs: TransferLeg[];
++  sourceOnHandAfter: number;
++  destOnHandAfter: number;
++  companyWacAfter: number;
++  companyOnHandAfter: number;
++  unitCostApplied: number;
++}
++
++export interface TransferWacFailure {
++  ok: false;
++  reason: "insufficient_stock" | "invalid_qty" | "invalid_transfer";
++}
++
++export type TransferWacResult = TransferWacSuccess | TransferWacFailure;
++
++export interface MixedInventoryOp {
++  kind: TransferOpKind;
++  branchId: string;
++  qty: number;
++  unitCost?: number;
++  /** For TRANSFER: destination branch. */
++  destBranchId?: string;
++}
++
++export interface TransferWacAuditInput {
++  productId: string;
++  branches: BranchStockSnapshot[];
++  companyWacStored: number;
++  companyOnHandStored: number;
++  ops: MixedInventoryOp[];
++  /** Expected company WAC after replaying ops from an initial state. */
++  initialCompanyWac: number;
++  initialCompanyOnHand: number;
++  initialBranches: BranchStockSnapshot[];
++}
++
++export type TransferWacIssueCode =
++  | "company_wac_drift"
++  | "branch_onhand_mismatch"
++  | "missing_leg";
++
++export interface TransferWacIssue {
++  code: TransferWacIssueCode;
++  message: string;
++  branchId?: string;
++}
++
++export interface TransferWacAuditResult {
++  ok: boolean;
++  issues: TransferWacIssue[];
++  expectedCompanyWac: number;
++  expectedBranches: BranchStockSnapshot[];
++}
+diff --git a/src/modules/inventory/domain/TransferWacMath.ts b/src/modules/inventory/domain/TransferWacMath.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/modules/inventory/domain/TransferWacMath.ts
+@@ -0,0 +1,96 @@
++import {
++  TransferLeg,
++  TransferRequest,
++  TransferWacFailure,
++  TransferWacResult,
++  TransferWacSuccess,
++} from "./TransferWacTypes";
++
++export function roundCost(value: number): number {
++  return Math.round(value * 1e6) / 1e6;
++}
++
++export function validateTransferQty(qty: unknown): TransferWacFailure | null {
++  const n = Number(qty);
++  if (!Number.isFinite(n) || n <= 0) {
++    return { ok: false, reason: "invalid_qty" };
++  }
++  return null;
++}
++
++export function validateTransferIdentity(req: TransferRequest): TransferWacFailure | null {
++  const productId = String(req.productId ?? "").trim();
++  const source = String(req.sourceBranchId ?? "").trim();
++  const dest = String(req.destBranchId ?? "").trim();
++  if (!productId || !source || !dest || source === dest) {
++    return { ok: false, reason: "invalid_transfer" };
++  }
++  if (!Number.isFinite(req.unitCost) || req.unitCost < 0) {
++    return { ok: false, reason: "invalid_transfer" };
++  }
++  if (!Number.isFinite(req.sourceOnHand) || !Number.isFinite(req.destOnHand)) {
++    return { ok: false, reason: "invalid_transfer" };
++  }
++  return null;
++}
++
++export function calculateTransferLegs(req: TransferRequest): TransferWacResult {
++  const qtyFail = validateTransferQty(req.qty);
++  if (qtyFail) return qtyFail;
++  const idFail = validateTransferIdentity(req);
++  if (idFail) return idFail;
++
++  const qty = Number(req.qty);
++  if (req.sourceOnHand < qty) {
++    return { ok: false, reason: "insufficient_stock" };
++  }
++
++  const unitCost = roundCost(req.unitCost);
++  const sourceBefore = req.sourceOnHand;
++  const destBefore = req.destOnHand;
++  const sourceAfter = sourceBefore - qty;
++  const destAfter = destBefore + qty;
++
++  const legs: TransferLeg[] = [
++    {
++      branchId: String(req.sourceBranchId).trim(),
++      qtyDelta: -qty,
++      unitCost,
++      onHandBefore: sourceBefore,
++      onHandAfter: sourceAfter,
++    },
++    {
++      branchId: String(req.destBranchId).trim(),
++      qtyDelta: qty,
++      unitCost,
++      onHandBefore: destBefore,
++      onHandAfter: destAfter,
++    },
++  ];
++
++  const success: TransferWacSuccess = {
++    ok: true,
++    legs,
++    sourceOnHandAfter: sourceAfter,
++    destOnHandAfter: destAfter,
++    // Transfer-only: company WAC and company on-hand unchanged.
++    companyWacAfter: roundCost(req.companyWac),
++    companyOnHandAfter: req.companyOnHand,
++    unitCostApplied: unitCost,
++  };
++  return success;
++}
++
++export function applyTransferWac(req: TransferRequest): TransferWacResult {
++  return calculateTransferLegs(req);
++}
++
++export function mirrorLegs(result: TransferWacResult): TransferLeg[] {
++  if (!result.ok) return [];
++  return result.legs.map((leg) => ({ ...leg }));
++}
++
++export function netQtyMoved(result: TransferWacResult): number {
++  if (!result.ok) return 0;
++  return result.legs.filter((l) => l.qtyDelta > 0).reduce((s, l) => s + l.qtyDelta, 0);
++}
+diff --git a/src/modules/inventory/domain/TransferWacAudit.ts b/src/modules/inventory/domain/TransferWacAudit.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/modules/inventory/domain/TransferWacAudit.ts
+@@ -0,0 +1,153 @@
++import { calculateTransferLegs, roundCost } from "./TransferWacMath";
++import {
++  BranchStockSnapshot,
++  MixedInventoryOp,
++  TransferWacAuditInput,
++  TransferWacAuditResult,
++  TransferWacIssue,
++} from "./TransferWacTypes";
++
++function cloneBranches(branches: BranchStockSnapshot[]): Map<string, number> {
++  const map = new Map<string, number>();
++  for (const b of branches) {
++    const id = String(b.branchId ?? "").trim();
++    if (!id) continue;
++    map.set(id, Number(b.onHand) || 0);
++  }
++  return map;
++}
++
++function toSnapshots(map: Map<string, number>): BranchStockSnapshot[] {
++  return [...map.entries()]
++    .map(([branchId, onHand]) => ({ branchId, onHand }))
++    .sort((a, b) => a.branchId.localeCompare(b.branchId));
++}
++
++/**
++ * Replay mixed ops. POSITIVE increases branch + company qty and may change WAC.
++ * NEGATIVE decreases branch + company qty without changing WAC.
++ * TRANSFER moves between branches; company WAC and company on-hand stay put.
++ */
++export function replayOps(
++  initialBranches: BranchStockSnapshot[],
++  initialCompanyWac: number,
++  initialCompanyOnHand: number,
++  ops: MixedInventoryOp[]
++): { branches: Map<string, number>; companyWac: number; companyOnHand: number; issues: TransferWacIssue[] } {
++  const branches = cloneBranches(initialBranches);
++  let companyWac = roundCost(initialCompanyWac);
++  let companyOnHand = initialCompanyOnHand;
++  const issues: TransferWacIssue[] = [];
++
++  for (const op of ops) {
++    const kind = op.kind;
++    const branchId = String(op.branchId ?? "").trim();
++    const qty = Number(op.qty);
++    if (!branchId || !Number.isFinite(qty) || qty <= 0) {
++      issues.push({ code: "missing_leg", message: "invalid op skipped" });
++      continue;
++    }
++    if (!branches.has(branchId)) branches.set(branchId, 0);
++
++    if (kind === "POSITIVE") {
++      const unitCost = Number(op.unitCost ?? companyWac);
++      const before = companyOnHand;
++      const after = before + qty;
++      if (after > 0 && Number.isFinite(unitCost)) {
++        companyWac = roundCost(((before * companyWac) + (qty * unitCost)) / after);
++      }
++      companyOnHand = after;
++      branches.set(branchId, (branches.get(branchId) ?? 0) + qty);
++      continue;
++    }
++
++    if (kind === "NEGATIVE") {
++      companyOnHand = companyOnHand - qty;
++      branches.set(branchId, (branches.get(branchId) ?? 0) - qty);
++      continue;
++    }
++
++    if (kind === "TRANSFER") {
++      const dest = String(op.destBranchId ?? "").trim();
++      if (!dest) {
++        issues.push({ code: "missing_leg", message: "transfer missing dest", branchId });
++        continue;
++      }
++      const sourceOnHand = branches.get(branchId) ?? 0;
++      const destOnHand = branches.get(dest) ?? 0;
++      const result = calculateTransferLegs({
++        productId: "audit",
++        sourceBranchId: branchId,
++        destBranchId: dest,
++        qty,
++        sourceOnHand,
++        destOnHand,
++        unitCost: companyWac,
++        companyWac,
++        companyOnHand,
++      });
++      if (!result.ok) {
++        issues.push({ code: "missing_leg", message: result.reason, branchId });
++        continue;
++      }
++      if (result.legs.length !== 2) {
++        issues.push({ code: "missing_leg", message: "expected two transfer legs", branchId });
++      }
++      branches.set(branchId, result.sourceOnHandAfter);
++      branches.set(dest, result.destOnHandAfter);
++      // company WAC / on-hand intentionally unchanged
++      continue;
++    }
++
++    issues.push({ code: "missing_leg", message: `unknown kind ${String(kind)}` });
++  }
++
++  return { branches, companyWac, companyOnHand, issues };
++}
++
++export function auditTransferWacDrift(input: TransferWacAuditInput): TransferWacAuditResult {
++  const replayed = replayOps(
++    input.initialBranches,
++    input.initialCompanyWac,
++    input.initialCompanyOnHand,
++    input.ops
++  );
++  const issues: TransferWacIssue[] = [...replayed.issues];
++  const expectedCompanyWac = replayed.companyWac;
++  const expectedBranches = toSnapshots(replayed.branches);
++
++  if (roundCost(input.companyWacStored) !== expectedCompanyWac) {
++    issues.push({
++      code: "company_wac_drift",
++      message: `stored ${input.companyWacStored} expected ${expectedCompanyWac}`,
++    });
++  }
++
++  const storedMap = cloneBranches(input.branches);
++  for (const expected of expectedBranches) {
++    const stored = storedMap.get(expected.branchId);
++    if (stored === undefined || stored !== expected.onHand) {
++      issues.push({
++        code: "branch_onhand_mismatch",
++        message: `branch ${expected.branchId} stored ${stored ?? "missing"} expected ${expected.onHand}`,
++        branchId: expected.branchId,
++      });
++    }
++  }
++  for (const [branchId] of storedMap) {
++    if (!replayed.branches.has(branchId)) {
++      issues.push({
++        code: "branch_onhand_mismatch",
++        message: `unexpected stored branch ${branchId}`,
++        branchId,
++      });
++    }
++  }
++
++  return {
++    ok: issues.length === 0,
++    issues,
++    expectedCompanyWac,
++    expectedBranches,
++  };
++}
+diff --git a/src/modules/inventory/domain/TransferWacEngine.ts b/src/modules/inventory/domain/TransferWacEngine.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/modules/inventory/domain/TransferWacEngine.ts
+@@ -0,0 +1,135 @@
++import { auditTransferWacDrift } from "./TransferWacAudit";
++import { applyTransferWac, calculateTransferLegs, roundCost } from "./TransferWacMath";
++import {
++  TransferRequest,
++  TransferWacAuditInput,
++  TransferWacAuditResult,
++  TransferWacIssueCode,
++  TransferWacResult,
++} from "./TransferWacTypes";
++
++export type {
++  TransferOpKind,
++  BranchStockSnapshot,
++  TransferRequest,
++  TransferLeg,
++  TransferWacSuccess,
++  TransferWacFailure,
++  TransferWacResult,
++  MixedInventoryOp,
++  TransferWacAuditInput,
++  TransferWacIssueCode,
++  TransferWacIssue,
++  TransferWacAuditResult,
++} from "./TransferWacTypes";
++
++export { roundCost, validateTransferQty, validateTransferIdentity } from "./TransferWacMath";
++export { replayOps } from "./TransferWacAudit";
++
++export class TransferWacEngine {
++  calculateLegs(req: TransferRequest): TransferWacResult {
++    return calculateTransferLegs(req);
++  }
++
++  apply(req: TransferRequest): TransferWacResult {
++    return applyTransferWac(req);
++  }
++
++  audit(input: TransferWacAuditInput): TransferWacAuditResult {
++    return auditTransferWacDrift(input);
++  }
++}
++
++export { calculateTransferLegs, applyTransferWac, auditTransferWacDrift };
++
++export const transferWacEngine = new TransferWacEngine();
++
++export function describeTransferResult(result: TransferWacResult): string {
++  if (!result.ok) return `fail:${result.reason}`;
++  return `ok:src=${result.sourceOnHandAfter},dest=${result.destOnHandAfter},wac=${result.companyWacAfter}`;
++}
++
++export function transferMovedQty(result: TransferWacResult): number {
++  if (!result.ok) return 0;
++  const destLeg = result.legs.find((leg) => leg.qtyDelta > 0);
++  return destLeg ? destLeg.qtyDelta : 0;
++}
++
++export function assertCompanyWacUnchanged(
++  before: number,
++  result: TransferWacResult
++): void {
++  if (!result.ok) throw new Error("transfer failed");
++  if (roundCost(before) !== result.companyWacAfter) {
++    throw new Error("company WAC changed on transfer");
++  }
++}
++
++export function invertTransferRequest(req: TransferRequest): TransferRequest {
++  return {
++    ...req,
++    sourceBranchId: req.destBranchId,
++    destBranchId: req.sourceBranchId,
++    sourceOnHand: req.destOnHand,
++    destOnHand: req.sourceOnHand,
++  };
++}
++
++export function summarizeAudit(result: TransferWacAuditResult): string {
++  if (result.ok) return "clean";
++  return result.issues.map((i) => i.code).sort().join(",");
++}
++
++export function hasIssueCode(result: TransferWacAuditResult, code: TransferWacIssueCode): boolean {
++  return result.issues.some((issue) => issue.code === code);
++}
++
++export function expectedOnHand(
++  result: TransferWacAuditResult,
++  branchId: string
++): number | null {
++  const row = result.expectedBranches.find((b) => b.branchId === branchId);
++  return row ? row.onHand : null;
++}
++
++export function buildTransferRequest(partial: Partial<TransferRequest> & Pick<TransferRequest, "productId" | "sourceBranchId" | "destBranchId" | "qty">): TransferRequest {
++  return {
++    sourceOnHand: partial.sourceOnHand ?? partial.qty,
++    destOnHand: partial.destOnHand ?? 0,
++    unitCost: partial.unitCost ?? 0,
++    companyWac: partial.companyWac ?? partial.unitCost ?? 0,
++    companyOnHand: partial.companyOnHand ?? (partial.sourceOnHand ?? partial.qty) + (partial.destOnHand ?? 0),
++    ...partial,
++  };
++}
++
++export function isTransferOnlySafe(result: TransferWacResult, companyWacBefore: number, companyOnHandBefore: number): boolean {
++  if (!result.ok) return false;
++  return (
++    result.companyWacAfter === roundCost(companyWacBefore) &&
++    result.companyOnHandAfter === companyOnHandAfter(companyOnHandBefore)
++  );
++}
++
++function companyOnHandAfter(before: number): number {
++  return before;
++}
++
++export function legPairValid(result: TransferWacResult): boolean {
++  if (!result.ok) return false;
++  if (result.legs.length !== 2) return false;
++  const [outLeg, inLeg] = result.legs;
++  return outLeg.qtyDelta === -inLeg.qtyDelta && outLeg.unitCost === inLeg.unitCost;
++}
++
++export function auditIssueMessages(result: TransferWacAuditResult): string[] {
++  return result.issues.map((issue) => `${issue.code}:${issue.message}`);
++}
++
++export function countIssuesByCode(result: TransferWacAuditResult): Record<string, number> {
++  const counts: Record<string, number> = {};
++  for (const issue of result.issues) {
++    counts[issue.code] = (counts[issue.code] ?? 0) + 1;
++  }
++  return counts;
++}
+diff --git a/src/modules/inventory/domain/index.ts b/src/modules/inventory/domain/index.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/modules/inventory/domain/index.ts
+@@ -0,0 +1,26 @@
++export {
++  TransferWacEngine,
++  transferWacEngine,
++  calculateTransferLegs,
++  applyTransferWac,
++  auditTransferWacDrift,
++  roundCost,
++  validateTransferQty,
++  validateTransferIdentity,
++  replayOps,
++} from "./TransferWacEngine";
++
++export type {
++  TransferOpKind,
++  BranchStockSnapshot,
++  TransferRequest,
++  TransferLeg,
++  TransferWacSuccess,
++  TransferWacFailure,
++  TransferWacResult,
++  MixedInventoryOp,
++  TransferWacAuditInput,
++  TransferWacIssueCode,
++  TransferWacIssue,
++  TransferWacAuditResult,
++} from "./TransferWacEngine";

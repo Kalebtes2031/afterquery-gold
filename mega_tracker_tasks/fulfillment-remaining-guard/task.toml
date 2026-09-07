@@ -1,0 +1,38 @@
+schema_version = "1.1"
+artifacts = ["/logs/artifacts/model.patch"]
+
+[task]
+name = "mega-tracker/fulfillment-remaining-guard"
+
+[metadata]
+task_id = "fulfillment-remaining-guard"
+display_title = "Fulfillment Remaining Guard"
+display_description = "Pure remaining-qty guard for partial ship/receive with validation and consistency audit."
+category = "feature"
+language = "typescript"
+repository_url = "https://github.com/dawit2119/mega-tracker"
+base_commit_hash = "0b40f7e7515a05dbcadff4942d353af4ef02954f"
+
+[agent]
+timeout_sec = 5400
+
+[verifier]
+environment_mode = "separate"
+timeout_sec = 1800
+
+[verifier.environment]
+build_timeout_sec = 1800
+cpus = 2
+memory_mb = 8192
+storage_mb = 20480
+allow_internet = false
+
+[environment]
+build_timeout_sec = 1800
+docker_image = "us-docker.pkg.dev/afterquery-compute/compute-images/gold-repo-mega-tracker:v1"
+os = "linux"
+cpus = 2
+memory_mb = 8192
+storage_mb = 20480
+gpus = 0
+allow_internet = false
