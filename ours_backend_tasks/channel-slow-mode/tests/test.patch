@@ -1,0 +1,713 @@
+diff --git a/packages/backend/src/gold_tests/slow_mode_config.test.ts b/packages/backend/src/gold_tests/slow_mode_config.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/slow_mode_config.test.ts
+@@ -0,0 +1,114 @@
++import { describe, expect, it } from "vitest";
++import {
++  DEFAULT_SLOW_MODE_SECONDS,
++  MAX_SLOW_MODE_SECONDS,
++  MIN_SLOW_MODE_SECONDS,
++  ChannelSlowModeService,
++  MemoryChannelSlowModeStore,
++  clearChannelSlowMode,
++  getChannelSlowMode,
++  setChannelSlowMode,
++} from "#ours/backend/services/slow_mode.ts";
++
++const service = () => new ChannelSlowModeService(new MemoryChannelSlowModeStore());
++
++describe("Channel slow mode config", () => {
++  it("enables slow mode with the default interval", async () => {
++    const result = await service().setChannelSlowMode("room-1");
++    expect(result).toEqual({
++      ok: true,
++      channelId: "room-1",
++      intervalSeconds: DEFAULT_SLOW_MODE_SECONDS,
++      enabled: true,
++    });
++  });
++
++  it("trims the channel id and keeps its case including colons", async () => {
++    const slow = service();
++    const result = await slow.setChannelSlowMode("  Team:West  ", { intervalSeconds: 12 });
++    expect(result).toMatchObject({ ok: true, channelId: "Team:West", intervalSeconds: 12 });
++    await expect(slow.getChannelSlowMode("Team:West")).resolves.toEqual({
++      channelId: "Team:West",
++      intervalSeconds: 12,
++      enabled: true,
++    });
++  });
++
++  it("rejects an empty channel id", async () => {
++    await expect(service().setChannelSlowMode("   ")).resolves.toEqual({
++      ok: false,
++      reason: "invalid_channel",
++    });
++  });
++
++  it("rejects a non-finite interval", async () => {
++    await expect(service().setChannelSlowMode("room-1", { intervalSeconds: Number.NaN })).resolves.toEqual({
++      ok: false,
++      reason: "invalid_interval",
++      channelId: "room-1",
++    });
++  });
++
++  it("clamps an interval below the minimum to one second", async () => {
++    const result = await service().setChannelSlowMode("room-1", { intervalSeconds: 0 });
++    expect(result).toMatchObject({ ok: true, intervalSeconds: MIN_SLOW_MODE_SECONDS });
++  });
++
++  it("clamps an interval above the maximum to six hundred seconds", async () => {
++    const result = await service().setChannelSlowMode("room-1", { intervalSeconds: 9999 });
++    expect(result).toMatchObject({ ok: true, intervalSeconds: MAX_SLOW_MODE_SECONDS });
++  });
++
++  it("truncates a fractional interval before clamping", async () => {
++    const result = await service().setChannelSlowMode("room-1", { intervalSeconds: 15.9 });
++    expect(result).toMatchObject({ ok: true, intervalSeconds: 15 });
++  });
++
++  it("overwrites a previous interval when set again", async () => {
++    const slow = service();
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 10 });
++    await expect(slow.setChannelSlowMode("room-1", { intervalSeconds: 40 })).resolves.toMatchObject({
++      intervalSeconds: 40,
++    });
++    await expect(slow.getChannelSlowMode("room-1")).resolves.toMatchObject({ intervalSeconds: 40 });
++  });
++
++  it("returns null from get when slow mode was never enabled", async () => {
++    await expect(service().getChannelSlowMode("room-1")).resolves.toBeNull();
++  });
++
++  it("returns null from get for an invalid channel id", async () => {
++    await expect(service().getChannelSlowMode("  ")).resolves.toBeNull();
++  });
++
++  it("clears an enabled channel and removes its cooldowns", async () => {
++    const slow = service();
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 20 });
++    await slow.recordChannelSpeak("room-1", "alice", { now: 1_000 });
++    await expect(slow.clearChannelSlowMode("room-1")).resolves.toEqual({
++      ok: true,
++      channelId: "room-1",
++      cleared: true,
++    });
++    await expect(slow.getChannelSlowMode("room-1")).resolves.toBeNull();
++    await expect(slow.listActiveCooldowns("room-1", { now: 1_000 })).resolves.toEqual([]);
++  });
++
++  it("reports not_enabled when clearing a channel that has no slow mode", async () => {
++    await expect(service().clearChannelSlowMode("room-1")).resolves.toEqual({
++      ok: false,
++      reason: "not_enabled",
++      channelId: "room-1",
++    });
++  });
++
++  it("supports the config convenience helpers", async () => {
++    const store = new MemoryChannelSlowModeStore();
++    await expect(setChannelSlowMode("room-1", { intervalSeconds: 25 }, store)).resolves.toMatchObject({
++      ok: true,
++      intervalSeconds: 25,
++    });
++    await expect(getChannelSlowMode("room-1", store)).resolves.toMatchObject({ enabled: true });
++    await expect(clearChannelSlowMode("room-1", store)).resolves.toMatchObject({ cleared: true });
++  });
++});
+diff --git a/packages/backend/src/gold_tests/slow_mode_speak.test.ts b/packages/backend/src/gold_tests/slow_mode_speak.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/slow_mode_speak.test.ts
+@@ -0,0 +1,157 @@
++import { describe, expect, it } from "vitest";
++import {
++  ChannelSlowModeService,
++  MemoryChannelSlowModeStore,
++  canSpeak,
++  recordChannelSpeak,
++  trySpeak,
++} from "#ours/backend/services/slow_mode.ts";
++
++const NOW = 1_700_000_000_000;
++const service = () => new ChannelSlowModeService(new MemoryChannelSlowModeStore());
++
++describe("Channel slow mode speak gate", () => {
++  it("allows speaking when slow mode is off", async () => {
++    await expect(service().canSpeak("room-1", "alice", { now: NOW })).resolves.toEqual({
++      ok: true,
++      allowed: true,
++      channelId: "room-1",
++      nickname: "alice",
++      availableAt: NOW,
++      remainingSeconds: 0,
++    });
++  });
++
++  it("allows the first speak after slow mode is enabled", async () => {
++    const slow = service();
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 30 });
++    await expect(slow.canSpeak("room-1", "alice", { now: NOW })).resolves.toMatchObject({
++      ok: true,
++      allowed: true,
++      remainingSeconds: 0,
++    });
++  });
++
++  it("records a speak and opens a cooldown window", async () => {
++    const slow = service();
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 30 });
++    await expect(slow.recordChannelSpeak("room-1", "alice", { now: NOW })).resolves.toEqual({
++      ok: true,
++      channelId: "room-1",
++      nickname: "alice",
++      lastSpokeAt: NOW,
++      availableAt: NOW + 30_000,
++    });
++  });
++
++  it("denies speaking while the cooldown is still active", async () => {
++    const slow = service();
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 30 });
++    await slow.recordChannelSpeak("room-1", "alice", { now: NOW });
++    await expect(slow.canSpeak("room-1", "alice", { now: NOW + 5_000 })).resolves.toEqual({
++      ok: true,
++      allowed: false,
++      channelId: "room-1",
++      nickname: "alice",
++      availableAt: NOW + 30_000,
++      remainingSeconds: 25,
++    });
++  });
++
++  it("allows speaking again once the cooldown expires", async () => {
++    const slow = service();
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 20 });
++    await slow.recordChannelSpeak("room-1", "alice", { now: NOW });
++    await expect(slow.canSpeak("room-1", "alice", { now: NOW + 20_000 })).resolves.toMatchObject({
++      allowed: true,
++      remainingSeconds: 0,
++    });
++  });
++
++  it("refuses to record another speak while the cooldown is active", async () => {
++    const slow = service();
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 30 });
++    await slow.recordChannelSpeak("room-1", "alice", { now: NOW });
++    await expect(slow.recordChannelSpeak("room-1", "alice", { now: NOW + 1_000 })).resolves.toEqual({
++      ok: false,
++      reason: "cooldown_active",
++      channelId: "room-1",
++      nickname: "alice",
++    });
++  });
++
++  it("stores nicknames lowercase after trimming", async () => {
++    const slow = service();
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 15 });
++    const result = await slow.recordChannelSpeak("room-1", "  AlIce  ", { now: NOW });
++    expect(result).toMatchObject({ ok: true, nickname: "alice" });
++  });
++
++  it("rejects an invalid nickname on speak checks", async () => {
++    const slow = service();
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 15 });
++    await expect(slow.canSpeak("room-1", "ab", { now: NOW })).resolves.toEqual({
++      ok: false,
++      reason: "invalid_nickname",
++      channelId: "room-1",
++    });
++  });
++
++  it("rejects recording a speak when slow mode is not enabled", async () => {
++    await expect(service().recordChannelSpeak("room-1", "alice", { now: NOW })).resolves.toEqual({
++      ok: false,
++      reason: "not_enabled",
++      channelId: "room-1",
++      nickname: "alice",
++    });
++  });
++
++  it("trySpeak records on success and returns allowed true", async () => {
++    const slow = service();
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 25 });
++    await expect(slow.trySpeak("room-1", "alice", { now: NOW })).resolves.toEqual({
++      ok: true,
++      allowed: true,
++      channelId: "room-1",
++      nickname: "alice",
++      availableAt: NOW + 25_000,
++      remainingSeconds: 0,
++    });
++    await expect(slow.canSpeak("room-1", "alice", { now: NOW + 1_000 })).resolves.toMatchObject({
++      allowed: false,
++      remainingSeconds: 24,
++    });
++  });
++
++  it("trySpeak returns the denial without recording when blocked", async () => {
++    const slow = service();
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 30 });
++    await slow.recordChannelSpeak("room-1", "alice", { now: NOW });
++    await expect(slow.trySpeak("room-1", "alice", { now: NOW + 2_000 })).resolves.toMatchObject({
++      ok: true,
++      allowed: false,
++      remainingSeconds: 28,
++    });
++  });
++
++  it("keeps remainingSeconds floored and never negative", async () => {
++    const slow = service();
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 10 });
++    await slow.recordChannelSpeak("room-1", "alice", { now: NOW });
++    await expect(slow.canSpeak("room-1", "alice", { now: NOW + 9_400 })).resolves.toMatchObject({
++      allowed: false,
++      remainingSeconds: 0,
++    });
++  });
++
++  it("supports the speak convenience helpers", async () => {
++    const store = new MemoryChannelSlowModeStore();
++    const slow = new ChannelSlowModeService(store);
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 20 });
++    await expect(canSpeak("room-1", "alice", { now: NOW }, store)).resolves.toMatchObject({ allowed: true });
++    await expect(recordChannelSpeak("room-1", "alice", { now: NOW }, store)).resolves.toMatchObject({ ok: true });
++    await expect(trySpeak("room-1", "alice", { now: NOW + 1_000 }, store)).resolves.toMatchObject({
++      allowed: false,
++    });
++  });
++});
+diff --git a/packages/backend/src/gold_tests/slow_mode_cooldowns.test.ts b/packages/backend/src/gold_tests/slow_mode_cooldowns.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/slow_mode_cooldowns.test.ts
+@@ -0,0 +1,112 @@
++import { describe, expect, it } from "vitest";
++import {
++  ChannelSlowModeService,
++  MemoryChannelSlowModeStore,
++  getCooldown,
++  listActiveCooldowns,
++  sweepExpiredCooldowns,
++} from "#ours/backend/services/slow_mode.ts";
++
++const NOW = 1_700_000_000_000;
++const service = () => new ChannelSlowModeService(new MemoryChannelSlowModeStore());
++
++describe("Channel slow mode cooldowns", () => {
++  it("lists active cooldowns sorted by nickname", async () => {
++    const slow = service();
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 40 });
++    await slow.recordChannelSpeak("room-1", "zoe", { now: NOW });
++    await slow.recordChannelSpeak("room-1", "amy", { now: NOW });
++    await slow.recordChannelSpeak("room-1", "bob", { now: NOW });
++    const listed = await slow.listActiveCooldowns("room-1", { now: NOW + 1_000 });
++    expect(listed.map((row) => row.nickname)).toEqual(["amy", "bob", "zoe"]);
++  });
++
++  it("skips expired cooldowns from the active list", async () => {
++    const slow = service();
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 10 });
++    await slow.recordChannelSpeak("room-1", "alice", { now: NOW });
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 40 });
++    await slow.recordChannelSpeak("room-1", "bob", { now: NOW + 10_000 });
++    const listed = await slow.listActiveCooldowns("room-1", { now: NOW + 10_000 });
++    expect(listed.map((row) => row.nickname)).toEqual(["bob"]);
++  });
++
++  it("returns an empty list for an invalid channel", async () => {
++    await expect(service().listActiveCooldowns("  ", { now: NOW })).resolves.toEqual([]);
++  });
++
++  it("returns a live cooldown view from getCooldown", async () => {
++    const slow = service();
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 30 });
++    await slow.recordChannelSpeak("room-1", "alice", { now: NOW });
++    await expect(slow.getCooldown("room-1", "ALICE", { now: NOW + 4_000 })).resolves.toEqual({
++      channelId: "room-1",
++      nickname: "alice",
++      lastSpokeAt: NOW,
++      availableAt: NOW + 30_000,
++      remainingSeconds: 26,
++    });
++  });
++
++  it("returns null from getCooldown when the window has expired", async () => {
++    const slow = service();
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 12 });
++    await slow.recordChannelSpeak("room-1", "alice", { now: NOW });
++    await expect(slow.getCooldown("room-1", "alice", { now: NOW + 12_000 })).resolves.toBeNull();
++  });
++
++  it("sweeps expired cooldowns and reports sorted nicknames", async () => {
++    const slow = service();
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 10 });
++    await slow.recordChannelSpeak("room-1", "zoe", { now: NOW });
++    await slow.recordChannelSpeak("room-1", "amy", { now: NOW });
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 40 });
++    await slow.recordChannelSpeak("room-1", "bob", { now: NOW + 10_000 });
++    await expect(slow.sweepExpiredCooldowns("room-1", { now: NOW + 10_000 })).resolves.toEqual({
++      removed: 2,
++      nicknames: ["amy", "zoe"],
++    });
++    await expect(slow.listActiveCooldowns("room-1", { now: NOW + 10_000 })).resolves.toHaveLength(1);
++  });
++
++  it("returns a zero sweep for an invalid channel", async () => {
++    await expect(service().sweepExpiredCooldowns(" ", { now: NOW })).resolves.toEqual({
++      removed: 0,
++      nicknames: [],
++    });
++  });
++
++  it("lets users keep independent cooldown clocks", async () => {
++    const slow = service();
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 30 });
++    await slow.recordChannelSpeak("room-1", "alice", { now: NOW });
++    await expect(slow.canSpeak("room-1", "bob", { now: NOW + 1_000 })).resolves.toMatchObject({
++      allowed: true,
++    });
++  });
++
++  it("does not carry cooldowns across different channels", async () => {
++    const slow = service();
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 30 });
++    await slow.setChannelSlowMode("room-2", { intervalSeconds: 30 });
++    await slow.recordChannelSpeak("room-1", "alice", { now: NOW });
++    await expect(slow.canSpeak("room-2", "alice", { now: NOW + 1_000 })).resolves.toMatchObject({
++      allowed: true,
++    });
++  });
++
++  it("supports the cooldown convenience helpers", async () => {
++    const store = new MemoryChannelSlowModeStore();
++    const slow = new ChannelSlowModeService(store);
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 20 });
++    await slow.recordChannelSpeak("room-1", "alice", { now: NOW });
++    await expect(getCooldown("room-1", "alice", { now: NOW }, store)).resolves.toMatchObject({
++      nickname: "alice",
++    });
++    await expect(listActiveCooldowns("room-1", { now: NOW }, store)).resolves.toHaveLength(1);
++    await expect(sweepExpiredCooldowns("room-1", { now: NOW + 20_000 }, store)).resolves.toEqual({
++      removed: 1,
++      nicknames: ["alice"],
++    });
++  });
++});
+diff --git a/packages/backend/src/gold_tests/slow_mode_edges.test.ts b/packages/backend/src/gold_tests/slow_mode_edges.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/slow_mode_edges.test.ts
+@@ -0,0 +1,77 @@
++import { describe, expect, it } from "vitest";
++import {
++  ChannelSlowModeService,
++  MemoryChannelSlowModeStore,
++  createChannelSlowModeService,
++} from "#ours/backend/services/slow_mode.ts";
++
++const NOW = 1_700_000_000_000;
++
++describe("Channel slow mode edges", () => {
++  it("accepts a one second interval at the minimum bound", async () => {
++    const slow = createChannelSlowModeService(new MemoryChannelSlowModeStore());
++    await expect(slow.setChannelSlowMode("room-1", { intervalSeconds: 1 })).resolves.toMatchObject({
++      intervalSeconds: 1,
++    });
++  });
++
++  it("accepts a six hundred second interval at the maximum bound", async () => {
++    const slow = createChannelSlowModeService(new MemoryChannelSlowModeStore());
++    await expect(slow.setChannelSlowMode("room-1", { intervalSeconds: 600 })).resolves.toMatchObject({
++      intervalSeconds: 600,
++    });
++  });
++
++  it("rejects a blank nickname when recording a speak", async () => {
++    const slow = createChannelSlowModeService(new MemoryChannelSlowModeStore());
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 20 });
++    await expect(slow.recordChannelSpeak("room-1", "  ", { now: NOW })).resolves.toEqual({
++      ok: false,
++      reason: "invalid_nickname",
++      channelId: "room-1",
++    });
++  });
++
++  it("rejects an empty channel when recording a speak", async () => {
++    const slow = createChannelSlowModeService(new MemoryChannelSlowModeStore());
++    await expect(slow.recordChannelSpeak("  ", "alice", { now: NOW })).resolves.toEqual({
++      ok: false,
++      reason: "invalid_channel",
++    });
++  });
++
++  it("allows a new speak window after an expired cooldown is recorded again", async () => {
++    const slow = createChannelSlowModeService(new MemoryChannelSlowModeStore());
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 15 });
++    await slow.recordChannelSpeak("room-1", "alice", { now: NOW });
++    await expect(slow.recordChannelSpeak("room-1", "alice", { now: NOW + 15_000 })).resolves.toEqual({
++      ok: true,
++      channelId: "room-1",
++      nickname: "alice",
++      lastSpokeAt: NOW + 15_000,
++      availableAt: NOW + 30_000,
++    });
++  });
++
++  it("uses the latest interval when opening a new cooldown", async () => {
++    const slow = createChannelSlowModeService(new MemoryChannelSlowModeStore());
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 10 });
++    await slow.recordChannelSpeak("room-1", "alice", { now: NOW });
++    await slow.setChannelSlowMode("room-1", { intervalSeconds: 50 });
++    await expect(slow.recordChannelSpeak("room-1", "alice", { now: NOW + 10_000 })).resolves.toMatchObject({
++      availableAt: NOW + 10_000 + 50_000,
++    });
++  });
++
++  it("returns null from getCooldown for an invalid nickname", async () => {
++    const slow = createChannelSlowModeService(new MemoryChannelSlowModeStore());
++    await expect(slow.getCooldown("room-1", "ab", { now: NOW })).resolves.toBeNull();
++  });
++
++  it("can construct the service through createChannelSlowModeService", async () => {
++    const store = new MemoryChannelSlowModeStore();
++    const slow = createChannelSlowModeService(store);
++    expect(slow).toBeInstanceOf(ChannelSlowModeService);
++    await expect(slow.getChannelSlowMode("room-1")).resolves.toBeNull();
++  });
++});
+diff --git a/packages/backend/src/gold_tests/p2p_constants_compat.test.ts b/packages/backend/src/gold_tests/p2p_constants_compat.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/p2p_constants_compat.test.ts
+@@ -0,0 +1,32 @@
++import { describe, expect, it } from "vitest";
++import { CHAT_CHANNEL_ROLES, CHAT_REACTIONS, CHAT_USER_TYPES } from "#ours/backend/constants/index.ts";
++
++describe("Existing chat constants", () => {
++  it("keeps HEART mapped to HEART", () => expect(CHAT_REACTIONS.HEART).toBe("HEART"));
++  it("keeps HANDS_UP mapped to HANDS_UP", () => expect(CHAT_REACTIONS.HANDS_UP).toBe("HANDS_UP"));
++  it("keeps FIRE mapped to FIRE", () => expect(CHAT_REACTIONS.FIRE).toBe("FIRE"));
++  it("keeps MUSIC mapped to MUSIC", () => expect(CHAT_REACTIONS.MUSIC).toBe("MUSIC"));
++  it("keeps SURPRISED mapped to SURPRISED", () => expect(CHAT_REACTIONS.SURPRISED).toBe("SURPRISED"));
++  it("keeps exactly five supported reaction keys", () => {
++    expect(Object.keys(CHAT_REACTIONS).sort()).toEqual(["FIRE", "HANDS_UP", "HEART", "MUSIC", "SURPRISED"]);
++  });
++  it("keeps reaction values unique", () => expect(new Set(Object.values(CHAT_REACTIONS)).size).toBe(5));
++  it("keeps TEMPORARY mapped to temporary", () => expect(CHAT_USER_TYPES.TEMPORARY).toBe("temporary"));
++  it("keeps REGULAR mapped to regular", () => expect(CHAT_USER_TYPES.REGULAR).toBe("regular"));
++  it("keeps ARTIST mapped to artist", () => expect(CHAT_USER_TYPES.ARTIST).toBe("artist"));
++  it("keeps ADMIN mapped to admin", () => expect(CHAT_USER_TYPES.ADMIN).toBe("admin"));
++  it("keeps MODERATOR mapped to moderator", () => expect(CHAT_USER_TYPES.MODERATOR).toBe("moderator"));
++  it("keeps ANONYMOUS mapped to anonymous", () => expect(CHAT_USER_TYPES.ANONYMOUS).toBe("anonymous"));
++  it("keeps exactly six user types", () => expect(Object.keys(CHAT_USER_TYPES)).toHaveLength(6));
++  it("keeps user type values unique", () => expect(new Set(Object.values(CHAT_USER_TYPES)).size).toBe(6));
++  it("keeps every user type value lowercase", () => {
++    expect(Object.values(CHAT_USER_TYPES).every((value) => value === value.toLowerCase())).toBe(true);
++  });
++  it("keeps OWNER mapped to owner", () => expect(CHAT_CHANNEL_ROLES.OWNER).toBe("owner"));
++  it("keeps VIEWER mapped to viewer", () => expect(CHAT_CHANNEL_ROLES.VIEWER).toBe("viewer"));
++  it("keeps exactly two channel roles", () => expect(Object.keys(CHAT_CHANNEL_ROLES)).toHaveLength(2));
++  it("keeps channel role values unique", () => expect(new Set(Object.values(CHAT_CHANNEL_ROLES)).size).toBe(2));
++  it("keeps channel role keys uppercase", () => {
++    expect(Object.keys(CHAT_CHANNEL_ROLES).every((key) => key === key.toUpperCase())).toBe(true);
++  });
++});
+diff --git a/packages/backend/src/gold_tests/p2p_input_validation_compat.test.ts b/packages/backend/src/gold_tests/p2p_input_validation_compat.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/p2p_input_validation_compat.test.ts
+@@ -0,0 +1,87 @@
++import { describe, expect, it } from "vitest";
++import { invalidNicknameMessage, isValidNickname } from "#ours/shared/inputValidation.ts";
++
++describe("isValidNickname", () => {
++  it("accepts a three character latin nickname", () => {
++    expect(isValidNickname("abc")).toBe(true);
++  });
++
++  it("accepts exactly twenty four characters", () => {
++    expect(isValidNickname("a".repeat(24))).toBe(true);
++  });
++
++  it("rejects two character nicknames", () => {
++    expect(isValidNickname("ab")).toBe(false);
++  });
++
++  it("rejects twenty five character nicknames", () => {
++    expect(isValidNickname("a".repeat(25))).toBe(false);
++  });
++
++  it("rejects the empty string", () => {
++    expect(isValidNickname("")).toBe(false);
++  });
++
++  it("accepts digits", () => {
++    expect(isValidNickname("user123")).toBe(true);
++  });
++
++  it("accepts non-latin letters", () => {
++    expect(isValidNickname("日本語")).toBe(true);
++  });
++
++  it("accepts accented letters", () => {
++    expect(isValidNickname("José")).toBe(true);
++  });
++
++  it("normalizes decomposed combining marks before validating", () => {
++    expect(isValidNickname("éric")).toBe(true);
++  });
++
++  it("accepts the period character", () => {
++    expect(isValidNickname("a.b.c")).toBe(true);
++  });
++
++  it("accepts the underscore character", () => {
++    expect(isValidNickname("a_b_c")).toBe(true);
++  });
++
++  it("accepts the hyphen character", () => {
++    expect(isValidNickname("a-b-c")).toBe(true);
++  });
++
++  it("rejects spaces", () => {
++    expect(isValidNickname("a b c")).toBe(false);
++  });
++
++  it("rejects emoji", () => {
++    expect(isValidNickname("abc\u{1f600}")).toBe(false);
++  });
++
++  it("rejects punctuation such as exclamation marks", () => {
++    expect(isValidNickname("abc!")).toBe(false);
++  });
++
++  it("rejects the at sign", () => {
++    expect(isValidNickname("a@bc")).toBe(false);
++  });
++
++  it("rejects forward slashes", () => {
++    expect(isValidNickname("a/bc")).toBe(false);
++  });
++
++  it("rejects leading and trailing whitespace around a valid core", () => {
++    expect(isValidNickname(" abc ")).toBe(false);
++  });
++});
++
++describe("invalidNicknameMessage", () => {
++  it("is a non-empty string", () => {
++    expect(typeof invalidNicknameMessage).toBe("string");
++    expect(invalidNicknameMessage.length).toBeGreaterThan(0);
++  });
++
++  it("mentions the allowed length range", () => {
++    expect(invalidNicknameMessage).toContain("3-24");
++  });
++});
+diff --git a/packages/backend/src/gold_tests/p2p_env_utils_compat.test.ts b/packages/backend/src/gold_tests/p2p_env_utils_compat.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/p2p_env_utils_compat.test.ts
+@@ -0,0 +1,56 @@
++import { beforeEach, describe, expect, it } from "vitest";
++import { checkEnvVar } from "#ours/backend/utils/env_utils.ts";
++
++const KEY = "OURS_TEST_ENV_UTILS_KEY";
++
++describe("checkEnvVar", () => {
++  beforeEach(() => {
++    delete process.env[KEY];
++  });
++
++  it("returns the raw value when the variable is set", () => {
++    process.env[KEY] = "hello";
++    expect(checkEnvVar(KEY)).toBe("hello");
++  });
++
++  it("returns values that contain spaces unchanged", () => {
++    process.env[KEY] = "  spaced value  ";
++    expect(checkEnvVar(KEY)).toBe("  spaced value  ");
++  });
++
++  it("returns numeric-looking values as strings", () => {
++    process.env[KEY] = "4000";
++    expect(checkEnvVar(KEY)).toBe("4000");
++  });
++
++  it("returns the default when the variable is missing", () => {
++    expect(checkEnvVar(KEY, "fallback")).toBe("fallback");
++  });
++
++  it("returns the default when the variable is an empty string", () => {
++    process.env[KEY] = "";
++    expect(checkEnvVar(KEY, "fallback")).toBe("fallback");
++  });
++
++  it("returns an empty-string default rather than throwing", () => {
++    expect(checkEnvVar(KEY, "")).toBe("");
++  });
++
++  it("prefers the real value over the default when both exist", () => {
++    process.env[KEY] = "real";
++    expect(checkEnvVar(KEY, "fallback")).toBe("real");
++  });
++
++  it("throws when the variable is missing and no default is given", () => {
++    expect(() => checkEnvVar(KEY)).toThrow(`process.env.${KEY} is not set`);
++  });
++
++  it("throws when the variable is an empty string and no default is given", () => {
++    process.env[KEY] = "";
++    expect(() => checkEnvVar(KEY)).toThrow(`process.env.${KEY} is not set`);
++  });
++
++  it("throws an Error instance", () => {
++    expect(() => checkEnvVar(KEY)).toThrow(Error);
++  });
++});
+diff --git a/packages/backend/src/gold_tests/p2p_gif_compat.test.ts b/packages/backend/src/gold_tests/p2p_gif_compat.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/p2p_gif_compat.test.ts
+@@ -0,0 +1,30 @@
++import { describe, expect, it } from "vitest";
++import { resolveGifByUrl } from "#ours/backend/services/gif_service.ts";
++
++describe("resolveGifByUrl", () => {
++  it("throws for an unsupported provider host", async () => {
++    await expect(resolveGifByUrl("https://example.com/cat.gif")).rejects.toThrow("Unsupported GIF provider");
++  });
++
++  it("throws for a malformed url", async () => {
++    await expect(resolveGifByUrl("not-a-url")).rejects.toThrow();
++  });
++
++  it("throws when a Giphy page url has no extractable id", async () => {
++    await expect(resolveGifByUrl("https://giphy.com/")).rejects.toThrow("Unable to extract Giphy id");
++  });
++
++  it("resolves a direct Giphy .gif url without a network call", async () => {
++    await expect(resolveGifByUrl("https://media.giphy.com/media/abc123/giphy.gif")).resolves.toMatchObject({
++      provider: "giphy",
++      url: "https://media.giphy.com/media/abc123/giphy.gif",
++    });
++  });
++
++  it("resolves a direct Tenor .gif url without a network call", async () => {
++    await expect(resolveGifByUrl("https://media.tenor.com/xyz987.gif")).resolves.toMatchObject({
++      provider: "tenor",
++      url: "https://media.tenor.com/xyz987.gif",
++    });
++  });
++});

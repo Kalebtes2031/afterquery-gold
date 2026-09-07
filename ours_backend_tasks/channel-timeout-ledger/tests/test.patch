@@ -1,0 +1,701 @@
+diff --git a/packages/backend/src/gold_tests/timeout_apply_behavior.test.ts b/packages/backend/src/gold_tests/timeout_apply_behavior.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/timeout_apply_behavior.test.ts
+@@ -0,0 +1,143 @@
++import { describe, expect, it } from "vitest";
++import {
++  DEFAULT_TIMEOUT_SECONDS,
++  MAX_TIMEOUT_SECONDS,
++  MIN_TIMEOUT_SECONDS,
++  ChannelTimeoutLedger,
++  MemoryChannelTimeoutStore,
++  applyChannelTimeout,
++} from "#ours/backend/services/timeouts.ts";
++
++const NOW = 1_700_000_000_000;
++
++const ledger = () => new ChannelTimeoutLedger(new MemoryChannelTimeoutStore());
++
++describe("Channel timeout apply", () => {
++  it("applies a new timeout with the default duration", async () => {
++    const result = await ledger().applyChannelTimeout("room-1", "alice", "mod-1", { now: NOW });
++    expect(result).toEqual({
++      ok: true,
++      status: "applied",
++      channelId: "room-1",
++      nickname: "alice",
++      moderatorId: "mod-1",
++      expiresAt: NOW + DEFAULT_TIMEOUT_SECONDS * 1000,
++      remainingSeconds: DEFAULT_TIMEOUT_SECONDS,
++    });
++  });
++
++  it("stores the nickname in lowercase and keeps the channel id case", async () => {
++    const timeouts = ledger();
++    const result = await timeouts.applyChannelTimeout("  Room:West  ", "  AlIce  ", "mod-1", { now: NOW });
++    expect(result).toMatchObject({ ok: true, channelId: "Room:West", nickname: "alice" });
++  });
++
++  it("extends a live timeout when the new expiry is later", async () => {
++    const timeouts = ledger();
++    await timeouts.applyChannelTimeout("room-1", "alice", "mod-1", { now: NOW, seconds: 30 });
++    const result = await timeouts.applyChannelTimeout("room-1", "alice", "mod-2", {
++      now: NOW + 1_000,
++      seconds: 80,
++      reason: "spam",
++    });
++    expect(result).toEqual({
++      ok: true,
++      status: "extended",
++      channelId: "room-1",
++      nickname: "alice",
++      moderatorId: "mod-2",
++      expiresAt: NOW + 1_000 + 80_000,
++      remainingSeconds: 80,
++      reason: "spam",
++    });
++  });
++
++  it("keeps the existing row when the new expiry is not later", async () => {
++    const timeouts = ledger();
++    await timeouts.applyChannelTimeout("room-1", "alice", "mod-1", { now: NOW, seconds: 90, reason: "first" });
++    const result = await timeouts.applyChannelTimeout("room-1", "alice", "mod-2", {
++      now: NOW + 1_000,
++      seconds: 20,
++      reason: "ignored",
++    });
++    expect(result).toEqual({
++      ok: true,
++      status: "kept",
++      channelId: "room-1",
++      nickname: "alice",
++      moderatorId: "mod-1",
++      expiresAt: NOW + 90_000,
++      remainingSeconds: 89,
++      reason: "first",
++    });
++  });
++
++  it("applies again after the previous timeout has expired", async () => {
++    const timeouts = ledger();
++    await timeouts.applyChannelTimeout("room-1", "alice", "mod-1", { now: NOW, seconds: 10 });
++    const result = await timeouts.applyChannelTimeout("room-1", "alice", "mod-2", { now: NOW + 10_000, seconds: 15 });
++    expect(result).toMatchObject({ ok: true, status: "applied", moderatorId: "mod-2", remainingSeconds: 15 });
++  });
++
++  it("uses the default duration when seconds is missing or not finite", async () => {
++    const timeouts = ledger();
++    const missing = await timeouts.applyChannelTimeout("room-1", "alice", "mod-1", { now: NOW });
++    const invalid = await timeouts.applyChannelTimeout("room-2", "bob", "mod-1", { now: NOW, seconds: Number.POSITIVE_INFINITY });
++    expect(missing).toMatchObject({ remainingSeconds: DEFAULT_TIMEOUT_SECONDS });
++    expect(invalid).toMatchObject({ remainingSeconds: DEFAULT_TIMEOUT_SECONDS });
++  });
++
++  it("truncates a fractional duration before clamping", async () => {
++    const result = await ledger().applyChannelTimeout("room-1", "alice", "mod-1", { now: NOW, seconds: 21.8 });
++    expect(result).toMatchObject({ ok: true, remainingSeconds: 21 });
++  });
++
++  it("clamps a duration below the minimum to ten seconds", async () => {
++    const result = await ledger().applyChannelTimeout("room-1", "alice", "mod-1", { now: NOW, seconds: 2 });
++    expect(result).toMatchObject({ remainingSeconds: MIN_TIMEOUT_SECONDS });
++  });
++
++  it("clamps a duration above the maximum to one day", async () => {
++    const result = await ledger().applyChannelTimeout("room-1", "alice", "mod-1", { now: NOW, seconds: 200_000 });
++    expect(result).toMatchObject({ remainingSeconds: MAX_TIMEOUT_SECONDS });
++  });
++
++  it("drops a blank reason and trims a long reason to eighty characters", async () => {
++    const timeouts = ledger();
++    const blank = await timeouts.applyChannelTimeout("room-1", "alice", "mod-1", { now: NOW, reason: "   " });
++    const long = await timeouts.applyChannelTimeout("room-2", "bob", "mod-1", { now: NOW, reason: "x".repeat(90) });
++    expect(blank.ok).toBe(true);
++    expect(blank).not.toHaveProperty("reason");
++    expect(long).toMatchObject({ reason: "x".repeat(80) });
++  });
++
++  it("rejects an empty channel id", async () => {
++    await expect(ledger().applyChannelTimeout("   ", "alice", "mod-1", { now: NOW })).resolves.toEqual({
++      ok: false,
++      reason: "invalid_channel",
++    });
++  });
++
++  it("rejects a nickname that fails the shared nickname rules", async () => {
++    await expect(ledger().applyChannelTimeout("room-1", "ab", "mod-1", { now: NOW })).resolves.toEqual({
++      ok: false,
++      reason: "invalid_nickname",
++      channelId: "room-1",
++    });
++  });
++
++  it("rejects a blank moderator id", async () => {
++    await expect(ledger().applyChannelTimeout("room-1", "alice", "  ", { now: NOW })).resolves.toEqual({
++      ok: false,
++      reason: "invalid_moderator",
++      channelId: "room-1",
++      nickname: "alice",
++    });
++  });
++
++  it("supports the applyChannelTimeout convenience function", async () => {
++    const store = new MemoryChannelTimeoutStore();
++    const result = await applyChannelTimeout("room-1", "alice", "mod-1", { now: NOW }, store);
++    expect(result).toMatchObject({ ok: true, status: "applied" });
++  });
++});
+diff --git a/packages/backend/src/gold_tests/timeout_lift_and_lookup.test.ts b/packages/backend/src/gold_tests/timeout_lift_and_lookup.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/timeout_lift_and_lookup.test.ts
+@@ -0,0 +1,123 @@
++import { describe, expect, it } from "vitest";
++import {
++  ChannelTimeoutLedger,
++  MemoryChannelTimeoutStore,
++  getTimeout,
++  isTimedOut,
++  liftChannelTimeout,
++} from "#ours/backend/services/timeouts.ts";
++
++const NOW = 1_700_000_000_000;
++
++const ledger = () => new ChannelTimeoutLedger(new MemoryChannelTimeoutStore());
++
++describe("Channel timeout lift and lookup", () => {
++  it("lifts a live timeout even when another moderator asks", async () => {
++    const timeouts = ledger();
++    await timeouts.applyChannelTimeout("room-1", "alice", "mod-1", { now: NOW, seconds: 40 });
++    await expect(timeouts.liftChannelTimeout("room-1", "alice", "mod-2", { now: NOW + 1_000 })).resolves.toEqual({
++      ok: true,
++      channelId: "room-1",
++      nickname: "alice",
++      lifted: true,
++    });
++    await expect(timeouts.isTimedOut("room-1", "alice", { now: NOW + 1_000 })).resolves.toEqual({
++      timedOut: false,
++      remainingSeconds: 0,
++    });
++  });
++
++  it("reports not_found when lifting a missing timeout", async () => {
++    await expect(ledger().liftChannelTimeout("room-1", "alice", "mod-1", { now: NOW })).resolves.toEqual({
++      ok: false,
++      reason: "not_found",
++      channelId: "room-1",
++      nickname: "alice",
++    });
++  });
++
++  it("treats an expired timeout as gone when lifting", async () => {
++    const timeouts = ledger();
++    await timeouts.applyChannelTimeout("room-1", "alice", "mod-1", { now: NOW, seconds: 10 });
++    await expect(timeouts.liftChannelTimeout("room-1", "alice", "mod-1", { now: NOW + 10_000 })).resolves.toEqual({
++      ok: false,
++      reason: "not_found",
++      channelId: "room-1",
++      nickname: "alice",
++    });
++  });
++
++  it("rejects lift for invalid channel nickname or moderator", async () => {
++    const timeouts = ledger();
++    await expect(timeouts.liftChannelTimeout("  ", "alice", "mod-1")).resolves.toEqual({
++      ok: false,
++      reason: "invalid_channel",
++    });
++    await expect(timeouts.liftChannelTimeout("room-1", "ab", "mod-1")).resolves.toEqual({
++      ok: false,
++      reason: "invalid_nickname",
++      channelId: "room-1",
++    });
++    await expect(timeouts.liftChannelTimeout("room-1", "alice", " ")).resolves.toEqual({
++      ok: false,
++      reason: "invalid_moderator",
++      channelId: "room-1",
++      nickname: "alice",
++    });
++  });
++
++  it("reports a live timeout through isTimedOut", async () => {
++    const timeouts = ledger();
++    await timeouts.applyChannelTimeout("room-1", "alice", "mod-1", { now: NOW, seconds: 30, reason: "spam" });
++    const lookup = await timeouts.isTimedOut("room-1", "ALICE", { now: NOW + 2_000 });
++    expect(lookup.timedOut).toBe(true);
++    expect(lookup.remainingSeconds).toBe(28);
++    expect(lookup.record).toEqual({
++      channelId: "room-1",
++      nickname: "alice",
++      moderatorId: "mod-1",
++      expiresAt: NOW + 30_000,
++      remainingSeconds: 28,
++      expired: false,
++      reason: "spam",
++    });
++  });
++
++  it("reports not timed out for missing expired or invalid lookups", async () => {
++    const timeouts = ledger();
++    await timeouts.applyChannelTimeout("room-1", "alice", "mod-1", { now: NOW, seconds: 10 });
++    await expect(timeouts.isTimedOut("room-1", "alice", { now: NOW + 10_000 })).resolves.toEqual({
++      timedOut: false,
++      remainingSeconds: 0,
++    });
++    await expect(timeouts.isTimedOut("room-1", "missing", { now: NOW })).resolves.toEqual({
++      timedOut: false,
++      remainingSeconds: 0,
++    });
++    await expect(timeouts.isTimedOut("  ", "alice", { now: NOW })).resolves.toEqual({
++      timedOut: false,
++      remainingSeconds: 0,
++    });
++  });
++
++  it("returns only a live record from getTimeout", async () => {
++    const timeouts = ledger();
++    await timeouts.applyChannelTimeout("room-1", "alice", "mod-1", { now: NOW, seconds: 12 });
++    await expect(timeouts.getTimeout("room-1", "alice", { now: NOW })).resolves.toMatchObject({
++      nickname: "alice",
++      expired: false,
++    });
++    await expect(timeouts.getTimeout("room-1", "alice", { now: NOW + 12_000 })).resolves.toBeNull();
++  });
++
++  it("supports the lookup convenience functions", async () => {
++    const store = new MemoryChannelTimeoutStore();
++    const timeouts = new ChannelTimeoutLedger(store);
++    await timeouts.applyChannelTimeout("room-1", "alice", "mod-1", { now: NOW, seconds: 40 });
++    await expect(isTimedOut("room-1", "alice", { now: NOW }, store)).resolves.toMatchObject({ timedOut: true });
++    await expect(getTimeout("room-1", "alice", { now: NOW }, store)).resolves.toMatchObject({ nickname: "alice" });
++    await expect(liftChannelTimeout("room-1", "alice", "mod-9", { now: NOW }, store)).resolves.toMatchObject({
++      lifted: true,
++    });
++  });
++});
+diff --git a/packages/backend/src/gold_tests/timeout_list_and_sweep.test.ts b/packages/backend/src/gold_tests/timeout_list_and_sweep.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/timeout_list_and_sweep.test.ts
+@@ -0,0 +1,106 @@
++import { describe, expect, it } from "vitest";
++import {
++  ChannelTimeoutLedger,
++  MemoryChannelTimeoutStore,
++  countActiveTimeouts,
++  listChannelTimeouts,
++  listTimedOutChannels,
++  sweepExpiredTimeouts,
++} from "#ours/backend/services/timeouts.ts";
++
++const NOW = 1_700_000_000_000;
++
++const ledger = () => new ChannelTimeoutLedger(new MemoryChannelTimeoutStore());
++
++describe("Channel timeout lists and sweep", () => {
++  it("lists live timeouts for a channel sorted by nickname", async () => {
++    const timeouts = ledger();
++    await timeouts.applyChannelTimeout("room-1", "zoe", "mod-1", { now: NOW, seconds: 40 });
++    await timeouts.applyChannelTimeout("room-1", "amy", "mod-1", { now: NOW, seconds: 40 });
++    await timeouts.applyChannelTimeout("room-1", "bob", "mod-1", { now: NOW, seconds: 10 });
++    const listed = await timeouts.listChannelTimeouts("room-1", { now: NOW + 10_000 });
++    expect(listed.map((row) => row.nickname)).toEqual(["amy", "zoe"]);
++  });
++
++  it("includes stored expired rows only when asked", async () => {
++    const timeouts = ledger();
++    await timeouts.applyChannelTimeout("room-1", "alice", "mod-1", { now: NOW, seconds: 10 });
++    await timeouts.applyChannelTimeout("room-1", "bob", "mod-1", { now: NOW, seconds: 40 });
++    const live = await timeouts.listChannelTimeouts("room-1", { now: NOW + 10_000 });
++    const all = await timeouts.listChannelTimeouts("room-1", { now: NOW + 10_000, includeExpired: true });
++    expect(live.map((row) => row.nickname)).toEqual(["bob"]);
++    expect(all.map((row) => row.nickname)).toEqual(["alice", "bob"]);
++    expect(all.find((row) => row.nickname === "alice")?.expired).toBe(true);
++  });
++
++  it("returns an empty list for an invalid channel id", async () => {
++    await expect(ledger().listChannelTimeouts("   ", { now: NOW })).resolves.toEqual([]);
++  });
++
++  it("lists timed out channels in lexical order", async () => {
++    const timeouts = ledger();
++    await timeouts.applyChannelTimeout("zeta", "alice", "mod-1", { now: NOW, seconds: 40 });
++    await timeouts.applyChannelTimeout("alpha", "bob", "mod-1", { now: NOW, seconds: 40 });
++    await timeouts.applyChannelTimeout("gone", "carol", "mod-1", { now: NOW, seconds: 10 });
++    await expect(timeouts.listTimedOutChannels({ now: NOW + 10_000 })).resolves.toEqual(["alpha", "zeta"]);
++  });
++
++  it("counts live timeouts for one channel or across every channel", async () => {
++    const timeouts = ledger();
++    await timeouts.applyChannelTimeout("room-1", "alice", "mod-1", { now: NOW, seconds: 40 });
++    await timeouts.applyChannelTimeout("room-1", "bob", "mod-1", { now: NOW, seconds: 10 });
++    await timeouts.applyChannelTimeout("room-2", "carol", "mod-1", { now: NOW, seconds: 40 });
++    await expect(timeouts.countActiveTimeouts("room-1", { now: NOW + 10_000 })).resolves.toBe(1);
++    await expect(timeouts.countActiveTimeouts(undefined, { now: NOW + 10_000 })).resolves.toBe(2);
++    await expect(timeouts.countActiveTimeouts("   ", { now: NOW })).resolves.toBe(0);
++  });
++
++  it("sweeps expired rows for one channel and reports that channel", async () => {
++    const timeouts = ledger();
++    await timeouts.applyChannelTimeout("room-1", "alice", "mod-1", { now: NOW, seconds: 10 });
++    await timeouts.applyChannelTimeout("room-1", "bob", "mod-1", { now: NOW, seconds: 40 });
++    await expect(timeouts.sweepExpiredTimeouts("room-1", { now: NOW + 10_000 })).resolves.toEqual({
++      removed: 1,
++      channelIds: ["room-1"],
++    });
++    await expect(timeouts.listChannelTimeouts("room-1", { now: NOW + 5_000 })).resolves.toHaveLength(1);
++  });
++
++  it("sweeps expired rows across every channel when no channel is given", async () => {
++    const timeouts = ledger();
++    await timeouts.applyChannelTimeout("room-b", "alice", "mod-1", { now: NOW, seconds: 10 });
++    await timeouts.applyChannelTimeout("room-a", "bob", "mod-1", { now: NOW, seconds: 10 });
++    await timeouts.applyChannelTimeout("room-a", "carol", "mod-1", { now: NOW, seconds: 40 });
++    await expect(timeouts.sweepExpiredTimeouts(undefined, { now: NOW + 10_000 })).resolves.toEqual({
++      removed: 2,
++      channelIds: ["room-a", "room-b"],
++    });
++  });
++
++  it("returns a zero sweep for an invalid channel selection", async () => {
++    await expect(ledger().sweepExpiredTimeouts("  ", { now: NOW })).resolves.toEqual({
++      removed: 0,
++      channelIds: [],
++    });
++  });
++
++  it("floors remaining time and never goes negative", async () => {
++    const timeouts = ledger();
++    await timeouts.applyChannelTimeout("room-1", "alice", "mod-1", { now: NOW, seconds: 10 });
++    const view = await timeouts.listChannelTimeouts("room-1", { now: NOW + 9_400, includeExpired: true });
++    expect(view[0]?.remainingSeconds).toBe(0);
++  });
++
++  it("supports the list and sweep convenience functions", async () => {
++    const store = new MemoryChannelTimeoutStore();
++    const timeouts = new ChannelTimeoutLedger(store);
++    await timeouts.applyChannelTimeout("room-1", "alice", "mod-1", { now: NOW, seconds: 40 });
++    await expect(listChannelTimeouts("room-1", { now: NOW }, store)).resolves.toHaveLength(1);
++    await expect(listTimedOutChannels({ now: NOW }, store)).resolves.toEqual(["room-1"]);
++    await expect(countActiveTimeouts("room-1", { now: NOW }, store)).resolves.toBe(1);
++    await expect(sweepExpiredTimeouts("room-1", { now: NOW }, store)).resolves.toEqual({
++      removed: 0,
++      channelIds: [],
++    });
++  });
++});
+diff --git a/packages/backend/src/gold_tests/timeout_edge_behavior.test.ts b/packages/backend/src/gold_tests/timeout_edge_behavior.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/timeout_edge_behavior.test.ts
+@@ -0,0 +1,76 @@
++import { describe, expect, it } from "vitest";
++import {
++  ChannelTimeoutLedger,
++  MemoryChannelTimeoutStore,
++  createChannelTimeoutLedger,
++} from "#ours/backend/services/timeouts.ts";
++
++const NOW = 1_700_000_000_000;
++
++describe("Channel timeout extra edges", () => {
++  it("keeps colons inside a trimmed channel id", async () => {
++    const timeouts = createChannelTimeoutLedger(new MemoryChannelTimeoutStore());
++    const result = await timeouts.applyChannelTimeout("  team:west  ", "alice", "mod-1", { now: NOW, seconds: 20 });
++    expect(result).toMatchObject({ ok: true, channelId: "team:west" });
++  });
++
++  it("trims a reason before storing it", async () => {
++    const timeouts = createChannelTimeoutLedger(new MemoryChannelTimeoutStore());
++    const result = await timeouts.applyChannelTimeout("room-1", "alice", "mod-1", {
++      now: NOW,
++      seconds: 20,
++      reason: "  flood  ",
++    });
++    expect(result).toMatchObject({ reason: "flood" });
++  });
++
++  it("clamps a negative duration up to ten seconds", async () => {
++    const timeouts = createChannelTimeoutLedger(new MemoryChannelTimeoutStore());
++    const result = await timeouts.applyChannelTimeout("room-1", "alice", "mod-1", { now: NOW, seconds: -40 });
++    expect(result).toMatchObject({ ok: true, remainingSeconds: 10 });
++  });
++
++  it("keeps the live row when the new expiry is exactly the same", async () => {
++    const timeouts = createChannelTimeoutLedger(new MemoryChannelTimeoutStore());
++    await timeouts.applyChannelTimeout("room-1", "alice", "mod-1", { now: NOW, seconds: 40, reason: "keep-me" });
++    const result = await timeouts.applyChannelTimeout("room-1", "alice", "mod-2", {
++      now: NOW,
++      seconds: 40,
++      reason: "other",
++    });
++    expect(result).toMatchObject({
++      ok: true,
++      status: "kept",
++      moderatorId: "mod-1",
++      reason: "keep-me",
++      expiresAt: NOW + 40_000,
++    });
++  });
++
++  it("does not count an expired row after it has been swept", async () => {
++    const timeouts = createChannelTimeoutLedger(new MemoryChannelTimeoutStore());
++    await timeouts.applyChannelTimeout("room-1", "alice", "mod-1", { now: NOW, seconds: 10 });
++    await timeouts.sweepExpiredTimeouts("room-1", { now: NOW + 10_000 });
++    await expect(timeouts.countActiveTimeouts("room-1", { now: NOW + 10_000 })).resolves.toBe(0);
++    await expect(timeouts.listChannelTimeouts("room-1", { now: NOW + 10_000, includeExpired: true })).resolves.toEqual([]);
++  });
++
++  it("returns null from getTimeout for an invalid nickname", async () => {
++    const timeouts = createChannelTimeoutLedger(new MemoryChannelTimeoutStore());
++    await expect(timeouts.getTimeout("room-1", "ab", { now: NOW })).resolves.toBeNull();
++  });
++
++  it("does not treat a lifted user as timed out", async () => {
++    const timeouts = createChannelTimeoutLedger(new MemoryChannelTimeoutStore());
++    await timeouts.applyChannelTimeout("room-1", "alice", "mod-1", { now: NOW, seconds: 50 });
++    await timeouts.liftChannelTimeout("room-1", "alice", "mod-1", { now: NOW + 1_000 });
++    await expect(timeouts.listTimedOutChannels({ now: NOW + 1_000 })).resolves.toEqual([]);
++  });
++
++  it("can construct the ledger through createChannelTimeoutLedger", async () => {
++    const store = new MemoryChannelTimeoutStore();
++    const timeouts = createChannelTimeoutLedger(store);
++    expect(timeouts).toBeInstanceOf(ChannelTimeoutLedger);
++    await expect(timeouts.countActiveTimeouts(undefined, { now: NOW })).resolves.toBe(0);
++  });
++});
+diff --git a/packages/backend/src/gold_tests/p2p_constants_compat.test.ts b/packages/backend/src/gold_tests/p2p_constants_compat.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/p2p_constants_compat.test.ts
+@@ -0,0 +1,32 @@
++import { describe, expect, it } from "vitest";
++import { CHAT_CHANNEL_ROLES, CHAT_REACTIONS, CHAT_USER_TYPES } from "#ours/backend/constants/index.ts";
++
++describe("Existing chat constants", () => {
++  it("keeps HEART mapped to HEART", () => expect(CHAT_REACTIONS.HEART).toBe("HEART"));
++  it("keeps HANDS_UP mapped to HANDS_UP", () => expect(CHAT_REACTIONS.HANDS_UP).toBe("HANDS_UP"));
++  it("keeps FIRE mapped to FIRE", () => expect(CHAT_REACTIONS.FIRE).toBe("FIRE"));
++  it("keeps MUSIC mapped to MUSIC", () => expect(CHAT_REACTIONS.MUSIC).toBe("MUSIC"));
++  it("keeps SURPRISED mapped to SURPRISED", () => expect(CHAT_REACTIONS.SURPRISED).toBe("SURPRISED"));
++  it("keeps exactly five supported reaction keys", () => {
++    expect(Object.keys(CHAT_REACTIONS).sort()).toEqual(["FIRE", "HANDS_UP", "HEART", "MUSIC", "SURPRISED"]);
++  });
++  it("keeps reaction values unique", () => expect(new Set(Object.values(CHAT_REACTIONS)).size).toBe(5));
++  it("keeps TEMPORARY mapped to temporary", () => expect(CHAT_USER_TYPES.TEMPORARY).toBe("temporary"));
++  it("keeps REGULAR mapped to regular", () => expect(CHAT_USER_TYPES.REGULAR).toBe("regular"));
++  it("keeps ARTIST mapped to artist", () => expect(CHAT_USER_TYPES.ARTIST).toBe("artist"));
++  it("keeps ADMIN mapped to admin", () => expect(CHAT_USER_TYPES.ADMIN).toBe("admin"));
++  it("keeps MODERATOR mapped to moderator", () => expect(CHAT_USER_TYPES.MODERATOR).toBe("moderator"));
++  it("keeps ANONYMOUS mapped to anonymous", () => expect(CHAT_USER_TYPES.ANONYMOUS).toBe("anonymous"));
++  it("keeps exactly six user types", () => expect(Object.keys(CHAT_USER_TYPES)).toHaveLength(6));
++  it("keeps user type values unique", () => expect(new Set(Object.values(CHAT_USER_TYPES)).size).toBe(6));
++  it("keeps every user type value lowercase", () => {
++    expect(Object.values(CHAT_USER_TYPES).every((value) => value === value.toLowerCase())).toBe(true);
++  });
++  it("keeps OWNER mapped to owner", () => expect(CHAT_CHANNEL_ROLES.OWNER).toBe("owner"));
++  it("keeps VIEWER mapped to viewer", () => expect(CHAT_CHANNEL_ROLES.VIEWER).toBe("viewer"));
++  it("keeps exactly two channel roles", () => expect(Object.keys(CHAT_CHANNEL_ROLES)).toHaveLength(2));
++  it("keeps channel role values unique", () => expect(new Set(Object.values(CHAT_CHANNEL_ROLES)).size).toBe(2));
++  it("keeps channel role keys uppercase", () => {
++    expect(Object.keys(CHAT_CHANNEL_ROLES).every((key) => key === key.toUpperCase())).toBe(true);
++  });
++});
+diff --git a/packages/backend/src/gold_tests/p2p_input_validation_compat.test.ts b/packages/backend/src/gold_tests/p2p_input_validation_compat.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/p2p_input_validation_compat.test.ts
+@@ -0,0 +1,87 @@
++import { describe, expect, it } from "vitest";
++import { invalidNicknameMessage, isValidNickname } from "#ours/shared/inputValidation.ts";
++
++describe("isValidNickname", () => {
++  it("accepts a three character latin nickname", () => {
++    expect(isValidNickname("abc")).toBe(true);
++  });
++
++  it("accepts exactly twenty four characters", () => {
++    expect(isValidNickname("a".repeat(24))).toBe(true);
++  });
++
++  it("rejects two character nicknames", () => {
++    expect(isValidNickname("ab")).toBe(false);
++  });
++
++  it("rejects twenty five character nicknames", () => {
++    expect(isValidNickname("a".repeat(25))).toBe(false);
++  });
++
++  it("rejects the empty string", () => {
++    expect(isValidNickname("")).toBe(false);
++  });
++
++  it("accepts digits", () => {
++    expect(isValidNickname("user123")).toBe(true);
++  });
++
++  it("accepts non-latin letters", () => {
++    expect(isValidNickname("日本語")).toBe(true);
++  });
++
++  it("accepts accented letters", () => {
++    expect(isValidNickname("José")).toBe(true);
++  });
++
++  it("normalizes decomposed combining marks before validating", () => {
++    expect(isValidNickname("éric")).toBe(true);
++  });
++
++  it("accepts the period character", () => {
++    expect(isValidNickname("a.b.c")).toBe(true);
++  });
++
++  it("accepts the underscore character", () => {
++    expect(isValidNickname("a_b_c")).toBe(true);
++  });
++
++  it("accepts the hyphen character", () => {
++    expect(isValidNickname("a-b-c")).toBe(true);
++  });
++
++  it("rejects spaces", () => {
++    expect(isValidNickname("a b c")).toBe(false);
++  });
++
++  it("rejects emoji", () => {
++    expect(isValidNickname("abc\u{1f600}")).toBe(false);
++  });
++
++  it("rejects punctuation such as exclamation marks", () => {
++    expect(isValidNickname("abc!")).toBe(false);
++  });
++
++  it("rejects the at sign", () => {
++    expect(isValidNickname("a@bc")).toBe(false);
++  });
++
++  it("rejects forward slashes", () => {
++    expect(isValidNickname("a/bc")).toBe(false);
++  });
++
++  it("rejects leading and trailing whitespace around a valid core", () => {
++    expect(isValidNickname(" abc ")).toBe(false);
++  });
++});
++
++describe("invalidNicknameMessage", () => {
++  it("is a non-empty string", () => {
++    expect(typeof invalidNicknameMessage).toBe("string");
++    expect(invalidNicknameMessage.length).toBeGreaterThan(0);
++  });
++
++  it("mentions the allowed length range", () => {
++    expect(invalidNicknameMessage).toContain("3-24");
++  });
++});
+diff --git a/packages/backend/src/gold_tests/p2p_env_utils_compat.test.ts b/packages/backend/src/gold_tests/p2p_env_utils_compat.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/p2p_env_utils_compat.test.ts
+@@ -0,0 +1,56 @@
++import { beforeEach, describe, expect, it } from "vitest";
++import { checkEnvVar } from "#ours/backend/utils/env_utils.ts";
++
++const KEY = "OURS_TEST_ENV_UTILS_KEY";
++
++describe("checkEnvVar", () => {
++  beforeEach(() => {
++    delete process.env[KEY];
++  });
++
++  it("returns the raw value when the variable is set", () => {
++    process.env[KEY] = "hello";
++    expect(checkEnvVar(KEY)).toBe("hello");
++  });
++
++  it("returns values that contain spaces unchanged", () => {
++    process.env[KEY] = "  spaced value  ";
++    expect(checkEnvVar(KEY)).toBe("  spaced value  ");
++  });
++
++  it("returns numeric-looking values as strings", () => {
++    process.env[KEY] = "4000";
++    expect(checkEnvVar(KEY)).toBe("4000");
++  });
++
++  it("returns the default when the variable is missing", () => {
++    expect(checkEnvVar(KEY, "fallback")).toBe("fallback");
++  });
++
++  it("returns the default when the variable is an empty string", () => {
++    process.env[KEY] = "";
++    expect(checkEnvVar(KEY, "fallback")).toBe("fallback");
++  });
++
++  it("returns an empty-string default rather than throwing", () => {
++    expect(checkEnvVar(KEY, "")).toBe("");
++  });
++
++  it("prefers the real value over the default when both exist", () => {
++    process.env[KEY] = "real";
++    expect(checkEnvVar(KEY, "fallback")).toBe("real");
++  });
++
++  it("throws when the variable is missing and no default is given", () => {
++    expect(() => checkEnvVar(KEY)).toThrow(`process.env.${KEY} is not set`);
++  });
++
++  it("throws when the variable is an empty string and no default is given", () => {
++    process.env[KEY] = "";
++    expect(() => checkEnvVar(KEY)).toThrow(`process.env.${KEY} is not set`);
++  });
++
++  it("throws an Error instance", () => {
++    expect(() => checkEnvVar(KEY)).toThrow(Error);
++  });
++});
+diff --git a/packages/backend/src/gold_tests/p2p_gif_compat.test.ts b/packages/backend/src/gold_tests/p2p_gif_compat.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/p2p_gif_compat.test.ts
+@@ -0,0 +1,30 @@
++import { describe, expect, it } from "vitest";
++import { resolveGifByUrl } from "#ours/backend/services/gif_service.ts";
++
++describe("resolveGifByUrl", () => {
++  it("throws for an unsupported provider host", async () => {
++    await expect(resolveGifByUrl("https://example.com/cat.gif")).rejects.toThrow("Unsupported GIF provider");
++  });
++
++  it("throws for a malformed url", async () => {
++    await expect(resolveGifByUrl("not-a-url")).rejects.toThrow();
++  });
++
++  it("throws when a Giphy page url has no extractable id", async () => {
++    await expect(resolveGifByUrl("https://giphy.com/")).rejects.toThrow("Unable to extract Giphy id");
++  });
++
++  it("resolves a direct Giphy .gif url without a network call", async () => {
++    await expect(resolveGifByUrl("https://media.giphy.com/media/abc123/giphy.gif")).resolves.toMatchObject({
++      provider: "giphy",
++      url: "https://media.giphy.com/media/abc123/giphy.gif",
++    });
++  });
++
++  it("resolves a direct Tenor .gif url without a network call", async () => {
++    await expect(resolveGifByUrl("https://media.tenor.com/xyz987.gif")).resolves.toMatchObject({
++      provider: "tenor",
++      url: "https://media.tenor.com/xyz987.gif",
++    });
++  });
++});

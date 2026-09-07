@@ -1,0 +1,696 @@
+diff --git a/packages/backend/src/services/nickname_hold_types.ts b/packages/backend/src/services/nickname_hold_types.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/nickname_hold_types.ts
+@@ -0,0 +1,98 @@
++export const DEFAULT_HOLD_SECONDS = 45;
++export const MIN_HOLD_SECONDS = 5;
++export const MAX_HOLD_SECONDS = 120;
++export const CONFIRMED_LEASE_SECONDS = 1800;
++
++export const NICKNAME_HOLD_STATUSES = ["held", "confirmed"] as const;
++export type NicknameHoldStatus = (typeof NICKNAME_HOLD_STATUSES)[number];
++
++export const NICKNAME_HOLD_FAILURE_REASONS = [
++  "invalid_nickname",
++  "invalid_holder",
++  "held",
++  "not_found",
++  "holder_mismatch",
++  "expired",
++] as const;
++export type NicknameHoldFailureReason = (typeof NICKNAME_HOLD_FAILURE_REASONS)[number];
++
++export interface NicknameHoldRecord {
++  nickname: string;
++  holderId: string;
++  status: NicknameHoldStatus;
++  expiresAt: number;
++}
++
++export interface NicknameHoldView extends NicknameHoldRecord {
++  remainingSeconds: number;
++}
++
++export interface NicknameHoldClockOptions {
++  now?: number;
++}
++
++export interface ClaimNicknameHoldOptions extends NicknameHoldClockOptions {
++  ttlSeconds?: number;
++}
++
++export interface NicknameHoldSuccess {
++  ok: true;
++  nickname: string;
++  holderId: string;
++  status: NicknameHoldStatus | "refreshed";
++  expiresAt: number;
++  remainingSeconds: number;
++}
++
++export interface NicknameHoldFailure {
++  ok: false;
++  reason: NicknameHoldFailureReason;
++  nickname?: string;
++  holderId?: string;
++  expiresAt?: number;
++  remainingSeconds?: number;
++}
++
++export type ClaimNicknameHoldResult = NicknameHoldSuccess | NicknameHoldFailure;
++export type ConfirmNicknameHoldResult = NicknameHoldSuccess | NicknameHoldFailure;
++
++export interface ReleaseNicknameHoldSuccess {
++  ok: true;
++  nickname: string;
++  released: true;
++}
++
++export type ReleaseNicknameHoldResult = ReleaseNicknameHoldSuccess | NicknameHoldFailure;
++
++export interface ListNicknameHoldsOptions extends NicknameHoldClockOptions {
++  holderId?: string;
++}
++
++export interface NicknameHoldStore {
++  getHold(nickname: string): Promise<NicknameHoldRecord | null>;
++  putHold(record: NicknameHoldRecord): Promise<void>;
++  deleteHold(nickname: string): Promise<void>;
++  listHolds(): Promise<NicknameHoldRecord[]>;
++  compareAndSetHold(
++    nickname: string,
++    expectedHolderId: string | null,
++    record: NicknameHoldRecord,
++  ): Promise<boolean>;
++}
++
++export function isNicknameHoldRecord(value: unknown): value is NicknameHoldRecord {
++  if (value === null || typeof value !== "object") {
++    return false;
++  }
++
++  const record = value as Partial<NicknameHoldRecord>;
++  return (
++    typeof record.nickname === "string" &&
++    record.nickname.length > 0 &&
++    typeof record.holderId === "string" &&
++    record.holderId.length > 0 &&
++    (record.status === "held" || record.status === "confirmed") &&
++    typeof record.expiresAt === "number" &&
++    Number.isFinite(record.expiresAt)
++  );
++}
+diff --git a/packages/backend/src/services/nickname_hold_utils.ts b/packages/backend/src/services/nickname_hold_utils.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/nickname_hold_utils.ts
+@@ -0,0 +1,93 @@
++import { isValidNickname } from "#ours/shared/inputValidation.ts";
++import {
++  CONFIRMED_LEASE_SECONDS,
++  DEFAULT_HOLD_SECONDS,
++  MAX_HOLD_SECONDS,
++  MIN_HOLD_SECONDS,
++  type NicknameHoldFailure,
++  type NicknameHoldFailureReason,
++  type NicknameHoldRecord,
++  type NicknameHoldView,
++} from "#ours/backend/services/nickname_hold_types.ts";
++
++export function readClock(now?: number): number {
++  if (typeof now === "number" && Number.isFinite(now)) {
++    return Math.trunc(now);
++  }
++  return Date.now();
++}
++
++export function remainingSeconds(expiresAt: number, now: number): number {
++  return Math.max(0, Math.floor((expiresAt - now) / 1000));
++}
++
++export function isHoldExpired(record: NicknameHoldRecord, now: number): boolean {
++  return record.expiresAt <= now;
++}
++
++export function clampHoldSeconds(ttlSeconds?: number): number {
++  const raw = typeof ttlSeconds === "number" && Number.isFinite(ttlSeconds) ? ttlSeconds : DEFAULT_HOLD_SECONDS;
++  const truncated = Math.trunc(raw);
++  return Math.min(MAX_HOLD_SECONDS, Math.max(MIN_HOLD_SECONDS, truncated));
++}
++
++export function confirmedExpiry(now: number): number {
++  return now + CONFIRMED_LEASE_SECONDS * 1000;
++}
++
++export function holdExpiry(now: number, ttlSeconds?: number): number {
++  return now + clampHoldSeconds(ttlSeconds) * 1000;
++}
++
++export function normalizeHolderId(holderId: string): string | null {
++  if (typeof holderId !== "string") {
++    return null;
++  }
++  const trimmed = holderId.trim();
++  return trimmed.length > 0 ? trimmed : null;
++}
++
++export function normalizeHeldNickname(nickname: string): string | null {
++  if (typeof nickname !== "string") {
++    return null;
++  }
++  const trimmed = nickname.trim();
++  if (!isValidNickname(trimmed)) {
++    return null;
++  }
++  return trimmed.normalize("NFC").toLowerCase();
++}
++
++export function toHoldView(record: NicknameHoldRecord, now: number): NicknameHoldView {
++  return {
++    nickname: record.nickname,
++    holderId: record.holderId,
++    status: record.status,
++    expiresAt: record.expiresAt,
++    remainingSeconds: remainingSeconds(record.expiresAt, now),
++  };
++}
++
++export function holdFailure(
++  reason: NicknameHoldFailureReason,
++  extra: Omit<NicknameHoldFailure, "ok" | "reason"> = {},
++): NicknameHoldFailure {
++  return { ok: false, reason, ...extra };
++}
++
++export function sortHoldViews(views: NicknameHoldView[]): NicknameHoldView[] {
++  return [...views].sort((left, right) => {
++    const nameOrder = left.nickname.localeCompare(right.nickname);
++    if (nameOrder !== 0) {
++      return nameOrder;
++    }
++    return left.holderId.localeCompare(right.holderId);
++  });
++}
++
++export function liveHold(record: NicknameHoldRecord | null, now: number): NicknameHoldRecord | null {
++  if (!record || isHoldExpired(record, now)) {
++    return null;
++  }
++  return record;
++}
+diff --git a/packages/backend/src/services/nickname_hold_store.ts b/packages/backend/src/services/nickname_hold_store.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/nickname_hold_store.ts
+@@ -0,0 +1,70 @@
++import {
++  isNicknameHoldRecord,
++  type NicknameHoldRecord,
++  type NicknameHoldStore,
++} from "#ours/backend/services/nickname_hold_types.ts";
++
++const cloneHold = (record: NicknameHoldRecord): NicknameHoldRecord => ({
++  nickname: record.nickname,
++  holderId: record.holderId,
++  status: record.status,
++  expiresAt: record.expiresAt,
++});
++
++export class MemoryNicknameHoldStore implements NicknameHoldStore {
++  private readonly records = new Map<string, NicknameHoldRecord>();
++
++  async getHold(nickname: string): Promise<NicknameHoldRecord | null> {
++    const record = this.records.get(nickname);
++    return record ? cloneHold(record) : null;
++  }
++
++  async putHold(record: NicknameHoldRecord): Promise<void> {
++    if (!isNicknameHoldRecord(record)) {
++      return;
++    }
++    this.records.set(record.nickname, cloneHold(record));
++  }
++
++  async deleteHold(nickname: string): Promise<void> {
++    this.records.delete(nickname);
++  }
++
++  async listHolds(): Promise<NicknameHoldRecord[]> {
++    return [...this.records.values()].map(cloneHold);
++  }
++
++  async compareAndSetHold(
++    nickname: string,
++    expectedHolderId: string | null,
++    record: NicknameHoldRecord,
++  ): Promise<boolean> {
++    if (!isNicknameHoldRecord(record) || record.nickname !== nickname) {
++      return false;
++    }
++
++    const current = this.records.get(nickname);
++    if (expectedHolderId === null) {
++      if (current) {
++        return false;
++      }
++    } else if (!current || current.holderId !== expectedHolderId) {
++      return false;
++    }
++
++    this.records.set(nickname, cloneHold(record));
++    return true;
++  }
++
++  clear(): void {
++    this.records.clear();
++  }
++
++  size(): number {
++    return this.records.size;
++  }
++}
++
++export function createMemoryNicknameHoldStore(): MemoryNicknameHoldStore {
++  return new MemoryNicknameHoldStore();
++}
+diff --git a/packages/backend/src/services/nickname_hold_policy.ts b/packages/backend/src/services/nickname_hold_policy.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/nickname_hold_policy.ts
+@@ -0,0 +1,42 @@
++import {
++  CONFIRMED_LEASE_SECONDS,
++  DEFAULT_HOLD_SECONDS,
++  MAX_HOLD_SECONDS,
++  MIN_HOLD_SECONDS,
++  type NicknameHoldRecord,
++} from "#ours/backend/services/nickname_hold_types.ts";
++
++export interface HoldDurationPolicy {
++  defaultSeconds: number;
++  minSeconds: number;
++  maxSeconds: number;
++  confirmedSeconds: number;
++}
++
++export const DEFAULT_HOLD_DURATION_POLICY: HoldDurationPolicy = {
++  defaultSeconds: DEFAULT_HOLD_SECONDS,
++  minSeconds: MIN_HOLD_SECONDS,
++  maxSeconds: MAX_HOLD_SECONDS,
++  confirmedSeconds: CONFIRMED_LEASE_SECONDS,
++};
++
++export function resolveHoldDuration(ttlSeconds: number | undefined, policy: HoldDurationPolicy = DEFAULT_HOLD_DURATION_POLICY): number {
++  const raw = typeof ttlSeconds === "number" && Number.isFinite(ttlSeconds) ? ttlSeconds : policy.defaultSeconds;
++  return Math.min(policy.maxSeconds, Math.max(policy.minSeconds, Math.trunc(raw)));
++}
++
++export function expiryFromDuration(now: number, seconds: number): number {
++  return now + seconds * 1000;
++}
++
++export function sameHolder(record: NicknameHoldRecord, holderId: string): boolean {
++  return record.holderId === holderId;
++}
++
++export function canStealHold(record: NicknameHoldRecord | null, now: number): boolean {
++  return record === null || record.expiresAt <= now;
++}
++
++export function describeHoldPolicy(policy: HoldDurationPolicy = DEFAULT_HOLD_DURATION_POLICY): string {
++  return `hold ${policy.minSeconds}-${policy.maxSeconds}s (default ${policy.defaultSeconds}s); confirmed ${policy.confirmedSeconds}s`;
++}
+diff --git a/packages/backend/src/services/nickname_hold_service.ts b/packages/backend/src/services/nickname_hold_service.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/nickname_hold_service.ts
+@@ -0,0 +1,295 @@
++import {
++  createMemoryNicknameHoldStore,
++} from "#ours/backend/services/nickname_hold_store.ts";
++import type {
++  ClaimNicknameHoldOptions,
++  ClaimNicknameHoldResult,
++  ConfirmNicknameHoldResult,
++  ListNicknameHoldsOptions,
++  NicknameHoldClockOptions,
++  NicknameHoldRecord,
++  NicknameHoldStore,
++  NicknameHoldView,
++  ReleaseNicknameHoldResult,
++} from "#ours/backend/services/nickname_hold_types.ts";
++import {
++  clampHoldSeconds,
++  confirmedExpiry,
++  holdExpiry,
++  holdFailure,
++  liveHold,
++  normalizeHeldNickname,
++  normalizeHolderId,
++  readClock,
++  remainingSeconds,
++  sortHoldViews,
++  toHoldView,
++} from "#ours/backend/services/nickname_hold_utils.ts";
++
++export class NicknameHoldService {
++  private readonly store: NicknameHoldStore;
++
++  constructor(store: NicknameHoldStore = createMemoryNicknameHoldStore()) {
++    this.store = store;
++  }
++
++  async claimNicknameHold(
++    nickname: string,
++    holderId: string,
++    options: ClaimNicknameHoldOptions = {},
++  ): Promise<ClaimNicknameHoldResult> {
++    const canonical = normalizeHeldNickname(nickname);
++    if (!canonical) {
++      return holdFailure("invalid_nickname");
++    }
++
++    const holder = normalizeHolderId(holderId);
++    if (!holder) {
++      return holdFailure("invalid_holder", { nickname: canonical });
++    }
++
++    const now = readClock(options.now);
++    const expiresAt = holdExpiry(now, options.ttlSeconds);
++    const current = await this.store.getHold(canonical);
++    const live = liveHold(current, now);
++
++    if (live && live.holderId !== holder) {
++      return holdFailure("held", {
++        nickname: canonical,
++        holderId: live.holderId,
++        expiresAt: live.expiresAt,
++        remainingSeconds: remainingSeconds(live.expiresAt, now),
++      });
++    }
++
++    const next: NicknameHoldRecord = {
++      nickname: canonical,
++      holderId: holder,
++      status: "held",
++      expiresAt,
++    };
++
++    if (live && live.holderId === holder) {
++      const swapped = await this.store.compareAndSetHold(canonical, holder, next);
++      if (!swapped) {
++        return this.claimNicknameHold(nickname, holderId, options);
++      }
++      return {
++        ok: true,
++        nickname: canonical,
++        holderId: holder,
++        status: "refreshed",
++        expiresAt,
++        remainingSeconds: remainingSeconds(expiresAt, now),
++      };
++    }
++
++    if (current && !live) {
++      await this.store.deleteHold(canonical);
++    }
++
++    const created = await this.store.compareAndSetHold(canonical, null, next);
++    if (!created) {
++      const winner = liveHold(await this.store.getHold(canonical), now);
++      if (winner && winner.holderId === holder) {
++        return {
++          ok: true,
++          nickname: canonical,
++          holderId: holder,
++          status: "held",
++          expiresAt: winner.expiresAt,
++          remainingSeconds: remainingSeconds(winner.expiresAt, now),
++        };
++      }
++      if (winner) {
++        return holdFailure("held", {
++          nickname: canonical,
++          holderId: winner.holderId,
++          expiresAt: winner.expiresAt,
++          remainingSeconds: remainingSeconds(winner.expiresAt, now),
++        });
++      }
++      return this.claimNicknameHold(nickname, holderId, options);
++    }
++
++    return {
++      ok: true,
++      nickname: canonical,
++      holderId: holder,
++      status: "held",
++      expiresAt,
++      remainingSeconds: remainingSeconds(expiresAt, now),
++    };
++  }
++
++  async confirmNicknameHold(
++    nickname: string,
++    holderId: string,
++    options: NicknameHoldClockOptions = {},
++  ): Promise<ConfirmNicknameHoldResult> {
++    const canonical = normalizeHeldNickname(nickname);
++    if (!canonical) {
++      return holdFailure("invalid_nickname");
++    }
++
++    const holder = normalizeHolderId(holderId);
++    if (!holder) {
++      return holdFailure("invalid_holder", { nickname: canonical });
++    }
++
++    const now = readClock(options.now);
++    const current = await this.store.getHold(canonical);
++    if (!current) {
++      return holdFailure("not_found", { nickname: canonical });
++    }
++    if (current.expiresAt <= now) {
++      await this.store.deleteHold(canonical);
++      return holdFailure("expired", { nickname: canonical, holderId: current.holderId });
++    }
++    if (current.holderId !== holder) {
++      return holdFailure("holder_mismatch", {
++        nickname: canonical,
++        holderId: current.holderId,
++        expiresAt: current.expiresAt,
++        remainingSeconds: remainingSeconds(current.expiresAt, now),
++      });
++    }
++
++    const expiresAt = confirmedExpiry(now);
++    const next: NicknameHoldRecord = {
++      nickname: canonical,
++      holderId: holder,
++      status: "confirmed",
++      expiresAt,
++    };
++    const swapped = await this.store.compareAndSetHold(canonical, holder, next);
++    if (!swapped) {
++      return this.confirmNicknameHold(nickname, holderId, options);
++    }
++
++    return {
++      ok: true,
++      nickname: canonical,
++      holderId: holder,
++      status: "confirmed",
++      expiresAt,
++      remainingSeconds: remainingSeconds(expiresAt, now),
++    };
++  }
++
++  async releaseNicknameHold(
++    nickname: string,
++    holderId: string,
++    options: NicknameHoldClockOptions = {},
++  ): Promise<ReleaseNicknameHoldResult> {
++    const canonical = normalizeHeldNickname(nickname);
++    if (!canonical) {
++      return holdFailure("invalid_nickname");
++    }
++
++    const holder = normalizeHolderId(holderId);
++    if (!holder) {
++      return holdFailure("invalid_holder", { nickname: canonical });
++    }
++
++    const current = await this.store.getHold(canonical);
++    if (!current) {
++      return holdFailure("not_found", { nickname: canonical });
++    }
++
++    const now = readClock(options.now);
++    if (current.expiresAt <= now) {
++      await this.store.deleteHold(canonical);
++      return holdFailure("not_found", { nickname: canonical });
++    }
++    if (current.holderId !== holder) {
++      return holdFailure("holder_mismatch", {
++        nickname: canonical,
++        holderId: current.holderId,
++        expiresAt: current.expiresAt,
++        remainingSeconds: remainingSeconds(current.expiresAt, now),
++      });
++    }
++
++    await this.store.deleteHold(canonical);
++    return { ok: true, nickname: canonical, released: true };
++  }
++
++  async getNicknameHold(nickname: string, options: NicknameHoldClockOptions = {}): Promise<NicknameHoldView | null> {
++    const canonical = normalizeHeldNickname(nickname);
++    if (!canonical) {
++      return null;
++    }
++
++    const now = readClock(options.now);
++    const live = liveHold(await this.store.getHold(canonical), now);
++    return live ? toHoldView(live, now) : null;
++  }
++
++  async listNicknameHolds(options: ListNicknameHoldsOptions = {}): Promise<NicknameHoldView[]> {
++    const now = readClock(options.now);
++    const holder = options.holderId === undefined ? undefined : normalizeHolderId(options.holderId);
++    const views: NicknameHoldView[] = [];
++
++    for (const record of await this.store.listHolds()) {
++      const live = liveHold(record, now);
++      if (!live) {
++        continue;
++      }
++      if (holder !== undefined && live.holderId !== holder) {
++        continue;
++      }
++      views.push(toHoldView(live, now));
++    }
++
++    return sortHoldViews(views);
++  }
++}
++
++export function createNicknameHoldService(store?: NicknameHoldStore): NicknameHoldService {
++  return new NicknameHoldService(store ?? createMemoryNicknameHoldStore());
++}
++
++export async function claimNicknameHold(
++  nickname: string,
++  holderId: string,
++  options: ClaimNicknameHoldOptions = {},
++  store?: NicknameHoldStore,
++): Promise<ClaimNicknameHoldResult> {
++  return createNicknameHoldService(store).claimNicknameHold(nickname, holderId, options);
++}
++
++export async function confirmNicknameHold(
++  nickname: string,
++  holderId: string,
++  options: NicknameHoldClockOptions = {},
++  store?: NicknameHoldStore,
++): Promise<ConfirmNicknameHoldResult> {
++  return createNicknameHoldService(store).confirmNicknameHold(nickname, holderId, options);
++}
++
++export async function releaseNicknameHold(
++  nickname: string,
++  holderId: string,
++  options: NicknameHoldClockOptions = {},
++  store?: NicknameHoldStore,
++): Promise<ReleaseNicknameHoldResult> {
++  return createNicknameHoldService(store).releaseNicknameHold(nickname, holderId, options);
++}
++
++export async function getNicknameHold(
++  nickname: string,
++  options: NicknameHoldClockOptions = {},
++  store?: NicknameHoldStore,
++): Promise<NicknameHoldView | null> {
++  return createNicknameHoldService(store).getNicknameHold(nickname, options);
++}
++
++export async function listNicknameHolds(
++  options: ListNicknameHoldsOptions = {},
++  store?: NicknameHoldStore,
++): Promise<NicknameHoldView[]> {
++  return createNicknameHoldService(store).listNicknameHolds(options);
++}
++
++export { clampHoldSeconds };
+diff --git a/packages/backend/src/services/nickname_holds.ts b/packages/backend/src/services/nickname_holds.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/nickname_holds.ts
+@@ -0,0 +1,62 @@
++export {
++  NicknameHoldService,
++  claimNicknameHold,
++  confirmNicknameHold,
++  createNicknameHoldService,
++  getNicknameHold,
++  listNicknameHolds,
++  releaseNicknameHold,
++} from "#ours/backend/services/nickname_hold_service.ts";
++
++export {
++  MemoryNicknameHoldStore,
++  createMemoryNicknameHoldStore,
++} from "#ours/backend/services/nickname_hold_store.ts";
++
++export {
++  CONFIRMED_LEASE_SECONDS,
++  DEFAULT_HOLD_SECONDS,
++  MAX_HOLD_SECONDS,
++  MIN_HOLD_SECONDS,
++  NICKNAME_HOLD_FAILURE_REASONS,
++  NICKNAME_HOLD_STATUSES,
++  isNicknameHoldRecord,
++  type ClaimNicknameHoldOptions,
++  type ClaimNicknameHoldResult,
++  type ConfirmNicknameHoldResult,
++  type ListNicknameHoldsOptions,
++  type NicknameHoldClockOptions,
++  type NicknameHoldFailure,
++  type NicknameHoldFailureReason,
++  type NicknameHoldRecord,
++  type NicknameHoldStatus,
++  type NicknameHoldStore,
++  type NicknameHoldSuccess,
++  type NicknameHoldView,
++  type ReleaseNicknameHoldResult,
++} from "#ours/backend/services/nickname_hold_types.ts";
++
++export {
++  clampHoldSeconds,
++  confirmedExpiry,
++  holdExpiry,
++  holdFailure,
++  isHoldExpired,
++  liveHold,
++  normalizeHeldNickname,
++  normalizeHolderId,
++  readClock,
++  remainingSeconds,
++  sortHoldViews,
++  toHoldView,
++} from "#ours/backend/services/nickname_hold_utils.ts";
++
++export {
++  DEFAULT_HOLD_DURATION_POLICY,
++  canStealHold,
++  describeHoldPolicy,
++  expiryFromDuration,
++  resolveHoldDuration,
++  sameHolder,
++  type HoldDurationPolicy,
++} from "#ours/backend/services/nickname_hold_policy.ts";

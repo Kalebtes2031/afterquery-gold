@@ -1,0 +1,1426 @@
+diff --git a/packages/backend/src/gold_tests/gold_node_harness.test.ts b/packages/backend/src/gold_tests/gold_node_harness.test.ts
+new file mode 100644
+index 0000000..efef34c
+--- /dev/null
++++ b/packages/backend/src/gold_tests/gold_node_harness.test.ts
+@@ -0,0 +1,107 @@
++import assert from "node:assert/strict";
++import { isDeepStrictEqual } from "node:util";
++
++const tests = [];
++const beforeEachHooks = [];
++const suiteStack = [];
++
++export const describe = (name, body) => {
++  suiteStack.push(name);
++  try { body(); } finally { suiteStack.pop(); }
++};
++
++export const it = (name, body) => {
++  const prefix = suiteStack.join(" > ");
++  tests.push({ name: prefix ? `${prefix} > ${name}` : name, body });
++};
++
++export const beforeEach = (hook) => { beforeEachHooks.push(hook); };
++
++const check = (condition, message, negated) => {
++  const ok = negated ? !condition : condition;
++  if (!ok) throw new assert.AssertionError({ message });
++};
++
++const makeExpect = (actual, negated = false) => ({
++  toBe(expected) {
++    check(Object.is(actual, expected), `expected ${String(actual)} ${negated ? "not " : ""}to be ${String(expected)}`, negated);
++  },
++  toEqual(expected) {
++    check(isDeepStrictEqual(actual, expected), `expected values ${negated ? "not " : ""}to be deeply equal`, negated);
++  },
++  toContain(expected) {
++    const found = typeof actual?.includes === "function" && actual.includes(expected);
++    check(found, `expected value ${negated ? "not " : ""}to contain ${String(expected)}`, negated);
++  },
++  toContainEqual(expected) {
++    const found = Array.isArray(actual) && actual.some((value) => isDeepStrictEqual(value, expected));
++    check(found, `expected array ${negated ? "not " : ""}to contain deeply equal value`, negated);
++  },
++  toHaveLength(expected) {
++    check(actual != null && actual.length === expected, `expected length ${expected}, received ${actual?.length}`, negated);
++  },
++  toBeGreaterThan(expected) {
++    check(actual > expected, `expected ${actual} ${negated ? "not " : ""}to be greater than ${expected}`, negated);
++  },
++  toThrow(expected) {
++    let thrown;
++    try { actual(); } catch (error) { thrown = error; }
++    let matched = thrown !== undefined;
++    if (matched && typeof expected === "string") matched = String(thrown?.message ?? thrown).includes(expected);
++    if (matched && typeof expected === "function") matched = thrown instanceof expected;
++    check(matched, `expected function ${negated ? "not " : ""}to throw expected error`, negated);
++  },
++  get not() { return makeExpect(actual, !negated); },
++});
++
++export const expect = (actual) => makeExpect(actual);
++
++export const mockFunction = () => {
++  let implementation = () => undefined;
++  const fn = (...args) => {
++    fn.mock.calls.push(args);
++    return implementation(...args);
++  };
++  fn.mock = { calls: [] };
++  fn.mockResolvedValue = (value) => { implementation = () => Promise.resolve(value); return fn; };
++  fn.mockImplementation = (value) => { implementation = value; return fn; };
++  fn.mockClear = () => { fn.mock.calls.length = 0; return fn; };
++  return fn;
++};
++
++export const installFixedDate = (iso) => {
++  const RealDate = globalThis.Date;
++  const fixed = new RealDate(iso).getTime();
++  class FixedDate extends RealDate {
++    constructor(...args) { super(...(args.length ? args : [fixed])); }
++    static now() { return fixed; }
++  }
++  globalThis.Date = FixedDate;
++  return () => { globalThis.Date = RealDate; };
++};
++
++export const runRegisteredTests = async () => {
++  const results = [];
++  for (const test of tests) {
++    const started = Date.now();
++    try {
++      for (const hook of beforeEachHooks) await hook();
++      await test.body();
++      results.push({ name: test.name, status: "passed", duration: Date.now() - started });
++    } catch (error) {
++      results.push({
++        name: test.name,
++        status: "failed",
++        duration: Date.now() - started,
++        message: String(error?.stack ?? error),
++      });
++    }
++  }
++  const output = process.env.GOLD_RESULT_FILE;
++  if (!output) throw new Error("GOLD_RESULT_FILE is required");
++  const { writeFile } = await import("node:fs/promises");
++  await writeFile(output, `${JSON.stringify(results, null, 2)}\n`);
++  const passed = results.filter((item) => item.status === "passed").length;
++  console.log(`[gold-node] ${passed}/${results.length} passed`);
++  if (passed !== results.length) process.exitCode = 1;
++};
+diff --git a/packages/backend/src/gold_tests/p2p_constants_compat.test.ts b/packages/backend/src/gold_tests/p2p_constants_compat.test.ts
+new file mode 100644
+index 0000000..d249582
+--- /dev/null
++++ b/packages/backend/src/gold_tests/p2p_constants_compat.test.ts
+@@ -0,0 +1,28 @@
++import { describe, expect, it, runRegisteredTests } from "#ours/backend/gold_tests/gold_node_harness.test.ts";
++import { CHAT_CHANNEL_ROLES, CHAT_REACTIONS, CHAT_USER_TYPES } from "#ours/backend/constants/index.ts";
++
++describe("Existing chat constants", () => {
++  it("keeps HEART mapped to HEART", () => expect(CHAT_REACTIONS.HEART).toBe("HEART"));
++  it("keeps HANDS_UP mapped to HANDS_UP", () => expect(CHAT_REACTIONS.HANDS_UP).toBe("HANDS_UP"));
++  it("keeps FIRE mapped to FIRE", () => expect(CHAT_REACTIONS.FIRE).toBe("FIRE"));
++  it("keeps MUSIC mapped to MUSIC", () => expect(CHAT_REACTIONS.MUSIC).toBe("MUSIC"));
++  it("keeps SURPRISED mapped to SURPRISED", () => expect(CHAT_REACTIONS.SURPRISED).toBe("SURPRISED"));
++  it("keeps exactly five supported reaction keys", () => expect(Object.keys(CHAT_REACTIONS).sort()).toEqual(["FIRE", "HANDS_UP", "HEART", "MUSIC", "SURPRISED"]));
++  it("keeps reaction values unique", () => expect(new Set(Object.values(CHAT_REACTIONS)).size).toBe(5));
++  it("keeps TEMPORARY mapped to temporary", () => expect(CHAT_USER_TYPES.TEMPORARY).toBe("temporary"));
++  it("keeps REGULAR mapped to regular", () => expect(CHAT_USER_TYPES.REGULAR).toBe("regular"));
++  it("keeps ARTIST mapped to artist", () => expect(CHAT_USER_TYPES.ARTIST).toBe("artist"));
++  it("keeps ADMIN mapped to admin", () => expect(CHAT_USER_TYPES.ADMIN).toBe("admin"));
++  it("keeps MODERATOR mapped to moderator", () => expect(CHAT_USER_TYPES.MODERATOR).toBe("moderator"));
++  it("keeps ANONYMOUS mapped to anonymous", () => expect(CHAT_USER_TYPES.ANONYMOUS).toBe("anonymous"));
++  it("keeps exactly six user types", () => expect(Object.keys(CHAT_USER_TYPES)).toHaveLength(6));
++  it("keeps user type values unique", () => expect(new Set(Object.values(CHAT_USER_TYPES)).size).toBe(6));
++  it("keeps every user type value lowercase", () => expect(Object.values(CHAT_USER_TYPES).every((value) => value === value.toLowerCase())).toBe(true));
++  it("keeps OWNER mapped to owner", () => expect(CHAT_CHANNEL_ROLES.OWNER).toBe("owner"));
++  it("keeps VIEWER mapped to viewer", () => expect(CHAT_CHANNEL_ROLES.VIEWER).toBe("viewer"));
++  it("keeps exactly two channel roles", () => expect(Object.keys(CHAT_CHANNEL_ROLES)).toHaveLength(2));
++  it("keeps channel role values unique", () => expect(new Set(Object.values(CHAT_CHANNEL_ROLES)).size).toBe(2));
++  it("keeps channel role keys uppercase", () => expect(Object.keys(CHAT_CHANNEL_ROLES).every((key) => key === key.toUpperCase())).toBe(true));
++});
++
++await runRegisteredTests();
+diff --git a/packages/backend/src/gold_tests/p2p_env_utils_compat.test.ts b/packages/backend/src/gold_tests/p2p_env_utils_compat.test.ts
+new file mode 100644
+index 0000000..9db3871
+--- /dev/null
++++ b/packages/backend/src/gold_tests/p2p_env_utils_compat.test.ts
+@@ -0,0 +1,58 @@
++import { beforeEach, describe, expect, it, runRegisteredTests } from "#ours/backend/gold_tests/gold_node_harness.test.ts";
++import { checkEnvVar } from "#ours/backend/utils/env_utils.ts";
++
++const KEY = "OURS_TEST_ENV_UTILS_KEY";
++
++describe("checkEnvVar", () => {
++  beforeEach(() => {
++    delete process.env[KEY];
++  });
++
++  it("returns the raw value when the variable is set", () => {
++    process.env[KEY] = "hello";
++    expect(checkEnvVar(KEY)).toBe("hello");
++  });
++
++  it("returns values that contain spaces unchanged", () => {
++    process.env[KEY] = "  spaced value  ";
++    expect(checkEnvVar(KEY)).toBe("  spaced value  ");
++  });
++
++  it("returns numeric-looking values as strings", () => {
++    process.env[KEY] = "4000";
++    expect(checkEnvVar(KEY)).toBe("4000");
++  });
++
++  it("returns the default when the variable is missing", () => {
++    expect(checkEnvVar(KEY, "fallback")).toBe("fallback");
++  });
++
++  it("returns the default when the variable is an empty string", () => {
++    process.env[KEY] = "";
++    expect(checkEnvVar(KEY, "fallback")).toBe("fallback");
++  });
++
++  it("returns an empty-string default rather than throwing", () => {
++    expect(checkEnvVar(KEY, "")).toBe("");
++  });
++
++  it("prefers the real value over the default when both exist", () => {
++    process.env[KEY] = "real";
++    expect(checkEnvVar(KEY, "fallback")).toBe("real");
++  });
++
++  it("throws when the variable is missing and no default is given", () => {
++    expect(() => checkEnvVar(KEY)).toThrow(`process.env.${KEY} is not set`);
++  });
++
++  it("throws when the variable is an empty string and no default is given", () => {
++    process.env[KEY] = "";
++    expect(() => checkEnvVar(KEY)).toThrow(`process.env.${KEY} is not set`);
++  });
++
++  it("throws an Error instance", () => {
++    expect(() => checkEnvVar(KEY)).toThrow(Error);
++  });
++});
++
++await runRegisteredTests();
+diff --git a/packages/backend/src/gold_tests/p2p_input_validation_compat.test.ts b/packages/backend/src/gold_tests/p2p_input_validation_compat.test.ts
+new file mode 100644
+index 0000000..97adc97
+--- /dev/null
++++ b/packages/backend/src/gold_tests/p2p_input_validation_compat.test.ts
+@@ -0,0 +1,89 @@
++import { describe, expect, it, runRegisteredTests } from "#ours/backend/gold_tests/gold_node_harness.test.ts";
++import { invalidNicknameMessage, isValidNickname } from "../../../shared/src/inputValidation.ts";
++
++describe("isValidNickname", () => {
++  it("accepts a three character latin nickname", () => {
++    expect(isValidNickname("abc")).toBe(true);
++  });
++
++  it("accepts exactly twenty four characters", () => {
++    expect(isValidNickname("a".repeat(24))).toBe(true);
++  });
++
++  it("rejects two character nicknames", () => {
++    expect(isValidNickname("ab")).toBe(false);
++  });
++
++  it("rejects twenty five character nicknames", () => {
++    expect(isValidNickname("a".repeat(25))).toBe(false);
++  });
++
++  it("rejects the empty string", () => {
++    expect(isValidNickname("")).toBe(false);
++  });
++
++  it("accepts digits", () => {
++    expect(isValidNickname("user123")).toBe(true);
++  });
++
++  it("accepts non-latin letters", () => {
++    expect(isValidNickname("日本語")).toBe(true);
++  });
++
++  it("accepts accented letters", () => {
++    expect(isValidNickname("José")).toBe(true);
++  });
++
++  it("normalizes decomposed combining marks before validating", () => {
++    expect(isValidNickname("éric")).toBe(true);
++  });
++
++  it("accepts the period character", () => {
++    expect(isValidNickname("a.b.c")).toBe(true);
++  });
++
++  it("accepts the underscore character", () => {
++    expect(isValidNickname("a_b_c")).toBe(true);
++  });
++
++  it("accepts the hyphen character", () => {
++    expect(isValidNickname("a-b-c")).toBe(true);
++  });
++
++  it("rejects spaces", () => {
++    expect(isValidNickname("a b c")).toBe(false);
++  });
++
++  it("rejects emoji", () => {
++    expect(isValidNickname("abc\u{1f600}")).toBe(false);
++  });
++
++  it("rejects punctuation such as exclamation marks", () => {
++    expect(isValidNickname("abc!")).toBe(false);
++  });
++
++  it("rejects the at sign", () => {
++    expect(isValidNickname("a@bc")).toBe(false);
++  });
++
++  it("rejects forward slashes", () => {
++    expect(isValidNickname("a/bc")).toBe(false);
++  });
++
++  it("rejects leading and trailing whitespace around a valid core", () => {
++    expect(isValidNickname(" abc ")).toBe(false);
++  });
++});
++
++describe("invalidNicknameMessage", () => {
++  it("is a non-empty string", () => {
++    expect(typeof invalidNicknameMessage).toBe("string");
++    expect(invalidNicknameMessage.length).toBeGreaterThan(0);
++  });
++
++  it("mentions the allowed length range", () => {
++    expect(invalidNicknameMessage).toContain("3-24");
++  });
++});
++
++await runRegisteredTests();
+diff --git a/packages/backend/src/gold_tests/p2p_reaction_operations_compat.test.ts b/packages/backend/src/gold_tests/p2p_reaction_operations_compat.test.ts
+new file mode 100644
+index 0000000..b255116
+--- /dev/null
++++ b/packages/backend/src/gold_tests/p2p_reaction_operations_compat.test.ts
+@@ -0,0 +1,97 @@
++import { describe, expect, it, runRegisteredTests } from "#ours/backend/gold_tests/gold_node_harness.test.ts";
++import { FakeRedisClient, getNodeClientMock, reactionIdFor } from "#ours/backend/gold_tests/reaction_integrity_fixture.test.ts";
++
++const reactionOperations = await import("#ours/backend/session/operations/reactions.ts");
++
++const freshRedis = () => {
++  const redis = new FakeRedisClient();
++  getNodeClientMock.mockResolvedValue(redis);
++  return redis;
++};
++
++describe("Existing reaction operations", () => {
++  it("adds a new reaction and returns its supplied identity fields", async () => {
++    freshRedis();
++    const result = await reactionOperations.addReaction("m1", "u1", "HEART", "room-1");
++    expect(result.messageId).toBe("m1");
++    expect(result.userId).toBe("u1");
++    expect(result.reaction).toBe("HEART");
++    expect(result.roomId).toBe("room-1");
++  });
++
++  it("stores a new reaction hash", async () => {
++    const redis = freshRedis();
++    await reactionOperations.addReaction("m1", "u1", "HEART", "room-1");
++    expect(redis.hashes.size).toBe(1);
++  });
++
++  it("indexes a new reaction by message", async () => {
++    const redis = freshRedis();
++    await reactionOperations.addReaction("m1", "u1", "HEART", "room-1");
++    const id = reactionIdFor("m1", "u1", "HEART");
++    expect(redis.sets.get("message_reactions:m1")?.has(id)).toBe(true);
++  });
++
++  it("indexes a new reaction by user and message", async () => {
++    const redis = freshRedis();
++    await reactionOperations.addReaction("m1", "u1", "HEART", "room-1");
++    expect(redis.sets.get("user_message_reactions:u1:m1")?.size).toBe(1);
++  });
++
++  it("indexes a new reaction by room", async () => {
++    const redis = freshRedis();
++    await reactionOperations.addReaction("m1", "u1", "HEART", "room-1");
++    expect(redis.sets.get("room_reactions:room-1")?.size).toBe(1);
++  });
++
++  it("indexes a new reaction in the room timeline", async () => {
++    const redis = freshRedis();
++    await reactionOperations.addReaction("m1", "u1", "HEART", "room-1");
++    expect(redis.sortedSets.get("room_reactions_by_time:room-1")?.size).toBe(1);
++  });
++
++  it("removes an existing reaction from its hash and indexes", async () => {
++    const redis = freshRedis();
++    const id = redis.seedReaction({ messageId: "m1", userId: "u1", reaction: "HEART" });
++    expect(await reactionOperations.removeReaction("m1", "u1", "HEART")).toBe(true);
++    expect(redis.hashes.has(`reaction:${id}`)).toBe(false);
++    expect(redis.sets.get("message_reactions:m1")?.has(id)).toBe(false);
++    expect(redis.sets.get("user_message_reactions:u1:m1")?.has(id)).toBe(false);
++    expect(redis.sets.get("room_reactions:room-1")?.has(id)).toBe(false);
++    expect(redis.sortedSets.get("room_reactions_by_time:room-1")?.has(id)).toBe(false);
++  });
++
++  it("returns false when removing a reaction that does not exist", async () => {
++    freshRedis();
++    expect(await reactionOperations.removeReaction("m1", "u1", "HEART")).toBe(false);
++  });
++
++  it("groups message reactions and reports the total count", async () => {
++    const redis = freshRedis();
++    redis.seedReaction({ messageId: "m1", userId: "u1", reaction: "HEART" });
++    redis.seedReaction({ messageId: "m1", userId: "u2", reaction: "HEART" });
++    redis.seedReaction({ messageId: "m1", userId: "u3", reaction: "FIRE" });
++    const result = await reactionOperations.getMessageReactions("m1");
++    expect(result.totalCount).toBe(3);
++    expect(result.reactions).toContainEqual({ reaction: "HEART", count: 2 });
++    expect(result.reactions).toContainEqual({ reaction: "FIRE", count: 1 });
++  });
++
++  it("returns the current user's reactions for a message", async () => {
++    const redis = freshRedis();
++    redis.seedReaction({ messageId: "m1", userId: "u1", reaction: "HEART" });
++    redis.seedReaction({ messageId: "m1", userId: "u1", reaction: "FIRE" });
++    const result = await reactionOperations.getUserReactionsForMessage("m1", "u1");
++    expect(result.sort()).toEqual(["FIRE", "HEART"]);
++  });
++
++  it("returns room reactions in newest-first timeline order", async () => {
++    const redis = freshRedis();
++    redis.seedReaction({ messageId: "older", userId: "u1", timestamp: "2026-01-01T00:00:00.000Z" });
++    redis.seedReaction({ messageId: "newer", userId: "u2", timestamp: "2026-01-02T00:00:00.000Z" });
++    const result = await reactionOperations.getRoomReactions("room-1", 10);
++    expect(result.map((item) => item.messageId)).toEqual(["newer", "older"]);
++  });
++});
++
++await runRegisteredTests();
+diff --git a/packages/backend/src/gold_tests/reaction_audit_behavior.test.ts b/packages/backend/src/gold_tests/reaction_audit_behavior.test.ts
+new file mode 100644
+index 0000000..af9f3fc
+--- /dev/null
++++ b/packages/backend/src/gold_tests/reaction_audit_behavior.test.ts
+@@ -0,0 +1,212 @@
++import { beforeEach, describe, expect, it, installFixedDate, runRegisteredTests } from "#ours/backend/gold_tests/gold_node_harness.test.ts";
++import {
++  FakeRedisClient,
++  getNodeClientMock,
++  invokeOperation,
++} from "#ours/backend/gold_tests/reaction_integrity_fixture.test.ts";
++
++const reactionOperations = await import("#ours/backend/session/operations/reactions.ts");
++
++
++type IssueCode =
++  | "invalid_timestamp"
++  | "missing_message_index"
++  | "missing_record"
++  | "missing_room_index"
++  | "missing_timeline_index"
++  | "missing_user_index"
++  | "stale_timeline_score"
++  | "wrong_room";
++
++interface AuditResult {
++  roomId: string;
++  reactionCount: number;
++  issueCount: number;
++  healthy: boolean;
++  issueCounts: Record<IssueCode, number>;
++  issues: Array<{ reactionId: string; code: IssueCode }>;
++}
++
++const auditRoom = (roomId: string) =>
++  invokeOperation<AuditResult>(reactionOperations as Record<string, unknown>, "auditRoomReactionIntegrity", roomId);
++
++const codes = (result: AuditResult) => result.issues.map((issue) => issue.code);
++
++let redis: FakeRedisClient;
++
++beforeEach(() => {
++  redis = new FakeRedisClient();
++  getNodeClientMock.mockResolvedValue(redis);
++});
++
++describe("Reaction index audit", () => {
++  it("reports a healthy room with no issues", async () => {
++    redis.seedReaction();
++
++    const result = await auditRoom("room-1");
++
++    expect(result.roomId).toBe("room-1");
++    expect(result.reactionCount).toBe(1);
++    expect(result.issueCount).toBe(0);
++    expect(result.healthy).toBe(true);
++    expect(result.issues).toEqual([]);
++  });
++
++  it("returns zero counts for every issue code when healthy", async () => {
++    redis.seedReaction();
++
++    const result = await auditRoom("room-1");
++
++    expect(result.issueCounts).toEqual({
++      invalid_timestamp: 0,
++      missing_message_index: 0,
++      missing_record: 0,
++      missing_room_index: 0,
++      missing_timeline_index: 0,
++      missing_user_index: 0,
++      stale_timeline_score: 0,
++      wrong_room: 0,
++    });
++  });
++
++  it("reports a room index reference with no backing hash", async () => {
++    redis.seedRoomReference("room-1", "missing-id", 10);
++
++    const result = await auditRoom("room-1");
++
++    expect(result.healthy).toBe(false);
++    expect(result.reactionCount).toBe(0);
++    expect(result.issues).toEqual([{ reactionId: "missing-id", code: "missing_record" }]);
++  });
++
++  it("reports a record indexed into the wrong room", async () => {
++    const id = redis.seedReaction({ roomId: "room-2" });
++    redis.seedRoomReference("room-1", id, 10);
++
++    const result = await auditRoom("room-1");
++
++    expect(result.issues).toEqual([{ reactionId: id, code: "wrong_room" }]);
++  });
++
++  it("reports an invalid timestamp before checking secondary indexes", async () => {
++    const id = redis.seedReaction({ timestamp: "bad-time", messageIndexed: false, userIndexed: false });
++
++    const result = await auditRoom("room-1");
++
++    expect(result.issues).toEqual([{ reactionId: id, code: "invalid_timestamp" }]);
++  });
++
++  it("reports a timeline-only record as missing its room set index", async () => {
++    const id = redis.seedReaction({ roomIndexed: false });
++
++    const result = await auditRoom("room-1");
++
++    expect(result.issues).toContainEqual({ reactionId: id, code: "missing_room_index" });
++  });
++
++  it("reports a room-set record missing from the timeline index", async () => {
++    const id = redis.seedReaction({ timelineIndexed: false });
++
++    const result = await auditRoom("room-1");
++
++    expect(result.issues).toContainEqual({ reactionId: id, code: "missing_timeline_index" });
++  });
++
++  it("reports a stale timeline score", async () => {
++    const id = redis.seedReaction({ timelineScore: 1 });
++
++    const result = await auditRoom("room-1");
++
++    expect(result.issues).toContainEqual({ reactionId: id, code: "stale_timeline_score" });
++  });
++
++  it("reports a missing message index", async () => {
++    const id = redis.seedReaction({ messageIndexed: false });
++
++    const result = await auditRoom("room-1");
++
++    expect(result.issues).toContainEqual({ reactionId: id, code: "missing_message_index" });
++  });
++
++  it("reports a missing user-message index", async () => {
++    const id = redis.seedReaction({ userIndexed: false });
++
++    const result = await auditRoom("room-1");
++
++    expect(result.issues).toContainEqual({ reactionId: id, code: "missing_user_index" });
++  });
++
++  it("can report several index problems for one valid reaction", async () => {
++    const id = redis.seedReaction({
++      roomIndexed: false,
++      timelineScore: 1,
++      messageIndexed: false,
++      userIndexed: false,
++    });
++
++    const result = await auditRoom("room-1");
++
++    expect(result.issues.map((issue) => issue.code).sort()).toEqual([
++      "missing_message_index",
++      "missing_room_index",
++      "missing_user_index",
++      "stale_timeline_score",
++    ].sort());
++  });
++
++  it("keeps issue ordering deterministic while sorting by reaction id", async () => {
++    const one = redis.seedReaction({ messageId: "m-1", userId: "u-1", messageIndexed: false, userIndexed: false });
++    const two = redis.seedReaction({ messageId: "m-2", userId: "u-2", timelineIndexed: false });
++
++    const first = await auditRoom("room-1");
++    const second = await auditRoom("room-1");
++    const ids = first.issues.map((issue) => issue.reactionId);
++
++    expect(ids).toEqual([...ids].sort((left, right) => left.localeCompare(right)));
++    expect(first.issues).toEqual(second.issues);
++    expect(first.issues.some((issue) => issue.reactionId === one)).toBe(true);
++    expect(first.issues.some((issue) => issue.reactionId === two)).toBe(true);
++  });
++
++  it("counts only valid records belonging to the audited room", async () => {
++    redis.seedReaction({ messageId: "valid" });
++    const wrong = redis.seedReaction({ messageId: "wrong", roomId: "room-2" });
++    redis.seedRoomReference("room-1", wrong, 10);
++    redis.seedRoomReference("room-1", "missing-id", 20);
++
++    const result = await auditRoom("room-1");
++
++    expect(result.reactionCount).toBe(1);
++  });
++
++  it("tracks issue totals by code", async () => {
++    redis.seedReaction({ messageId: "m-1", userId: "u-1", messageIndexed: false });
++    redis.seedReaction({ messageId: "m-2", userId: "u-2", messageIndexed: false });
++    redis.seedRoomReference("room-1", "missing-id", 10);
++
++    const result = await auditRoom("room-1");
++
++    expect(result.issueCounts).toEqual({
++      invalid_timestamp: 0,
++      missing_message_index: 2,
++      missing_record: 1,
++      missing_room_index: 0,
++      missing_timeline_index: 0,
++      missing_user_index: 0,
++      stale_timeline_score: 0,
++      wrong_room: 0,
++    });
++    expect(result.issueCount).toBe(3);
++  });
++
++  it("marks a room unhealthy whenever at least one issue exists", async () => {
++    redis.seedReaction({ timelineIndexed: false });
++
++    const result = await auditRoom("room-1");
++
++    expect(result.healthy).toBe(false);
++    expect(result.issueCount).toBeGreaterThan(0);
++  });
++});
++
++await runRegisteredTests();
+diff --git a/packages/backend/src/gold_tests/reaction_integrity_fixture.test.ts b/packages/backend/src/gold_tests/reaction_integrity_fixture.test.ts
+new file mode 100644
+index 0000000..41f0361
+--- /dev/null
++++ b/packages/backend/src/gold_tests/reaction_integrity_fixture.test.ts
+@@ -0,0 +1,359 @@
++import { createHash } from "node:crypto";
++import { mock } from "node:test";
++import { mockFunction } from "#ours/backend/gold_tests/gold_node_harness.test.ts";
++
++export const getNodeClientMock = mockFunction();
++
++mock.module("#ours/backend/session/redis.ts", {
++  namedExports: {
++    getNodeClient: (...args: unknown[]) => getNodeClientMock(...args),
++  },
++});
++
++export interface SeedReactionOptions {
++  messageId?: string;
++  userId?: string;
++  reaction?: string;
++  roomId?: string;
++  timestamp?: string;
++  roomIndexed?: boolean;
++  timelineIndexed?: boolean;
++  messageIndexed?: boolean;
++  userIndexed?: boolean;
++  timelineScore?: number;
++}
++
++export const reactionIdFor = (messageId: string, userId: string, reaction: string) =>
++  createHash("sha256").update(`${messageId}:${userId}:${reaction}`).digest("hex").substring(0, 16);
++
++const cloneHash = (value: Record<string, string> | undefined) => ({ ...(value ?? {}) });
++
++const flattenStrings = (values: unknown[]) =>
++  values.flatMap((value) => (Array.isArray(value) ? value : [value])).map(String);
++
++const globMatches = (value: string, pattern = "*") => {
++  const expression = pattern
++    .replace(/[.+^${}()|\\]/g, "\\$&")
++    .replace(/\*/g, ".*")
++    .replace(/\?/g, ".");
++  return new RegExp(`^${expression}$`).test(value);
++};
++
++export class FakeRedisClient {
++  readonly hashes = new Map<string, Record<string, string>>();
++  readonly sets = new Map<string, Set<string>>();
++  readonly sortedSets = new Map<string, Map<string, number>>();
++
++  private setFor(key: string) {
++    const existing = this.sets.get(key);
++    if (existing) return existing;
++    const created = new Set<string>();
++    this.sets.set(key, created);
++    return created;
++  }
++
++  private sortedSetFor(key: string) {
++    const existing = this.sortedSets.get(key);
++    if (existing) return existing;
++    const created = new Map<string, number>();
++    this.sortedSets.set(key, created);
++    return created;
++  }
++
++  private allKeys() {
++    return Array.from(new Set([...this.hashes.keys(), ...this.sets.keys(), ...this.sortedSets.keys()])).sort();
++  }
++
++  private keyType(key: string) {
++    if (this.hashes.has(key)) return "hash";
++    if (this.sets.has(key)) return "set";
++    if (this.sortedSets.has(key)) return "zset";
++    return "none";
++  }
++
++  private sortedEntries(key: string, reverse = false) {
++    const entries = Array.from(this.sortedSets.get(key)?.entries() ?? []).sort((left, right) => {
++      const scoreDifference = left[1] - right[1];
++      if (scoreDifference !== 0) return scoreDifference;
++      return left[0].localeCompare(right[0]);
++    });
++    return reverse ? entries.reverse() : entries;
++  }
++
++  private sliceRange<T>(values: T[], start: number, stop: number) {
++    const from = start < 0 ? Math.max(0, values.length + start) : start;
++    const through = stop < 0 ? values.length + stop : stop;
++    if (through < from) return [];
++    return values.slice(from, through + 1);
++  }
++
++  async exists(...input: unknown[]) {
++    return flattenStrings(input).filter((key) => this.keyType(key) !== "none").length;
++  }
++
++  async type(key: string) {
++    return this.keyType(key);
++  }
++
++  async keys(pattern = "*") {
++    return this.allKeys().filter((key) => globMatches(key, pattern));
++  }
++
++  async scan(_cursor: string | number, options: { MATCH?: string; COUNT?: number; TYPE?: string } = {}) {
++    const keys = this.allKeys().filter((key) => {
++      if (options.MATCH && !globMatches(key, options.MATCH)) return false;
++      if (options.TYPE && this.keyType(key) !== options.TYPE) return false;
++      return true;
++    });
++    return { cursor: "0", keys };
++  }
++
++  async *scanIterator(options: { cursor?: string; MATCH?: string; COUNT?: number; TYPE?: string } = {}) {
++    const { keys } = await this.scan(options.cursor ?? "0", options);
++    if (keys.length > 0) yield keys;
++  }
++
++  async hGetAll(key: string) {
++    return cloneHash(this.hashes.get(key));
++  }
++
++  async hGet(key: string, field: string) {
++    return this.hashes.get(key)?.[field] ?? null;
++  }
++
++  async hMGet(key: string, ...input: unknown[]) {
++    const fields = flattenStrings(input);
++    return fields.map((field) => this.hashes.get(key)?.[field] ?? null);
++  }
++
++  async hmGet(key: string, ...input: unknown[]) {
++    return this.hMGet(key, ...input);
++  }
++
++  async hExists(key: string, field: string) {
++    return Object.hasOwn(this.hashes.get(key) ?? {}, field);
++  }
++
++  async hKeys(key: string) {
++    return Object.keys(this.hashes.get(key) ?? {});
++  }
++
++  async hSet(key: string, fieldOrValue: string | Record<string, string>, value?: string) {
++    const current = cloneHash(this.hashes.get(key));
++    if (typeof fieldOrValue === "string") {
++      current[fieldOrValue] = value ?? "";
++    } else {
++      Object.assign(current, fieldOrValue);
++    }
++    this.hashes.set(key, current);
++    return 1;
++  }
++
++  async hScan(key: string, _cursor: string | number, options: { MATCH?: string; COUNT?: number } = {}) {
++    const entries = Object.entries(this.hashes.get(key) ?? {})
++      .filter(([field]) => !options.MATCH || globMatches(field, options.MATCH))
++      .map(([field, value]) => ({ field, value }));
++    return { cursor: "0", entries };
++  }
++
++  async *hScanIterator(key: string, options: { cursor?: string; MATCH?: string; COUNT?: number } = {}) {
++    const { entries } = await this.hScan(key, options.cursor ?? "0", options);
++    if (entries.length > 0) yield entries;
++  }
++
++  async sMembers(key: string) {
++    return Array.from(this.sets.get(key) ?? []);
++  }
++
++  async sIsMember(key: string, value: string) {
++    return this.sets.get(key)?.has(value) ?? false;
++  }
++
++  async sMIsMember(key: string, ...input: unknown[]) {
++    return flattenStrings(input).map((value) => this.sets.get(key)?.has(value) ?? false);
++  }
++
++  async sCard(key: string) {
++    return this.sets.get(key)?.size ?? 0;
++  }
++
++  async sAdd(key: string, ...input: unknown[]) {
++    const set = this.setFor(key);
++    const before = set.size;
++    for (const value of flattenStrings(input)) set.add(value);
++    return set.size - before;
++  }
++
++  async sRem(key: string, ...input: unknown[]) {
++    let removed = 0;
++    const set = this.sets.get(key);
++    for (const value of flattenStrings(input)) {
++      if (set?.delete(value)) removed += 1;
++    }
++    return removed;
++  }
++
++  async sScan(key: string, _cursor: string | number, options: { MATCH?: string; COUNT?: number } = {}) {
++    const members = Array.from(this.sets.get(key) ?? []).filter(
++      (value) => !options.MATCH || globMatches(value, options.MATCH),
++    );
++    return { cursor: "0", members };
++  }
++
++  async *sScanIterator(key: string, options: { cursor?: string; MATCH?: string; COUNT?: number } = {}) {
++    const { members } = await this.sScan(key, options.cursor ?? "0", options);
++    if (members.length > 0) yield members;
++  }
++
++  async zAdd(key: string, ...input: unknown[]) {
++    const entries = input.flatMap((value) => (Array.isArray(value) ? value : [value])) as Array<{
++      score: number;
++      value: string;
++    }>;
++    const set = this.sortedSetFor(key);
++    let added = 0;
++    for (const entry of entries) {
++      if (!set.has(entry.value)) added += 1;
++      set.set(entry.value, Number(entry.score));
++    }
++    return added;
++  }
++
++  async zRem(key: string, ...input: unknown[]) {
++    let removed = 0;
++    const set = this.sortedSets.get(key);
++    for (const value of flattenStrings(input)) {
++      if (set?.delete(value)) removed += 1;
++    }
++    return removed;
++  }
++
++  async zScore(key: string, value: string) {
++    return this.sortedSets.get(key)?.get(value) ?? null;
++  }
++
++  async zMScore(key: string, ...input: unknown[]) {
++    return flattenStrings(input).map((value) => this.sortedSets.get(key)?.get(value) ?? null);
++  }
++
++  async zCard(key: string) {
++    return this.sortedSets.get(key)?.size ?? 0;
++  }
++
++  async zRange(key: string, start: number, stop: number, options?: { REV?: boolean }) {
++    return this.sliceRange(this.sortedEntries(key, options?.REV), start, stop).map(([value]) => value);
++  }
++
++  async zRangeWithScores(key: string, start: number, stop: number, options?: { REV?: boolean }) {
++    return this.sliceRange(this.sortedEntries(key, options?.REV), start, stop).map(([value, score]) => ({ value, score }));
++  }
++
++  async zScan(key: string, _cursor: string | number, options: { MATCH?: string; COUNT?: number } = {}) {
++    const members = this.sortedEntries(key)
++      .filter(([value]) => !options.MATCH || globMatches(value, options.MATCH))
++      .map(([value, score]) => ({ value, score }));
++    return { cursor: "0", members };
++  }
++
++  async *zScanIterator(key: string, options: { cursor?: string; MATCH?: string; COUNT?: number } = {}) {
++    const { members } = await this.zScan(key, options.cursor ?? "0", options);
++    if (members.length > 0) yield members;
++  }
++
++  async del(...input: unknown[]) {
++    let removed = 0;
++    for (const key of flattenStrings(input)) {
++      const existed = this.keyType(key) !== "none";
++      this.hashes.delete(key);
++      this.sets.delete(key);
++      this.sortedSets.delete(key);
++      if (existed) removed += 1;
++    }
++    return removed;
++  }
++
++  async unlink(...input: unknown[]) {
++    return this.del(...input);
++  }
++
++  multi() {
++    const commands: Array<{ command: string; args: unknown[] }> = [];
++    const queue = (command: string, args: unknown[]) => {
++      commands.push({ command, args });
++      return pipeline;
++    };
++    const pipeline = {
++      exists: (...args: unknown[]) => queue("exists", args),
++      type: (...args: unknown[]) => queue("type", args),
++      keys: (...args: unknown[]) => queue("keys", args),
++      scan: (...args: unknown[]) => queue("scan", args),
++      hGetAll: (...args: unknown[]) => queue("hGetAll", args),
++      hGet: (...args: unknown[]) => queue("hGet", args),
++      hMGet: (...args: unknown[]) => queue("hMGet", args),
++      hmGet: (...args: unknown[]) => queue("hMGet", args),
++      hExists: (...args: unknown[]) => queue("hExists", args),
++      hKeys: (...args: unknown[]) => queue("hKeys", args),
++      hSet: (...args: unknown[]) => queue("hSet", args),
++      hScan: (...args: unknown[]) => queue("hScan", args),
++      sMembers: (...args: unknown[]) => queue("sMembers", args),
++      sIsMember: (...args: unknown[]) => queue("sIsMember", args),
++      sMIsMember: (...args: unknown[]) => queue("sMIsMember", args),
++      sCard: (...args: unknown[]) => queue("sCard", args),
++      sAdd: (...args: unknown[]) => queue("sAdd", args),
++      sRem: (...args: unknown[]) => queue("sRem", args),
++      sScan: (...args: unknown[]) => queue("sScan", args),
++      zAdd: (...args: unknown[]) => queue("zAdd", args),
++      zRem: (...args: unknown[]) => queue("zRem", args),
++      zScore: (...args: unknown[]) => queue("zScore", args),
++      zMScore: (...args: unknown[]) => queue("zMScore", args),
++      zCard: (...args: unknown[]) => queue("zCard", args),
++      zRange: (...args: unknown[]) => queue("zRange", args),
++      zRangeWithScores: (...args: unknown[]) => queue("zRangeWithScores", args),
++      zScan: (...args: unknown[]) => queue("zScan", args),
++      del: (...args: unknown[]) => queue("del", args),
++      unlink: (...args: unknown[]) => queue("unlink", args),
++      exec: async () => {
++        const results: unknown[] = [];
++        for (const entry of commands) results.push(await this.execute(entry.command, entry.args));
++        return results;
++      },
++    };
++    return pipeline;
++  }
++
++  private async execute(command: string, args: unknown[]) {
++    const candidate = (this as unknown as Record<string, unknown>)[command];
++    if (typeof candidate !== "function") throw new Error(`Unsupported fake Redis command: ${command}`);
++    return candidate.apply(this, args);
++  }
++
++  seedReaction(options: SeedReactionOptions = {}) {
++    const messageId = options.messageId ?? "message-1";
++    const userId = options.userId ?? "user-1";
++    const reaction = options.reaction ?? "HEART";
++    const roomId = options.roomId ?? "room-1";
++    const timestamp = options.timestamp ?? "2026-01-01T00:00:00.000Z";
++    const reactionId = reactionIdFor(messageId, userId, reaction);
++    this.hashes.set(`reaction:${reactionId}`, { messageId, userId, reaction, roomId, timestamp });
++
++    if (options.roomIndexed ?? true) this.setFor(`room_reactions:${roomId}`).add(reactionId);
++    if (options.timelineIndexed ?? true) {
++      const score = options.timelineScore ?? new Date(timestamp).getTime();
++      this.sortedSetFor(`room_reactions_by_time:${roomId}`).set(reactionId, score);
++    }
++    if (options.messageIndexed ?? true) this.setFor(`message_reactions:${messageId}`).add(reactionId);
++    if (options.userIndexed ?? true) this.setFor(`user_message_reactions:${userId}:${messageId}`).add(reactionId);
++    return reactionId;
++  }
++
++  seedRoomReference(roomId: string, reactionId: string, timelineScore = 1) {
++    this.setFor(`room_reactions:${roomId}`).add(reactionId);
++    this.sortedSetFor(`room_reactions_by_time:${roomId}`).set(reactionId, timelineScore);
++  }
++}
++
++export const invokeOperation = async <T>(module: Record<string, unknown>, name: string, ...args: unknown[]) => {
++  const candidate = module[name];
++  if (typeof candidate !== "function") throw new Error(`Missing operation: ${name}`);
++  return (await candidate(...args)) as T;
++};
+diff --git a/packages/backend/src/gold_tests/reaction_repair_behavior.test.ts b/packages/backend/src/gold_tests/reaction_repair_behavior.test.ts
+new file mode 100644
+index 0000000..e64e0e2
+--- /dev/null
++++ b/packages/backend/src/gold_tests/reaction_repair_behavior.test.ts
+@@ -0,0 +1,218 @@
++import { beforeEach, describe, expect, it, installFixedDate, runRegisteredTests } from "#ours/backend/gold_tests/gold_node_harness.test.ts";
++import {
++  FakeRedisClient,
++  getNodeClientMock,
++  invokeOperation,
++} from "#ours/backend/gold_tests/reaction_integrity_fixture.test.ts";
++
++const reactionOperations = await import("#ours/backend/session/operations/reactions.ts");
++
++
++interface RepairResult {
++  roomId: string;
++  beforeIssueCount: number;
++  repaired: number;
++  removed: number;
++  afterIssueCount: number;
++}
++
++const repairRoom = (roomId: string) =>
++  invokeOperation<RepairResult>(reactionOperations as Record<string, unknown>, "repairRoomReactionIntegrity", roomId);
++
++const auditRoom = (roomId: string) =>
++  invokeOperation<{ issueCount: number }>(reactionOperations as Record<string, unknown>, "auditRoomReactionIntegrity", roomId);
++
++let redis: FakeRedisClient;
++
++beforeEach(() => {
++  redis = new FakeRedisClient();
++  getNodeClientMock.mockResolvedValue(redis);
++});
++
++describe("Reaction index repair", () => {
++  it("leaves a healthy room unchanged", async () => {
++    redis.seedReaction();
++
++    const result = await repairRoom("room-1");
++
++    expect(result).toEqual({
++      roomId: "room-1",
++      beforeIssueCount: 0,
++      repaired: 0,
++      removed: 0,
++      afterIssueCount: 0,
++    });
++  });
++
++  it("removes a missing record from both room indexes", async () => {
++    redis.seedRoomReference("room-1", "missing-id", 10);
++
++    const result = await repairRoom("room-1");
++
++    expect(result.removed).toBe(1);
++    expect(redis.sets.get("room_reactions:room-1")?.has("missing-id")).toBe(false);
++    expect(redis.sortedSets.get("room_reactions_by_time:room-1")?.has("missing-id")).toBe(false);
++  });
++
++  it("removes a wrong-room record from the audited room without deleting its hash", async () => {
++    const id = redis.seedReaction({ roomId: "room-2" });
++    redis.seedRoomReference("room-1", id, 10);
++
++    await repairRoom("room-1");
++
++    expect(redis.sets.get("room_reactions:room-1")?.has(id)).toBe(false);
++    expect(redis.sortedSets.get("room_reactions_by_time:room-1")?.has(id)).toBe(false);
++    expect(redis.hashes.get(`reaction:${id}`)?.roomId).toBe("room-2");
++  });
++
++  it("removes an invalid-timestamp record from the room indexes", async () => {
++    const id = redis.seedReaction({ timestamp: "bad-time" });
++
++    const result = await repairRoom("room-1");
++
++    expect(result.removed).toBe(1);
++    expect(redis.sets.get("room_reactions:room-1")?.has(id)).toBe(false);
++    expect(redis.sortedSets.get("room_reactions_by_time:room-1")?.has(id)).toBe(false);
++  });
++
++  it("restores a missing room set index", async () => {
++    const id = redis.seedReaction({ roomIndexed: false });
++
++    const result = await repairRoom("room-1");
++
++    expect(result.repaired).toBe(1);
++    expect(redis.sets.get("room_reactions:room-1")?.has(id)).toBe(true);
++  });
++
++  it("restores a missing timeline index", async () => {
++    const id = redis.seedReaction({ timelineIndexed: false, timestamp: "2026-01-02T00:00:00.000Z" });
++
++    await repairRoom("room-1");
++
++    expect(redis.sortedSets.get("room_reactions_by_time:room-1")?.get(id)).toBe(
++      new Date("2026-01-02T00:00:00.000Z").getTime(),
++    );
++  });
++
++  it("corrects a stale timeline score from the hash timestamp", async () => {
++    const id = redis.seedReaction({ timestamp: "2026-01-02T00:00:00.000Z", timelineScore: 1 });
++
++    await repairRoom("room-1");
++
++    expect(redis.sortedSets.get("room_reactions_by_time:room-1")?.get(id)).toBe(
++      new Date("2026-01-02T00:00:00.000Z").getTime(),
++    );
++  });
++
++  it("restores a missing message index", async () => {
++    const id = redis.seedReaction({ messageId: "m-1", messageIndexed: false });
++
++    await repairRoom("room-1");
++
++    expect(redis.sets.get("message_reactions:m-1")?.has(id)).toBe(true);
++  });
++
++  it("restores a missing user-message index", async () => {
++    const id = redis.seedReaction({ messageId: "m-1", userId: "u-1", userIndexed: false });
++
++    await repairRoom("room-1");
++
++    expect(redis.sets.get("user_message_reactions:u-1:m-1")?.has(id)).toBe(true);
++  });
++
++  it("counts one repaired record even when several indexes were wrong", async () => {
++    redis.seedReaction({ roomIndexed: false, timelineScore: 1, messageIndexed: false, userIndexed: false });
++
++    const result = await repairRoom("room-1");
++
++    expect(result.beforeIssueCount).toBe(4);
++    expect(result.repaired).toBe(1);
++    expect(result.removed).toBe(0);
++    expect(result.afterIssueCount).toBe(0);
++  });
++
++  it("repairs several damaged records in one run", async () => {
++    const first = redis.seedReaction({ messageId: "m-1", userId: "u-1", messageIndexed: false });
++    const second = redis.seedReaction({ messageId: "m-2", userId: "u-2", timelineIndexed: false });
++
++    const result = await repairRoom("room-1");
++
++    expect(result.repaired).toBe(2);
++    expect(redis.sets.get("message_reactions:m-1")?.has(first)).toBe(true);
++    expect(redis.sortedSets.get("room_reactions_by_time:room-1")?.has(second)).toBe(true);
++    expect(result.afterIssueCount).toBe(0);
++  });
++
++  it("reports zero remaining issues after a successful repair", async () => {
++    redis.seedReaction({ messageIndexed: false, userIndexed: false, timelineScore: 1 });
++
++    const result = await repairRoom("room-1");
++
++    expect(result.afterIssueCount).toBe(0);
++    expect((await auditRoom("room-1")).issueCount).toBe(0);
++  });
++
++  it("is idempotent when run a second time", async () => {
++    redis.seedReaction({ messageIndexed: false });
++
++    await repairRoom("room-1");
++    const second = await repairRoom("room-1");
++
++    expect(second.beforeIssueCount).toBe(0);
++    expect(second.repaired).toBe(0);
++    expect(second.removed).toBe(0);
++    expect(second.afterIssueCount).toBe(0);
++  });
++
++  it("does not rewrite a valid reaction hash while repairing indexes", async () => {
++    const id = redis.seedReaction({ timestamp: "2026-01-02T00:00:00.000Z", messageIndexed: false });
++    const before = { ...redis.hashes.get(`reaction:${id}`) };
++
++    await repairRoom("room-1");
++
++    expect(redis.hashes.get(`reaction:${id}`)).toEqual(before);
++  });
++
++  it("does not add invalid records to message or user indexes", async () => {
++    const id = redis.seedReaction({
++      messageId: "m-1",
++      userId: "u-1",
++      timestamp: "bad-time",
++      messageIndexed: false,
++      userIndexed: false,
++    });
++
++    await repairRoom("room-1");
++
++    expect(redis.sets.get("message_reactions:m-1")?.has(id)).not.toBe(true);
++    expect(redis.sets.get("user_message_reactions:u-1:m-1")?.has(id)).not.toBe(true);
++  });
++
++  it("refreshing an existing reaction updates the timeline score with its new timestamp", async () => {
++    const id = redis.seedReaction({ timestamp: "2025-01-01T00:00:00.000Z", timelineScore: 1 });
++    const restoreDate = installFixedDate("2026-02-03T04:05:06.000Z");
++
++    await reactionOperations.addReaction("message-1", "user-1", "HEART", "room-1");
++
++    expect(redis.hashes.get(`reaction:${id}`)?.timestamp).toBe("2026-02-03T04:05:06.000Z");
++    expect(redis.sortedSets.get("room_reactions_by_time:room-1")?.get(id)).toBe(
++      new Date("2026-02-03T04:05:06.000Z").getTime(),
++    );
++    restoreDate();
++  });
++
++  it("refreshing an existing reaction keeps the stored room as canonical", async () => {
++    const id = redis.seedReaction({ roomId: "room-original" });
++    const restoreDate = installFixedDate("2026-02-03T04:05:06.000Z");
++
++    const result = await reactionOperations.addReaction("message-1", "user-1", "HEART", "room-other");
++
++    expect(result.roomId).toBe("room-original");
++    expect(redis.sortedSets.get("room_reactions_by_time:room-original")?.has(id)).toBe(true);
++    expect(redis.sortedSets.get("room_reactions_by_time:room-other")?.has(id)).not.toBe(true);
++    restoreDate();
++  });
++
++});
++
++await runRegisteredTests();
+diff --git a/packages/backend/src/gold_tests/reaction_timeline_behavior.test.ts b/packages/backend/src/gold_tests/reaction_timeline_behavior.test.ts
+new file mode 100644
+index 0000000..06a79b2
+--- /dev/null
++++ b/packages/backend/src/gold_tests/reaction_timeline_behavior.test.ts
+@@ -0,0 +1,204 @@
++import { beforeEach, describe, expect, it, installFixedDate, runRegisteredTests } from "#ours/backend/gold_tests/gold_node_harness.test.ts";
++import {
++  FakeRedisClient,
++  getNodeClientMock,
++  invokeOperation,
++} from "#ours/backend/gold_tests/reaction_integrity_fixture.test.ts";
++
++const reactionOperations = await import("#ours/backend/session/operations/reactions.ts");
++const operationBarrel = await import("#ours/backend/session/operations/index.ts");
++
++
++interface TimelineEntry {
++  reactionId: string;
++  messageId: string;
++  userId: string;
++  reaction: string;
++  roomId: string;
++  timestamp: Date;
++}
++
++const readTimeline = (roomId: string, options?: { since?: number; until?: number; limit?: number }) =>
++  invokeOperation<TimelineEntry[]>(reactionOperations as Record<string, unknown>, "getRoomReactionTimeline", roomId, options);
++
++const timestamp = (value: string) => new Date(value).getTime();
++
++let redis: FakeRedisClient;
++
++beforeEach(() => {
++  redis = new FakeRedisClient();
++  getNodeClientMock.mockResolvedValue(redis);
++});
++
++describe("Reaction timeline integrity", () => {
++  it("exports the integrity operations from the reaction operations barrel", () => {
++    expect(typeof operationBarrel.getRoomReactionTimeline).toBe("function");
++    expect(typeof operationBarrel.auditRoomReactionIntegrity).toBe("function");
++    expect(typeof operationBarrel.repairRoomReactionIntegrity).toBe("function");
++  });
++
++  it("returns the complete public timeline entry shape", async () => {
++    const id = redis.seedReaction({
++      messageId: "message-shape",
++      userId: "user-shape",
++      reaction: "FIRE",
++      roomId: "room-1",
++      timestamp: "2026-01-05T06:07:08.000Z",
++    });
++
++    const result = await readTimeline("room-1");
++
++    expect(result).toEqual([{
++      reactionId: id,
++      messageId: "message-shape",
++      userId: "user-shape",
++      reaction: "FIRE",
++      roomId: "room-1",
++      timestamp: new Date("2026-01-05T06:07:08.000Z"),
++    }]);
++  });
++
++  it("returns a canonical room timeline newest first", async () => {
++    redis.seedReaction({ messageId: "old", timestamp: "2026-01-01T00:00:00.000Z" });
++    redis.seedReaction({ messageId: "new", timestamp: "2026-01-03T00:00:00.000Z" });
++    redis.seedReaction({ messageId: "middle", timestamp: "2026-01-02T00:00:00.000Z" });
++
++    const result = await readTimeline("room-1");
++
++    expect(result.map((entry) => entry.messageId)).toEqual(["new", "middle", "old"]);
++  });
++
++  it("uses the reaction hash timestamp instead of a stale sorted-set score", async () => {
++    redis.seedReaction({
++      messageId: "really-new",
++      timestamp: "2026-01-04T00:00:00.000Z",
++      timelineScore: timestamp("2025-01-01T00:00:00.000Z"),
++    });
++    redis.seedReaction({ messageId: "older", timestamp: "2026-01-02T00:00:00.000Z" });
++
++    const result = await readTimeline("room-1");
++
++    expect(result.map((entry) => entry.messageId)).toEqual(["really-new", "older"]);
++  });
++
++  it("includes a valid reaction that is missing only from the timeline index", async () => {
++    redis.seedReaction({ messageId: "message-a", timelineIndexed: false });
++
++    const result = await readTimeline("room-1");
++
++    expect(result).toHaveLength(1);
++    expect(result[0].messageId).toBe("message-a");
++  });
++
++  it("includes a valid reaction that is present only in the timeline index", async () => {
++    const id = redis.seedReaction({ messageId: "message-a", roomIndexed: false });
++
++    const result = await readTimeline("room-1");
++
++    expect(result.map((entry) => entry.reactionId)).toEqual([id]);
++  });
++
++  it("ignores room index entries whose reaction hash is missing", async () => {
++    redis.seedRoomReference("room-1", "missing-id", timestamp("2026-01-01T00:00:00.000Z"));
++
++    expect(await readTimeline("room-1")).toEqual([]);
++  });
++
++  it("ignores records that belong to another room", async () => {
++    const id = redis.seedReaction({ roomId: "room-2" });
++    redis.seedRoomReference("room-1", id, timestamp("2026-01-01T00:00:00.000Z"));
++
++    expect(await readTimeline("room-1")).toEqual([]);
++  });
++
++  it("ignores records with an invalid timestamp", async () => {
++    redis.seedReaction({ timestamp: "not-a-date" });
++
++    expect(await readTimeline("room-1")).toEqual([]);
++  });
++
++  it("applies the since boundary inclusively", async () => {
++    redis.seedReaction({ messageId: "before", timestamp: "2026-01-01T00:00:00.000Z" });
++    redis.seedReaction({ messageId: "at", timestamp: "2026-01-02T00:00:00.000Z" });
++    redis.seedReaction({ messageId: "after", timestamp: "2026-01-03T00:00:00.000Z" });
++
++    const result = await readTimeline("room-1", { since: timestamp("2026-01-02T00:00:00.000Z") });
++
++    expect(result.map((entry) => entry.messageId)).toEqual(["after", "at"]);
++  });
++
++  it("applies the until boundary inclusively", async () => {
++    redis.seedReaction({ messageId: "before", timestamp: "2026-01-01T00:00:00.000Z" });
++    redis.seedReaction({ messageId: "at", timestamp: "2026-01-02T00:00:00.000Z" });
++    redis.seedReaction({ messageId: "after", timestamp: "2026-01-03T00:00:00.000Z" });
++
++    const result = await readTimeline("room-1", { until: timestamp("2026-01-02T00:00:00.000Z") });
++
++    expect(result.map((entry) => entry.messageId)).toEqual(["at", "before"]);
++  });
++
++  it("returns no reactions when since is after until", async () => {
++    redis.seedReaction();
++
++    const result = await readTimeline("room-1", {
++      since: timestamp("2026-01-03T00:00:00.000Z"),
++      until: timestamp("2026-01-02T00:00:00.000Z"),
++    });
++
++    expect(result).toEqual([]);
++  });
++
++  it("uses one item when the requested limit is zero", async () => {
++    redis.seedReaction({ messageId: "one", timestamp: "2026-01-02T00:00:00.000Z" });
++    redis.seedReaction({ messageId: "two", timestamp: "2026-01-01T00:00:00.000Z" });
++
++    expect(await readTimeline("room-1", { limit: 0 })).toHaveLength(1);
++  });
++
++  it("truncates a fractional limit before applying it", async () => {
++    redis.seedReaction({ messageId: "one", timestamp: "2026-01-03T00:00:00.000Z" });
++    redis.seedReaction({ messageId: "two", timestamp: "2026-01-02T00:00:00.000Z" });
++    redis.seedReaction({ messageId: "three", timestamp: "2026-01-01T00:00:00.000Z" });
++
++    expect(await readTimeline("room-1", { limit: 2.9 })).toHaveLength(2);
++  });
++
++  it("uses the default limit for a non-finite limit", async () => {
++    for (let index = 0; index < 4; index += 1) {
++      redis.seedReaction({ messageId: `message-${index}`, userId: `user-${index}` });
++    }
++
++    expect(await readTimeline("room-1", { limit: Number.NaN })).toHaveLength(4);
++  });
++
++  it("caps the timeline at one hundred reactions", async () => {
++    for (let index = 0; index < 105; index += 1) {
++      redis.seedReaction({
++        messageId: `message-${index}`,
++        userId: `user-${index}`,
++        timestamp: new Date(1_760_000_000_000 + index).toISOString(),
++      });
++    }
++
++    expect(await readTimeline("room-1", { limit: 500 })).toHaveLength(100);
++  });
++
++  it("ignores non-finite time boundaries", async () => {
++    redis.seedReaction({ messageId: "kept" });
++
++    const result = await readTimeline("room-1", { since: Number.NaN, until: Number.POSITIVE_INFINITY });
++
++    expect(result.map((entry) => entry.messageId)).toEqual(["kept"]);
++  });
++
++  it("breaks equal timestamp ties by reaction id", async () => {
++    const first = redis.seedReaction({ messageId: "a", userId: "u-a" });
++    const second = redis.seedReaction({ messageId: "b", userId: "u-b" });
++
++    const result = await readTimeline("room-1");
++
++    expect(result.map((entry) => entry.reactionId)).toEqual([first, second].sort((a, b) => a.localeCompare(b)));
++  });
++});
++
++await runRegisteredTests();

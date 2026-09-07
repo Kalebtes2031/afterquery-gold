@@ -1,0 +1,674 @@
+diff --git a/packages/backend/src/gold_tests/hold_claim_behavior.test.ts b/packages/backend/src/gold_tests/hold_claim_behavior.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/hold_claim_behavior.test.ts
+@@ -0,0 +1,122 @@
++import { describe, expect, it } from "vitest";
++import {
++  DEFAULT_HOLD_SECONDS,
++  MAX_HOLD_SECONDS,
++  MIN_HOLD_SECONDS,
++  MemoryNicknameHoldStore,
++  NicknameHoldService,
++  claimNicknameHold,
++} from "#ours/backend/services/nickname_holds.ts";
++
++const NOW = 1_700_000_000_000;
++
++const service = () => new NicknameHoldService(new MemoryNicknameHoldStore());
++
++describe("Nickname hold claims", () => {
++  it("creates a held reservation for a free nickname", async () => {
++    const result = await service().claimNicknameHold("alice", "holder-1", { now: NOW });
++    expect(result).toEqual({
++      ok: true,
++      nickname: "alice",
++      holderId: "holder-1",
++      status: "held",
++      expiresAt: NOW + DEFAULT_HOLD_SECONDS * 1000,
++      remainingSeconds: DEFAULT_HOLD_SECONDS,
++    });
++  });
++
++  it("stores the nickname in lowercase after trimming", async () => {
++    const holds = service();
++    const result = await holds.claimNicknameHold("  AlIce  ", "holder-1", { now: NOW });
++    expect(result).toMatchObject({ ok: true, nickname: "alice" });
++    await expect(holds.getNicknameHold("ALICE", { now: NOW })).resolves.toMatchObject({
++      nickname: "alice",
++      holderId: "holder-1",
++    });
++  });
++
++  it("refreshes the expiry when the same holder claims again", async () => {
++    const holds = service();
++    await holds.claimNicknameHold("alice", "holder-1", { now: NOW, ttlSeconds: 20 });
++    const result = await holds.claimNicknameHold("alice", "holder-1", { now: NOW + 5_000, ttlSeconds: 40 });
++    expect(result).toMatchObject({
++      ok: true,
++      status: "refreshed",
++      holderId: "holder-1",
++      expiresAt: NOW + 5_000 + 40_000,
++      remainingSeconds: 40,
++    });
++  });
++
++  it("rejects a second holder while the hold is still live", async () => {
++    const holds = service();
++    await holds.claimNicknameHold("alice", "holder-1", { now: NOW, ttlSeconds: 30 });
++    const result = await holds.claimNicknameHold("alice", "holder-2", { now: NOW + 1_000 });
++    expect(result).toEqual({
++      ok: false,
++      reason: "held",
++      nickname: "alice",
++      holderId: "holder-1",
++      expiresAt: NOW + 30_000,
++      remainingSeconds: 29,
++    });
++  });
++
++  it("lets a new holder take an expired reservation", async () => {
++    const holds = service();
++    await holds.claimNicknameHold("alice", "holder-1", { now: NOW, ttlSeconds: 10 });
++    const result = await holds.claimNicknameHold("alice", "holder-2", { now: NOW + 10_000 });
++    expect(result).toMatchObject({ ok: true, status: "held", holderId: "holder-2", nickname: "alice" });
++  });
++
++  it("defaults a missing ttl to forty five seconds", async () => {
++    const result = await service().claimNicknameHold("alice", "holder-1", { now: NOW });
++    expect(result).toMatchObject({ ok: true, remainingSeconds: 45, expiresAt: NOW + 45_000 });
++  });
++
++  it("uses the default ttl when the requested ttl is not finite", async () => {
++    const result = await service().claimNicknameHold("alice", "holder-1", { now: NOW, ttlSeconds: Number.NaN });
++    expect(result).toMatchObject({ ok: true, remainingSeconds: DEFAULT_HOLD_SECONDS });
++  });
++
++  it("truncates a fractional ttl toward zero before clamping", async () => {
++    const result = await service().claimNicknameHold("alice", "holder-1", { now: NOW, ttlSeconds: 12.9 });
++    expect(result).toMatchObject({ ok: true, remainingSeconds: 12 });
++  });
++
++  it("clamps a ttl below the minimum to five seconds", async () => {
++    const result = await service().claimNicknameHold("alice", "holder-1", { now: NOW, ttlSeconds: 1 });
++    expect(result).toMatchObject({ ok: true, remainingSeconds: MIN_HOLD_SECONDS });
++  });
++
++  it("clamps a ttl above the maximum to one hundred twenty seconds", async () => {
++    const result = await service().claimNicknameHold("alice", "holder-1", { now: NOW, ttlSeconds: 999 });
++    expect(result).toMatchObject({ ok: true, remainingSeconds: MAX_HOLD_SECONDS });
++  });
++
++  it("rejects a nickname that fails the shared nickname rules", async () => {
++    await expect(service().claimNicknameHold("ab", "holder-1", { now: NOW })).resolves.toEqual({
++      ok: false,
++      reason: "invalid_nickname",
++    });
++  });
++
++  it("rejects a blank holder id", async () => {
++    await expect(service().claimNicknameHold("alice", "   ", { now: NOW })).resolves.toEqual({
++      ok: false,
++      reason: "invalid_holder",
++      nickname: "alice",
++    });
++  });
++
++  it("keeps the holder id case as supplied after trimming", async () => {
++    const result = await service().claimNicknameHold("alice", "  Holder-A  ", { now: NOW });
++    expect(result).toMatchObject({ ok: true, holderId: "Holder-A" });
++  });
++
++  it("supports the claimNicknameHold convenience function", async () => {
++    const store = new MemoryNicknameHoldStore();
++    const result = await claimNicknameHold("alice", "holder-1", { now: NOW }, store);
++    expect(result).toMatchObject({ ok: true, nickname: "alice" });
++  });
++});
+diff --git a/packages/backend/src/gold_tests/hold_confirm_release_behavior.test.ts b/packages/backend/src/gold_tests/hold_confirm_release_behavior.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/hold_confirm_release_behavior.test.ts
+@@ -0,0 +1,140 @@
++import { describe, expect, it } from "vitest";
++import {
++  CONFIRMED_LEASE_SECONDS,
++  MemoryNicknameHoldStore,
++  NicknameHoldService,
++  confirmNicknameHold,
++  releaseNicknameHold,
++} from "#ours/backend/services/nickname_holds.ts";
++
++const NOW = 1_700_000_000_000;
++
++const service = () => new NicknameHoldService(new MemoryNicknameHoldStore());
++
++describe("Nickname hold confirm and release", () => {
++  it("confirms a live hold into an eighteen hundred second lease", async () => {
++    const holds = service();
++    await holds.claimNicknameHold("alice", "holder-1", { now: NOW, ttlSeconds: 20 });
++    const result = await holds.confirmNicknameHold("alice", "holder-1", { now: NOW + 1_000 });
++    expect(result).toEqual({
++      ok: true,
++      nickname: "alice",
++      holderId: "holder-1",
++      status: "confirmed",
++      expiresAt: NOW + 1_000 + CONFIRMED_LEASE_SECONDS * 1000,
++      remainingSeconds: CONFIRMED_LEASE_SECONDS,
++    });
++  });
++
++  it("refreshes the confirmed lease when the same holder confirms again", async () => {
++    const holds = service();
++    await holds.claimNicknameHold("alice", "holder-1", { now: NOW });
++    await holds.confirmNicknameHold("alice", "holder-1", { now: NOW });
++    const result = await holds.confirmNicknameHold("alice", "holder-1", { now: NOW + 10_000 });
++    expect(result).toMatchObject({
++      ok: true,
++      status: "confirmed",
++      expiresAt: NOW + 10_000 + CONFIRMED_LEASE_SECONDS * 1000,
++    });
++  });
++
++  it("does not let another holder confirm a live reservation", async () => {
++    const holds = service();
++    await holds.claimNicknameHold("alice", "holder-1", { now: NOW, ttlSeconds: 40 });
++    const result = await holds.confirmNicknameHold("alice", "holder-2", { now: NOW + 1_000 });
++    expect(result).toMatchObject({
++      ok: false,
++      reason: "holder_mismatch",
++      nickname: "alice",
++      holderId: "holder-1",
++    });
++  });
++
++  it("reports expired when confirm runs after the hold lapses", async () => {
++    const holds = service();
++    await holds.claimNicknameHold("alice", "holder-1", { now: NOW, ttlSeconds: 10 });
++    const result = await holds.confirmNicknameHold("alice", "holder-1", { now: NOW + 10_000 });
++    expect(result).toEqual({
++      ok: false,
++      reason: "expired",
++      nickname: "alice",
++      holderId: "holder-1",
++    });
++  });
++
++  it("reports not_found when confirming a nickname that was never held", async () => {
++    await expect(service().confirmNicknameHold("alice", "holder-1", { now: NOW })).resolves.toEqual({
++      ok: false,
++      reason: "not_found",
++      nickname: "alice",
++    });
++  });
++
++  it("releases a live hold for the current holder", async () => {
++    const holds = service();
++    await holds.claimNicknameHold("alice", "holder-1", { now: NOW });
++    await expect(holds.releaseNicknameHold("alice", "holder-1", { now: NOW })).resolves.toEqual({
++      ok: true,
++      nickname: "alice",
++      released: true,
++    });
++    await expect(holds.getNicknameHold("alice", { now: NOW })).resolves.toBeNull();
++  });
++
++  it("does not let another holder release a live reservation", async () => {
++    const holds = service();
++    await holds.claimNicknameHold("alice", "holder-1", { now: NOW, ttlSeconds: 30 });
++    const result = await holds.releaseNicknameHold("alice", "holder-2", { now: NOW + 1_000 });
++    expect(result).toMatchObject({ ok: false, reason: "holder_mismatch", holderId: "holder-1" });
++  });
++
++  it("treats an expired hold as gone when releasing", async () => {
++    const holds = service();
++    await holds.claimNicknameHold("alice", "holder-1", { now: NOW, ttlSeconds: 5 });
++    await expect(holds.releaseNicknameHold("alice", "holder-1", { now: NOW + 5_000 })).resolves.toEqual({
++      ok: false,
++      reason: "not_found",
++      nickname: "alice",
++    });
++  });
++
++  it("reports not_found when releasing a missing nickname", async () => {
++    await expect(service().releaseNicknameHold("alice", "holder-1")).resolves.toEqual({
++      ok: false,
++      reason: "not_found",
++      nickname: "alice",
++    });
++  });
++
++  it("rejects confirm and release for an invalid nickname", async () => {
++    const holds = service();
++    await expect(holds.confirmNicknameHold("ab", "holder-1")).resolves.toEqual({
++      ok: false,
++      reason: "invalid_nickname",
++    });
++    await expect(holds.releaseNicknameHold("ab", "holder-1")).resolves.toEqual({
++      ok: false,
++      reason: "invalid_nickname",
++    });
++  });
++
++  it("supports the confirm and release convenience functions", async () => {
++    const store = new MemoryNicknameHoldStore();
++    await claimAndConfirm(store);
++    await expect(confirmNicknameHold("alice", "holder-1", { now: NOW + 2_000 }, store)).resolves.toMatchObject({
++      ok: true,
++      status: "confirmed",
++    });
++    await expect(releaseNicknameHold("alice", "holder-1", { now: NOW + 3_000 }, store)).resolves.toEqual({
++      ok: true,
++      nickname: "alice",
++      released: true,
++    });
++  });
++});
++
++async function claimAndConfirm(store: MemoryNicknameHoldStore) {
++  const holds = new NicknameHoldService(store);
++  await holds.claimNicknameHold("alice", "holder-1", { now: NOW });
++  await holds.confirmNicknameHold("alice", "holder-1", { now: NOW });
++}
+diff --git a/packages/backend/src/gold_tests/hold_list_and_races.test.ts b/packages/backend/src/gold_tests/hold_list_and_races.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/hold_list_and_races.test.ts
+@@ -0,0 +1,87 @@
++import { describe, expect, it } from "vitest";
++import {
++  MemoryNicknameHoldStore,
++  NicknameHoldService,
++  getNicknameHold,
++  listNicknameHolds,
++} from "#ours/backend/services/nickname_holds.ts";
++
++const NOW = 1_700_000_000_000;
++
++const service = () => new NicknameHoldService(new MemoryNicknameHoldStore());
++
++describe("Nickname hold reads and races", () => {
++  it("returns the public hold view for a live reservation", async () => {
++    const holds = service();
++    await holds.claimNicknameHold("alice", "holder-1", { now: NOW, ttlSeconds: 20 });
++    await expect(holds.getNicknameHold("Alice", { now: NOW + 2_000 })).resolves.toEqual({
++      nickname: "alice",
++      holderId: "holder-1",
++      status: "held",
++      expiresAt: NOW + 20_000,
++      remainingSeconds: 18,
++    });
++  });
++
++  it("returns null for a missing or expired hold", async () => {
++    const holds = service();
++    await expect(holds.getNicknameHold("alice", { now: NOW })).resolves.toBeNull();
++    await holds.claimNicknameHold("alice", "holder-1", { now: NOW, ttlSeconds: 8 });
++    await expect(holds.getNicknameHold("alice", { now: NOW + 8_000 })).resolves.toBeNull();
++  });
++
++  it("returns null when get is asked for an invalid nickname", async () => {
++    await expect(service().getNicknameHold("ab", { now: NOW })).resolves.toBeNull();
++  });
++
++  it("lists live holds sorted by nickname and skips expired rows", async () => {
++    const holds = service();
++    await holds.claimNicknameHold("zoe", "h-z", { now: NOW, ttlSeconds: 30 });
++    await holds.claimNicknameHold("amy", "h-a", { now: NOW, ttlSeconds: 30 });
++    await holds.claimNicknameHold("bob", "h-b", { now: NOW, ttlSeconds: 5 });
++    const listed = await holds.listNicknameHolds({ now: NOW + 5_000 });
++    expect(listed.map((row) => row.nickname)).toEqual(["amy", "zoe"]);
++  });
++
++  it("filters the hold list by holder id", async () => {
++    const holds = service();
++    await holds.claimNicknameHold("amy", "same", { now: NOW, ttlSeconds: 30 });
++    await holds.claimNicknameHold("zoe", "other", { now: NOW, ttlSeconds: 30 });
++    await holds.claimNicknameHold("bob", "same", { now: NOW, ttlSeconds: 30 });
++    const listed = await holds.listNicknameHolds({ now: NOW, holderId: "same" });
++    expect(listed.map((row) => row.nickname)).toEqual(["amy", "bob"]);
++  });
++
++  it("never reports a negative remaining time", async () => {
++    const holds = service();
++    await holds.claimNicknameHold("alice", "holder-1", { now: NOW, ttlSeconds: 10 });
++    const view = await holds.getNicknameHold("alice", { now: NOW + 9_500 });
++    expect(view?.remainingSeconds).toBe(0);
++  });
++
++  it("lets exactly one holder win when two claim a free nickname together", async () => {
++    const holds = service();
++    const [first, second] = await Promise.all([
++      holds.claimNicknameHold("alice", "holder-1", { now: NOW, ttlSeconds: 30 }),
++      holds.claimNicknameHold("alice", "holder-2", { now: NOW, ttlSeconds: 30 }),
++    ]);
++    const outcomes = [first, second];
++    expect(outcomes.filter((row) => row.ok).length).toBe(1);
++    expect(outcomes.filter((row) => !row.ok && row.reason === "held").length).toBe(1);
++  });
++
++  it("keeps remainingSeconds as a floored whole number", async () => {
++    const holds = service();
++    await holds.claimNicknameHold("alice", "holder-1", { now: NOW, ttlSeconds: 12 });
++    const view = await holds.getNicknameHold("alice", { now: NOW + 1_400 });
++    expect(view?.remainingSeconds).toBe(10);
++  });
++
++  it("supports the read convenience functions", async () => {
++    const store = new MemoryNicknameHoldStore();
++    const holds = new NicknameHoldService(store);
++    await holds.claimNicknameHold("alice", "holder-1", { now: NOW, ttlSeconds: 25 });
++    await expect(getNicknameHold("alice", { now: NOW }, store)).resolves.toMatchObject({ nickname: "alice" });
++    await expect(listNicknameHolds({ now: NOW }, store)).resolves.toHaveLength(1);
++  });
++});
+diff --git a/packages/backend/src/gold_tests/hold_edge_behavior.test.ts b/packages/backend/src/gold_tests/hold_edge_behavior.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/hold_edge_behavior.test.ts
+@@ -0,0 +1,72 @@
++import { describe, expect, it } from "vitest";
++import {
++  MemoryNicknameHoldStore,
++  NicknameHoldService,
++  createNicknameHoldService,
++  listNicknameHolds,
++} from "#ours/backend/services/nickname_holds.ts";
++
++const NOW = 1_700_000_000_000;
++
++describe("Nickname hold extra edges", () => {
++  it("accepts a nickname with hyphen period and underscore", async () => {
++    const holds = createNicknameHoldService(new MemoryNicknameHoldStore());
++    const result = await holds.claimNicknameHold("a.b_c-d", "holder-1", { now: NOW, ttlSeconds: 20 });
++    expect(result).toMatchObject({ ok: true, nickname: "a.b_c-d" });
++  });
++
++  it("normalizes a decomposed accent before storing the nickname", async () => {
++    const holds = createNicknameHoldService(new MemoryNicknameHoldStore());
++    const decomposed = "e\u0301ric";
++    const result = await holds.claimNicknameHold(decomposed, "holder-1", { now: NOW });
++    expect(result).toMatchObject({ ok: true, nickname: decomposed.normalize("NFC").toLowerCase() });
++  });
++
++  it("clamps a negative ttl up to five seconds", async () => {
++    const holds = createNicknameHoldService(new MemoryNicknameHoldStore());
++    const result = await holds.claimNicknameHold("alice", "holder-1", { now: NOW, ttlSeconds: -12 });
++    expect(result).toMatchObject({ ok: true, remainingSeconds: 5 });
++  });
++
++  it("rejects confirm when the holder id is blank", async () => {
++    const holds = createNicknameHoldService(new MemoryNicknameHoldStore());
++    await holds.claimNicknameHold("alice", "holder-1", { now: NOW });
++    await expect(holds.confirmNicknameHold("alice", "   ", { now: NOW })).resolves.toEqual({
++      ok: false,
++      reason: "invalid_holder",
++      nickname: "alice",
++    });
++  });
++
++  it("rejects release when the holder id is blank", async () => {
++    const holds = createNicknameHoldService(new MemoryNicknameHoldStore());
++    await holds.claimNicknameHold("alice", "holder-1", { now: NOW });
++    await expect(holds.releaseNicknameHold("alice", "\t", { now: NOW })).resolves.toEqual({
++      ok: false,
++      reason: "invalid_holder",
++      nickname: "alice",
++    });
++  });
++
++  it("returns an empty list when nothing is held", async () => {
++    const store = new MemoryNicknameHoldStore();
++    await expect(listNicknameHolds({ now: NOW }, store)).resolves.toEqual([]);
++  });
++
++  it("returns no holds when the holder filter is blank", async () => {
++    const holds = createNicknameHoldService(new MemoryNicknameHoldStore());
++    await holds.claimNicknameHold("alice", "holder-1", { now: NOW, ttlSeconds: 20 });
++    const listed = await holds.listNicknameHolds({ now: NOW, holderId: "   " });
++    expect(listed).toEqual([]);
++  });
++
++  it("treats a confirmed hold as live until the eighteen hundred second lease ends", async () => {
++    const holds = createNicknameHoldService(new MemoryNicknameHoldStore());
++    await holds.claimNicknameHold("alice", "holder-1", { now: NOW, ttlSeconds: 10 });
++    await holds.confirmNicknameHold("alice", "holder-1", { now: NOW });
++    await expect(holds.getNicknameHold("alice", { now: NOW + 60_000 })).resolves.toMatchObject({
++      status: "confirmed",
++      holderId: "holder-1",
++    });
++  });
++});
+diff --git a/packages/backend/src/gold_tests/p2p_constants_compat.test.ts b/packages/backend/src/gold_tests/p2p_constants_compat.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/p2p_constants_compat.test.ts
+@@ -0,0 +1,32 @@
++import { describe, expect, it } from "vitest";
++import { CHAT_CHANNEL_ROLES, CHAT_REACTIONS, CHAT_USER_TYPES } from "#ours/backend/constants/index.ts";
++
++describe("Existing chat constants", () => {
++  it("keeps HEART mapped to HEART", () => expect(CHAT_REACTIONS.HEART).toBe("HEART"));
++  it("keeps HANDS_UP mapped to HANDS_UP", () => expect(CHAT_REACTIONS.HANDS_UP).toBe("HANDS_UP"));
++  it("keeps FIRE mapped to FIRE", () => expect(CHAT_REACTIONS.FIRE).toBe("FIRE"));
++  it("keeps MUSIC mapped to MUSIC", () => expect(CHAT_REACTIONS.MUSIC).toBe("MUSIC"));
++  it("keeps SURPRISED mapped to SURPRISED", () => expect(CHAT_REACTIONS.SURPRISED).toBe("SURPRISED"));
++  it("keeps exactly five supported reaction keys", () => {
++    expect(Object.keys(CHAT_REACTIONS).sort()).toEqual(["FIRE", "HANDS_UP", "HEART", "MUSIC", "SURPRISED"]);
++  });
++  it("keeps reaction values unique", () => expect(new Set(Object.values(CHAT_REACTIONS)).size).toBe(5));
++  it("keeps TEMPORARY mapped to temporary", () => expect(CHAT_USER_TYPES.TEMPORARY).toBe("temporary"));
++  it("keeps REGULAR mapped to regular", () => expect(CHAT_USER_TYPES.REGULAR).toBe("regular"));
++  it("keeps ARTIST mapped to artist", () => expect(CHAT_USER_TYPES.ARTIST).toBe("artist"));
++  it("keeps ADMIN mapped to admin", () => expect(CHAT_USER_TYPES.ADMIN).toBe("admin"));
++  it("keeps MODERATOR mapped to moderator", () => expect(CHAT_USER_TYPES.MODERATOR).toBe("moderator"));
++  it("keeps ANONYMOUS mapped to anonymous", () => expect(CHAT_USER_TYPES.ANONYMOUS).toBe("anonymous"));
++  it("keeps exactly six user types", () => expect(Object.keys(CHAT_USER_TYPES)).toHaveLength(6));
++  it("keeps user type values unique", () => expect(new Set(Object.values(CHAT_USER_TYPES)).size).toBe(6));
++  it("keeps every user type value lowercase", () => {
++    expect(Object.values(CHAT_USER_TYPES).every((value) => value === value.toLowerCase())).toBe(true);
++  });
++  it("keeps OWNER mapped to owner", () => expect(CHAT_CHANNEL_ROLES.OWNER).toBe("owner"));
++  it("keeps VIEWER mapped to viewer", () => expect(CHAT_CHANNEL_ROLES.VIEWER).toBe("viewer"));
++  it("keeps exactly two channel roles", () => expect(Object.keys(CHAT_CHANNEL_ROLES)).toHaveLength(2));
++  it("keeps channel role values unique", () => expect(new Set(Object.values(CHAT_CHANNEL_ROLES)).size).toBe(2));
++  it("keeps channel role keys uppercase", () => {
++    expect(Object.keys(CHAT_CHANNEL_ROLES).every((key) => key === key.toUpperCase())).toBe(true);
++  });
++});
+diff --git a/packages/backend/src/gold_tests/p2p_input_validation_compat.test.ts b/packages/backend/src/gold_tests/p2p_input_validation_compat.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/p2p_input_validation_compat.test.ts
+@@ -0,0 +1,87 @@
++import { describe, expect, it } from "vitest";
++import { invalidNicknameMessage, isValidNickname } from "#ours/shared/inputValidation.ts";
++
++describe("isValidNickname", () => {
++  it("accepts a three character latin nickname", () => {
++    expect(isValidNickname("abc")).toBe(true);
++  });
++
++  it("accepts exactly twenty four characters", () => {
++    expect(isValidNickname("a".repeat(24))).toBe(true);
++  });
++
++  it("rejects two character nicknames", () => {
++    expect(isValidNickname("ab")).toBe(false);
++  });
++
++  it("rejects twenty five character nicknames", () => {
++    expect(isValidNickname("a".repeat(25))).toBe(false);
++  });
++
++  it("rejects the empty string", () => {
++    expect(isValidNickname("")).toBe(false);
++  });
++
++  it("accepts digits", () => {
++    expect(isValidNickname("user123")).toBe(true);
++  });
++
++  it("accepts non-latin letters", () => {
++    expect(isValidNickname("日本語")).toBe(true);
++  });
++
++  it("accepts accented letters", () => {
++    expect(isValidNickname("José")).toBe(true);
++  });
++
++  it("normalizes decomposed combining marks before validating", () => {
++    expect(isValidNickname("éric")).toBe(true);
++  });
++
++  it("accepts the period character", () => {
++    expect(isValidNickname("a.b.c")).toBe(true);
++  });
++
++  it("accepts the underscore character", () => {
++    expect(isValidNickname("a_b_c")).toBe(true);
++  });
++
++  it("accepts the hyphen character", () => {
++    expect(isValidNickname("a-b-c")).toBe(true);
++  });
++
++  it("rejects spaces", () => {
++    expect(isValidNickname("a b c")).toBe(false);
++  });
++
++  it("rejects emoji", () => {
++    expect(isValidNickname("abc\u{1f600}")).toBe(false);
++  });
++
++  it("rejects punctuation such as exclamation marks", () => {
++    expect(isValidNickname("abc!")).toBe(false);
++  });
++
++  it("rejects the at sign", () => {
++    expect(isValidNickname("a@bc")).toBe(false);
++  });
++
++  it("rejects forward slashes", () => {
++    expect(isValidNickname("a/bc")).toBe(false);
++  });
++
++  it("rejects leading and trailing whitespace around a valid core", () => {
++    expect(isValidNickname(" abc ")).toBe(false);
++  });
++});
++
++describe("invalidNicknameMessage", () => {
++  it("is a non-empty string", () => {
++    expect(typeof invalidNicknameMessage).toBe("string");
++    expect(invalidNicknameMessage.length).toBeGreaterThan(0);
++  });
++
++  it("mentions the allowed length range", () => {
++    expect(invalidNicknameMessage).toContain("3-24");
++  });
++});
+diff --git a/packages/backend/src/gold_tests/p2p_env_utils_compat.test.ts b/packages/backend/src/gold_tests/p2p_env_utils_compat.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/p2p_env_utils_compat.test.ts
+@@ -0,0 +1,56 @@
++import { beforeEach, describe, expect, it } from "vitest";
++import { checkEnvVar } from "#ours/backend/utils/env_utils.ts";
++
++const KEY = "OURS_TEST_ENV_UTILS_KEY";
++
++describe("checkEnvVar", () => {
++  beforeEach(() => {
++    delete process.env[KEY];
++  });
++
++  it("returns the raw value when the variable is set", () => {
++    process.env[KEY] = "hello";
++    expect(checkEnvVar(KEY)).toBe("hello");
++  });
++
++  it("returns values that contain spaces unchanged", () => {
++    process.env[KEY] = "  spaced value  ";
++    expect(checkEnvVar(KEY)).toBe("  spaced value  ");
++  });
++
++  it("returns numeric-looking values as strings", () => {
++    process.env[KEY] = "4000";
++    expect(checkEnvVar(KEY)).toBe("4000");
++  });
++
++  it("returns the default when the variable is missing", () => {
++    expect(checkEnvVar(KEY, "fallback")).toBe("fallback");
++  });
++
++  it("returns the default when the variable is an empty string", () => {
++    process.env[KEY] = "";
++    expect(checkEnvVar(KEY, "fallback")).toBe("fallback");
++  });
++
++  it("returns an empty-string default rather than throwing", () => {
++    expect(checkEnvVar(KEY, "")).toBe("");
++  });
++
++  it("prefers the real value over the default when both exist", () => {
++    process.env[KEY] = "real";
++    expect(checkEnvVar(KEY, "fallback")).toBe("real");
++  });
++
++  it("throws when the variable is missing and no default is given", () => {
++    expect(() => checkEnvVar(KEY)).toThrow(`process.env.${KEY} is not set`);
++  });
++
++  it("throws when the variable is an empty string and no default is given", () => {
++    process.env[KEY] = "";
++    expect(() => checkEnvVar(KEY)).toThrow(`process.env.${KEY} is not set`);
++  });
++
++  it("throws an Error instance", () => {
++    expect(() => checkEnvVar(KEY)).toThrow(Error);
++  });
++});
+diff --git a/packages/backend/src/gold_tests/p2p_gif_compat.test.ts b/packages/backend/src/gold_tests/p2p_gif_compat.test.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/gold_tests/p2p_gif_compat.test.ts
+@@ -0,0 +1,30 @@
++import { describe, expect, it } from "vitest";
++import { resolveGifByUrl } from "#ours/backend/services/gif_service.ts";
++
++describe("resolveGifByUrl", () => {
++  it("throws for an unsupported provider host", async () => {
++    await expect(resolveGifByUrl("https://example.com/cat.gif")).rejects.toThrow("Unsupported GIF provider");
++  });
++
++  it("throws for a malformed url", async () => {
++    await expect(resolveGifByUrl("not-a-url")).rejects.toThrow();
++  });
++
++  it("throws when a Giphy page url has no extractable id", async () => {
++    await expect(resolveGifByUrl("https://giphy.com/")).rejects.toThrow("Unable to extract Giphy id");
++  });
++
++  it("resolves a direct Giphy .gif url without a network call", async () => {
++    await expect(resolveGifByUrl("https://media.giphy.com/media/abc123/giphy.gif")).resolves.toMatchObject({
++      provider: "giphy",
++      url: "https://media.giphy.com/media/abc123/giphy.gif",
++    });
++  });
++
++  it("resolves a direct Tenor .gif url without a network call", async () => {
++    await expect(resolveGifByUrl("https://media.tenor.com/xyz987.gif")).resolves.toMatchObject({
++      provider: "tenor",
++      url: "https://media.tenor.com/xyz987.gif",
++    });
++  });
++});

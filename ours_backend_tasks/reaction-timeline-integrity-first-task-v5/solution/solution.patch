@@ -1,0 +1,656 @@
+diff --git a/packages/backend/src/session/operations/index.ts b/packages/backend/src/session/operations/index.ts
+index a64b230..441a4b6 100644
+--- a/packages/backend/src/session/operations/index.ts
++++ b/packages/backend/src/session/operations/index.ts
+@@ -18,8 +18,16 @@ export const {
+   removeMessage,
+ } = messageOps;
+ 
+-export const { addReaction, removeReaction, getMessageReactions, getUserReactionsForMessage, getRoomReactions } =
+-  reactionOps;
++export const {
++  addReaction,
++  removeReaction,
++  getMessageReactions,
++  getUserReactionsForMessage,
++  getRoomReactions,
++  getRoomReactionTimeline,
++  auditRoomReactionIntegrity,
++  repairRoomReactionIntegrity,
++} = reactionOps;
+ 
+ export const {
+   setUser,
+@@ -39,3 +47,11 @@ export const addUser = userOps.setUser;
+ 
+ // Export types
+ export type { MessageReactions } from "#ours/backend/session/operations/reactions.ts";
++export type {
++  ReactionIntegrityIssue,
++  ReactionIntegrityIssueCode,
++  RoomReactionAudit,
++  RoomReactionRepairResult,
++  RoomReactionTimelineEntry,
++  RoomReactionTimelineOptions,
++} from "#ours/backend/session/reaction_integrity_types.ts";
+diff --git a/packages/backend/src/session/operations/reactions.ts b/packages/backend/src/session/operations/reactions.ts
+index 5bd2ac9..3900e68 100644
+--- a/packages/backend/src/session/operations/reactions.ts
++++ b/packages/backend/src/session/operations/reactions.ts
+@@ -1,6 +1,9 @@
+ import { createHash } from "node:crypto";
+ import type { ReactionEventEntity } from "#ours/backend/session/models/index.ts";
+ import { getNodeClient } from "#ours/backend/session/redis.ts";
++import { auditRoomReactionIntegrity as auditIntegrity, repairRoomReactionIntegrity as repairIntegrity, refreshReactionTimelineScore } from "#ours/backend/session/reaction_integrity.ts";
++import { getRoomReactionTimeline as readReactionTimeline } from "#ours/backend/session/reaction_timeline.ts";
++import type { RoomReactionTimelineOptions } from "#ours/backend/session/reaction_integrity_types.ts";
+ 
+ export interface MessageReactions {
+   messageId: string;
+@@ -38,12 +41,14 @@ export async function addReaction(
+ 
+   if (Object.keys(existing).length > 0) {
+     // If it already exists, just update the timestamp
++    const storedRoomId = existing.roomId || roomId;
+     await client.hSet(existingKey, "timestamp", timestamp.toISOString());
++    await refreshReactionTimelineScore(client, storedRoomId, reactionId, timestamp);
+     return {
+       messageId,
+       userId,
+       reaction,
+-      roomId,
++      roomId: storedRoomId,
+       timestamp,
+     };
+   }
+@@ -298,3 +303,18 @@ export async function searchRoomReactions(
+ 
+   return reactions;
+ }
++
++export const getRoomReactionTimeline = async (roomId: string, options?: RoomReactionTimelineOptions) => {
++  const client = await getNodeClient();
++  return readReactionTimeline(client, roomId, options);
++};
++
++export const auditRoomReactionIntegrity = async (roomId: string) => {
++  const client = await getNodeClient();
++  return auditIntegrity(client, roomId);
++};
++
++export const repairRoomReactionIntegrity = async (roomId: string) => {
++  const client = await getNodeClient();
++  return repairIntegrity(client, roomId);
++};
+diff --git a/packages/backend/src/session/reaction_audit_report.ts b/packages/backend/src/session/reaction_audit_report.ts
+new file mode 100644
+index 0000000..7e50159
+--- /dev/null
++++ b/packages/backend/src/session/reaction_audit_report.ts
+@@ -0,0 +1,46 @@
++import {
++  countReactionIssues,
++  REACTION_INTEGRITY_CODES,
++  totalReactionIssueCount,
++} from "#ours/backend/session/reaction_issue_counts.ts";
++import type {
++  ReactionIntegrityIssue,
++  RoomReactionAudit,
++} from "#ours/backend/session/reaction_integrity_types.ts";
++
++const codePosition = new Map(
++  REACTION_INTEGRITY_CODES.map((code, index) => [code, index] as const),
++);
++
++const compareReactionIssues = (left: ReactionIntegrityIssue, right: ReactionIntegrityIssue) => {
++  const idDifference = left.reactionId.localeCompare(right.reactionId);
++  if (idDifference !== 0) return idDifference;
++  return (codePosition.get(left.code) ?? 0) - (codePosition.get(right.code) ?? 0);
++};
++
++const issueKey = (issue: ReactionIntegrityIssue) => `${issue.reactionId}\u0000${issue.code}`;
++
++export const normalizeReactionIssues = (issues: ReactionIntegrityIssue[]) => {
++  const unique = new Map<string, ReactionIntegrityIssue>();
++  for (const issue of issues) unique.set(issueKey(issue), issue);
++  return Array.from(unique.values()).sort(compareReactionIssues);
++};
++
++export const buildRoomReactionAudit = (
++  roomId: string,
++  reactionCount: number,
++  issues: ReactionIntegrityIssue[],
++): RoomReactionAudit => {
++  const normalizedIssues = normalizeReactionIssues(issues);
++  const issueCounts = countReactionIssues(normalizedIssues);
++  const issueCount = totalReactionIssueCount(issueCounts);
++
++  return {
++    roomId,
++    reactionCount,
++    issueCount,
++    healthy: issueCount === 0,
++    issueCounts,
++    issues: normalizedIssues,
++  };
++};
+diff --git a/packages/backend/src/session/reaction_index_observation.ts b/packages/backend/src/session/reaction_index_observation.ts
+new file mode 100644
+index 0000000..94b9bb2
+--- /dev/null
++++ b/packages/backend/src/session/reaction_index_observation.ts
+@@ -0,0 +1,100 @@
++import type { RedisClientType } from "redis";
++import { classifyRecordIssue, toReactionEntity } from "#ours/backend/session/reaction_record.ts";
++import { reactionKeys } from "#ours/backend/session/reaction_snapshot.ts";
++import type {
++  ReactionIntegrityIssue,
++  ReactionIntegrityIssueCode,
++  ReactionRecordSnapshot,
++} from "#ours/backend/session/reaction_integrity_types.ts";
++
++interface ReactionIndexObservation {
++  reactionId: string;
++  recordIssue: ReactionIntegrityIssueCode | null;
++  expectedTimestamp: number | null;
++  roomIndexed: boolean;
++  timelineIndexed: boolean;
++  timelineScore: number | null;
++  messageIndexed: boolean;
++  userIndexed: boolean;
++}
++
++const emptyObservation = (
++  snapshot: ReactionRecordSnapshot,
++  recordIssue: ReactionIntegrityIssueCode,
++): ReactionIndexObservation => ({
++  reactionId: snapshot.reactionId,
++  recordIssue,
++  expectedTimestamp: null,
++  roomIndexed: snapshot.roomIndexed,
++  timelineIndexed: snapshot.timelineScore !== null,
++  timelineScore: snapshot.timelineScore,
++  messageIndexed: false,
++  userIndexed: false,
++});
++
++export const observeReactionIndexes = async (
++  client: RedisClientType,
++  roomId: string,
++  snapshot: ReactionRecordSnapshot,
++): Promise<ReactionIndexObservation> => {
++  const recordIssue = classifyRecordIssue(snapshot, roomId);
++  if (recordIssue) return emptyObservation(snapshot, recordIssue);
++
++  const entity = toReactionEntity(snapshot.data);
++  if (!entity) return emptyObservation(snapshot, "invalid_timestamp");
++
++  const [messageIndexed, userIndexed] = await Promise.all([
++    client.sIsMember(reactionKeys.messageReactions(entity.messageId), snapshot.reactionId),
++    client.sIsMember(
++      reactionKeys.userMessageReactions(entity.userId, entity.messageId),
++      snapshot.reactionId,
++    ),
++  ]);
++
++  return {
++    reactionId: snapshot.reactionId,
++    recordIssue: null,
++    expectedTimestamp: entity.timestamp.getTime(),
++    roomIndexed: snapshot.roomIndexed,
++    timelineIndexed: snapshot.timelineScore !== null,
++    timelineScore: snapshot.timelineScore,
++    messageIndexed,
++    userIndexed,
++  };
++};
++
++const addIssue = (
++  issues: ReactionIntegrityIssue[],
++  reactionId: string,
++  code: ReactionIntegrityIssueCode,
++  when: boolean,
++) => {
++  if (when) issues.push({ reactionId, code });
++};
++
++export const issuesForReactionObservation = (
++  observation: ReactionIndexObservation,
++): ReactionIntegrityIssue[] => {
++  if (observation.recordIssue) {
++    return [{ reactionId: observation.reactionId, code: observation.recordIssue }];
++  }
++
++  const issues: ReactionIntegrityIssue[] = [];
++  addIssue(issues, observation.reactionId, "missing_room_index", !observation.roomIndexed);
++  addIssue(issues, observation.reactionId, "missing_timeline_index", !observation.timelineIndexed);
++  addIssue(
++    issues,
++    observation.reactionId,
++    "stale_timeline_score",
++    observation.timelineIndexed && observation.timelineScore !== observation.expectedTimestamp,
++  );
++  addIssue(issues, observation.reactionId, "missing_message_index", !observation.messageIndexed);
++  addIssue(issues, observation.reactionId, "missing_user_index", !observation.userIndexed);
++  return issues;
++};
++
++export const inspectReactionIndexes = async (
++  client: RedisClientType,
++  roomId: string,
++  snapshot: ReactionRecordSnapshot,
++) => issuesForReactionObservation(await observeReactionIndexes(client, roomId, snapshot));
+diff --git a/packages/backend/src/session/reaction_integrity.ts b/packages/backend/src/session/reaction_integrity.ts
+new file mode 100644
+index 0000000..8a26e29
+--- /dev/null
++++ b/packages/backend/src/session/reaction_integrity.ts
+@@ -0,0 +1,83 @@
++import type { RedisClientType } from "redis";
++import { classifyRecordIssue, parseReactionTimestamp } from "#ours/backend/session/reaction_record.ts";
++import { collectRoomReactionSnapshots, reactionKeys } from "#ours/backend/session/reaction_snapshot.ts";
++import { buildReactionRepairPlan, countRepairActions } from "#ours/backend/session/reaction_repair_plan.ts";
++import { inspectReactionIndexes } from "#ours/backend/session/reaction_index_observation.ts";
++import { buildRoomReactionAudit } from "#ours/backend/session/reaction_audit_report.ts";
++import type {
++  ReactionIntegrityIssue,
++  ReactionRecordSnapshot,
++  RoomReactionAudit,
++  RoomReactionRepairResult,
++} from "#ours/backend/session/reaction_integrity_types.ts";
++
++export const auditRoomReactionIntegrity = async (client: RedisClientType, roomId: string): Promise<RoomReactionAudit> => {
++  const snapshots = await collectRoomReactionSnapshots(client, roomId);
++  const issues: ReactionIntegrityIssue[] = [];
++  const validIds = new Set<string>();
++
++  for (const snapshot of snapshots) {
++    const snapshotIssues = await inspectReactionIndexes(client, roomId, snapshot);
++    issues.push(...snapshotIssues);
++    if (!classifyRecordIssue(snapshot, roomId)) validIds.add(snapshot.reactionId);
++  }
++
++  return buildRoomReactionAudit(roomId, validIds.size, issues);
++};
++
++const applyRepairPlan = (
++  pipeline: ReturnType<RedisClientType["multi"]>,
++  roomId: string,
++  plan: ReturnType<typeof buildReactionRepairPlan>,
++) => {
++  for (const entry of plan) {
++    if (entry.action === "remove") {
++      pipeline.sRem(reactionKeys.roomReactions(roomId), entry.reactionId);
++      pipeline.zRem(reactionKeys.roomReactionsByTime(roomId), entry.reactionId);
++      continue;
++    }
++
++    pipeline.sAdd(reactionKeys.roomReactions(roomId), entry.reactionId);
++    pipeline.sAdd(reactionKeys.messageReactions(entry.messageId), entry.reactionId);
++    pipeline.sAdd(reactionKeys.userMessageReactions(entry.userId, entry.messageId), entry.reactionId);
++    pipeline.zAdd(reactionKeys.roomReactionsByTime(roomId), {
++      score: entry.timestamp,
++      value: entry.reactionId,
++    });
++  }
++};
++
++export const repairRoomReactionIntegrity = async (
++  client: RedisClientType,
++  roomId: string,
++): Promise<RoomReactionRepairResult> => {
++  const before = await auditRoomReactionIntegrity(client, roomId);
++  const snapshots = await collectRoomReactionSnapshots(client, roomId);
++  const plan = buildReactionRepairPlan(roomId, snapshots, before.issues);
++  const pipeline = client.multi();
++  applyRepairPlan(pipeline, roomId, plan);
++  if (plan.length > 0) await pipeline.exec();
++  const after = await auditRoomReactionIntegrity(client, roomId);
++  const counts = countRepairActions(plan);
++  return {
++    roomId,
++    beforeIssueCount: before.issueCount,
++    repaired: counts.repaired,
++    removed: counts.removed,
++    afterIssueCount: after.issueCount,
++  };
++};
++
++export const refreshReactionTimelineScore = async (
++  client: RedisClientType,
++  roomId: string,
++  reactionId: string,
++  timestamp: Date,
++) => {
++  await client.zAdd(reactionKeys.roomReactionsByTime(roomId), {
++    score: timestamp.getTime(),
++    value: reactionId,
++  });
++};
++
++export const timestampForSnapshot = (snapshot: ReactionRecordSnapshot) => parseReactionTimestamp(snapshot.data.timestamp);
+diff --git a/packages/backend/src/session/reaction_integrity_types.ts b/packages/backend/src/session/reaction_integrity_types.ts
+new file mode 100644
+index 0000000..e57fd9d
+--- /dev/null
++++ b/packages/backend/src/session/reaction_integrity_types.ts
+@@ -0,0 +1,50 @@
++import type { ReactionEventEntity } from "#ours/backend/session/models/index.ts";
++
++export type ReactionIntegrityIssueCode =
++  | "invalid_timestamp"
++  | "missing_message_index"
++  | "missing_record"
++  | "missing_room_index"
++  | "missing_timeline_index"
++  | "missing_user_index"
++  | "stale_timeline_score"
++  | "wrong_room";
++
++export interface ReactionIntegrityIssue {
++  reactionId: string;
++  code: ReactionIntegrityIssueCode;
++}
++
++export interface RoomReactionAudit {
++  roomId: string;
++  reactionCount: number;
++  issueCount: number;
++  healthy: boolean;
++  issueCounts: Record<ReactionIntegrityIssueCode, number>;
++  issues: ReactionIntegrityIssue[];
++}
++
++export interface RoomReactionRepairResult {
++  roomId: string;
++  beforeIssueCount: number;
++  repaired: number;
++  removed: number;
++  afterIssueCount: number;
++}
++
++export interface RoomReactionTimelineOptions {
++  since?: number;
++  until?: number;
++  limit?: number;
++}
++
++export interface RoomReactionTimelineEntry extends ReactionEventEntity {
++  reactionId: string;
++}
++
++export interface ReactionRecordSnapshot {
++  reactionId: string;
++  data: Record<string, string>;
++  roomIndexed: boolean;
++  timelineScore: number | null;
++}
+diff --git a/packages/backend/src/session/reaction_issue_counts.ts b/packages/backend/src/session/reaction_issue_counts.ts
+new file mode 100644
+index 0000000..88e8e9d
+--- /dev/null
++++ b/packages/backend/src/session/reaction_issue_counts.ts
+@@ -0,0 +1,40 @@
++import type {
++  ReactionIntegrityIssue,
++  ReactionIntegrityIssueCode,
++} from "#ours/backend/session/reaction_integrity_types.ts";
++
++export const REACTION_INTEGRITY_CODES = [
++  "invalid_timestamp",
++  "missing_message_index",
++  "missing_record",
++  "missing_room_index",
++  "missing_timeline_index",
++  "missing_user_index",
++  "stale_timeline_score",
++  "wrong_room",
++] as const satisfies readonly ReactionIntegrityIssueCode[];
++
++export type ReactionIssueCounts = Record<ReactionIntegrityIssueCode, number>;
++
++export const emptyReactionIssueCounts = (): ReactionIssueCounts => ({
++  invalid_timestamp: 0,
++  missing_message_index: 0,
++  missing_record: 0,
++  missing_room_index: 0,
++  missing_timeline_index: 0,
++  missing_user_index: 0,
++  stale_timeline_score: 0,
++  wrong_room: 0,
++});
++
++export const countReactionIssues = (issues: ReactionIntegrityIssue[]) => {
++  const counts = emptyReactionIssueCounts();
++  for (const issue of issues) counts[issue.code] += 1;
++  return counts;
++};
++
++export const issueCodesForCount = (counts: ReactionIssueCounts) =>
++  REACTION_INTEGRITY_CODES.filter((code) => counts[code] > 0);
++
++export const totalReactionIssueCount = (counts: ReactionIssueCounts) =>
++  REACTION_INTEGRITY_CODES.reduce((total, code) => total + counts[code], 0);
+diff --git a/packages/backend/src/session/reaction_record.ts b/packages/backend/src/session/reaction_record.ts
+new file mode 100644
+index 0000000..0b008b5
+--- /dev/null
++++ b/packages/backend/src/session/reaction_record.ts
+@@ -0,0 +1,68 @@
++import type { ReactionEventEntity } from "#ours/backend/session/models/index.ts";
++import type {
++  ReactionIntegrityIssueCode,
++  ReactionRecordSnapshot,
++  RoomReactionTimelineEntry,
++} from "#ours/backend/session/reaction_integrity_types.ts";
++
++const REQUIRED_TEXT_FIELDS = ["messageId", "userId", "reaction", "roomId"] as const;
++
++export const parseReactionTimestamp = (value: string | undefined) => {
++  if (!value) return null;
++  const timestamp = new Date(value);
++  return Number.isFinite(timestamp.getTime()) ? timestamp : null;
++};
++
++export const isReactionRecordPresent = (data: Record<string, string>) => Object.keys(data).length > 0;
++
++export const hasRequiredReactionFields = (data: Record<string, string>) =>
++  REQUIRED_TEXT_FIELDS.every((field) => typeof data[field] === "string" && data[field].length > 0);
++
++export const toReactionEntity = (data: Record<string, string>): ReactionEventEntity | null => {
++  const timestamp = parseReactionTimestamp(data.timestamp);
++  if (!timestamp || !hasRequiredReactionFields(data)) return null;
++  return {
++    messageId: data.messageId,
++    userId: data.userId,
++    reaction: data.reaction,
++    roomId: data.roomId,
++    timestamp,
++  };
++};
++
++export const toTimelineEntry = (snapshot: ReactionRecordSnapshot): RoomReactionTimelineEntry | null => {
++  const entity = toReactionEntity(snapshot.data);
++  if (!entity) return null;
++  return { ...entity, reactionId: snapshot.reactionId };
++};
++
++export const classifyRecordIssue = (snapshot: ReactionRecordSnapshot, roomId: string) => {
++  if (!isReactionRecordPresent(snapshot.data)) return "missing_record" satisfies ReactionIntegrityIssueCode;
++  if (!parseReactionTimestamp(snapshot.data.timestamp)) return "invalid_timestamp" satisfies ReactionIntegrityIssueCode;
++  if (!hasRequiredReactionFields(snapshot.data)) return "invalid_timestamp" satisfies ReactionIntegrityIssueCode;
++  if (snapshot.data.roomId !== roomId) return "wrong_room" satisfies ReactionIntegrityIssueCode;
++  return null;
++};
++
++export const compareTimelineEntries = (left: RoomReactionTimelineEntry, right: RoomReactionTimelineEntry) => {
++  const timeDifference = right.timestamp.getTime() - left.timestamp.getTime();
++  if (timeDifference !== 0) return timeDifference;
++  return left.reactionId.localeCompare(right.reactionId);
++};
++
++export const normalizeTimelineLimit = (value: number | undefined) => {
++  if (value === undefined || !Number.isFinite(value)) return 100;
++  return Math.min(100, Math.max(1, Math.trunc(value)));
++};
++
++export const normalizeTimelineBoundary = (value: number | undefined) =>
++  value !== undefined && Number.isFinite(value) ? value : undefined;
++
++export const normalizeTimelineOptions = (options?: { since?: number; until?: number; limit?: number }) => ({
++  since: normalizeTimelineBoundary(options?.since),
++  until: normalizeTimelineBoundary(options?.until),
++  limit: normalizeTimelineLimit(options?.limit),
++});
++
++export const timelineRangeIsValid = (since: number | undefined, until: number | undefined) =>
++  since === undefined || until === undefined || since <= until;
+diff --git a/packages/backend/src/session/reaction_repair_plan.ts b/packages/backend/src/session/reaction_repair_plan.ts
+new file mode 100644
+index 0000000..9948531
+--- /dev/null
++++ b/packages/backend/src/session/reaction_repair_plan.ts
+@@ -0,0 +1,61 @@
++import { classifyRecordIssue, toReactionEntity } from "#ours/backend/session/reaction_record.ts";
++import type {
++  ReactionIntegrityIssue,
++  ReactionRecordSnapshot,
++} from "#ours/backend/session/reaction_integrity_types.ts";
++
++export interface ReactionRepairPlanRemove {
++  action: "remove";
++  reactionId: string;
++}
++
++export interface ReactionRepairPlanRestore {
++  action: "restore";
++  reactionId: string;
++  messageId: string;
++  userId: string;
++  timestamp: number;
++}
++
++export type ReactionRepairPlanEntry = ReactionRepairPlanRemove | ReactionRepairPlanRestore;
++
++const affectedReactionIds = (issues: ReactionIntegrityIssue[]) => new Set(issues.map((issue) => issue.reactionId));
++
++const toPlanEntry = (roomId: string, snapshot: ReactionRecordSnapshot): ReactionRepairPlanEntry | null => {
++  if (classifyRecordIssue(snapshot, roomId)) {
++    return { action: "remove", reactionId: snapshot.reactionId };
++  }
++
++  const entity = toReactionEntity(snapshot.data);
++  if (!entity) return { action: "remove", reactionId: snapshot.reactionId };
++
++  return {
++    action: "restore",
++    reactionId: snapshot.reactionId,
++    messageId: entity.messageId,
++    userId: entity.userId,
++    timestamp: entity.timestamp.getTime(),
++  };
++};
++
++export const buildReactionRepairPlan = (
++  roomId: string,
++  snapshots: ReactionRecordSnapshot[],
++  issues: ReactionIntegrityIssue[],
++) => {
++  const affected = affectedReactionIds(issues);
++  const plan: ReactionRepairPlanEntry[] = [];
++
++  for (const snapshot of snapshots) {
++    if (!affected.has(snapshot.reactionId)) continue;
++    const entry = toPlanEntry(roomId, snapshot);
++    if (entry) plan.push(entry);
++  }
++
++  return plan.sort((left, right) => left.reactionId.localeCompare(right.reactionId));
++};
++
++export const countRepairActions = (plan: ReactionRepairPlanEntry[]) => ({
++  repaired: plan.filter((entry) => entry.action === "restore").length,
++  removed: plan.filter((entry) => entry.action === "remove").length,
++});
+diff --git a/packages/backend/src/session/reaction_snapshot.ts b/packages/backend/src/session/reaction_snapshot.ts
+new file mode 100644
+index 0000000..187f9b8
+--- /dev/null
++++ b/packages/backend/src/session/reaction_snapshot.ts
+@@ -0,0 +1,33 @@
++import type { RedisClientType } from "redis";
++import type { ReactionRecordSnapshot } from "#ours/backend/session/reaction_integrity_types.ts";
++
++export const reactionKeys = {
++  reaction: (id: string) => `reaction:${id}`,
++  messageReactions: (messageId: string) => `message_reactions:${messageId}`,
++  userMessageReactions: (userId: string, messageId: string) => `user_message_reactions:${userId}:${messageId}`,
++  roomReactions: (roomId: string) => `room_reactions:${roomId}`,
++  roomReactionsByTime: (roomId: string) => `room_reactions_by_time:${roomId}`,
++} as const;
++
++const uniqueSorted = (values: string[]) => Array.from(new Set(values)).sort((a, b) => a.localeCompare(b));
++
++export const collectRoomReactionSnapshots = async (client: RedisClientType, roomId: string) => {
++  const roomIds = await client.sMembers(reactionKeys.roomReactions(roomId));
++  const timelineIds = await client.zRange(reactionKeys.roomReactionsByTime(roomId), 0, -1);
++  const reactionIds = uniqueSorted([...roomIds, ...timelineIds]);
++  const roomIdSet = new Set(roomIds);
++  const snapshots: ReactionRecordSnapshot[] = [];
++
++  for (const reactionId of reactionIds) {
++    const data = (await client.hGetAll(reactionKeys.reaction(reactionId))) as Record<string, string>;
++    const timelineScore = await client.zScore(reactionKeys.roomReactionsByTime(roomId), reactionId);
++    snapshots.push({
++      reactionId,
++      data,
++      roomIndexed: roomIdSet.has(reactionId),
++      timelineScore,
++    });
++  }
++
++  return snapshots;
++};
+diff --git a/packages/backend/src/session/reaction_timeline.ts b/packages/backend/src/session/reaction_timeline.ts
+new file mode 100644
+index 0000000..384d4d8
+--- /dev/null
++++ b/packages/backend/src/session/reaction_timeline.ts
+@@ -0,0 +1,37 @@
++import type { RedisClientType } from "redis";
++import {
++  compareTimelineEntries,
++  normalizeTimelineOptions,
++  timelineRangeIsValid,
++  toTimelineEntry,
++} from "#ours/backend/session/reaction_record.ts";
++import { collectRoomReactionSnapshots } from "#ours/backend/session/reaction_snapshot.ts";
++import type {
++  RoomReactionTimelineEntry,
++  RoomReactionTimelineOptions,
++} from "#ours/backend/session/reaction_integrity_types.ts";
++
++const withinBoundary = (entry: RoomReactionTimelineEntry, since: number | undefined, until: number | undefined) => {
++  const value = entry.timestamp.getTime();
++  if (since !== undefined && value < since) return false;
++  if (until !== undefined && value > until) return false;
++  return true;
++};
++
++export const getRoomReactionTimeline = async (
++  client: RedisClientType,
++  roomId: string,
++  options?: RoomReactionTimelineOptions,
++) => {
++  const normalized = normalizeTimelineOptions(options);
++  if (!timelineRangeIsValid(normalized.since, normalized.until)) return [];
++
++  const snapshots = await collectRoomReactionSnapshots(client, roomId);
++  const entries = snapshots
++    .map(toTimelineEntry)
++    .filter((entry): entry is RoomReactionTimelineEntry => entry !== null && entry.roomId === roomId)
++    .filter((entry) => withinBoundary(entry, normalized.since, normalized.until))
++    .sort(compareTimelineEntries);
++
++  return entries.slice(0, normalized.limit);
++};

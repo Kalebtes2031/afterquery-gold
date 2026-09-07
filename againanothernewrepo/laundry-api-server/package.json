@@ -1,0 +1,36 @@
+{
+  "name": "laundry-api-server",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "Redacted Author",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@huggingface/inference": "^4.13.12",
+    "@langchain/community": "^1.1.14",
+    "@langchain/core": "^1.1.21",
+    "@langchain/groq": "^1.1.0",
+    "@langchain/openai": "^1.2.7",
+    "cloudinary": "^2.9.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^5.2.1",
+    "firebase-admin": "^13.6.0",
+    "jsonwebtoken": "^9.0.3",
+    "langchain": "^1.2.20",
+    "multer": "^2.0.2",
+    "nodemailer": "^8.0.5",
+    "pg": "^8.20.0",
+    "streamifier": "^0.1.1"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/multer": "^2.0.0",
+    "@types/node": "^25.2.2"
+  }
+}

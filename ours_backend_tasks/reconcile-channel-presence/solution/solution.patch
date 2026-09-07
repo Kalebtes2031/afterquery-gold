@@ -1,0 +1,594 @@
+diff --git a/packages/backend/src/services/presence.ts b/packages/backend/src/services/presence.ts
+new file mode 100644
+index 0000000..a5eb521
+--- /dev/null
++++ b/packages/backend/src/services/presence.ts
+@@ -0,0 +1,25 @@
++export {
++  PresenceReconciliationService,
++  auditChannelPresence,
++  auditPresenceChannels,
++  createPresenceReconciliationService,
++  repairChannelPresence,
++  repairPresenceChannels,
++} from "#ours/backend/services/presence_reconciliation_service.ts";
++
++export {
++  PRESENCE_ISSUE_CODES,
++  createEmptyPresenceIssueCounts,
++  type ChannelPresenceAudit,
++  type ChannelPresenceRepair,
++  type PresenceAuditSweep,
++  type PresenceIssue,
++  type PresenceIssueCode,
++  type PresenceIssueCounts,
++  type PresenceRepairSweep,
++  type PresenceRepairSweepSummary,
++  type PresenceStore,
++  type PresenceSweepSummary,
++} from "#ours/backend/services/presence_reconciliation_types.ts";
++
++export { RedisPresenceStore, createRedisPresenceStore } from "#ours/backend/services/redis_presence_store.ts";
+diff --git a/packages/backend/src/services/presence_reconciliation_service.ts b/packages/backend/src/services/presence_reconciliation_service.ts
+new file mode 100644
+index 0000000..105fbec
+--- /dev/null
++++ b/packages/backend/src/services/presence_reconciliation_service.ts
+@@ -0,0 +1,238 @@
++import type { UserSession } from "#ours/backend/session/types.ts";
++import { createRedisPresenceStore } from "#ours/backend/services/redis_presence_store.ts";
++import {
++  createEmptyPresenceIssueCounts,
++  type ChannelPresenceAudit,
++  type ChannelPresenceRepair,
++  type PresenceAuditSweep,
++  type PresenceIssue,
++  type PresenceRepairSweep,
++  type PresenceStore,
++} from "#ours/backend/services/presence_reconciliation_types.ts";
++import {
++  addPresenceIssueCounts,
++  repairedNicknames as listRepairedNicknames,
++  sortPresenceIssues,
++  totalPresenceIssues,
++  uniquePresenceValues,
++  countPresenceIssues,
++} from "#ours/backend/services/presence_reconciliation_utils.ts";
++
++const DEFAULT_SESSION_TTL_SECONDS = 1800;
++
++export class PresenceReconciliationService {
++  private readonly store: PresenceStore;
++
++  constructor(store: PresenceStore = createRedisPresenceStore()) {
++    this.store = store;
++  }
++
++  private async loadSessions(nicknames: string[]): Promise<Map<string, UserSession | null>> {
++    const sessions = new Map<string, UserSession | null>();
++    for (const nickname of nicknames) {
++      sessions.set(nickname, await this.store.getUserByNickname(nickname));
++    }
++    return sessions;
++  }
++
++  private async discoverChannelIds(): Promise<string[]> {
++    const trackedChannels = await this.store.listChannelIds();
++    const nicknames = uniquePresenceValues(await this.store.listUserNicknames());
++    const channelIds = new Set(trackedChannels);
++
++    for (const nickname of nicknames) {
++      const user = await this.store.getUserByNickname(nickname);
++      if (user?.channelId) channelIds.add(user.channelId);
++    }
++
++    return uniquePresenceValues(channelIds);
++  }
++
++  async auditChannel(channelId: string): Promise<ChannelPresenceAudit> {
++    const members = uniquePresenceValues(await this.store.getChannelUsers(channelId));
++    const memberSet = new Set(members);
++    const storedNicknames = uniquePresenceValues(await this.store.listUserNicknames());
++    const candidates = uniquePresenceValues([...members, ...storedNicknames]);
++    const sessions = await this.loadSessions(candidates);
++    const issues: PresenceIssue[] = [];
++    let sessionCount = 0;
++    let validCount = 0;
++
++    for (const nickname of candidates) {
++      const user = sessions.get(nickname) ?? null;
++      const isMember = memberSet.has(nickname);
++
++      if (isMember && !user) {
++        issues.push({ nickname, code: "missing_session" });
++        continue;
++      }
++
++      if (isMember && user && user.channelId !== channelId) {
++        issues.push({
++          nickname,
++          code: "channel_mismatch",
++          sessionChannelId: user.channelId,
++        });
++      }
++
++      if (user?.channelId !== channelId) continue;
++
++      sessionCount += 1;
++      if (isMember) validCount += 1;
++      else issues.push({ nickname, code: "missing_membership" });
++
++      const ttl = await this.store.getUserTtl(nickname);
++      if (ttl === -1) issues.push({ nickname, code: "missing_session_ttl" });
++    }
++
++    const sortedIssues = sortPresenceIssues(issues);
++    const issueCounts = countPresenceIssues(sortedIssues);
++
++    return {
++      channelId,
++      memberCount: members.length,
++      sessionCount,
++      validCount,
++      healthy: sortedIssues.length === 0,
++      issueCounts,
++      issues: sortedIssues,
++    };
++  }
++
++  async repairChannel(channelId: string): Promise<ChannelPresenceRepair> {
++    const before = await this.auditChannel(channelId);
++    const removed = new Set<string>();
++    const added = new Set<string>();
++    const ttlFixed = new Set<string>();
++
++    for (const issue of before.issues) {
++      switch (issue.code) {
++        case "missing_session":
++        case "channel_mismatch":
++          if (!removed.has(issue.nickname)) {
++            await this.store.removeUserFromChannel(channelId, issue.nickname);
++            removed.add(issue.nickname);
++          }
++          break;
++        case "missing_membership":
++          if (!added.has(issue.nickname)) {
++            await this.store.addUserToChannel(channelId, issue.nickname);
++            added.add(issue.nickname);
++          }
++          break;
++        case "missing_session_ttl":
++          if (!ttlFixed.has(issue.nickname)) {
++            const fixed = await this.store.ensureUserTtl(issue.nickname, DEFAULT_SESSION_TTL_SECONDS);
++            if (fixed) ttlFixed.add(issue.nickname);
++          }
++          break;
++      }
++    }
++
++    const after = await this.auditChannel(channelId);
++    const repairedNicknames = new Set([...removed, ...added, ...ttlFixed]);
++
++    return {
++      channelId,
++      removed: uniquePresenceValues(removed),
++      added: uniquePresenceValues(added),
++      ttlFixed: uniquePresenceValues(ttlFixed),
++      repairedUsers: repairedNicknames.size,
++      before,
++      after,
++    };
++  }
++
++  async auditChannels(channelIds: string[]): Promise<PresenceAuditSweep> {
++    const channels: ChannelPresenceAudit[] = [];
++    const issueCounts = createEmptyPresenceIssueCounts();
++
++    for (const channelId of uniquePresenceValues(channelIds)) {
++      const audit = await this.auditChannel(channelId);
++      channels.push(audit);
++      addPresenceIssueCounts(issueCounts, audit.issueCounts);
++    }
++
++    const healthyChannels = channels.filter((channel) => channel.healthy).length;
++
++    return {
++      channels,
++      summary: {
++        channelCount: channels.length,
++        healthyChannels,
++        unhealthyChannels: channels.length - healthyChannels,
++        issueCount: totalPresenceIssues(issueCounts),
++        issueCounts,
++      },
++    };
++  }
++
++  async auditAllChannels(): Promise<PresenceAuditSweep> {
++    return await this.auditChannels(await this.discoverChannelIds());
++  }
++
++  async repairChannels(channelIds: string[]): Promise<PresenceRepairSweep> {
++    const repairs: ChannelPresenceRepair[] = [];
++    const repairedNicknames = new Set<string>();
++    const remainingIssueCounts = createEmptyPresenceIssueCounts();
++    let repairedChannels = 0;
++
++    for (const channelId of uniquePresenceValues(channelIds)) {
++      const repair = await this.repairChannel(channelId);
++      repairs.push(repair);
++
++      if (repair.repairedUsers > 0) repairedChannels += 1;
++      for (const nickname of listRepairedNicknames(repair)) {
++        repairedNicknames.add(nickname);
++      }
++      addPresenceIssueCounts(remainingIssueCounts, repair.after.issueCounts);
++    }
++
++    return {
++      repairs,
++      summary: {
++        channelCount: repairs.length,
++        repairedChannels,
++        repairedUsers: repairedNicknames.size,
++        remainingIssues: totalPresenceIssues(remainingIssueCounts),
++        issueCounts: remainingIssueCounts,
++      },
++    };
++  }
++
++  async repairAllChannels(): Promise<PresenceRepairSweep> {
++    return await this.repairChannels(await this.discoverChannelIds());
++  }
++}
++
++export function createPresenceReconciliationService(store?: PresenceStore): PresenceReconciliationService {
++  return new PresenceReconciliationService(store);
++}
++
++export async function auditChannelPresence(
++  channelId: string,
++  store?: PresenceStore,
++): Promise<ChannelPresenceAudit> {
++  return await createPresenceReconciliationService(store).auditChannel(channelId);
++}
++
++export async function repairChannelPresence(
++  channelId: string,
++  store?: PresenceStore,
++): Promise<ChannelPresenceRepair> {
++  return await createPresenceReconciliationService(store).repairChannel(channelId);
++}
++
++export async function auditPresenceChannels(
++  channelIds: string[],
++  store?: PresenceStore,
++): Promise<PresenceAuditSweep> {
++  return await createPresenceReconciliationService(store).auditChannels(channelIds);
++}
++
++export async function repairPresenceChannels(
++  channelIds: string[],
++  store?: PresenceStore,
++): Promise<PresenceRepairSweep> {
++  return await createPresenceReconciliationService(store).repairChannels(channelIds);
++}
+diff --git a/packages/backend/src/services/presence_reconciliation_types.ts b/packages/backend/src/services/presence_reconciliation_types.ts
+new file mode 100644
+index 0000000..1484512
+--- /dev/null
++++ b/packages/backend/src/services/presence_reconciliation_types.ts
+@@ -0,0 +1,84 @@
++import type { UserSession } from "#ours/backend/session/types.ts";
++
++export const PRESENCE_ISSUE_CODES = [
++  "missing_session",
++  "channel_mismatch",
++  "missing_membership",
++  "missing_session_ttl",
++] as const;
++
++export type PresenceIssueCode = (typeof PRESENCE_ISSUE_CODES)[number];
++
++export interface PresenceIssue {
++  nickname: string;
++  code: PresenceIssueCode;
++  sessionChannelId?: string;
++}
++
++export type PresenceIssueCounts = Record<PresenceIssueCode, number>;
++
++export interface ChannelPresenceAudit {
++  channelId: string;
++  memberCount: number;
++  sessionCount: number;
++  validCount: number;
++  healthy: boolean;
++  issueCounts: PresenceIssueCounts;
++  issues: PresenceIssue[];
++}
++
++export interface ChannelPresenceRepair {
++  channelId: string;
++  removed: string[];
++  added: string[];
++  ttlFixed: string[];
++  repairedUsers: number;
++  before: ChannelPresenceAudit;
++  after: ChannelPresenceAudit;
++}
++
++export interface PresenceSweepSummary {
++  channelCount: number;
++  healthyChannels: number;
++  unhealthyChannels: number;
++  issueCount: number;
++  issueCounts: PresenceIssueCounts;
++}
++
++export interface PresenceAuditSweep {
++  channels: ChannelPresenceAudit[];
++  summary: PresenceSweepSummary;
++}
++
++export interface PresenceRepairSweepSummary {
++  channelCount: number;
++  repairedChannels: number;
++  repairedUsers: number;
++  remainingIssues: number;
++  issueCounts: PresenceIssueCounts;
++}
++
++export interface PresenceRepairSweep {
++  repairs: ChannelPresenceRepair[];
++  summary: PresenceRepairSweepSummary;
++}
++
++export interface PresenceStore {
++  listChannelIds(): Promise<string[]>;
++  listUserNicknames(): Promise<string[]>;
++  getChannelUsers(channelId: string): Promise<string[]>;
++  getUserByNickname(nickname: string): Promise<UserSession | null>;
++  getUserTtl(nickname: string): Promise<number>;
++  addUserToChannel(channelId: string, nickname: string): Promise<void>;
++  removeUserFromChannel(channelId: string, nickname: string): Promise<void>;
++  ensureUserTtl(nickname: string, ttlSeconds?: number): Promise<boolean>;
++}
++
++export function createEmptyPresenceIssueCounts(): PresenceIssueCounts {
++  return {
++    missing_session: 0,
++    channel_mismatch: 0,
++    missing_membership: 0,
++    missing_session_ttl: 0,
++  };
++}
+diff --git a/packages/backend/src/services/presence_reconciliation_utils.ts b/packages/backend/src/services/presence_reconciliation_utils.ts
+new file mode 100644
+index 0000000..5743655
+--- /dev/null
++++ b/packages/backend/src/services/presence_reconciliation_utils.ts
+@@ -0,0 +1,87 @@
++import {
++  PRESENCE_ISSUE_CODES,
++  createEmptyPresenceIssueCounts,
++  type ChannelPresenceRepair,
++  type PresenceIssue,
++  type PresenceIssueCode,
++  type PresenceIssueCounts,
++} from "#ours/backend/services/presence_reconciliation_types.ts";
++
++const ISSUE_RANK = new Map<PresenceIssueCode, number>(
++  PRESENCE_ISSUE_CODES.map((code, index) => [code, index]),
++);
++
++export function uniquePresenceValues(values: Iterable<string>): string[] {
++  const unique = new Set<string>();
++
++  for (const value of values) {
++    if (value.length === 0) continue;
++    unique.add(value);
++  }
++
++  return [...unique].sort((left, right) => left.localeCompare(right));
++}
++
++export function sortPresenceIssues(issues: Iterable<PresenceIssue>): PresenceIssue[] {
++  return [...issues].sort((left, right) => {
++    const nicknameOrder = left.nickname.localeCompare(right.nickname);
++    if (nicknameOrder !== 0) return nicknameOrder;
++
++    const leftRank = ISSUE_RANK.get(left.code) ?? Number.MAX_SAFE_INTEGER;
++    const rightRank = ISSUE_RANK.get(right.code) ?? Number.MAX_SAFE_INTEGER;
++    return leftRank - rightRank;
++  });
++}
++
++export function countPresenceIssues(issues: Iterable<PresenceIssue>): PresenceIssueCounts {
++  const counts = createEmptyPresenceIssueCounts();
++
++  for (const issue of issues) {
++    counts[issue.code] += 1;
++  }
++
++  return counts;
++}
++
++export function addPresenceIssueCounts(
++  target: PresenceIssueCounts,
++  source: PresenceIssueCounts,
++): PresenceIssueCounts {
++  for (const code of PRESENCE_ISSUE_CODES) {
++    target[code] += source[code];
++  }
++
++  return target;
++}
++
++export function totalPresenceIssues(counts: PresenceIssueCounts): number {
++  let total = 0;
++
++  for (const code of PRESENCE_ISSUE_CODES) {
++    total += counts[code];
++  }
++
++  return total;
++}
++
++export function repairedNicknames(repair: ChannelPresenceRepair): string[] {
++  return uniquePresenceValues([
++    ...repair.removed,
++    ...repair.added,
++    ...repair.ttlFixed,
++  ]);
++}
++
++export function collectRepairedNicknames(
++  repairs: Iterable<ChannelPresenceRepair>,
++): Set<string> {
++  const nicknames = new Set<string>();
++
++  for (const repair of repairs) {
++    for (const nickname of repairedNicknames(repair)) {
++      nicknames.add(nickname);
++    }
++  }
++
++  return nicknames;
++}
+diff --git a/packages/backend/src/services/redis_presence_store.ts b/packages/backend/src/services/redis_presence_store.ts
+new file mode 100644
+index 0000000..bd413e3
+--- /dev/null
++++ b/packages/backend/src/services/redis_presence_store.ts
+@@ -0,0 +1,41 @@
++import * as session from "#ours/backend/session/index.ts";
++import type { UserSession } from "#ours/backend/session/types.ts";
++import type { PresenceStore } from "#ours/backend/services/presence_reconciliation_types.ts";
++
++export class RedisPresenceStore implements PresenceStore {
++  async listChannelIds(): Promise<string[]> {
++    return await session.users.listChannelIds();
++  }
++
++  async listUserNicknames(): Promise<string[]> {
++    return await session.users.listUserNicknames();
++  }
++
++  async getChannelUsers(channelId: string): Promise<string[]> {
++    return await session.users.getChannelUsers(channelId);
++  }
++
++  async getUserByNickname(nickname: string): Promise<UserSession | null> {
++    return await session.users.getUserByNickname(nickname);
++  }
++
++  async getUserTtl(nickname: string): Promise<number> {
++    return await session.users.getUserTtl(nickname);
++  }
++
++  async addUserToChannel(channelId: string, nickname: string): Promise<void> {
++    await session.users.addUserToChannel(channelId, nickname);
++  }
++
++  async removeUserFromChannel(channelId: string, nickname: string): Promise<void> {
++    await session.users.removeUserFromChannel(channelId, nickname);
++  }
++
++  async ensureUserTtl(nickname: string, ttlSeconds?: number): Promise<boolean> {
++    return await session.users.ensureUserTtl(nickname, ttlSeconds);
++  }
++}
++
++export function createRedisPresenceStore(): PresenceStore {
++  return new RedisPresenceStore();
++}
+diff --git a/packages/backend/src/session/operations/index.ts b/packages/backend/src/session/operations/index.ts
+index a64b230..00ac165 100644
+--- a/packages/backend/src/session/operations/index.ts
++++ b/packages/backend/src/session/operations/index.ts
+@@ -32,6 +32,10 @@ export const {
+   removeUserFromChannel,
+   getChannelUsers,
+   getChannelUserCount,
++  getUserTtl,
++  ensureUserTtl,
++  listUserNicknames,
++  listChannelIds,
+ } = userOps;
+ 
+ // Friendly alias
+diff --git a/packages/backend/src/session/operations/users.ts b/packages/backend/src/session/operations/users.ts
+index 456d89c..45b71ee 100644
+--- a/packages/backend/src/session/operations/users.ts
++++ b/packages/backend/src/session/operations/users.ts
+@@ -1,7 +1,7 @@
+ import { getNodeClient } from "#ours/backend/session/redis.ts";
+ import type { UserSession } from "#ours/backend/session/types.ts";
+ 
+-const DEFAULT_TTL_SECONDS = 1800;
++export const DEFAULT_TTL_SECONDS = 1800;
+ 
+ export async function setUser(
+   nickname: string,
+@@ -29,13 +29,58 @@ export async function getUserByNickname(nickname: string): Promise<UserSession |
+   }
+ }
+ 
+-export async function updateUser(nickname: string, userData: UserSession): Promise<string> {
++export async function updateUser(
++  nickname: string,
++  userData: UserSession,
++  ttlSeconds = DEFAULT_TTL_SECONDS,
++): Promise<string> {
+   const client = await getNodeClient();
+   const key = `user:${nickname}`;
+-  const result = await client.setEx(key, 1800, JSON.stringify(userData));
++  const result = await client.setEx(key, ttlSeconds, JSON.stringify(userData));
+   return result;
+ }
+ 
++
++export async function getUserTtl(nickname: string): Promise<number> {
++  const client = await getNodeClient();
++  return await client.ttl(`user:${nickname}`);
++}
++
++export async function ensureUserTtl(
++  nickname: string,
++  ttlSeconds = DEFAULT_TTL_SECONDS,
++): Promise<boolean> {
++  const client = await getNodeClient();
++  const key = `user:${nickname}`;
++  const ttl = await client.ttl(key);
++
++  if (ttl === -2) return false;
++  if (ttl !== -1) return false;
++
++  return Boolean(await client.expire(key, ttlSeconds));
++}
++
++export async function listUserNicknames(): Promise<string[]> {
++  const client = await getNodeClient();
++  const keys: string[] = await client.keys("user:*");
++  return [...new Set<string>(keys.map((key: string) => key.slice("user:".length)).filter(Boolean))].sort((a, b) =>
++    a.localeCompare(b),
++  );
++}
++
++export async function listChannelIds(): Promise<string[]> {
++  const client = await getNodeClient();
++  const keys: string[] = await client.keys("channel:*:users");
++  const channelIds: string[] = [];
++
++  for (const key of keys) {
++    const match = /^channel:(.+):users$/.exec(key);
++    if (match?.[1]) channelIds.push(match[1]);
++  }
++
++  return [...new Set(channelIds)].sort((a, b) => a.localeCompare(b));
++}
++
+ export async function userExists(nickname: string, userId?: string): Promise<boolean> {
+   const client = await getNodeClient();
+   const key = `user:${nickname}`;

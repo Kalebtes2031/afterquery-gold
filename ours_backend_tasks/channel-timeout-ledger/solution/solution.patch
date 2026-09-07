@@ -1,0 +1,783 @@
+diff --git a/packages/backend/src/services/timeout_ledger_types.ts b/packages/backend/src/services/timeout_ledger_types.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/timeout_ledger_types.ts
+@@ -0,0 +1,114 @@
++export const DEFAULT_TIMEOUT_SECONDS = 300;
++export const MIN_TIMEOUT_SECONDS = 10;
++export const MAX_TIMEOUT_SECONDS = 86_400;
++export const MAX_TIMEOUT_REASON_LENGTH = 80;
++
++export const TIMEOUT_APPLY_STATUSES = ["applied", "extended", "kept"] as const;
++export type TimeoutApplyStatus = (typeof TIMEOUT_APPLY_STATUSES)[number];
++
++export const TIMEOUT_FAILURE_REASONS = [
++  "invalid_channel",
++  "invalid_nickname",
++  "invalid_moderator",
++  "not_found",
++] as const;
++export type TimeoutFailureReason = (typeof TIMEOUT_FAILURE_REASONS)[number];
++
++export interface ChannelTimeoutRecord {
++  channelId: string;
++  nickname: string;
++  moderatorId: string;
++  expiresAt: number;
++  reason?: string;
++}
++
++export interface ChannelTimeoutView extends ChannelTimeoutRecord {
++  remainingSeconds: number;
++  expired: boolean;
++}
++
++export interface TimeoutClockOptions {
++  now?: number;
++}
++
++export interface ApplyChannelTimeoutOptions extends TimeoutClockOptions {
++  seconds?: number;
++  reason?: string;
++}
++
++export interface ListChannelTimeoutsOptions extends TimeoutClockOptions {
++  includeExpired?: boolean;
++}
++
++export interface ApplyTimeoutSuccess {
++  ok: true;
++  status: TimeoutApplyStatus;
++  channelId: string;
++  nickname: string;
++  moderatorId: string;
++  expiresAt: number;
++  remainingSeconds: number;
++  reason?: string;
++}
++
++export interface TimeoutFailure {
++  ok: false;
++  reason: TimeoutFailureReason;
++  channelId?: string;
++  nickname?: string;
++}
++
++export type ApplyChannelTimeoutResult = ApplyTimeoutSuccess | TimeoutFailure;
++
++export interface LiftTimeoutSuccess {
++  ok: true;
++  channelId: string;
++  nickname: string;
++  lifted: true;
++}
++
++export type LiftChannelTimeoutResult = LiftTimeoutSuccess | TimeoutFailure;
++
++export interface TimedOutLookup {
++  timedOut: boolean;
++  remainingSeconds: number;
++  record?: ChannelTimeoutView;
++}
++
++export interface TimeoutSweepResult {
++  removed: number;
++  channelIds: string[];
++}
++
++export interface ChannelTimeoutStore {
++  getTimeout(channelId: string, nickname: string): Promise<ChannelTimeoutRecord | null>;
++  putTimeout(record: ChannelTimeoutRecord): Promise<void>;
++  deleteTimeout(channelId: string, nickname: string): Promise<void>;
++  listTimeouts(channelId?: string): Promise<ChannelTimeoutRecord[]>;
++  compareAndSetTimeout(
++    channelId: string,
++    nickname: string,
++    expectedExpiresAt: number | null,
++    record: ChannelTimeoutRecord,
++  ): Promise<boolean>;
++}
++
++export function isChannelTimeoutRecord(value: unknown): value is ChannelTimeoutRecord {
++  if (value === null || typeof value !== "object") {
++    return false;
++  }
++
++  const record = value as Partial<ChannelTimeoutRecord>;
++  const reasonOk = record.reason === undefined || (typeof record.reason === "string" && record.reason.length > 0);
++  return (
++    typeof record.channelId === "string" &&
++    record.channelId.length > 0 &&
++    typeof record.nickname === "string" &&
++    record.nickname.length > 0 &&
++    typeof record.moderatorId === "string" &&
++    record.moderatorId.length > 0 &&
++    typeof record.expiresAt === "number" &&
++    Number.isFinite(record.expiresAt) &&
++    reasonOk
++  );
++}
+diff --git a/packages/backend/src/services/timeout_ledger_utils.ts b/packages/backend/src/services/timeout_ledger_utils.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/timeout_ledger_utils.ts
+@@ -0,0 +1,117 @@
++import { isValidNickname } from "#ours/shared/inputValidation.ts";
++import {
++  DEFAULT_TIMEOUT_SECONDS,
++  MAX_TIMEOUT_REASON_LENGTH,
++  MAX_TIMEOUT_SECONDS,
++  MIN_TIMEOUT_SECONDS,
++  type ChannelTimeoutRecord,
++  type ChannelTimeoutView,
++  type TimeoutFailure,
++  type TimeoutFailureReason,
++} from "#ours/backend/services/timeout_ledger_types.ts";
++
++export function readTimeoutClock(now?: number): number {
++  if (typeof now === "number" && Number.isFinite(now)) {
++    return Math.trunc(now);
++  }
++  return Date.now();
++}
++
++export function timeoutRemainingSeconds(expiresAt: number, now: number): number {
++  return Math.max(0, Math.floor((expiresAt - now) / 1000));
++}
++
++export function isTimeoutExpired(record: ChannelTimeoutRecord, now: number): boolean {
++  return record.expiresAt <= now;
++}
++
++export function clampTimeoutSeconds(seconds?: number): number {
++  const raw = typeof seconds === "number" && Number.isFinite(seconds) ? seconds : DEFAULT_TIMEOUT_SECONDS;
++  return Math.min(MAX_TIMEOUT_SECONDS, Math.max(MIN_TIMEOUT_SECONDS, Math.trunc(raw)));
++}
++
++export function timeoutExpiry(now: number, seconds?: number): number {
++  return now + clampTimeoutSeconds(seconds) * 1000;
++}
++
++export function normalizeChannelId(channelId: string): string | null {
++  if (typeof channelId !== "string") {
++    return null;
++  }
++  const trimmed = channelId.trim();
++  return trimmed.length > 0 ? trimmed : null;
++}
++
++export function normalizeTimeoutNickname(nickname: string): string | null {
++  if (typeof nickname !== "string") {
++    return null;
++  }
++  const trimmed = nickname.trim();
++  if (!isValidNickname(trimmed)) {
++    return null;
++  }
++  return trimmed.normalize("NFC").toLowerCase();
++}
++
++export function normalizeModeratorId(moderatorId: string): string | null {
++  if (typeof moderatorId !== "string") {
++    return null;
++  }
++  const trimmed = moderatorId.trim();
++  return trimmed.length > 0 ? trimmed : null;
++}
++
++export function normalizeTimeoutReason(reason?: string): string | undefined {
++  if (typeof reason !== "string") {
++    return undefined;
++  }
++  const trimmed = reason.trim();
++  if (trimmed.length === 0) {
++    return undefined;
++  }
++  return trimmed.slice(0, MAX_TIMEOUT_REASON_LENGTH);
++}
++
++export function toTimeoutView(record: ChannelTimeoutRecord, now: number): ChannelTimeoutView {
++  const expired = isTimeoutExpired(record, now);
++  const view: ChannelTimeoutView = {
++    channelId: record.channelId,
++    nickname: record.nickname,
++    moderatorId: record.moderatorId,
++    expiresAt: record.expiresAt,
++    remainingSeconds: timeoutRemainingSeconds(record.expiresAt, now),
++    expired,
++  };
++  if (record.reason !== undefined) {
++    view.reason = record.reason;
++  }
++  return view;
++}
++
++export function timeoutFailure(
++  reason: TimeoutFailureReason,
++  extra: Omit<TimeoutFailure, "ok" | "reason"> = {},
++): TimeoutFailure {
++  return { ok: false, reason, ...extra };
++}
++
++export function sortTimeoutViews(views: ChannelTimeoutView[]): ChannelTimeoutView[] {
++  return [...views].sort((left, right) => {
++    const channelOrder = left.channelId.localeCompare(right.channelId);
++    if (channelOrder !== 0) {
++      return channelOrder;
++    }
++    return left.nickname.localeCompare(right.nickname);
++  });
++}
++
++export function uniqueSortedIds(ids: Iterable<string>): string[] {
++  return [...new Set([...ids].filter((id) => id.length > 0))].sort((left, right) => left.localeCompare(right));
++}
++
++export function liveTimeout(record: ChannelTimeoutRecord | null, now: number): ChannelTimeoutRecord | null {
++  if (!record || isTimeoutExpired(record, now)) {
++    return null;
++  }
++  return record;
++}
+diff --git a/packages/backend/src/services/timeout_ledger_store.ts b/packages/backend/src/services/timeout_ledger_store.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/timeout_ledger_store.ts
+@@ -0,0 +1,84 @@
++import {
++  isChannelTimeoutRecord,
++  type ChannelTimeoutRecord,
++  type ChannelTimeoutStore,
++} from "#ours/backend/services/timeout_ledger_types.ts";
++
++const timeoutKey = (channelId: string, nickname: string) => `${channelId}\u0000${nickname}`;
++
++const cloneTimeout = (record: ChannelTimeoutRecord): ChannelTimeoutRecord => {
++  const copy: ChannelTimeoutRecord = {
++    channelId: record.channelId,
++    nickname: record.nickname,
++    moderatorId: record.moderatorId,
++    expiresAt: record.expiresAt,
++  };
++  if (record.reason !== undefined) {
++    copy.reason = record.reason;
++  }
++  return copy;
++};
++
++export class MemoryChannelTimeoutStore implements ChannelTimeoutStore {
++  private readonly records = new Map<string, ChannelTimeoutRecord>();
++
++  async getTimeout(channelId: string, nickname: string): Promise<ChannelTimeoutRecord | null> {
++    const record = this.records.get(timeoutKey(channelId, nickname));
++    return record ? cloneTimeout(record) : null;
++  }
++
++  async putTimeout(record: ChannelTimeoutRecord): Promise<void> {
++    if (!isChannelTimeoutRecord(record)) {
++      return;
++    }
++    this.records.set(timeoutKey(record.channelId, record.nickname), cloneTimeout(record));
++  }
++
++  async deleteTimeout(channelId: string, nickname: string): Promise<void> {
++    this.records.delete(timeoutKey(channelId, nickname));
++  }
++
++  async listTimeouts(channelId?: string): Promise<ChannelTimeoutRecord[]> {
++    const rows = [...this.records.values()].map(cloneTimeout);
++    if (channelId === undefined) {
++      return rows;
++    }
++    return rows.filter((record) => record.channelId === channelId);
++  }
++
++  async compareAndSetTimeout(
++    channelId: string,
++    nickname: string,
++    expectedExpiresAt: number | null,
++    record: ChannelTimeoutRecord,
++  ): Promise<boolean> {
++    if (!isChannelTimeoutRecord(record) || record.channelId !== channelId || record.nickname !== nickname) {
++      return false;
++    }
++
++    const key = timeoutKey(channelId, nickname);
++    const current = this.records.get(key);
++    if (expectedExpiresAt === null) {
++      if (current) {
++        return false;
++      }
++    } else if (!current || current.expiresAt !== expectedExpiresAt) {
++      return false;
++    }
++
++    this.records.set(key, cloneTimeout(record));
++    return true;
++  }
++
++  clear(): void {
++    this.records.clear();
++  }
++
++  size(): number {
++    return this.records.size;
++  }
++}
++
++export function createMemoryChannelTimeoutStore(): MemoryChannelTimeoutStore {
++  return new MemoryChannelTimeoutStore();
++}
+diff --git a/packages/backend/src/services/timeout_ledger_policy.ts b/packages/backend/src/services/timeout_ledger_policy.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/timeout_ledger_policy.ts
+@@ -0,0 +1,37 @@
++import {
++  DEFAULT_TIMEOUT_SECONDS,
++  MAX_TIMEOUT_REASON_LENGTH,
++  MAX_TIMEOUT_SECONDS,
++  MIN_TIMEOUT_SECONDS,
++  type ChannelTimeoutRecord,
++} from "#ours/backend/services/timeout_ledger_types.ts";
++
++export interface TimeoutDurationPolicy {
++  defaultSeconds: number;
++  minSeconds: number;
++  maxSeconds: number;
++  maxReasonLength: number;
++}
++
++export const DEFAULT_TIMEOUT_DURATION_POLICY: TimeoutDurationPolicy = {
++  defaultSeconds: DEFAULT_TIMEOUT_SECONDS,
++  minSeconds: MIN_TIMEOUT_SECONDS,
++  maxSeconds: MAX_TIMEOUT_SECONDS,
++  maxReasonLength: MAX_TIMEOUT_REASON_LENGTH,
++};
++
++export function resolveTimeoutDuration(
++  seconds: number | undefined,
++  policy: TimeoutDurationPolicy = DEFAULT_TIMEOUT_DURATION_POLICY,
++): number {
++  const raw = typeof seconds === "number" && Number.isFinite(seconds) ? seconds : policy.defaultSeconds;
++  return Math.min(policy.maxSeconds, Math.max(policy.minSeconds, Math.trunc(raw)));
++}
++
++export function shouldExtendTimeout(current: ChannelTimeoutRecord, nextExpiresAt: number): boolean {
++  return nextExpiresAt > current.expiresAt;
++}
++
++export function describeTimeoutPolicy(policy: TimeoutDurationPolicy = DEFAULT_TIMEOUT_DURATION_POLICY): string {
++  return `timeout ${policy.minSeconds}-${policy.maxSeconds}s (default ${policy.defaultSeconds}s); reason <= ${policy.maxReasonLength}`;
++}
+diff --git a/packages/backend/src/services/timeout_ledger_service.ts b/packages/backend/src/services/timeout_ledger_service.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/timeout_ledger_service.ts
+@@ -0,0 +1,330 @@
++import { createMemoryChannelTimeoutStore } from "#ours/backend/services/timeout_ledger_store.ts";
++import type {
++  ApplyChannelTimeoutOptions,
++  ApplyChannelTimeoutResult,
++  ChannelTimeoutRecord,
++  ChannelTimeoutStore,
++  ChannelTimeoutView,
++  LiftChannelTimeoutResult,
++  ListChannelTimeoutsOptions,
++  TimedOutLookup,
++  TimeoutClockOptions,
++  TimeoutSweepResult,
++} from "#ours/backend/services/timeout_ledger_types.ts";
++import {
++  liveTimeout,
++  normalizeChannelId,
++  normalizeModeratorId,
++  normalizeTimeoutNickname,
++  normalizeTimeoutReason,
++  readTimeoutClock,
++  sortTimeoutViews,
++  timeoutExpiry,
++  timeoutFailure,
++  timeoutRemainingSeconds,
++  toTimeoutView,
++  uniqueSortedIds,
++} from "#ours/backend/services/timeout_ledger_utils.ts";
++
++export class ChannelTimeoutLedger {
++  private readonly store: ChannelTimeoutStore;
++
++  constructor(store: ChannelTimeoutStore = createMemoryChannelTimeoutStore()) {
++    this.store = store;
++  }
++
++  async applyChannelTimeout(
++    channelId: string,
++    nickname: string,
++    moderatorId: string,
++    options: ApplyChannelTimeoutOptions = {},
++  ): Promise<ApplyChannelTimeoutResult> {
++    const channel = normalizeChannelId(channelId);
++    if (!channel) {
++      return timeoutFailure("invalid_channel");
++    }
++
++    const user = normalizeTimeoutNickname(nickname);
++    if (!user) {
++      return timeoutFailure("invalid_nickname", { channelId: channel });
++    }
++
++    const moderator = normalizeModeratorId(moderatorId);
++    if (!moderator) {
++      return timeoutFailure("invalid_moderator", { channelId: channel, nickname: user });
++    }
++
++    const now = readTimeoutClock(options.now);
++    const expiresAt = timeoutExpiry(now, options.seconds);
++    const reason = normalizeTimeoutReason(options.reason);
++    const current = await this.store.getTimeout(channel, user);
++    const live = liveTimeout(current, now);
++
++    const next: ChannelTimeoutRecord = {
++      channelId: channel,
++      nickname: user,
++      moderatorId: moderator,
++      expiresAt,
++    };
++    if (reason !== undefined) {
++      next.reason = reason;
++    }
++
++    if (live) {
++      if (expiresAt > live.expiresAt) {
++        const swapped = await this.store.compareAndSetTimeout(channel, user, live.expiresAt, next);
++        if (!swapped) {
++          return this.applyChannelTimeout(channelId, nickname, moderatorId, options);
++        }
++        return {
++          ok: true,
++          status: "extended",
++          channelId: channel,
++          nickname: user,
++          moderatorId: moderator,
++          expiresAt,
++          remainingSeconds: timeoutRemainingSeconds(expiresAt, now),
++          ...(reason !== undefined ? { reason } : {}),
++        };
++      }
++
++      return {
++        ok: true,
++        status: "kept",
++        channelId: live.channelId,
++        nickname: live.nickname,
++        moderatorId: live.moderatorId,
++        expiresAt: live.expiresAt,
++        remainingSeconds: timeoutRemainingSeconds(live.expiresAt, now),
++        ...(live.reason !== undefined ? { reason: live.reason } : {}),
++      };
++    }
++
++    if (current && !live) {
++      await this.store.deleteTimeout(channel, user);
++    }
++
++    const created = await this.store.compareAndSetTimeout(channel, user, null, next);
++    if (!created) {
++      return this.applyChannelTimeout(channelId, nickname, moderatorId, options);
++    }
++
++    return {
++      ok: true,
++      status: "applied",
++      channelId: channel,
++      nickname: user,
++      moderatorId: moderator,
++      expiresAt,
++      remainingSeconds: timeoutRemainingSeconds(expiresAt, now),
++      ...(reason !== undefined ? { reason } : {}),
++    };
++  }
++
++  async liftChannelTimeout(
++    channelId: string,
++    nickname: string,
++    moderatorId: string,
++    options: TimeoutClockOptions = {},
++  ): Promise<LiftChannelTimeoutResult> {
++    const channel = normalizeChannelId(channelId);
++    if (!channel) {
++      return timeoutFailure("invalid_channel");
++    }
++
++    const user = normalizeTimeoutNickname(nickname);
++    if (!user) {
++      return timeoutFailure("invalid_nickname", { channelId: channel });
++    }
++
++    const moderator = normalizeModeratorId(moderatorId);
++    if (!moderator) {
++      return timeoutFailure("invalid_moderator", { channelId: channel, nickname: user });
++    }
++
++    const now = readTimeoutClock(options.now);
++    const current = await this.store.getTimeout(channel, user);
++    if (!current) {
++      return timeoutFailure("not_found", { channelId: channel, nickname: user });
++    }
++    if (current.expiresAt <= now) {
++      await this.store.deleteTimeout(channel, user);
++      return timeoutFailure("not_found", { channelId: channel, nickname: user });
++    }
++
++    await this.store.deleteTimeout(channel, user);
++    return { ok: true, channelId: channel, nickname: user, lifted: true };
++  }
++
++  async isTimedOut(channelId: string, nickname: string, options: TimeoutClockOptions = {}): Promise<TimedOutLookup> {
++    const view = await this.getTimeout(channelId, nickname, options);
++    if (!view || view.expired) {
++      return { timedOut: false, remainingSeconds: 0 };
++    }
++    return { timedOut: true, remainingSeconds: view.remainingSeconds, record: view };
++  }
++
++  async getTimeout(
++    channelId: string,
++    nickname: string,
++    options: TimeoutClockOptions = {},
++  ): Promise<ChannelTimeoutView | null> {
++    const channel = normalizeChannelId(channelId);
++    const user = normalizeTimeoutNickname(nickname);
++    if (!channel || !user) {
++      return null;
++    }
++
++    const now = readTimeoutClock(options.now);
++    const live = liveTimeout(await this.store.getTimeout(channel, user), now);
++    return live ? toTimeoutView(live, now) : null;
++  }
++
++  async listChannelTimeouts(
++    channelId: string,
++    options: ListChannelTimeoutsOptions = {},
++  ): Promise<ChannelTimeoutView[]> {
++    const channel = normalizeChannelId(channelId);
++    if (!channel) {
++      return [];
++    }
++
++    const now = readTimeoutClock(options.now);
++    const includeExpired = options.includeExpired === true;
++    const views: ChannelTimeoutView[] = [];
++
++    for (const record of await this.store.listTimeouts(channel)) {
++      const view = toTimeoutView(record, now);
++      if (view.expired && !includeExpired) {
++        continue;
++      }
++      views.push(view);
++    }
++
++    return sortTimeoutViews(views);
++  }
++
++  async listTimedOutChannels(options: TimeoutClockOptions = {}): Promise<string[]> {
++    const now = readTimeoutClock(options.now);
++    const channelIds: string[] = [];
++
++    for (const record of await this.store.listTimeouts()) {
++      if (liveTimeout(record, now)) {
++        channelIds.push(record.channelId);
++      }
++    }
++
++    return uniqueSortedIds(channelIds);
++  }
++
++  async countActiveTimeouts(channelId?: string, options: TimeoutClockOptions = {}): Promise<number> {
++    const now = readTimeoutClock(options.now);
++    const channel = channelId === undefined ? undefined : normalizeChannelId(channelId);
++    if (channelId !== undefined && !channel) {
++      return 0;
++    }
++
++    let count = 0;
++    for (const record of await this.store.listTimeouts(channel)) {
++      if (liveTimeout(record, now)) {
++        count += 1;
++      }
++    }
++    return count;
++  }
++
++  async sweepExpiredTimeouts(channelId?: string, options: TimeoutClockOptions = {}): Promise<TimeoutSweepResult> {
++    const now = readTimeoutClock(options.now);
++    const channel = channelId === undefined ? undefined : normalizeChannelId(channelId);
++    if (channelId !== undefined && !channel) {
++      return { removed: 0, channelIds: [] };
++    }
++
++    const removedChannels: string[] = [];
++    let removed = 0;
++
++    for (const record of await this.store.listTimeouts(channel)) {
++      if (record.expiresAt > now) {
++        continue;
++      }
++      await this.store.deleteTimeout(record.channelId, record.nickname);
++      removed += 1;
++      removedChannels.push(record.channelId);
++    }
++
++    return { removed, channelIds: uniqueSortedIds(removedChannels) };
++  }
++}
++
++export function createChannelTimeoutLedger(store?: ChannelTimeoutStore): ChannelTimeoutLedger {
++  return new ChannelTimeoutLedger(store ?? createMemoryChannelTimeoutStore());
++}
++
++export async function applyChannelTimeout(
++  channelId: string,
++  nickname: string,
++  moderatorId: string,
++  options: ApplyChannelTimeoutOptions = {},
++  store?: ChannelTimeoutStore,
++): Promise<ApplyChannelTimeoutResult> {
++  return createChannelTimeoutLedger(store).applyChannelTimeout(channelId, nickname, moderatorId, options);
++}
++
++export async function liftChannelTimeout(
++  channelId: string,
++  nickname: string,
++  moderatorId: string,
++  options: TimeoutClockOptions = {},
++  store?: ChannelTimeoutStore,
++): Promise<LiftChannelTimeoutResult> {
++  return createChannelTimeoutLedger(store).liftChannelTimeout(channelId, nickname, moderatorId, options);
++}
++
++export async function isTimedOut(
++  channelId: string,
++  nickname: string,
++  options: TimeoutClockOptions = {},
++  store?: ChannelTimeoutStore,
++): Promise<TimedOutLookup> {
++  return createChannelTimeoutLedger(store).isTimedOut(channelId, nickname, options);
++}
++
++export async function getTimeout(
++  channelId: string,
++  nickname: string,
++  options: TimeoutClockOptions = {},
++  store?: ChannelTimeoutStore,
++): Promise<ChannelTimeoutView | null> {
++  return createChannelTimeoutLedger(store).getTimeout(channelId, nickname, options);
++}
++
++export async function listChannelTimeouts(
++  channelId: string,
++  options: ListChannelTimeoutsOptions = {},
++  store?: ChannelTimeoutStore,
++): Promise<ChannelTimeoutView[]> {
++  return createChannelTimeoutLedger(store).listChannelTimeouts(channelId, options);
++}
++
++export async function listTimedOutChannels(
++  options: TimeoutClockOptions = {},
++  store?: ChannelTimeoutStore,
++): Promise<string[]> {
++  return createChannelTimeoutLedger(store).listTimedOutChannels(options);
++}
++
++export async function countActiveTimeouts(
++  channelId?: string,
++  options: TimeoutClockOptions = {},
++  store?: ChannelTimeoutStore,
++): Promise<number> {
++  return createChannelTimeoutLedger(store).countActiveTimeouts(channelId, options);
++}
++
++export async function sweepExpiredTimeouts(
++  channelId?: string,
++  options: TimeoutClockOptions = {},
++  store?: ChannelTimeoutStore,
++): Promise<TimeoutSweepResult> {
++  return createChannelTimeoutLedger(store).sweepExpiredTimeouts(channelId, options);
++}
+diff --git a/packages/backend/src/services/timeouts.ts b/packages/backend/src/services/timeouts.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/timeouts.ts
+@@ -0,0 +1,65 @@
++export {
++  ChannelTimeoutLedger,
++  applyChannelTimeout,
++  countActiveTimeouts,
++  createChannelTimeoutLedger,
++  getTimeout,
++  isTimedOut,
++  liftChannelTimeout,
++  listChannelTimeouts,
++  listTimedOutChannels,
++  sweepExpiredTimeouts,
++} from "#ours/backend/services/timeout_ledger_service.ts";
++
++export {
++  MemoryChannelTimeoutStore,
++  createMemoryChannelTimeoutStore,
++} from "#ours/backend/services/timeout_ledger_store.ts";
++
++export {
++  DEFAULT_TIMEOUT_SECONDS,
++  MAX_TIMEOUT_REASON_LENGTH,
++  MAX_TIMEOUT_SECONDS,
++  MIN_TIMEOUT_SECONDS,
++  TIMEOUT_APPLY_STATUSES,
++  TIMEOUT_FAILURE_REASONS,
++  isChannelTimeoutRecord,
++  type ApplyChannelTimeoutOptions,
++  type ApplyChannelTimeoutResult,
++  type ApplyTimeoutSuccess,
++  type ChannelTimeoutRecord,
++  type ChannelTimeoutStore,
++  type ChannelTimeoutView,
++  type LiftChannelTimeoutResult,
++  type ListChannelTimeoutsOptions,
++  type TimedOutLookup,
++  type TimeoutClockOptions,
++  type TimeoutFailure,
++  type TimeoutFailureReason,
++  type TimeoutSweepResult,
++} from "#ours/backend/services/timeout_ledger_types.ts";
++
++export {
++  DEFAULT_TIMEOUT_DURATION_POLICY,
++  describeTimeoutPolicy,
++  resolveTimeoutDuration,
++  shouldExtendTimeout,
++  type TimeoutDurationPolicy,
++} from "#ours/backend/services/timeout_ledger_policy.ts";
++
++export {
++  clampTimeoutSeconds,
++  isTimeoutExpired,
++  liveTimeout,
++  normalizeChannelId,
++  normalizeModeratorId,
++  normalizeTimeoutNickname,
++  normalizeTimeoutReason,
++  readTimeoutClock,
++  sortTimeoutViews,
++  timeoutExpiry,
++  timeoutFailure,
++  timeoutRemainingSeconds,
++  toTimeoutView,
++  uniqueSortedIds,
++} from "#ours/backend/services/timeout_ledger_utils.ts";

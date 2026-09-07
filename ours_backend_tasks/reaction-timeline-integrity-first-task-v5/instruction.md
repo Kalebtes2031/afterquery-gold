@@ -1,0 +1,11 @@
+Reaction history is drifting in Redis after reconnects and replayed events. Sometimes the reaction hash is right but one of its indexes is missing or stale, so room history disagrees with the stored reaction. Make the reaction operations use the hash as the source of truth and add a way to inspect and repair that drift.
+
+If `addReaction` sees the same message/user/reaction again, reuse it, refresh its timestamp and timeline score, and keep the stored room even if the new call supplies another. Add `getRoomReactionTimeline`, `auditRoomReactionIntegrity`, and `repairRoomReactionIntegrity`, and expose all three from `packages/backend/src/session/operations/index.ts`.
+
+`getRoomReactionTimeline(roomId, options?)` reads ids from both room indexes and returns `{ reactionId, messageId, userId, reaction, roomId, timestamp }`, with `timestamp` as a `Date`. Skip missing hashes, invalid timestamps, and hashes for another room. Sort newest first by hash timestamp, using reactionId for ties. `since` and `until` are inclusive finite epoch-millisecond bounds. Ignore non-finite bounds; `since > until` returns `[]`. Truncate `limit`, clamp it to 1–100, and default to 100 when absent or non-finite.
+
+Audit returns `{ roomId, reactionCount, issueCount, healthy, issueCounts, issues }`; each issue is `{ reactionId, code }`. Codes are `missing_record`, `wrong_room`, `invalid_timestamp`, `missing_room_index`, `missing_timeline_index`, `stale_timeline_score`, `missing_message_index`, and `missing_user_index`. Missing, wrong-room, or invalid-timestamp records get only that record-level issue. `reactionCount` counts valid room hashes; `issueCount` is total issues; `healthy` means zero. `issueCounts` always has all eight keys, using zero when absent. Sort issues by reactionId and keep same-reaction order deterministic.
+
+Repair missing/stale indexes and remove unusable or wrong-room ids from this room's indexes without rewriting valid hashes. `repaired` and `removed` count reaction ids, not index operations. Return `{ roomId, beforeIssueCount, repaired, removed, afterIssueCount }`; rerunning repair on a healthy room does nothing.
+
+IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.

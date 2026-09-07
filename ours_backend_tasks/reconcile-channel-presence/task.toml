@@ -1,0 +1,28 @@
+schema_version = "1.1"
+artifacts = ["/logs/artifacts/model.patch"]
+
+[task]
+name = "ours/reconcile-channel-presence"
+
+[metadata]
+task_id = "reconcile-channel-presence"
+display_title = "Reconcile Channel Presence"
+display_description = "Audit and repair Redis channel membership when user sessions and presence sets drift apart."
+category = "bugfix"
+language = "typescript"
+repository_url = "https://github.com/Flourid-Collective/ours.git"
+base_commit_hash = "519bfd8ee87e3aef50ed6584a364ef081f398d1c"
+
+[agent]
+timeout_sec = 5400
+
+[verifier]
+environment_mode = "separate"
+timeout_sec = 1800
+
+[verifier.environment]
+build_timeout_sec = 1800
+cpus = 2
+memory_mb = 8192
+storage_mb = 20480
+allow_internet = false

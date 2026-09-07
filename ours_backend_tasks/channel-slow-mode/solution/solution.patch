@@ -1,0 +1,708 @@
+diff --git a/packages/backend/src/services/slow_mode_types.ts b/packages/backend/src/services/slow_mode_types.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/slow_mode_types.ts
+@@ -0,0 +1,125 @@
++export const DEFAULT_SLOW_MODE_SECONDS = 20;
++export const MIN_SLOW_MODE_SECONDS = 1;
++export const MAX_SLOW_MODE_SECONDS = 600;
++export const DEFAULT_COOLDOWN_SWEEP_LIMIT = 100;
++
++export const SLOW_MODE_FAILURE_REASONS = [
++  "invalid_channel",
++  "invalid_nickname",
++  "invalid_interval",
++  "not_enabled",
++  "cooldown_active",
++] as const;
++export type SlowModeFailureReason = (typeof SLOW_MODE_FAILURE_REASONS)[number];
++
++export interface ChannelSlowModeConfig {
++  channelId: string;
++  intervalSeconds: number;
++  enabled: boolean;
++}
++
++export interface ChannelSpeakCooldown {
++  channelId: string;
++  nickname: string;
++  lastSpokeAt: number;
++  availableAt: number;
++}
++
++export interface SpeakCooldownView extends ChannelSpeakCooldown {
++  remainingSeconds: number;
++}
++
++export interface SlowModeClockOptions {
++  now?: number;
++}
++
++export interface SetSlowModeOptions extends SlowModeClockOptions {
++  intervalSeconds?: number;
++}
++
++export interface SpeakAttemptSuccess {
++  ok: true;
++  allowed: true;
++  channelId: string;
++  nickname: string;
++  availableAt: number;
++  remainingSeconds: 0;
++}
++
++export interface SpeakAttemptDenied {
++  ok: true;
++  allowed: false;
++  channelId: string;
++  nickname: string;
++  availableAt: number;
++  remainingSeconds: number;
++}
++
++export type SpeakAttemptResult = SpeakAttemptSuccess | SpeakAttemptDenied;
++
++export interface SlowModeFailure {
++  ok: false;
++  reason: SlowModeFailureReason;
++  channelId?: string;
++  nickname?: string;
++}
++
++export type SetSlowModeResult =
++  | { ok: true; channelId: string; intervalSeconds: number; enabled: true }
++  | SlowModeFailure;
++
++export type ClearSlowModeResult =
++  | { ok: true; channelId: string; cleared: true }
++  | SlowModeFailure;
++
++export type RecordSpeakResult =
++  | { ok: true; channelId: string; nickname: string; lastSpokeAt: number; availableAt: number }
++  | SlowModeFailure;
++
++export interface CooldownSweepResult {
++  removed: number;
++  nicknames: string[];
++}
++
++export interface ChannelSlowModeStore {
++  getConfig(channelId: string): Promise<ChannelSlowModeConfig | null>;
++  putConfig(config: ChannelSlowModeConfig): Promise<void>;
++  deleteConfig(channelId: string): Promise<void>;
++  getCooldown(channelId: string, nickname: string): Promise<ChannelSpeakCooldown | null>;
++  putCooldown(cooldown: ChannelSpeakCooldown): Promise<void>;
++  deleteCooldown(channelId: string, nickname: string): Promise<void>;
++  listCooldowns(channelId: string): Promise<ChannelSpeakCooldown[]>;
++  compareAndSetCooldown(
++    channelId: string,
++    nickname: string,
++    expectedAvailableAt: number | null,
++    cooldown: ChannelSpeakCooldown,
++  ): Promise<boolean>;
++}
++
++export function isChannelSlowModeConfig(value: unknown): value is ChannelSlowModeConfig {
++  if (value === null || typeof value !== "object") return false;
++  const row = value as Partial<ChannelSlowModeConfig>;
++  return (
++    typeof row.channelId === "string" &&
++    row.channelId.length > 0 &&
++    typeof row.intervalSeconds === "number" &&
++    Number.isFinite(row.intervalSeconds) &&
++    typeof row.enabled === "boolean"
++  );
++}
++
++export function isChannelSpeakCooldown(value: unknown): value is ChannelSpeakCooldown {
++  if (value === null || typeof value !== "object") return false;
++  const row = value as Partial<ChannelSpeakCooldown>;
++  return (
++    typeof row.channelId === "string" &&
++    row.channelId.length > 0 &&
++    typeof row.nickname === "string" &&
++    row.nickname.length > 0 &&
++    typeof row.lastSpokeAt === "number" &&
++    Number.isFinite(row.lastSpokeAt) &&
++    typeof row.availableAt === "number" &&
++    Number.isFinite(row.availableAt)
++  );
++}
+diff --git a/packages/backend/src/services/slow_mode_utils.ts b/packages/backend/src/services/slow_mode_utils.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/slow_mode_utils.ts
+@@ -0,0 +1,71 @@
++import { isValidNickname } from "#ours/shared/inputValidation.ts";
++import {
++  DEFAULT_SLOW_MODE_SECONDS,
++  MAX_SLOW_MODE_SECONDS,
++  MIN_SLOW_MODE_SECONDS,
++  type ChannelSpeakCooldown,
++  type SlowModeFailure,
++  type SlowModeFailureReason,
++  type SpeakCooldownView,
++} from "#ours/backend/services/slow_mode_types.ts";
++
++export function readSlowModeClock(now?: number): number {
++  if (typeof now === "number" && Number.isFinite(now)) return Math.trunc(now);
++  return Date.now();
++}
++
++export function clampSlowModeSeconds(seconds?: number): number | null {
++  if (seconds === undefined) return DEFAULT_SLOW_MODE_SECONDS;
++  if (typeof seconds !== "number" || !Number.isFinite(seconds)) return null;
++  return Math.min(MAX_SLOW_MODE_SECONDS, Math.max(MIN_SLOW_MODE_SECONDS, Math.trunc(seconds)));
++}
++
++export function normalizeSlowChannelId(channelId: string): string | null {
++  if (typeof channelId !== "string") return null;
++  const trimmed = channelId.trim();
++  return trimmed.length > 0 ? trimmed : null;
++}
++
++export function normalizeSlowNickname(nickname: string): string | null {
++  if (typeof nickname !== "string") return null;
++  const trimmed = nickname.trim();
++  if (!isValidNickname(trimmed)) return null;
++  return trimmed.normalize("NFC").toLowerCase();
++}
++
++export function remainingCooldownSeconds(availableAt: number, now: number): number {
++  return Math.max(0, Math.floor((availableAt - now) / 1000));
++}
++
++export function isCooldownActive(cooldown: ChannelSpeakCooldown, now: number): boolean {
++  return cooldown.availableAt > now;
++}
++
++export function toCooldownView(cooldown: ChannelSpeakCooldown, now: number): SpeakCooldownView {
++  return {
++    channelId: cooldown.channelId,
++    nickname: cooldown.nickname,
++    lastSpokeAt: cooldown.lastSpokeAt,
++    availableAt: cooldown.availableAt,
++    remainingSeconds: remainingCooldownSeconds(cooldown.availableAt, now),
++  };
++}
++
++export function sortCooldownViews(views: SpeakCooldownView[]): SpeakCooldownView[] {
++  return [...views].sort((left, right) => left.nickname.localeCompare(right.nickname));
++}
++
++export function uniqueSortedNicknames(values: Iterable<string>): string[] {
++  return [...new Set([...values].filter((value) => value.length > 0))].sort((a, b) => a.localeCompare(b));
++}
++
++export function slowModeFailure(
++  reason: SlowModeFailureReason,
++  extra: Omit<SlowModeFailure, "ok" | "reason"> = {},
++): SlowModeFailure {
++  return { ok: false, reason, ...extra };
++}
++
++export function availableAtFromSpeak(now: number, intervalSeconds: number): number {
++  return now + intervalSeconds * 1000;
++}
+diff --git a/packages/backend/src/services/slow_mode_store.ts b/packages/backend/src/services/slow_mode_store.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/slow_mode_store.ts
+@@ -0,0 +1,90 @@
++import {
++  isChannelSlowModeConfig,
++  isChannelSpeakCooldown,
++  type ChannelSlowModeConfig,
++  type ChannelSlowModeStore,
++  type ChannelSpeakCooldown,
++} from "#ours/backend/services/slow_mode_types.ts";
++
++const cooldownKey = (channelId: string, nickname: string) => `${channelId}\u0000${nickname}`;
++
++const cloneConfig = (config: ChannelSlowModeConfig): ChannelSlowModeConfig => ({
++  channelId: config.channelId,
++  intervalSeconds: config.intervalSeconds,
++  enabled: config.enabled,
++});
++
++const cloneCooldown = (cooldown: ChannelSpeakCooldown): ChannelSpeakCooldown => ({
++  channelId: cooldown.channelId,
++  nickname: cooldown.nickname,
++  lastSpokeAt: cooldown.lastSpokeAt,
++  availableAt: cooldown.availableAt,
++});
++
++export class MemoryChannelSlowModeStore implements ChannelSlowModeStore {
++  private readonly configs = new Map<string, ChannelSlowModeConfig>();
++  private readonly cooldowns = new Map<string, ChannelSpeakCooldown>();
++
++  async getConfig(channelId: string): Promise<ChannelSlowModeConfig | null> {
++    const row = this.configs.get(channelId);
++    return row ? cloneConfig(row) : null;
++  }
++
++  async putConfig(config: ChannelSlowModeConfig): Promise<void> {
++    if (!isChannelSlowModeConfig(config)) return;
++    this.configs.set(config.channelId, cloneConfig(config));
++  }
++
++  async deleteConfig(channelId: string): Promise<void> {
++    this.configs.delete(channelId);
++  }
++
++  async getCooldown(channelId: string, nickname: string): Promise<ChannelSpeakCooldown | null> {
++    const row = this.cooldowns.get(cooldownKey(channelId, nickname));
++    return row ? cloneCooldown(row) : null;
++  }
++
++  async putCooldown(cooldown: ChannelSpeakCooldown): Promise<void> {
++    if (!isChannelSpeakCooldown(cooldown)) return;
++    this.cooldowns.set(cooldownKey(cooldown.channelId, cooldown.nickname), cloneCooldown(cooldown));
++  }
++
++  async deleteCooldown(channelId: string, nickname: string): Promise<void> {
++    this.cooldowns.delete(cooldownKey(channelId, nickname));
++  }
++
++  async listCooldowns(channelId: string): Promise<ChannelSpeakCooldown[]> {
++    return [...this.cooldowns.values()]
++      .filter((row) => row.channelId === channelId)
++      .map(cloneCooldown);
++  }
++
++  async compareAndSetCooldown(
++    channelId: string,
++    nickname: string,
++    expectedAvailableAt: number | null,
++    cooldown: ChannelSpeakCooldown,
++  ): Promise<boolean> {
++    if (!isChannelSpeakCooldown(cooldown) || cooldown.channelId !== channelId || cooldown.nickname !== nickname) {
++      return false;
++    }
++    const key = cooldownKey(channelId, nickname);
++    const current = this.cooldowns.get(key);
++    if (expectedAvailableAt === null) {
++      if (current) return false;
++    } else if (!current || current.availableAt !== expectedAvailableAt) {
++      return false;
++    }
++    this.cooldowns.set(key, cloneCooldown(cooldown));
++    return true;
++  }
++
++  clear(): void {
++    this.configs.clear();
++    this.cooldowns.clear();
++  }
++}
++
++export function createMemoryChannelSlowModeStore(): MemoryChannelSlowModeStore {
++  return new MemoryChannelSlowModeStore();
++}
+diff --git a/packages/backend/src/services/slow_mode_policy.ts b/packages/backend/src/services/slow_mode_policy.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/slow_mode_policy.ts
+@@ -0,0 +1,25 @@
++import {
++  DEFAULT_SLOW_MODE_SECONDS,
++  MAX_SLOW_MODE_SECONDS,
++  MIN_SLOW_MODE_SECONDS,
++} from "#ours/backend/services/slow_mode_types.ts";
++
++export interface SlowModePolicy {
++  defaultSeconds: number;
++  minSeconds: number;
++  maxSeconds: number;
++}
++
++export const DEFAULT_SLOW_MODE_POLICY: SlowModePolicy = {
++  defaultSeconds: DEFAULT_SLOW_MODE_SECONDS,
++  minSeconds: MIN_SLOW_MODE_SECONDS,
++  maxSeconds: MAX_SLOW_MODE_SECONDS,
++};
++
++export function describeSlowModePolicy(policy: SlowModePolicy = DEFAULT_SLOW_MODE_POLICY): string {
++  return `slow-mode ${policy.minSeconds}-${policy.maxSeconds}s (default ${policy.defaultSeconds}s)`;
++}
++
++export function isWithinSlowModeBounds(seconds: number, policy: SlowModePolicy = DEFAULT_SLOW_MODE_POLICY): boolean {
++  return Number.isFinite(seconds) && seconds >= policy.minSeconds && seconds <= policy.maxSeconds;
++}
+diff --git a/packages/backend/src/services/slow_mode_service.ts b/packages/backend/src/services/slow_mode_service.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/slow_mode_service.ts
+@@ -0,0 +1,297 @@
++import { createMemoryChannelSlowModeStore } from "#ours/backend/services/slow_mode_store.ts";
++import type {
++  ChannelSlowModeConfig,
++  ChannelSlowModeStore,
++  ChannelSpeakCooldown,
++  ClearSlowModeResult,
++  CooldownSweepResult,
++  RecordSpeakResult,
++  SetSlowModeOptions,
++  SetSlowModeResult,
++  SlowModeClockOptions,
++  SpeakAttemptResult,
++  SpeakCooldownView,
++} from "#ours/backend/services/slow_mode_types.ts";
++import {
++  availableAtFromSpeak,
++  clampSlowModeSeconds,
++  isCooldownActive,
++  normalizeSlowChannelId,
++  normalizeSlowNickname,
++  readSlowModeClock,
++  remainingCooldownSeconds,
++  slowModeFailure,
++  sortCooldownViews,
++  toCooldownView,
++  uniqueSortedNicknames,
++} from "#ours/backend/services/slow_mode_utils.ts";
++
++export class ChannelSlowModeService {
++  private readonly store: ChannelSlowModeStore;
++
++  constructor(store: ChannelSlowModeStore = createMemoryChannelSlowModeStore()) {
++    this.store = store;
++  }
++
++  async setChannelSlowMode(channelId: string, options: SetSlowModeOptions = {}): Promise<SetSlowModeResult> {
++    const channel = normalizeSlowChannelId(channelId);
++    if (!channel) return slowModeFailure("invalid_channel");
++
++    const intervalSeconds = clampSlowModeSeconds(options.intervalSeconds);
++    if (intervalSeconds === null) return slowModeFailure("invalid_interval", { channelId: channel });
++
++    const config: ChannelSlowModeConfig = {
++      channelId: channel,
++      intervalSeconds,
++      enabled: true,
++    };
++    await this.store.putConfig(config);
++    return { ok: true, channelId: channel, intervalSeconds, enabled: true };
++  }
++
++  async getChannelSlowMode(channelId: string): Promise<ChannelSlowModeConfig | null> {
++    const channel = normalizeSlowChannelId(channelId);
++    if (!channel) return null;
++    const config = await this.store.getConfig(channel);
++    if (!config || !config.enabled) return null;
++    return config;
++  }
++
++  async clearChannelSlowMode(channelId: string): Promise<ClearSlowModeResult> {
++    const channel = normalizeSlowChannelId(channelId);
++    if (!channel) return slowModeFailure("invalid_channel");
++
++    const current = await this.store.getConfig(channel);
++    if (!current || !current.enabled) return slowModeFailure("not_enabled", { channelId: channel });
++
++    await this.store.deleteConfig(channel);
++    for (const cooldown of await this.store.listCooldowns(channel)) {
++      await this.store.deleteCooldown(channel, cooldown.nickname);
++    }
++    return { ok: true, channelId: channel, cleared: true };
++  }
++
++  async canSpeak(
++    channelId: string,
++    nickname: string,
++    options: SlowModeClockOptions = {},
++  ): Promise<SpeakAttemptResult | ReturnType<typeof slowModeFailure>> {
++    const channel = normalizeSlowChannelId(channelId);
++    if (!channel) return slowModeFailure("invalid_channel");
++    const user = normalizeSlowNickname(nickname);
++    if (!user) return slowModeFailure("invalid_nickname", { channelId: channel });
++
++    const now = readSlowModeClock(options.now);
++    const config = await this.store.getConfig(channel);
++    if (!config || !config.enabled) {
++      return {
++        ok: true,
++        allowed: true,
++        channelId: channel,
++        nickname: user,
++        availableAt: now,
++        remainingSeconds: 0,
++      };
++    }
++
++    const cooldown = await this.store.getCooldown(channel, user);
++    if (!cooldown || !isCooldownActive(cooldown, now)) {
++      return {
++        ok: true,
++        allowed: true,
++        channelId: channel,
++        nickname: user,
++        availableAt: now,
++        remainingSeconds: 0,
++      };
++    }
++
++    return {
++      ok: true,
++      allowed: false,
++      channelId: channel,
++      nickname: user,
++      availableAt: cooldown.availableAt,
++      remainingSeconds: remainingCooldownSeconds(cooldown.availableAt, now),
++    };
++  }
++
++  async recordChannelSpeak(
++    channelId: string,
++    nickname: string,
++    options: SlowModeClockOptions = {},
++  ): Promise<RecordSpeakResult> {
++    const channel = normalizeSlowChannelId(channelId);
++    if (!channel) return slowModeFailure("invalid_channel");
++    const user = normalizeSlowNickname(nickname);
++    if (!user) return slowModeFailure("invalid_nickname", { channelId: channel });
++
++    const config = await this.store.getConfig(channel);
++    if (!config || !config.enabled) return slowModeFailure("not_enabled", { channelId: channel, nickname: user });
++
++    const now = readSlowModeClock(options.now);
++    const current = await this.store.getCooldown(channel, user);
++    if (current && isCooldownActive(current, now)) {
++      return slowModeFailure("cooldown_active", { channelId: channel, nickname: user });
++    }
++
++    const availableAt = availableAtFromSpeak(now, config.intervalSeconds);
++    const next: ChannelSpeakCooldown = {
++      channelId: channel,
++      nickname: user,
++      lastSpokeAt: now,
++      availableAt,
++    };
++
++    if (current) {
++      const swapped = await this.store.compareAndSetCooldown(channel, user, current.availableAt, next);
++      if (!swapped) return this.recordChannelSpeak(channelId, nickname, options);
++      return { ok: true, channelId: channel, nickname: user, lastSpokeAt: now, availableAt };
++    }
++
++    const created = await this.store.compareAndSetCooldown(channel, user, null, next);
++    if (!created) return this.recordChannelSpeak(channelId, nickname, options);
++    return { ok: true, channelId: channel, nickname: user, lastSpokeAt: now, availableAt };
++  }
++
++  async trySpeak(
++    channelId: string,
++    nickname: string,
++    options: SlowModeClockOptions = {},
++  ): Promise<SpeakAttemptResult | ReturnType<typeof slowModeFailure>> {
++    const check = await this.canSpeak(channelId, nickname, options);
++    if (!check.ok || !check.allowed) return check;
++    const recorded = await this.recordChannelSpeak(channelId, nickname, options);
++    if (!recorded.ok) {
++      // Race: someone else recorded first; re-check.
++      return this.canSpeak(channelId, nickname, options);
++    }
++    return {
++      ok: true,
++      allowed: true,
++      channelId: recorded.channelId,
++      nickname: recorded.nickname,
++      availableAt: recorded.availableAt,
++      remainingSeconds: 0,
++    };
++  }
++
++  async listActiveCooldowns(channelId: string, options: SlowModeClockOptions = {}): Promise<SpeakCooldownView[]> {
++    const channel = normalizeSlowChannelId(channelId);
++    if (!channel) return [];
++    const now = readSlowModeClock(options.now);
++    const views: SpeakCooldownView[] = [];
++    for (const cooldown of await this.store.listCooldowns(channel)) {
++      if (!isCooldownActive(cooldown, now)) continue;
++      views.push(toCooldownView(cooldown, now));
++    }
++    return sortCooldownViews(views);
++  }
++
++  async getCooldown(
++    channelId: string,
++    nickname: string,
++    options: SlowModeClockOptions = {},
++  ): Promise<SpeakCooldownView | null> {
++    const channel = normalizeSlowChannelId(channelId);
++    const user = normalizeSlowNickname(nickname);
++    if (!channel || !user) return null;
++    const now = readSlowModeClock(options.now);
++    const cooldown = await this.store.getCooldown(channel, user);
++    if (!cooldown || !isCooldownActive(cooldown, now)) return null;
++    return toCooldownView(cooldown, now);
++  }
++
++  async sweepExpiredCooldowns(channelId: string, options: SlowModeClockOptions = {}): Promise<CooldownSweepResult> {
++    const channel = normalizeSlowChannelId(channelId);
++    if (!channel) return { removed: 0, nicknames: [] };
++    const now = readSlowModeClock(options.now);
++    const nicknames: string[] = [];
++    let removed = 0;
++    for (const cooldown of await this.store.listCooldowns(channel)) {
++      if (isCooldownActive(cooldown, now)) continue;
++      await this.store.deleteCooldown(channel, cooldown.nickname);
++      removed += 1;
++      nicknames.push(cooldown.nickname);
++    }
++    return { removed, nicknames: uniqueSortedNicknames(nicknames) };
++  }
++}
++
++export function createChannelSlowModeService(store?: ChannelSlowModeStore): ChannelSlowModeService {
++  return new ChannelSlowModeService(store ?? createMemoryChannelSlowModeStore());
++}
++
++export async function setChannelSlowMode(
++  channelId: string,
++  options: SetSlowModeOptions = {},
++  store?: ChannelSlowModeStore,
++): Promise<SetSlowModeResult> {
++  return createChannelSlowModeService(store).setChannelSlowMode(channelId, options);
++}
++
++export async function getChannelSlowMode(
++  channelId: string,
++  store?: ChannelSlowModeStore,
++): Promise<ChannelSlowModeConfig | null> {
++  return createChannelSlowModeService(store).getChannelSlowMode(channelId);
++}
++
++export async function clearChannelSlowMode(
++  channelId: string,
++  store?: ChannelSlowModeStore,
++): Promise<ClearSlowModeResult> {
++  return createChannelSlowModeService(store).clearChannelSlowMode(channelId);
++}
++
++export async function canSpeak(
++  channelId: string,
++  nickname: string,
++  options: SlowModeClockOptions = {},
++  store?: ChannelSlowModeStore,
++) {
++  return createChannelSlowModeService(store).canSpeak(channelId, nickname, options);
++}
++
++export async function recordChannelSpeak(
++  channelId: string,
++  nickname: string,
++  options: SlowModeClockOptions = {},
++  store?: ChannelSlowModeStore,
++): Promise<RecordSpeakResult> {
++  return createChannelSlowModeService(store).recordChannelSpeak(channelId, nickname, options);
++}
++
++export async function trySpeak(
++  channelId: string,
++  nickname: string,
++  options: SlowModeClockOptions = {},
++  store?: ChannelSlowModeStore,
++) {
++  return createChannelSlowModeService(store).trySpeak(channelId, nickname, options);
++}
++
++export async function listActiveCooldowns(
++  channelId: string,
++  options: SlowModeClockOptions = {},
++  store?: ChannelSlowModeStore,
++): Promise<SpeakCooldownView[]> {
++  return createChannelSlowModeService(store).listActiveCooldowns(channelId, options);
++}
++
++export async function getCooldown(
++  channelId: string,
++  nickname: string,
++  options: SlowModeClockOptions = {},
++  store?: ChannelSlowModeStore,
++): Promise<SpeakCooldownView | null> {
++  return createChannelSlowModeService(store).getCooldown(channelId, nickname, options);
++}
++
++export async function sweepExpiredCooldowns(
++  channelId: string,
++  options: SlowModeClockOptions = {},
++  store?: ChannelSlowModeStore,
++): Promise<CooldownSweepResult> {
++  return createChannelSlowModeService(store).sweepExpiredCooldowns(channelId, options);
++}
+diff --git a/packages/backend/src/services/slow_mode.ts b/packages/backend/src/services/slow_mode.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/packages/backend/src/services/slow_mode.ts
+@@ -0,0 +1,64 @@
++export {
++  ChannelSlowModeService,
++  canSpeak,
++  clearChannelSlowMode,
++  createChannelSlowModeService,
++  getChannelSlowMode,
++  getCooldown,
++  listActiveCooldowns,
++  recordChannelSpeak,
++  setChannelSlowMode,
++  sweepExpiredCooldowns,
++  trySpeak,
++} from "#ours/backend/services/slow_mode_service.ts";
++
++export {
++  MemoryChannelSlowModeStore,
++  createMemoryChannelSlowModeStore,
++} from "#ours/backend/services/slow_mode_store.ts";
++
++export {
++  DEFAULT_COOLDOWN_SWEEP_LIMIT,
++  DEFAULT_SLOW_MODE_SECONDS,
++  MAX_SLOW_MODE_SECONDS,
++  MIN_SLOW_MODE_SECONDS,
++  SLOW_MODE_FAILURE_REASONS,
++  isChannelSlowModeConfig,
++  isChannelSpeakCooldown,
++  type ChannelSlowModeConfig,
++  type ChannelSlowModeStore,
++  type ChannelSpeakCooldown,
++  type ClearSlowModeResult,
++  type CooldownSweepResult,
++  type RecordSpeakResult,
++  type SetSlowModeOptions,
++  type SetSlowModeResult,
++  type SlowModeClockOptions,
++  type SlowModeFailure,
++  type SlowModeFailureReason,
++  type SpeakAttemptDenied,
++  type SpeakAttemptResult,
++  type SpeakAttemptSuccess,
++  type SpeakCooldownView,
++} from "#ours/backend/services/slow_mode_types.ts";
++
++export {
++  DEFAULT_SLOW_MODE_POLICY,
++  describeSlowModePolicy,
++  isWithinSlowModeBounds,
++  type SlowModePolicy,
++} from "#ours/backend/services/slow_mode_policy.ts";
++
++export {
++  availableAtFromSpeak,
++  clampSlowModeSeconds,
++  isCooldownActive,
++  normalizeSlowChannelId,
++  normalizeSlowNickname,
++  readSlowModeClock,
++  remainingCooldownSeconds,
++  slowModeFailure,
++  sortCooldownViews,
++  toCooldownView,
++  uniqueSortedNicknames,
++} from "#ours/backend/services/slow_mode_utils.ts";

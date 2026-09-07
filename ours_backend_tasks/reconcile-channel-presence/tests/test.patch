@@ -1,0 +1,728 @@
+diff --git a/packages/backend/src/gold_tests/presence_audit_behavior.test.ts b/packages/backend/src/gold_tests/presence_audit_behavior.test.ts
+new file mode 100644
+index 0000000..7d55bee
+--- /dev/null
++++ b/packages/backend/src/gold_tests/presence_audit_behavior.test.ts
+@@ -0,0 +1,214 @@
++import { describe, expect, it } from "vitest";
++import {
++  PresenceReconciliationService,
++  auditChannelPresence,
++} from "#ours/backend/services/presence_reconciliation_service.ts";
++import type { PresenceStore } from "#ours/backend/services/presence_reconciliation_types.ts";
++import type { UserSession } from "#ours/backend/session/types.ts";
++
++const user = (nickname: string, channelId: string): UserSession => ({
++  sessionId: `session-${nickname}`,
++  nickname,
++  userType: "temporary",
++  channelId,
++  joinedAt: 1000,
++  lastActivity: 2000,
++  chatUserId: `chat-${nickname}`,
++  connectionStatus: "active",
++});
++
++class FakePresenceStore implements PresenceStore {
++  readonly channels = new Map<string, Set<string>>();
++  readonly users = new Map<string, { session: UserSession | null; ttl: number }>();
++
++  channel(channelId: string, ...nicknames: string[]): this {
++    this.channels.set(channelId, new Set(nicknames));
++    return this;
++  }
++
++  session(nickname: string, channelId: string, ttl = 1200): this {
++    this.users.set(nickname, { session: user(nickname, channelId), ttl });
++    return this;
++  }
++
++  malformed(nickname: string): this {
++    this.users.set(nickname, { session: null, ttl: 1200 });
++    return this;
++  }
++
++  async listChannelIds(): Promise<string[]> {
++    return [...this.channels.keys()];
++  }
++
++  async listUserNicknames(): Promise<string[]> {
++    return [...this.users.keys()];
++  }
++
++  async getChannelUsers(channelId: string): Promise<string[]> {
++    return [...(this.channels.get(channelId) ?? new Set<string>())];
++  }
++
++  async getUserByNickname(nickname: string): Promise<UserSession | null> {
++    return this.users.get(nickname)?.session ?? null;
++  }
++
++  async getUserTtl(nickname: string): Promise<number> {
++    return this.users.get(nickname)?.ttl ?? -2;
++  }
++
++  async addUserToChannel(channelId: string, nickname: string): Promise<void> {
++    const members = this.channels.get(channelId) ?? new Set<string>();
++    members.add(nickname);
++    this.channels.set(channelId, members);
++  }
++
++  async removeUserFromChannel(channelId: string, nickname: string): Promise<void> {
++    this.channels.get(channelId)?.delete(nickname);
++  }
++
++  async ensureUserTtl(nickname: string, ttlSeconds = 1800): Promise<boolean> {
++    const record = this.users.get(nickname);
++    if (!record || record.ttl !== -1) return false;
++    record.ttl = ttlSeconds;
++    return true;
++  }
++}
++
++const zeroCounts = {
++  missing_session: 0,
++  channel_mismatch: 0,
++  missing_membership: 0,
++  missing_session_ttl: 0,
++};
++
++describe("Channel presence audit", () => {
++  it("reports a healthy channel with matching sessions and memberships", async () => {
++    const store = new FakePresenceStore().channel("c1", "alice").session("alice", "c1");
++    const audit = await new PresenceReconciliationService(store).auditChannel("c1");
++    expect(audit).toEqual({
++      channelId: "c1",
++      memberCount: 1,
++      sessionCount: 1,
++      validCount: 1,
++      healthy: true,
++      issueCounts: zeroCounts,
++      issues: [],
++    });
++  });
++
++  it("keeps every issue counter present when the channel is healthy", async () => {
++    const audit = await new PresenceReconciliationService(new FakePresenceStore()).auditChannel("c1");
++    expect(audit.issueCounts).toEqual(zeroCounts);
++  });
++
++  it("reports a member whose session is missing", async () => {
++    const store = new FakePresenceStore().channel("c1", "ghost");
++    const audit = await new PresenceReconciliationService(store).auditChannel("c1");
++    expect(audit.issues).toEqual([{ nickname: "ghost", code: "missing_session" }]);
++    expect(audit.issueCounts.missing_session).toBe(1);
++  });
++
++  it("reports a member whose session points at another channel", async () => {
++    const store = new FakePresenceStore().channel("c1", "alice").session("alice", "c2");
++    const audit = await new PresenceReconciliationService(store).auditChannel("c1");
++    expect(audit.issues).toEqual([
++      { nickname: "alice", code: "channel_mismatch", sessionChannelId: "c2" },
++    ]);
++  });
++
++  it("reports a session that claims the channel but is absent from its member set", async () => {
++    const store = new FakePresenceStore().session("alice", "c1");
++    const audit = await new PresenceReconciliationService(store).auditChannel("c1");
++    expect(audit.issues).toEqual([{ nickname: "alice", code: "missing_membership" }]);
++    expect(audit.sessionCount).toBe(1);
++    expect(audit.validCount).toBe(0);
++  });
++
++  it("reports a channel session that has no Redis expiry", async () => {
++    const store = new FakePresenceStore().channel("c1", "alice").session("alice", "c1", -1);
++    const audit = await new PresenceReconciliationService(store).auditChannel("c1");
++    expect(audit.issues).toEqual([{ nickname: "alice", code: "missing_session_ttl" }]);
++    expect(audit.validCount).toBe(1);
++  });
++
++  it("can report missing membership and missing ttl for the same session", async () => {
++    const store = new FakePresenceStore().session("alice", "c1", -1);
++    const audit = await new PresenceReconciliationService(store).auditChannel("c1");
++    expect(audit.issues).toEqual([
++      { nickname: "alice", code: "missing_membership" },
++      { nickname: "alice", code: "missing_session_ttl" },
++    ]);
++  });
++
++  it("sorts issues by nickname and then by the stable issue-code order", async () => {
++    const store = new FakePresenceStore()
++      .channel("c1", "zoe", "bob")
++      .session("amy", "c1", -1)
++      .session("bob", "c2")
++      .malformed("zoe");
++    const audit = await new PresenceReconciliationService(store).auditChannel("c1");
++    expect(audit.issues).toEqual([
++      { nickname: "amy", code: "missing_membership" },
++      { nickname: "amy", code: "missing_session_ttl" },
++      { nickname: "bob", code: "channel_mismatch", sessionChannelId: "c2" },
++      { nickname: "zoe", code: "missing_session" },
++    ]);
++  });
++
++  it("counts members sessions and valid memberships independently", async () => {
++    const store = new FakePresenceStore()
++      .channel("c1", "alice", "bob", "ghost")
++      .session("alice", "c1")
++      .session("bob", "c2")
++      .session("carol", "c1");
++    const audit = await new PresenceReconciliationService(store).auditChannel("c1");
++    expect({ memberCount: audit.memberCount, sessionCount: audit.sessionCount, validCount: audit.validCount }).toEqual({
++      memberCount: 3,
++      sessionCount: 2,
++      validCount: 1,
++    });
++  });
++
++  it("tracks totals for every issue code", async () => {
++    const store = new FakePresenceStore()
++      .channel("c1", "ghost", "bob")
++      .session("bob", "c2")
++      .session("alice", "c1", -1);
++    const audit = await new PresenceReconciliationService(store).auditChannel("c1");
++    expect(audit.issueCounts).toEqual({
++      missing_session: 1,
++      channel_mismatch: 1,
++      missing_membership: 1,
++      missing_session_ttl: 1,
++    });
++    expect(audit.healthy).toBe(false);
++  });
++
++  it("does not treat an unreadable unindexed user key as a channel issue", async () => {
++    const store = new FakePresenceStore().malformed("orphan");
++    const audit = await new PresenceReconciliationService(store).auditChannel("c1");
++    expect(audit.issues).toEqual([]);
++    expect(audit.healthy).toBe(true);
++  });
++
++  it("does not report ttl drift for a session owned by another channel", async () => {
++    const store = new FakePresenceStore().channel("c1", "alice").session("alice", "c2", -1);
++    const audit = await new PresenceReconciliationService(store).auditChannel("c1");
++    expect(audit.issues).toEqual([
++      { nickname: "alice", code: "channel_mismatch", sessionChannelId: "c2" },
++    ]);
++  });
++
++  it("deduplicates channel members before calculating counts", async () => {
++    const store = new FakePresenceStore().session("alice", "c1");
++    store.getChannelUsers = async () => ["alice", "alice", "alice"];
++    const audit = await new PresenceReconciliationService(store).auditChannel("c1");
++    expect(audit.memberCount).toBe(1);
++    expect(audit.validCount).toBe(1);
++  });
++
++  it("supports the auditChannelPresence convenience function", async () => {
++    const store = new FakePresenceStore().channel("c1", "alice").session("alice", "c1");
++    await expect(auditChannelPresence("c1", store)).resolves.toMatchObject({ channelId: "c1", healthy: true });
++  });
++});
+diff --git a/packages/backend/src/gold_tests/presence_default_store_behavior.test.ts b/packages/backend/src/gold_tests/presence_default_store_behavior.test.ts
+new file mode 100644
+index 0000000..1f5b430
+--- /dev/null
++++ b/packages/backend/src/gold_tests/presence_default_store_behavior.test.ts
+@@ -0,0 +1,61 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import type { UserSession } from "#ours/backend/session/types.ts";
++
++const { usersMock } = vi.hoisted(() => ({
++  usersMock: {
++    listChannelIds: vi.fn(),
++    listUserNicknames: vi.fn(),
++    getChannelUsers: vi.fn(),
++    getUserByNickname: vi.fn(),
++    getUserTtl: vi.fn(),
++    addUserToChannel: vi.fn(),
++    removeUserFromChannel: vi.fn(),
++    ensureUserTtl: vi.fn(),
++  },
++}));
++
++vi.mock("#ours/backend/session/index.ts", () => ({ users: usersMock }));
++
++import { PresenceReconciliationService } from "#ours/backend/services/presence_reconciliation_service.ts";
++
++const session: UserSession = {
++  sessionId: "s1",
++  nickname: "alice",
++  userType: "temporary",
++  channelId: "c1",
++  joinedAt: 1000,
++  lastActivity: 2000,
++  chatUserId: "chat-1",
++  connectionStatus: "active",
++};
++
++beforeEach(() => {
++  usersMock.listChannelIds.mockResolvedValue(["c1"]);
++  usersMock.listUserNicknames.mockResolvedValue(["alice"]);
++  usersMock.getChannelUsers.mockResolvedValue(["alice"]);
++  usersMock.getUserByNickname.mockResolvedValue(session);
++  usersMock.getUserTtl.mockResolvedValue(900);
++  usersMock.addUserToChannel.mockResolvedValue(undefined);
++  usersMock.removeUserFromChannel.mockResolvedValue(undefined);
++  usersMock.ensureUserTtl.mockResolvedValue(false);
++});
++
++describe("Default presence store", () => {
++  it("uses the current Redis session operations when no store is supplied", async () => {
++    const audit = await new PresenceReconciliationService().auditChannel("c1");
++    expect(audit.healthy).toBe(true);
++    expect(usersMock.getChannelUsers).toHaveBeenCalledWith("c1");
++    expect(usersMock.listUserNicknames).toHaveBeenCalled();
++    expect(usersMock.getUserByNickname).toHaveBeenCalledWith("alice");
++    expect(usersMock.getUserTtl).toHaveBeenCalledWith("alice");
++  });
++
++  it("uses Redis membership operations for repairs", async () => {
++    usersMock.listUserNicknames.mockResolvedValue([]);
++    usersMock.getChannelUsers.mockResolvedValueOnce(["ghost"]).mockResolvedValueOnce([]);
++    usersMock.getUserByNickname.mockResolvedValue(null);
++    const repair = await new PresenceReconciliationService().repairChannel("c1");
++    expect(usersMock.removeUserFromChannel).toHaveBeenCalledWith("c1", "ghost");
++    expect(repair.after.healthy).toBe(true);
++  });
++});
+diff --git a/packages/backend/src/gold_tests/presence_repair_behavior.test.ts b/packages/backend/src/gold_tests/presence_repair_behavior.test.ts
+new file mode 100644
+index 0000000..f2a1756
+--- /dev/null
++++ b/packages/backend/src/gold_tests/presence_repair_behavior.test.ts
+@@ -0,0 +1,167 @@
++import { describe, expect, it } from "vitest";
++import {
++  PresenceReconciliationService,
++  repairChannelPresence,
++} from "#ours/backend/services/presence_reconciliation_service.ts";
++import type { PresenceStore } from "#ours/backend/services/presence_reconciliation_types.ts";
++import type { UserSession } from "#ours/backend/session/types.ts";
++
++const user = (nickname: string, channelId: string): UserSession => ({
++  sessionId: `session-${nickname}`,
++  nickname,
++  userType: "temporary",
++  channelId,
++  joinedAt: 1000,
++  lastActivity: 2000,
++  chatUserId: `chat-${nickname}`,
++  connectionStatus: "active",
++});
++
++class FakePresenceStore implements PresenceStore {
++  readonly channels = new Map<string, Set<string>>();
++  readonly users = new Map<string, { session: UserSession | null; ttl: number }>();
++  ttlRepairEnabled = true;
++
++  channel(channelId: string, ...nicknames: string[]): this {
++    this.channels.set(channelId, new Set(nicknames));
++    return this;
++  }
++
++  session(nickname: string, channelId: string, ttl = 1200): this {
++    this.users.set(nickname, { session: user(nickname, channelId), ttl });
++    return this;
++  }
++
++  async listChannelIds(): Promise<string[]> { return [...this.channels.keys()]; }
++  async listUserNicknames(): Promise<string[]> { return [...this.users.keys()]; }
++  async getChannelUsers(channelId: string): Promise<string[]> { return [...(this.channels.get(channelId) ?? new Set())]; }
++  async getUserByNickname(nickname: string): Promise<UserSession | null> { return this.users.get(nickname)?.session ?? null; }
++  async getUserTtl(nickname: string): Promise<number> { return this.users.get(nickname)?.ttl ?? -2; }
++
++  async addUserToChannel(channelId: string, nickname: string): Promise<void> {
++    const members = this.channels.get(channelId) ?? new Set<string>();
++    members.add(nickname);
++    this.channels.set(channelId, members);
++  }
++
++  async removeUserFromChannel(channelId: string, nickname: string): Promise<void> {
++    this.channels.get(channelId)?.delete(nickname);
++  }
++
++  async ensureUserTtl(nickname: string, ttlSeconds = 1800): Promise<boolean> {
++    if (!this.ttlRepairEnabled) return false;
++    const record = this.users.get(nickname);
++    if (!record || record.ttl !== -1) return false;
++    record.ttl = ttlSeconds;
++    return true;
++  }
++}
++
++describe("Channel presence repair", () => {
++  it("leaves a healthy channel unchanged", async () => {
++    const store = new FakePresenceStore().channel("c1", "alice").session("alice", "c1");
++    const repair = await new PresenceReconciliationService(store).repairChannel("c1");
++    expect(repair.removed).toEqual([]);
++    expect(repair.added).toEqual([]);
++    expect(repair.ttlFixed).toEqual([]);
++    expect(repair.repairedUsers).toBe(0);
++    expect(repair.after.healthy).toBe(true);
++  });
++
++  it("removes a channel member whose session is gone", async () => {
++    const store = new FakePresenceStore().channel("c1", "ghost");
++    const repair = await new PresenceReconciliationService(store).repairChannel("c1");
++    expect(repair.removed).toEqual(["ghost"]);
++    expect(await store.getChannelUsers("c1")).toEqual([]);
++  });
++
++  it("removes a member from the wrong channel without changing its session", async () => {
++    const store = new FakePresenceStore().channel("c1", "alice").session("alice", "c2");
++    const repair = await new PresenceReconciliationService(store).repairChannel("c1");
++    expect(repair.removed).toEqual(["alice"]);
++    expect((await store.getUserByNickname("alice"))?.channelId).toBe("c2");
++  });
++
++  it("adds a missing membership for a session that claims the channel", async () => {
++    const store = new FakePresenceStore().session("alice", "c1");
++    const repair = await new PresenceReconciliationService(store).repairChannel("c1");
++    expect(repair.added).toEqual(["alice"]);
++    expect(await store.getChannelUsers("c1")).toEqual(["alice"]);
++  });
++
++  it("restores a missing session ttl to eighteen hundred seconds", async () => {
++    const store = new FakePresenceStore().channel("c1", "alice").session("alice", "c1", -1);
++    const repair = await new PresenceReconciliationService(store).repairChannel("c1");
++    expect(repair.ttlFixed).toEqual(["alice"]);
++    expect(await store.getUserTtl("alice")).toBe(1800);
++  });
++
++  it("counts one repaired user when both membership and ttl were repaired", async () => {
++    const store = new FakePresenceStore().session("alice", "c1", -1);
++    const repair = await new PresenceReconciliationService(store).repairChannel("c1");
++    expect(repair.added).toEqual(["alice"]);
++    expect(repair.ttlFixed).toEqual(["alice"]);
++    expect(repair.repairedUsers).toBe(1);
++  });
++
++  it("sorts each repair list by nickname", async () => {
++    const store = new FakePresenceStore().channel("c1", "zoe", "bob").session("amy", "c1").session("carl", "c1");
++    const repair = await new PresenceReconciliationService(store).repairChannel("c1");
++    expect(repair.removed).toEqual(["bob", "zoe"]);
++    expect(repair.added).toEqual(["amy", "carl"]);
++  });
++
++  it("returns the audit from before and after the repair", async () => {
++    const store = new FakePresenceStore().channel("c1", "ghost").session("alice", "c1");
++    const repair = await new PresenceReconciliationService(store).repairChannel("c1");
++    expect(repair.before.healthy).toBe(false);
++    expect(repair.before.issues).toHaveLength(2);
++    expect(repair.after.healthy).toBe(true);
++    expect(repair.after.issues).toEqual([]);
++  });
++
++  it("is idempotent when the same channel is repaired twice", async () => {
++    const store = new FakePresenceStore().channel("c1", "ghost").session("alice", "c1", -1);
++    const service = new PresenceReconciliationService(store);
++    const first = await service.repairChannel("c1");
++    const second = await service.repairChannel("c1");
++    expect(first.repairedUsers).toBe(2);
++    expect(second.repairedUsers).toBe(0);
++    expect(second.after.healthy).toBe(true);
++  });
++
++  it("does not repair the ttl of a mismatched session while auditing the wrong channel", async () => {
++    const store = new FakePresenceStore().channel("c1", "alice").session("alice", "c2", -1);
++    const repair = await new PresenceReconciliationService(store).repairChannel("c1");
++    expect(repair.ttlFixed).toEqual([]);
++    expect(await store.getUserTtl("alice")).toBe(-1);
++  });
++
++  it("keeps an unresolved ttl issue when the store cannot set expiry", async () => {
++    const store = new FakePresenceStore().channel("c1", "alice").session("alice", "c1", -1);
++    store.ttlRepairEnabled = false;
++    const repair = await new PresenceReconciliationService(store).repairChannel("c1");
++    expect(repair.ttlFixed).toEqual([]);
++    expect(repair.after.issues).toEqual([{ nickname: "alice", code: "missing_session_ttl" }]);
++  });
++
++  it("repairs multiple issue kinds in one channel", async () => {
++    const store = new FakePresenceStore()
++      .channel("c1", "ghost", "bob")
++      .session("bob", "c2")
++      .session("alice", "c1", -1);
++    const repair = await new PresenceReconciliationService(store).repairChannel("c1");
++    expect(repair.removed).toEqual(["bob", "ghost"]);
++    expect(repair.added).toEqual(["alice"]);
++    expect(repair.ttlFixed).toEqual(["alice"]);
++    expect(repair.repairedUsers).toBe(3);
++    expect(repair.after.healthy).toBe(true);
++  });
++
++  it("supports the repairChannelPresence convenience function", async () => {
++    const store = new FakePresenceStore().session("alice", "c1");
++    const repair = await repairChannelPresence("c1", store);
++    expect(repair.added).toEqual(["alice"]);
++    expect(repair.after.healthy).toBe(true);
++  });
++});
+diff --git a/packages/backend/src/gold_tests/presence_session_operations.test.ts b/packages/backend/src/gold_tests/presence_session_operations.test.ts
+new file mode 100644
+index 0000000..aaa04f1
+--- /dev/null
++++ b/packages/backend/src/gold_tests/presence_session_operations.test.ts
+@@ -0,0 +1,108 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import type { UserSession } from "#ours/backend/session/types.ts";
++
++const { client } = vi.hoisted(() => ({
++  client: {
++    keys: vi.fn(),
++    ttl: vi.fn(),
++    expire: vi.fn(),
++    setEx: vi.fn(),
++  },
++}));
++
++vi.mock("#ours/backend/session/redis.ts", () => ({
++  getNodeClient: vi.fn(async () => client),
++}));
++
++import {
++  DEFAULT_TTL_SECONDS,
++  ensureUserTtl,
++  getUserTtl,
++  listChannelIds,
++  listUserNicknames,
++  updateUser,
++} from "#ours/backend/session/operations/users.ts";
++
++const session: UserSession = {
++  sessionId: "s1",
++  nickname: "alice",
++  userType: "temporary",
++  channelId: "c1",
++  joinedAt: 1000,
++  lastActivity: 2000,
++  chatUserId: "chat-1",
++  connectionStatus: "active",
++};
++
++beforeEach(() => {
++  client.keys.mockReset();
++  client.ttl.mockReset();
++  client.expire.mockReset();
++  client.setEx.mockReset();
++});
++
++describe("Presence session primitives", () => {
++  it("exports the default session ttl used by reconciliation", () => {
++    expect(DEFAULT_TTL_SECONDS).toBe(1800);
++  });
++
++  it("lists user nicknames without the Redis key prefix", async () => {
++    client.keys.mockResolvedValue(["user:zoe", "user:alice"]);
++    await expect(listUserNicknames()).resolves.toEqual(["alice", "zoe"]);
++    expect(client.keys).toHaveBeenCalledWith("user:*");
++  });
++
++  it("deduplicates user nicknames and ignores an empty suffix", async () => {
++    client.keys.mockResolvedValue(["user:alice", "user:alice", "user:"]);
++    await expect(listUserNicknames()).resolves.toEqual(["alice"]);
++  });
++
++  it("lists channel ids parsed from membership keys", async () => {
++    client.keys.mockResolvedValue(["channel:z:users", "channel:a:users"]);
++    await expect(listChannelIds()).resolves.toEqual(["a", "z"]);
++    expect(client.keys).toHaveBeenCalledWith("channel:*:users");
++  });
++
++  it("preserves colons inside channel ids and ignores malformed keys", async () => {
++    client.keys.mockResolvedValue(["channel:team:west:users", "channel::users", "not-a-channel"]);
++    await expect(listChannelIds()).resolves.toEqual(["team:west"]);
++  });
++
++  it("reads the ttl from the canonical user key", async () => {
++    client.ttl.mockResolvedValue(123);
++    await expect(getUserTtl("alice")).resolves.toBe(123);
++    expect(client.ttl).toHaveBeenCalledWith("user:alice");
++  });
++
++  it("does not create a ttl when the user key no longer exists", async () => {
++    client.ttl.mockResolvedValue(-2);
++    await expect(ensureUserTtl("alice")).resolves.toBe(false);
++    expect(client.expire).not.toHaveBeenCalled();
++  });
++
++  it("does not refresh a session that already has an expiry", async () => {
++    client.ttl.mockResolvedValue(500);
++    await expect(ensureUserTtl("alice")).resolves.toBe(false);
++    expect(client.expire).not.toHaveBeenCalled();
++  });
++
++  it("adds the default ttl when an existing session has no expiry", async () => {
++    client.ttl.mockResolvedValue(-1);
++    client.expire.mockResolvedValue(true);
++    await expect(ensureUserTtl("alice")).resolves.toBe(true);
++    expect(client.expire).toHaveBeenCalledWith("user:alice", 1800);
++  });
++
++  it("accepts a custom ttl when repairing an immortal session", async () => {
++    client.ttl.mockResolvedValue(-1);
++    client.expire.mockResolvedValue(true);
++    await expect(ensureUserTtl("alice", 90)).resolves.toBe(true);
++    expect(client.expire).toHaveBeenCalledWith("user:alice", 90);
++  });
++
++  it("lets updateUser use the same overridable ttl primitive", async () => {
++    client.setEx.mockResolvedValue("OK");
++    await expect(updateUser("alice", session, 90)).resolves.toBe("OK");
++    expect(client.setEx).toHaveBeenCalledWith("user:alice", 90, JSON.stringify(session));
++  });
++});
+diff --git a/packages/backend/src/gold_tests/presence_sweep_behavior.test.ts b/packages/backend/src/gold_tests/presence_sweep_behavior.test.ts
+new file mode 100644
+index 0000000..c44d5f7
+--- /dev/null
++++ b/packages/backend/src/gold_tests/presence_sweep_behavior.test.ts
+@@ -0,0 +1,148 @@
++import { describe, expect, it } from "vitest";
++import {
++  PresenceReconciliationService,
++  auditPresenceChannels,
++  repairPresenceChannels,
++} from "#ours/backend/services/presence_reconciliation_service.ts";
++import type { PresenceStore } from "#ours/backend/services/presence_reconciliation_types.ts";
++import type { UserSession } from "#ours/backend/session/types.ts";
++
++const user = (nickname: string, channelId: string): UserSession => ({
++  sessionId: `session-${nickname}`,
++  nickname,
++  userType: "temporary",
++  channelId,
++  joinedAt: 1000,
++  lastActivity: 2000,
++  chatUserId: `chat-${nickname}`,
++  connectionStatus: "active",
++});
++
++class FakePresenceStore implements PresenceStore {
++  readonly channels = new Map<string, Set<string>>();
++  readonly users = new Map<string, { session: UserSession | null; ttl: number }>();
++
++  channel(channelId: string, ...nicknames: string[]): this { this.channels.set(channelId, new Set(nicknames)); return this; }
++  session(nickname: string, channelId: string, ttl = 1200): this { this.users.set(nickname, { session: user(nickname, channelId), ttl }); return this; }
++  async listChannelIds(): Promise<string[]> { return [...this.channels.keys()]; }
++  async listUserNicknames(): Promise<string[]> { return [...this.users.keys()]; }
++  async getChannelUsers(channelId: string): Promise<string[]> { return [...(this.channels.get(channelId) ?? new Set())]; }
++  async getUserByNickname(nickname: string): Promise<UserSession | null> { return this.users.get(nickname)?.session ?? null; }
++  async getUserTtl(nickname: string): Promise<number> { return this.users.get(nickname)?.ttl ?? -2; }
++  async addUserToChannel(channelId: string, nickname: string): Promise<void> { const set = this.channels.get(channelId) ?? new Set<string>(); set.add(nickname); this.channels.set(channelId, set); }
++  async removeUserFromChannel(channelId: string, nickname: string): Promise<void> { this.channels.get(channelId)?.delete(nickname); }
++  async ensureUserTtl(nickname: string, ttlSeconds = 1800): Promise<boolean> { const record = this.users.get(nickname); if (!record || record.ttl !== -1) return false; record.ttl = ttlSeconds; return true; }
++}
++
++describe("Presence reconciliation sweeps", () => {
++  it("audits tracked channels in lexical order", async () => {
++    const store = new FakePresenceStore().channel("z-room").channel("a-room");
++    const sweep = await new PresenceReconciliationService(store).auditAllChannels();
++    expect(sweep.channels.map((channel) => channel.channelId)).toEqual(["a-room", "z-room"]);
++  });
++
++  it("discovers a channel that exists only in a user session", async () => {
++    const store = new FakePresenceStore().session("alice", "session-only");
++    const sweep = await new PresenceReconciliationService(store).auditAllChannels();
++    expect(sweep.channels.map((channel) => channel.channelId)).toEqual(["session-only"]);
++    expect(sweep.channels[0]?.issues).toEqual([{ nickname: "alice", code: "missing_membership" }]);
++  });
++
++  it("deduplicates channels found from sets and sessions", async () => {
++    const store = new FakePresenceStore().channel("c1", "alice").session("alice", "c1");
++    const sweep = await new PresenceReconciliationService(store).auditAllChannels();
++    expect(sweep.summary.channelCount).toBe(1);
++  });
++
++  it("returns an empty zeroed summary when there are no channels", async () => {
++    const sweep = await new PresenceReconciliationService(new FakePresenceStore()).auditAllChannels();
++    expect(sweep).toEqual({
++      channels: [],
++      summary: {
++        channelCount: 0,
++        healthyChannels: 0,
++        unhealthyChannels: 0,
++        issueCount: 0,
++        issueCounts: {
++          missing_session: 0,
++          channel_mismatch: 0,
++          missing_membership: 0,
++          missing_session_ttl: 0,
++        },
++      },
++    });
++  });
++
++  it("summarizes healthy and unhealthy channels", async () => {
++    const store = new FakePresenceStore()
++      .channel("c1", "alice")
++      .channel("c2", "ghost")
++      .session("alice", "c1");
++    const sweep = await new PresenceReconciliationService(store).auditAllChannels();
++    expect(sweep.summary.healthyChannels).toBe(1);
++    expect(sweep.summary.unhealthyChannels).toBe(1);
++    expect(sweep.summary.issueCount).toBe(1);
++  });
++
++  it("aggregates issue counts across channels", async () => {
++    const store = new FakePresenceStore().channel("c1", "ghost").session("alice", "c2", -1);
++    const sweep = await new PresenceReconciliationService(store).auditAllChannels();
++    expect(sweep.summary.issueCounts).toEqual({
++      missing_session: 1,
++      channel_mismatch: 0,
++      missing_membership: 1,
++      missing_session_ttl: 1,
++    });
++  });
++
++  it("auditChannels sorts and deduplicates an explicit channel selection", async () => {
++    const store = new FakePresenceStore().channel("b").channel("a").channel("ignored");
++    const sweep = await new PresenceReconciliationService(store).auditChannels(["b", "a", "b", ""]);
++    expect(sweep.channels.map((channel) => channel.channelId)).toEqual(["a", "b"]);
++    expect(sweep.summary.channelCount).toBe(2);
++  });
++
++  it("repairAllChannels moves a mismatched user to the channel named by its session", async () => {
++    const store = new FakePresenceStore().channel("old", "alice").session("alice", "new");
++    const sweep = await new PresenceReconciliationService(store).repairAllChannels();
++    expect(await store.getChannelUsers("old")).toEqual([]);
++    expect(await store.getChannelUsers("new")).toEqual(["alice"]);
++    expect(sweep.summary.remainingIssues).toBe(0);
++  });
++
++  it("counts one repaired user across several channel repairs", async () => {
++    const store = new FakePresenceStore().channel("old", "alice").session("alice", "new", -1);
++    const sweep = await new PresenceReconciliationService(store).repairAllChannels();
++    expect(sweep.summary.repairedChannels).toBe(2);
++    expect(sweep.summary.repairedUsers).toBe(1);
++  });
++
++  it("reports remaining issue counts after all repairs finish", async () => {
++    const store = new FakePresenceStore().channel("c1", "ghost").session("alice", "c2", -1);
++    const sweep = await new PresenceReconciliationService(store).repairAllChannels();
++    expect(sweep.summary.remainingIssues).toBe(0);
++    expect(sweep.summary.issueCounts).toEqual({
++      missing_session: 0,
++      channel_mismatch: 0,
++      missing_membership: 0,
++      missing_session_ttl: 0,
++    });
++  });
++
++  it("repairChannels touches only the explicit channel selection", async () => {
++    const store = new FakePresenceStore().channel("a", "ghost-a").channel("b", "ghost-b");
++    const sweep = await new PresenceReconciliationService(store).repairChannels(["a"]);
++    expect(sweep.repairs.map((repair) => repair.channelId)).toEqual(["a"]);
++    expect(await store.getChannelUsers("a")).toEqual([]);
++    expect(await store.getChannelUsers("b")).toEqual(["ghost-b"]);
++  });
++
++  it("supports the batch convenience functions", async () => {
++    const store = new FakePresenceStore().channel("c1", "ghost");
++    const audit = await auditPresenceChannels(["c1"], store);
++    expect(audit.summary.issueCount).toBe(1);
++    const repair = await repairPresenceChannels(["c1"], store);
++    expect(repair.summary.repairedUsers).toBe(1);
++    expect(repair.summary.remainingIssues).toBe(0);
++  });
++});
