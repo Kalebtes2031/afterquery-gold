@@ -1,0 +1,1068 @@
+diff --git a/db/migrations/035_branch_stock_reservation.sql b/db/migrations/035_branch_stock_reservation.sql
+new file mode 100644
+index 0000000..eea4576
+--- /dev/null
++++ b/db/migrations/035_branch_stock_reservation.sql
+@@ -0,0 +1,46 @@
++-- Soft stock reservations for in-progress sale drafts.
++-- Reservations reduce available-to-promise stock without moving physical inventory.
++
++CREATE TABLE branch_stock_reservation (
++  id            BIGSERIAL PRIMARY KEY,
++  company_id    BIGINT NOT NULL REFERENCES company(id) ON DELETE CASCADE,
++  draft_key     VARCHAR(120) NOT NULL,
++  branch_id     BIGINT NOT NULL REFERENCES branch(id),
++  status        VARCHAR(20) NOT NULL DEFAULT 'ACTIVE'
++                  CHECK (status IN ('ACTIVE', 'RELEASED', 'EXPIRED')),
++  expires_at    TIMESTAMPTZ NOT NULL,
++  created_by    BIGINT REFERENCES user_account(id),
++  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++  UNIQUE (company_id, draft_key)
++);
++
++CREATE TABLE branch_stock_reservation_item (
++  id              BIGSERIAL PRIMARY KEY,
++  reservation_id  BIGINT NOT NULL REFERENCES branch_stock_reservation(id) ON DELETE CASCADE,
++  product_id      BIGINT NOT NULL REFERENCES product(id),
++  quantity        NUMERIC(18,4) NOT NULL CHECK (quantity > 0),
++  UNIQUE (reservation_id, product_id)
++);
++
++CREATE TABLE branch_stock_reservation_event (
++  id              BIGSERIAL PRIMARY KEY,
++  company_id      BIGINT NOT NULL REFERENCES company(id) ON DELETE CASCADE,
++  reservation_id  BIGINT NOT NULL REFERENCES branch_stock_reservation(id) ON DELETE CASCADE,
++  draft_key       VARCHAR(120) NOT NULL,
++  event_type      VARCHAR(20) NOT NULL
++                    CHECK (event_type IN ('RESERVED', 'REPLACED', 'REFRESHED', 'RELEASED', 'EXPIRED')),
++  event_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++  created_by      BIGINT REFERENCES user_account(id),
++  details         JSONB NOT NULL DEFAULT '{}'::jsonb
++);
++
++CREATE INDEX idx_branch_stock_reservation_active
++  ON branch_stock_reservation(company_id, branch_id, expires_at)
++  WHERE status = 'ACTIVE';
++
++CREATE INDEX idx_branch_stock_reservation_item_product
++  ON branch_stock_reservation_item(product_id, reservation_id);
++
++CREATE INDEX idx_branch_stock_reservation_event_draft
++  ON branch_stock_reservation_event(company_id, draft_key, event_at, id);
+diff --git a/src/modules/sales/application/BranchStockReservationUseCases.ts b/src/modules/sales/application/BranchStockReservationUseCases.ts
+new file mode 100644
+index 0000000..84ff859
+--- /dev/null
++++ b/src/modules/sales/application/BranchStockReservationUseCases.ts
+@@ -0,0 +1,356 @@
++import { BranchRepository } from "../../branches/domain/Branch";
++import { InventoryBalanceRepository } from "../../inventory/domain/InventoryBalance";
++import { ProductRepository } from "../../inventory/domain/Product";
++import { ConflictError, EntityNotFoundError, ValidationError } from "../../../shared/domain/DomainError";
++import { TransactionManager } from "../../../shared/infrastructure/transactions/TransactionManager";
++import {
++  BranchStockReservation,
++  BranchStockReservationEventProps,
++  BranchStockReservationEventType,
++  BranchStockReservationItemProps,
++  BranchStockReservationRepository,
++  BranchStockReservationStatus,
++  normalizeReservationQuantity
++} from "../domain/BranchStockReservation";
++
++const DEFAULT_TTL_MINUTES = 15;
++const MAX_TTL_MINUTES = 120;
++
++export interface ReserveBranchStockInput {
++  companyId: number;
++  draftKey: string;
++  branchId: number;
++  items: BranchStockReservationItemProps[];
++  ttlMinutes?: number;
++  createdBy?: number | null;
++}
++
++export interface ReservationAvailabilityLine {
++  productId: number;
++  onHand: number;
++  reserved: number;
++  available: number;
++}
++
++export interface BranchStockReservationView {
++  id: number;
++  companyId: number;
++  draftKey: string;
++  branchId: number;
++  status: BranchStockReservationStatus;
++  expiresAt: Date;
++  items: BranchStockReservationItemProps[];
++}
++
++export interface BranchStockAvailabilityView {
++  branchId: number;
++  items: ReservationAvailabilityLine[];
++}
++
++export type ReservationClock = () => Date;
++
++function normalizeTtl(ttlMinutes?: number): number {
++  const ttl = ttlMinutes ?? DEFAULT_TTL_MINUTES;
++  if (!Number.isInteger(ttl) || ttl < 1 || ttl > MAX_TTL_MINUTES) {
++    throw new ValidationError(`ttlMinutes must be an integer from 1 through ${MAX_TTL_MINUTES}`);
++  }
++  return ttl;
++}
++
++function expiryFrom(now: Date, ttlMinutes?: number): Date {
++  const ttl = normalizeTtl(ttlMinutes);
++  return new Date(now.getTime() + ttl * 60_000);
++}
++
++function uniqueProductIds(items: BranchStockReservationItemProps[]): number[] {
++  return Array.from(new Set(items.map(item => item.productId)));
++}
++
++function toView(reservation: BranchStockReservation): BranchStockReservationView {
++  const p = reservation.toPrimitives();
++  return {
++    id: p.id!,
++    companyId: p.companyId,
++    draftKey: p.draftKey,
++    branchId: p.branchId,
++    status: p.status,
++    expiresAt: p.expiresAt,
++    items: p.items.map(item => ({ ...item }))
++  };
++}
++
++export class BranchStockReservationUseCases {
++  constructor(
++    private readonly txManager: TransactionManager,
++    private readonly reservationRepository: BranchStockReservationRepository,
++    private readonly inventoryBalanceRepository: InventoryBalanceRepository,
++    private readonly productRepository: ProductRepository,
++    private readonly branchRepository: BranchRepository,
++    private readonly clock: ReservationClock = () => new Date()
++  ) {}
++
++  async reserve(input: ReserveBranchStockInput): Promise<BranchStockReservationView> {
++    const now = this.clock();
++    const expiresAt = expiryFrom(now, input.ttlMinutes);
++    const draftKey = input.draftKey?.trim();
++
++    // Constructing a temporary aggregate gives every entry point the same structural validation.
++    BranchStockReservation.create({
++      companyId: input.companyId,
++      draftKey,
++      branchId: input.branchId,
++      expiresAt,
++      items: input.items,
++      createdBy: input.createdBy,
++      now
++    });
++
++    return this.txManager.run(async client => {
++      await this.reservationRepository.expireDue(input.companyId, now, client as any);
++      await this.assertBranchAndProducts(input.companyId, input.branchId, input.items, client as any);
++
++      const existing = await this.reservationRepository.findByDraftKey(
++        input.companyId,
++        draftKey,
++        client as any,
++        true
++      );
++
++      const productIds = uniqueProductIds(input.items);
++      const balances = await this.inventoryBalanceRepository.findByProductsBranch(
++        input.companyId,
++        input.branchId,
++        productIds,
++        client as any,
++        true
++      );
++      const balanceByProduct = new Map(balances.map(balance => [balance.productId, balance.quantityOnHand]));
++
++      const reservedByOthers = await this.reservationRepository.sumActiveReserved(
++        input.companyId,
++        input.branchId,
++        productIds,
++        now,
++        existing?.id ?? null,
++        client as any
++      );
++
++      for (const item of input.items) {
++        const requested = normalizeReservationQuantity(item.quantity);
++        const onHand = normalizeReservationQuantity(balanceByProduct.get(item.productId) ?? 0);
++        const reserved = normalizeReservationQuantity(reservedByOthers.get(item.productId) ?? 0);
++        const available = normalizeReservationQuantity(Math.max(0, onHand - reserved));
++        if (requested > available) {
++          throw new ConflictError(
++            `Insufficient available stock for product ${item.productId}: requested ${requested}, available ${available}`
++          );
++        }
++      }
++
++      let reservation: BranchStockReservation;
++      let eventType: BranchStockReservationEventType;
++      if (existing) {
++        eventType = existing.replace({
++          branchId: input.branchId,
++          expiresAt,
++          items: input.items,
++          updatedBy: input.createdBy,
++          now
++        });
++        reservation = existing;
++      } else {
++        reservation = BranchStockReservation.create({
++          companyId: input.companyId,
++          draftKey,
++          branchId: input.branchId,
++          expiresAt,
++          items: input.items,
++          createdBy: input.createdBy,
++          now
++        });
++        eventType = BranchStockReservationEventType.RESERVED;
++      }
++
++      const saved = await this.reservationRepository.save(reservation, client as any);
++      await this.reservationRepository.appendEvent({
++        companyId: input.companyId,
++        reservationId: saved.id!,
++        draftKey,
++        eventType,
++        eventAt: now,
++        createdBy: input.createdBy,
++        details: {
++          branchId: input.branchId,
++          expiresAt: expiresAt.toISOString(),
++          items: saved.items
++        }
++      }, client as any);
++
++      return toView(saved);
++    });
++  }
++
++  async get(companyId: number, draftKey: string): Promise<BranchStockReservationView> {
++    const normalizedKey = this.normalizeDraftKey(draftKey);
++    const now = this.clock();
++    return this.txManager.run(async client => {
++      await this.reservationRepository.expireDue(companyId, now, client as any);
++      const reservation = await this.reservationRepository.findByDraftKey(companyId, normalizedKey, client as any);
++      if (!reservation) throw new EntityNotFoundError("Stock reservation not found");
++      return toView(reservation);
++    });
++  }
++
++  async release(companyId: number, draftKey: string, createdBy?: number | null): Promise<BranchStockReservationView> {
++    const normalizedKey = this.normalizeDraftKey(draftKey);
++    const now = this.clock();
++    return this.txManager.run(async client => {
++      await this.reservationRepository.expireDue(companyId, now, client as any);
++      const reservation = await this.reservationRepository.findByDraftKey(
++        companyId,
++        normalizedKey,
++        client as any,
++        true
++      );
++      if (!reservation) throw new EntityNotFoundError("Stock reservation not found");
++
++      const changed = reservation.release(now);
++      if (!changed) return toView(reservation);
++
++      const saved = await this.reservationRepository.save(reservation, client as any);
++      await this.reservationRepository.appendEvent({
++        companyId,
++        reservationId: saved.id!,
++        draftKey: normalizedKey,
++        eventType: BranchStockReservationEventType.RELEASED,
++        eventAt: now,
++        createdBy: createdBy ?? null,
++        details: { branchId: saved.branchId, releasedItems: saved.items }
++      }, client as any);
++      return toView(saved);
++    });
++  }
++
++  async refresh(
++    companyId: number,
++    draftKey: string,
++    ttlMinutes?: number,
++    createdBy?: number | null
++  ): Promise<BranchStockReservationView> {
++    const normalizedKey = this.normalizeDraftKey(draftKey);
++    const now = this.clock();
++    const expiresAt = expiryFrom(now, ttlMinutes);
++
++    return this.txManager.run(async client => {
++      await this.reservationRepository.expireDue(companyId, now, client as any);
++      const reservation = await this.reservationRepository.findByDraftKey(
++        companyId,
++        normalizedKey,
++        client as any,
++        true
++      );
++      if (!reservation) throw new EntityNotFoundError("Stock reservation not found");
++
++      reservation.refresh(expiresAt, now);
++      const saved = await this.reservationRepository.save(reservation, client as any);
++      await this.reservationRepository.appendEvent({
++        companyId,
++        reservationId: saved.id!,
++        draftKey: normalizedKey,
++        eventType: BranchStockReservationEventType.REFRESHED,
++        eventAt: now,
++        createdBy: createdBy ?? null,
++        details: { expiresAt: expiresAt.toISOString() }
++      }, client as any);
++      return toView(saved);
++    });
++  }
++
++  async availability(companyId: number, branchId: number, productIds: number[]): Promise<BranchStockAvailabilityView> {
++    if (!Number.isInteger(branchId) || branchId <= 0) throw new ValidationError("Invalid branchId");
++    const uniqueIds = Array.from(new Set(productIds));
++    if (uniqueIds.length === 0) throw new ValidationError("At least one productId is required");
++    if (uniqueIds.some(id => !Number.isInteger(id) || id <= 0)) throw new ValidationError("Invalid productId");
++    if (uniqueIds.length > 100) throw new ValidationError("No more than 100 products can be checked at once");
++
++    const now = this.clock();
++    return this.txManager.run(async client => {
++      await this.reservationRepository.expireDue(companyId, now, client as any);
++      await this.assertBranchAndProducts(
++        companyId,
++        branchId,
++        uniqueIds.map(productId => ({ productId, quantity: 1 })),
++        client as any
++      );
++
++      const balances = await this.inventoryBalanceRepository.findByProductsBranch(
++        companyId,
++        branchId,
++        uniqueIds,
++        client as any,
++        false
++      );
++      const balanceByProduct = new Map(balances.map(balance => [balance.productId, balance.quantityOnHand]));
++      const reserved = await this.reservationRepository.sumActiveReserved(
++        companyId,
++        branchId,
++        uniqueIds,
++        now,
++        null,
++        client as any
++      );
++
++      return {
++        branchId,
++        items: uniqueIds.map(productId => {
++          const onHand = normalizeReservationQuantity(balanceByProduct.get(productId) ?? 0);
++          const reservedQuantity = normalizeReservationQuantity(reserved.get(productId) ?? 0);
++          return {
++            productId,
++            onHand,
++            reserved: reservedQuantity,
++            available: normalizeReservationQuantity(Math.max(0, onHand - reservedQuantity))
++          };
++        })
++      };
++    });
++  }
++
++  async events(companyId: number, draftKey: string): Promise<BranchStockReservationEventProps[]> {
++    const normalizedKey = this.normalizeDraftKey(draftKey);
++    const now = this.clock();
++    return this.txManager.run(async client => {
++      await this.reservationRepository.expireDue(companyId, now, client as any);
++      const reservation = await this.reservationRepository.findByDraftKey(companyId, normalizedKey, client as any);
++      if (!reservation) throw new EntityNotFoundError("Stock reservation not found");
++      return this.reservationRepository.listEvents(companyId, normalizedKey, client as any);
++    });
++  }
++
++  private normalizeDraftKey(draftKey: string): string {
++    const normalized = draftKey?.trim();
++    if (!normalized) throw new ValidationError("Draft key is required");
++    if (normalized.length > 120) throw new ValidationError("Draft key cannot exceed 120 characters");
++    return normalized;
++  }
++
++  private async assertBranchAndProducts(
++    companyId: number,
++    branchId: number,
++    items: BranchStockReservationItemProps[],
++    client: any
++  ): Promise<void> {
++    const branch = await this.branchRepository.findById(companyId, branchId, client);
++    if (!branch) throw new EntityNotFoundError("Branch not found");
++    if (!branch.toPrimitives().isActive) throw new ValidationError("Cannot reserve stock in an inactive branch");
++
++    const productIds = uniqueProductIds(items);
++    const products = await this.productRepository.findByIds(companyId, productIds, client);
++    const productById = new Map(products.map(product => [product.id!, product]));
++    for (const productId of productIds) {
++      const product = productById.get(productId);
++      if (!product) throw new EntityNotFoundError(`Product ID ${productId} not found`);
++      if (!product.isActive) throw new ValidationError(`Product ID ${productId} is inactive`);
++    }
++  }
++}
+diff --git a/src/modules/sales/domain/BranchStockReservation.ts b/src/modules/sales/domain/BranchStockReservation.ts
+new file mode 100644
+index 0000000..454762c
+--- /dev/null
++++ b/src/modules/sales/domain/BranchStockReservation.ts
+@@ -0,0 +1,268 @@
++import { Pool, PoolClient } from "pg";
++import { ValidationError } from "../../../shared/domain/DomainError";
++
++export enum BranchStockReservationStatus {
++  ACTIVE = "ACTIVE",
++  RELEASED = "RELEASED",
++  EXPIRED = "EXPIRED"
++}
++
++export enum BranchStockReservationEventType {
++  RESERVED = "RESERVED",
++  REPLACED = "REPLACED",
++  REFRESHED = "REFRESHED",
++  RELEASED = "RELEASED",
++  EXPIRED = "EXPIRED"
++}
++
++export interface BranchStockReservationItemProps {
++  productId: number;
++  quantity: number;
++}
++
++export interface BranchStockReservationProps {
++  id?: number;
++  companyId: number;
++  draftKey: string;
++  branchId: number;
++  status: BranchStockReservationStatus;
++  expiresAt: Date;
++  createdBy?: number | null;
++  createdAt?: Date;
++  updatedAt?: Date;
++  items: BranchStockReservationItemProps[];
++}
++
++export interface BranchStockReservationEventProps {
++  id?: number;
++  companyId: number;
++  reservationId: number;
++  draftKey: string;
++  eventType: BranchStockReservationEventType;
++  eventAt: Date;
++  createdBy?: number | null;
++  details?: Record<string, unknown>;
++}
++
++const QUANTITY_SCALE = 10_000;
++
++export function normalizeReservationQuantity(value: number): number {
++  if (!Number.isFinite(value)) {
++    throw new ValidationError("Reservation quantity must be a finite number");
++  }
++  return Math.round((value + Number.EPSILON) * QUANTITY_SCALE) / QUANTITY_SCALE;
++}
++
++export class BranchStockReservation {
++  private constructor(private props: BranchStockReservationProps) {
++    this.validate();
++  }
++
++  static create(input: {
++    companyId: number;
++    draftKey: string;
++    branchId: number;
++    expiresAt: Date;
++    createdBy?: number | null;
++    items: BranchStockReservationItemProps[];
++    now?: Date;
++  }): BranchStockReservation {
++    const now = input.now ?? new Date();
++    const expiresAt = new Date(input.expiresAt);
++    if (expiresAt.getTime() <= now.getTime()) {
++      throw new ValidationError("Reservation expiry must be in the future");
++    }
++
++    return new BranchStockReservation({
++      companyId: input.companyId,
++      draftKey: input.draftKey.trim(),
++      branchId: input.branchId,
++      status: BranchStockReservationStatus.ACTIVE,
++      expiresAt,
++      createdBy: input.createdBy ?? null,
++      createdAt: now,
++      updatedAt: now,
++      items: BranchStockReservation.normalizeItems(input.items)
++    });
++  }
++
++  static hydrate(props: BranchStockReservationProps): BranchStockReservation {
++    return new BranchStockReservation({
++      ...props,
++      expiresAt: new Date(props.expiresAt),
++      createdAt: props.createdAt ? new Date(props.createdAt) : undefined,
++      updatedAt: props.updatedAt ? new Date(props.updatedAt) : undefined,
++      items: BranchStockReservation.normalizeItems(props.items)
++    });
++  }
++
++  private static normalizeItems(items: BranchStockReservationItemProps[]): BranchStockReservationItemProps[] {
++    return items.map(item => ({
++      productId: item.productId,
++      quantity: normalizeReservationQuantity(item.quantity)
++    }));
++  }
++
++  private validate(): void {
++    if (!Number.isInteger(this.props.companyId) || this.props.companyId <= 0) {
++      throw new ValidationError("Company ID must be a positive integer");
++    }
++    if (!Number.isInteger(this.props.branchId) || this.props.branchId <= 0) {
++      throw new ValidationError("Branch ID must be a positive integer");
++    }
++    if (!this.props.draftKey || this.props.draftKey.trim().length === 0) {
++      throw new ValidationError("Draft key is required");
++    }
++    if (this.props.draftKey.length > 120) {
++      throw new ValidationError("Draft key cannot exceed 120 characters");
++    }
++    if (!(this.props.expiresAt instanceof Date) || Number.isNaN(this.props.expiresAt.getTime())) {
++      throw new ValidationError("Reservation expiry is invalid");
++    }
++    if (!Array.isArray(this.props.items) || this.props.items.length === 0) {
++      throw new ValidationError("Reservation must contain at least one item");
++    }
++    if (this.props.items.length > 100) {
++      throw new ValidationError("Reservation cannot contain more than 100 items");
++    }
++
++    const seen = new Set<number>();
++    for (const item of this.props.items) {
++      if (!Number.isInteger(item.productId) || item.productId <= 0) {
++        throw new ValidationError("Reservation product ID must be a positive integer");
++      }
++      if (seen.has(item.productId)) {
++        throw new ValidationError(`Product ${item.productId} cannot appear more than once in a reservation`);
++      }
++      seen.add(item.productId);
++      if (normalizeReservationQuantity(item.quantity) <= 0) {
++        throw new ValidationError("Reservation quantity must be greater than zero");
++      }
++    }
++  }
++
++  replace(input: {
++    branchId: number;
++    expiresAt: Date;
++    items: BranchStockReservationItemProps[];
++    updatedBy?: number | null;
++    now: Date;
++  }): BranchStockReservationEventType {
++    const wasActive = this.props.status === BranchStockReservationStatus.ACTIVE && !this.isExpiredAt(input.now);
++    const expiresAt = new Date(input.expiresAt);
++    if (expiresAt.getTime() <= input.now.getTime()) {
++      throw new ValidationError("Reservation expiry must be in the future");
++    }
++
++    this.props.branchId = input.branchId;
++    this.props.items = BranchStockReservation.normalizeItems(input.items);
++    this.props.expiresAt = expiresAt;
++    this.props.status = BranchStockReservationStatus.ACTIVE;
++    this.props.updatedAt = input.now;
++    if (input.updatedBy !== undefined) this.props.createdBy = input.updatedBy;
++    this.validate();
++
++    return wasActive
++      ? BranchStockReservationEventType.REPLACED
++      : BranchStockReservationEventType.RESERVED;
++  }
++
++  refresh(expiresAt: Date, now: Date): void {
++    if (this.isExpiredAt(now)) {
++      this.props.status = BranchStockReservationStatus.EXPIRED;
++      this.props.updatedAt = now;
++      throw new ValidationError("Cannot refresh an expired reservation");
++    }
++    if (this.props.status !== BranchStockReservationStatus.ACTIVE) {
++      throw new ValidationError("Only an active reservation can be refreshed");
++    }
++    const nextExpiry = new Date(expiresAt);
++    if (nextExpiry.getTime() <= now.getTime()) {
++      throw new ValidationError("Reservation expiry must be in the future");
++    }
++    this.props.expiresAt = nextExpiry;
++    this.props.updatedAt = now;
++  }
++
++  release(now: Date): boolean {
++    if (this.props.status !== BranchStockReservationStatus.ACTIVE) return false;
++    if (this.isExpiredAt(now)) {
++      this.props.status = BranchStockReservationStatus.EXPIRED;
++      this.props.updatedAt = now;
++      return false;
++    }
++    this.props.status = BranchStockReservationStatus.RELEASED;
++    this.props.updatedAt = now;
++    return true;
++  }
++
++  expire(now: Date): boolean {
++    if (this.props.status !== BranchStockReservationStatus.ACTIVE) return false;
++    if (!this.isExpiredAt(now)) return false;
++    this.props.status = BranchStockReservationStatus.EXPIRED;
++    this.props.updatedAt = now;
++    return true;
++  }
++
++  isExpiredAt(now: Date): boolean {
++    return this.props.expiresAt.getTime() <= now.getTime();
++  }
++
++  get id(): number | undefined { return this.props.id; }
++  get companyId(): number { return this.props.companyId; }
++  get draftKey(): string { return this.props.draftKey; }
++  get branchId(): number { return this.props.branchId; }
++  get status(): BranchStockReservationStatus { return this.props.status; }
++  get expiresAt(): Date { return new Date(this.props.expiresAt); }
++  get items(): BranchStockReservationItemProps[] { return this.props.items.map(i => ({ ...i })); }
++
++  toPrimitives(): BranchStockReservationProps {
++    return {
++      ...this.props,
++      expiresAt: new Date(this.props.expiresAt),
++      createdAt: this.props.createdAt ? new Date(this.props.createdAt) : undefined,
++      updatedAt: this.props.updatedAt ? new Date(this.props.updatedAt) : undefined,
++      items: this.items
++    };
++  }
++}
++
++export interface BranchStockReservationRepository {
++  findByDraftKey(
++    companyId: number,
++    draftKey: string,
++    client?: Pool | PoolClient,
++    forUpdate?: boolean
++  ): Promise<BranchStockReservation | null>;
++
++  save(
++    reservation: BranchStockReservation,
++    client?: Pool | PoolClient
++  ): Promise<BranchStockReservation>;
++
++  expireDue(
++    companyId: number,
++    now: Date,
++    client?: Pool | PoolClient
++  ): Promise<number>;
++
++  sumActiveReserved(
++    companyId: number,
++    branchId: number,
++    productIds: number[],
++    now: Date,
++    excludeReservationId?: number | null,
++    client?: Pool | PoolClient
++  ): Promise<Map<number, number>>;
++
++  appendEvent(
++    event: BranchStockReservationEventProps,
++    client?: Pool | PoolClient
++  ): Promise<void>;
++
++  listEvents(
++    companyId: number,
++    draftKey: string,
++    client?: Pool | PoolClient
++  ): Promise<BranchStockReservationEventProps[]>;
++}
+diff --git a/src/modules/sales/infrastructure/PgBranchStockReservationRepository.ts b/src/modules/sales/infrastructure/PgBranchStockReservationRepository.ts
+new file mode 100644
+index 0000000..bb41f4b
+--- /dev/null
++++ b/src/modules/sales/infrastructure/PgBranchStockReservationRepository.ts
+@@ -0,0 +1,201 @@
++import { Pool, PoolClient } from "pg";
++import { pgPool } from "../../../shared/infrastructure/db/pgPool";
++import {
++  BranchStockReservation,
++  BranchStockReservationEventProps,
++  BranchStockReservationEventType,
++  BranchStockReservationProps,
++  BranchStockReservationRepository,
++  BranchStockReservationStatus
++} from "../domain/BranchStockReservation";
++
++function dbOf(client?: Pool | PoolClient): Pool | PoolClient {
++  return client || pgPool;
++}
++
++export class PgBranchStockReservationRepository implements BranchStockReservationRepository {
++  private async loadItems(reservationId: number, client?: Pool | PoolClient): Promise<Array<{ productId: number; quantity: number }>> {
++    const res = await dbOf(client).query(
++      `SELECT product_id, quantity
++         FROM branch_stock_reservation_item
++        WHERE reservation_id = $1
++        ORDER BY product_id`,
++      [reservationId]
++    );
++    return res.rows.map(row => ({
++      productId: Number(row.product_id),
++      quantity: Number(row.quantity)
++    }));
++  }
++
++  private async mapRow(row: any, client?: Pool | PoolClient): Promise<BranchStockReservation> {
++    const items = await this.loadItems(Number(row.id), client);
++    const props: BranchStockReservationProps = {
++      id: Number(row.id),
++      companyId: Number(row.company_id),
++      draftKey: String(row.draft_key),
++      branchId: Number(row.branch_id),
++      status: row.status as BranchStockReservationStatus,
++      expiresAt: new Date(row.expires_at),
++      createdBy: row.created_by == null ? null : Number(row.created_by),
++      createdAt: new Date(row.created_at),
++      updatedAt: new Date(row.updated_at),
++      items
++    };
++    return BranchStockReservation.hydrate(props);
++  }
++
++  async findByDraftKey(
++    companyId: number,
++    draftKey: string,
++    client?: Pool | PoolClient,
++    forUpdate = false
++  ): Promise<BranchStockReservation | null> {
++    const sql = `SELECT *
++                   FROM branch_stock_reservation
++                  WHERE company_id = $1 AND draft_key = $2${forUpdate ? " FOR UPDATE" : ""}`;
++    const res = await dbOf(client).query(sql, [companyId, draftKey]);
++    if (res.rowCount === 0) return null;
++    return this.mapRow(res.rows[0], client);
++  }
++
++  async save(reservation: BranchStockReservation, client?: Pool | PoolClient): Promise<BranchStockReservation> {
++    const db = dbOf(client);
++    const p = reservation.toPrimitives();
++    const saved = await db.query(
++      `INSERT INTO branch_stock_reservation (
++         company_id, draft_key, branch_id, status, expires_at, created_by, created_at, updated_at
++       )
++       VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7,NOW()),COALESCE($8,NOW()))
++       ON CONFLICT (company_id, draft_key) DO UPDATE SET
++         branch_id = EXCLUDED.branch_id,
++         status = EXCLUDED.status,
++         expires_at = EXCLUDED.expires_at,
++         created_by = EXCLUDED.created_by,
++         updated_at = EXCLUDED.updated_at
++       RETURNING id`,
++      [
++        p.companyId,
++        p.draftKey,
++        p.branchId,
++        p.status,
++        p.expiresAt,
++        p.createdBy ?? null,
++        p.createdAt ?? null,
++        p.updatedAt ?? null
++      ]
++    );
++
++    const reservationId = Number(saved.rows[0].id);
++    await db.query("DELETE FROM branch_stock_reservation_item WHERE reservation_id = $1", [reservationId]);
++
++    if (p.items.length > 0) {
++      await db.query(
++        `INSERT INTO branch_stock_reservation_item (reservation_id, product_id, quantity)
++         SELECT $1, product_id, quantity
++           FROM unnest($2::bigint[], $3::numeric[]) AS x(product_id, quantity)`,
++        [reservationId, p.items.map(i => i.productId), p.items.map(i => i.quantity)]
++      );
++    }
++
++    const reloaded = await this.findByDraftKey(p.companyId, p.draftKey, client);
++    if (!reloaded) throw new Error("Failed to reload saved stock reservation");
++    return reloaded;
++  }
++
++  async expireDue(companyId: number, now: Date, client?: Pool | PoolClient): Promise<number> {
++    const res = await dbOf(client).query(
++      `WITH expired AS (
++         UPDATE branch_stock_reservation
++            SET status = 'EXPIRED', updated_at = $2
++          WHERE company_id = $1
++            AND status = 'ACTIVE'
++            AND expires_at <= $2
++         RETURNING id, company_id, draft_key, created_by, expires_at
++       ), inserted AS (
++         INSERT INTO branch_stock_reservation_event (
++           company_id, reservation_id, draft_key, event_type, event_at, created_by, details
++         )
++         SELECT company_id,
++                id,
++                draft_key,
++                'EXPIRED',
++                $2,
++                created_by,
++                jsonb_build_object('expiredAt', expires_at)
++           FROM expired
++         RETURNING id
++       )
++       SELECT COUNT(*)::int AS count FROM inserted`,
++      [companyId, now]
++    );
++    return Number(res.rows[0]?.count || 0);
++  }
++
++  async sumActiveReserved(
++    companyId: number,
++    branchId: number,
++    productIds: number[],
++    now: Date,
++    excludeReservationId?: number | null,
++    client?: Pool | PoolClient
++  ): Promise<Map<number, number>> {
++    if (productIds.length === 0) return new Map();
++    const res = await dbOf(client).query(
++      `SELECT i.product_id, COALESCE(SUM(i.quantity), 0) AS reserved_quantity
++         FROM branch_stock_reservation r
++         JOIN branch_stock_reservation_item i ON i.reservation_id = r.id
++        WHERE r.company_id = $1
++          AND r.branch_id = $2
++          AND r.status = 'ACTIVE'
++          AND r.expires_at > $3
++          AND i.product_id = ANY($4::bigint[])
++          AND ($5::bigint IS NULL OR r.id <> $5)
++        GROUP BY i.product_id`,
++      [companyId, branchId, now, productIds, excludeReservationId ?? null]
++    );
++
++    const totals = new Map<number, number>();
++    for (const row of res.rows) {
++      totals.set(Number(row.product_id), Number(row.reserved_quantity));
++    }
++    return totals;
++  }
++
++  async appendEvent(event: BranchStockReservationEventProps, client?: Pool | PoolClient): Promise<void> {
++    await dbOf(client).query(
++      `INSERT INTO branch_stock_reservation_event (
++         company_id, reservation_id, draft_key, event_type, event_at, created_by, details
++       ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)`,
++      [
++        event.companyId,
++        event.reservationId,
++        event.draftKey,
++        event.eventType,
++        event.eventAt,
++        event.createdBy ?? null,
++        JSON.stringify(event.details ?? {})
++      ]
++    );
++  }
++
++  async listEvents(companyId: number, draftKey: string, client?: Pool | PoolClient): Promise<BranchStockReservationEventProps[]> {
++    const res = await dbOf(client).query(
++      `SELECT id, company_id, reservation_id, draft_key, event_type, event_at, created_by, details
++         FROM branch_stock_reservation_event
++        WHERE company_id = $1 AND draft_key = $2
++        ORDER BY event_at, id`,
++      [companyId, draftKey]
++    );
++    return res.rows.map(row => ({
++      id: Number(row.id),
++      companyId: Number(row.company_id),
++      reservationId: Number(row.reservation_id),
++      draftKey: String(row.draft_key),
++      eventType: row.event_type as BranchStockReservationEventType,
++      eventAt: new Date(row.event_at),
++      createdBy: row.created_by == null ? null : Number(row.created_by),
++      details: row.details || {}
++    }));
++  }
++}
+diff --git a/src/modules/sales/presentation/SaleRouter.ts b/src/modules/sales/presentation/SaleRouter.ts
+index fc25a02..4a769b7 100644
+--- a/src/modules/sales/presentation/SaleRouter.ts
++++ b/src/modules/sales/presentation/SaleRouter.ts
+@@ -7,7 +7,7 @@ import { PgSalePaymentRepository } from "../infrastructure/PgSalePaymentReposito
+ import { PgShipmentRepository } from "../infrastructure/PgShipmentRepository";
+ import { PgPartnerRepository } from "../../partners/infrastructure/PgPartnerRepository";
+ import { PgProductRepository } from "../../inventory/infrastructure/PgProductRepository";
+-import { createSaleOrderSchema, recordSalePaymentSchema, recordShipmentSchema } from "./SaleSchemas";
++import { branchStockAvailabilityQuerySchema, createSaleOrderSchema, recordSalePaymentSchema, recordShipmentSchema, refreshBranchStockReservationSchema, reserveBranchStockSchema } from "./SaleSchemas";
+ import { CreateSaleOrderUseCase } from "../application/CreateSaleOrderUseCase";
+ import { GetSaleDetailsUseCase } from "../application/GetSaleDetailsUseCase";
+ import { GetNextSaleOrderNoUseCase } from "../application/GetNextSaleOrderNoUseCase";
+@@ -29,6 +29,9 @@ import { sendErrorResponse } from "../../../shared/presentation/http/ErrorHandle
+ import { ValidationError } from "../../../shared/domain/DomainError";
+ import { PaymentMethod } from "../domain/SalePayment";
+ import { WarehouseService } from "../../inventory/application/WarehouseService";
++import { PgBranchStockReservationRepository } from "../infrastructure/PgBranchStockReservationRepository";
++import { BranchStockReservationUseCases } from "../application/BranchStockReservationUseCases";
++import { PgBranchRepository } from "../../branches/infrastructure/PgBranchRepository";
+ 
+ const saleOrderRepo = new PgSaleOrderRepository();
+ const paymentRepo = new PgSalePaymentRepository();
+@@ -44,6 +47,8 @@ const pgLoanTxRepo = new PgLoanTransactionRepository();
+ const inventoryPendingRepo = new PgInventoryPendingRepository();
+ const inventoryCostRepo = new PgInventoryCostRepository();
+ const inventoryBalanceRepo = new PgInventoryBalanceRepository();
++const branchStockReservationRepo = new PgBranchStockReservationRepository();
++const branchRepo = new PgBranchRepository();
+ const recordInventoryTxUseCase = new RecordInventoryTransactionUseCase(inventoryBalanceRepo, inventoryCostRepo, inventoryTxRepo);
+ const profitSummaryRepo = new PgProductProfitSummaryRepository();
+ const warehouseService = new WarehouseService(inventoryPendingRepo, inventoryCostRepo, productRepo, recordInventoryTxUseCase);
+@@ -62,6 +67,14 @@ const createSaleOrderUseCase = new CreateSaleOrderUseCase(
+ const getSaleDetailsUseCase = new GetSaleDetailsUseCase(saleOrderRepo, paymentRepo, shipmentRepo);
+ const getNextSaleOrderNoUseCase = new GetNextSaleOrderNoUseCase(saleOrderRepo);
+ const recordSalePaymentUseCase = new RecordSalePaymentUseCase(txManager, saleOrderRepo, paymentRepo, accountTxService, recordLoanTxUseCase);
++const branchStockReservationUseCases = new BranchStockReservationUseCases(
++  txManager,
++  branchStockReservationRepo,
++  inventoryBalanceRepo,
++  productRepo,
++  branchRepo
++);
++
+ const recordShipmentUseCase = new RecordShipmentUseCase(
+   txManager, 
+   saleOrderRepo, 
+@@ -228,6 +241,78 @@ SaleRouter.get("/", requireAuth, requirePermission(accessPolicy, "SALES", "view"
+   }
+ });
+ 
++/**
++ * Reserve branch stock for an in-progress sale draft without moving inventory.
++ */
++SaleRouter.post("/stock-reservations", requireAuth, requirePermission(accessPolicy, "SALES", "create"), async (req: Request, res: Response) => {
++  try {
++    const companyId = parseCompanyId(req);
++    const createdBy = parseUserId(req);
++    const body = reserveBranchStockSchema.parse(req.body);
++    const result = await branchStockReservationUseCases.reserve({ companyId, createdBy, ...body });
++    res.status(201).json(result);
++  } catch (err) {
++    sendErrorResponse(res, err);
++  }
++});
++
++SaleRouter.get("/stock-reservations/availability", requireAuth, requirePermission(accessPolicy, "SALES", "view"), async (req: Request, res: Response) => {
++  try {
++    const companyId = parseCompanyId(req);
++    const query = branchStockAvailabilityQuerySchema.parse(req.query);
++    const result = await branchStockReservationUseCases.availability(companyId, query.branchId, query.productIds);
++    res.json(result);
++  } catch (err) {
++    sendErrorResponse(res, err);
++  }
++});
++
++SaleRouter.get("/stock-reservations/:draftKey/events", requireAuth, requirePermission(accessPolicy, "SALES", "view"), async (req: Request, res: Response) => {
++  try {
++    const result = await branchStockReservationUseCases.events(parseCompanyId(req), req.params.draftKey);
++    res.json(result);
++  } catch (err) {
++    sendErrorResponse(res, err);
++  }
++});
++
++SaleRouter.post("/stock-reservations/:draftKey/refresh", requireAuth, requirePermission(accessPolicy, "SALES", "update"), async (req: Request, res: Response) => {
++  try {
++    const body = refreshBranchStockReservationSchema.parse(req.body);
++    const result = await branchStockReservationUseCases.refresh(
++      parseCompanyId(req),
++      req.params.draftKey,
++      body.ttlMinutes,
++      parseUserId(req)
++    );
++    res.json(result);
++  } catch (err) {
++    sendErrorResponse(res, err);
++  }
++});
++
++SaleRouter.delete("/stock-reservations/:draftKey", requireAuth, requirePermission(accessPolicy, "SALES", "update"), async (req: Request, res: Response) => {
++  try {
++    const result = await branchStockReservationUseCases.release(
++      parseCompanyId(req),
++      req.params.draftKey,
++      parseUserId(req)
++    );
++    res.json(result);
++  } catch (err) {
++    sendErrorResponse(res, err);
++  }
++});
++
++SaleRouter.get("/stock-reservations/:draftKey", requireAuth, requirePermission(accessPolicy, "SALES", "view"), async (req: Request, res: Response) => {
++  try {
++    const result = await branchStockReservationUseCases.get(parseCompanyId(req), req.params.draftKey);
++    res.json(result);
++  } catch (err) {
++    sendErrorResponse(res, err);
++  }
++});
++
+ /**
+  * @openapi
+  * /api/v1/sales/{id}:
+diff --git a/src/modules/sales/presentation/SaleSchemas.ts b/src/modules/sales/presentation/SaleSchemas.ts
+index 70bbe05..ba3f99d 100644
+--- a/src/modules/sales/presentation/SaleSchemas.ts
++++ b/src/modules/sales/presentation/SaleSchemas.ts
+@@ -71,3 +71,42 @@ export const recordShipmentSchema = z.object({
+     )
+     .min(1, "At least one shipment item is required")
+ });
++
++
++export const reserveBranchStockSchema = z.object({
++  draftKey: z.string().trim().min(1).max(120),
++  branchId: z.number().int().positive(),
++  ttlMinutes: z.number().int().min(1).max(120).optional().default(15),
++  items: z.array(z.object({
++    productId: z.number().int().positive(),
++    quantity: z.number().positive()
++  })).min(1).max(100).superRefine((items, ctx) => {
++    const seen = new Set<number>();
++    for (let i = 0; i < items.length; i++) {
++      if (seen.has(items[i].productId)) {
++        ctx.addIssue({
++          code: z.ZodIssueCode.custom,
++          path: [i, "productId"],
++          message: `Product ${items[i].productId} cannot appear more than once`
++        });
++      }
++      seen.add(items[i].productId);
++    }
++  })
++});
++
++export const refreshBranchStockReservationSchema = z.object({
++  ttlMinutes: z.number().int().min(1).max(120).optional().default(15)
++});
++
++export const branchStockAvailabilityQuerySchema = z.object({
++  branchId: z.coerce.number().int().positive(),
++  productIds: z.string().min(1).transform(value => value.split(",").map(part => Number(part.trim())))
++}).superRefine((value, ctx) => {
++  if (value.productIds.length === 0 || value.productIds.length > 100) {
++    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["productIds"], message: "Provide between 1 and 100 product IDs" });
++  }
++  if (value.productIds.some(id => !Number.isInteger(id) || id <= 0)) {
++    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["productIds"], message: "productIds must be positive integers" });
++  }
++});

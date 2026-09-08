@@ -1,0 +1,978 @@
+diff --git a/src/modules/partners/application/__tests__/PartnerCreditLimitWorkflow.behavior.test.ts b/src/modules/partners/application/__tests__/PartnerCreditLimitWorkflow.behavior.test.ts
+new file mode 100644
+index 0000000..eaaf095
+--- /dev/null
++++ b/src/modules/partners/application/__tests__/PartnerCreditLimitWorkflow.behavior.test.ts
+@@ -0,0 +1,641 @@
++jest.mock("../../../inventory/domain/InventoryMovementService", () => ({
++  InventoryMovementService: {
++    calculateSaleFulfillment: jest.fn(() => ({
++      pendingAdjustments: [],
++      profitSummary: [],
++      inventoryTransactions: [],
++      inventoryBalances: [],
++      inventoryCosts: [],
++    })),
++  },
++}));
++
++import { Partner } from "../../domain/Partner";
++import {
++  GetPartnerCreditStatusUseCase,
++  PartnerCreditLimitService,
++  SetPartnerCreditLimitUseCase,
++} from "../PartnerCreditUseCases";
++import { PartnerCreditLimitExceededError } from "../../domain/PartnerCredit";
++import { EntityNotFoundError, ValidationError } from "../../../../shared/domain/DomainError";
++import { CreateSaleOrderUseCase } from "../../../sales/application/CreateSaleOrderUseCase";
++import { RecordSalePaymentUseCase } from "../../../sales/application/RecordSalePaymentUseCase";
++import {
++  DocumentStatus,
++  SaleOrder,
++  SaleOrderItem,
++  ShipmentOption,
++} from "../../../sales/domain/SaleOrder";
++import { PaymentMethod, SalePayment } from "../../../sales/domain/SalePayment";
++import { Product } from "../../../inventory/domain/Product";
++import {
++  RecordDirectLoanUseCase,
++  RecordHistoricalLoanUseCase,
++  RecordPartnerToPartnerLoanUseCase,
++} from "../../../finance/application/LoanUseCases";
++
++const makePartner = (id: number, creditLimit: number | null = null, companyId = 1) =>
++  Partner.hydrate({
++    id,
++    companyId,
++    partnerNo: `PAR-${String(id).padStart(6, "0")}`,
++    fullName: `Partner ${id}`,
++    phone: `555-${id}`,
++    isCustomer: true,
++    isSupplier: false,
++    isLoanLender: false,
++    isLoanBorrower: false,
++    isWalkIn: false,
++    loanBalance: 0,
++    creditLimit,
++  });
++
++const makeComponents = (
++  partnerId: number,
++  creditLimit: number | null,
++  openSales = 0,
++  loans = 0,
++  payments = 0
++) => ({ partnerId, creditLimit, openSales, loans, payments });
++
++describe("partner credit status application behavior", () => {
++  it("returns calculated status for a company partner", async () => {
++    const repo: any = {
++      getComponents: jest.fn().mockResolvedValue(makeComponents(8, 500, 300, 50, 100)),
++    };
++    const result = await new GetPartnerCreditStatusUseCase(repo).execute(2, 8);
++    expect(repo.getComponents).toHaveBeenCalledWith(2, 8);
++    expect(result).toMatchObject({
++      partnerId: 8,
++      creditLimit: 500,
++      exposure: 250,
++      availableCredit: 250,
++      overLimit: false,
++    });
++  });
++
++  it("returns over-limit status without rejecting reads", async () => {
++    const repo: any = {
++      getComponents: jest.fn().mockResolvedValue(makeComponents(8, 200, 300, 25, 50)),
++    };
++    const result = await new GetPartnerCreditStatusUseCase(repo).execute(2, 8);
++    expect(result.exposure).toBe(275);
++    expect(result.overLimit).toBe(true);
++    expect(result.availableCredit).toBe(-75);
++  });
++
++  it("throws not found when the partner is outside the company", async () => {
++    const repo: any = { getComponents: jest.fn().mockResolvedValue(null) };
++    await expect(new GetPartnerCreditStatusUseCase(repo).execute(2, 99)).rejects.toBeInstanceOf(
++      EntityNotFoundError
++    );
++  });
++
++  it("sets a finite nonnegative credit limit on an existing partner", async () => {
++    const existing = makePartner(4, null, 2);
++    const partnerRepo: any = {
++      findById: jest.fn().mockResolvedValue(existing),
++      update: jest.fn().mockImplementation(async (p: Partner) => p),
++    };
++    const result = await new SetPartnerCreditLimitUseCase(partnerRepo).execute(2, 4, 1200.5);
++    expect(partnerRepo.findById).toHaveBeenCalledWith(2, 4);
++    expect(existing.toPrimitives().creditLimit).toBe(1200.5);
++    expect(result).toEqual({ partnerId: 4, creditLimit: 1200.5 });
++  });
++
++  it("clears a configured limit by storing null", async () => {
++    const existing = makePartner(4, 700, 2);
++    const partnerRepo: any = {
++      findById: jest.fn().mockResolvedValue(existing),
++      update: jest.fn().mockImplementation(async (p: Partner) => p),
++    };
++    const result = await new SetPartnerCreditLimitUseCase(partnerRepo).execute(2, 4, null);
++    expect(existing.toPrimitives().creditLimit).toBeNull();
++    expect(result.creditLimit).toBeNull();
++  });
++
++  it("allows lowering a limit below current exposure because enforcement belongs to future increases", async () => {
++    const existing = makePartner(4, 700, 2);
++    const partnerRepo: any = {
++      findById: jest.fn().mockResolvedValue(existing),
++      update: jest.fn().mockImplementation(async (p: Partner) => p),
++    };
++    const result = await new SetPartnerCreditLimitUseCase(partnerRepo).execute(2, 4, 10);
++    expect(result.creditLimit).toBe(10);
++  });
++
++  it("rejects an invalid limit before reading the partner", async () => {
++    const partnerRepo: any = { findById: jest.fn(), update: jest.fn() };
++    await expect(new SetPartnerCreditLimitUseCase(partnerRepo).execute(2, 4, -1)).rejects.toBeInstanceOf(
++      ValidationError
++    );
++    expect(partnerRepo.findById).not.toHaveBeenCalled();
++  });
++
++  it("does not update when the partner is missing", async () => {
++    const partnerRepo: any = {
++      findById: jest.fn().mockResolvedValue(null),
++      update: jest.fn(),
++    };
++    await expect(new SetPartnerCreditLimitUseCase(partnerRepo).execute(2, 4, 100)).rejects.toBeInstanceOf(
++      EntityNotFoundError
++    );
++    expect(partnerRepo.update).not.toHaveBeenCalled();
++  });
++});
++
++describe("partner credit limit guard behavior", () => {
++  function setup(limit = 500, exposure = 200) {
++    const partnerRepo: any = {
++      findByIdForUpdate: jest.fn((_companyId: number, partnerId: number) =>
++        Promise.resolve(makePartner(partnerId, limit))
++      ),
++    };
++    const creditRepo: any = {
++      getComponents: jest.fn((_companyId: number, partnerId: number) =>
++        Promise.resolve(makeComponents(partnerId, limit, exposure, 0, 0))
++      ),
++    };
++    return {
++      partnerRepo,
++      creditRepo,
++      service: new PartnerCreditLimitService(partnerRepo, creditRepo),
++      client: {} as any,
++    };
++  }
++
++  it("admits a projected increase below the ceiling", async () => {
++    const s = setup(500, 200);
++    await expect(
++      s.service.assertProjectedDeltas(1, [{ partnerId: 7, amount: 299.99 }], s.client)
++    ).resolves.toBeUndefined();
++  });
++
++  it("admits a projected increase exactly at the ceiling", async () => {
++    const s = setup(500, 200);
++    await expect(
++      s.service.assertProjectedDeltas(1, [{ partnerId: 7, amount: 300 }], s.client)
++    ).resolves.toBeUndefined();
++  });
++
++  it("rejects a projected increase above the ceiling with the stable conflict error", async () => {
++    const s = setup(500, 200);
++    await expect(
++      s.service.assertProjectedDeltas(1, [{ partnerId: 7, amount: 300.01 }], s.client)
++    ).rejects.toMatchObject({
++      code: "PARTNER_CREDIT_LIMIT_EXCEEDED",
++      status: 409,
++      currentExposure: 200,
++      projectedExposure: 500.01,
++    });
++  });
++
++  it("does not block a partner merely because existing exposure is over the lowered limit when delta is nonpositive", async () => {
++    const s = setup(100, 200);
++    await expect(
++      s.service.assertProjectedDeltas(1, [{ partnerId: 7, amount: -10 }], s.client)
++    ).resolves.toBeUndefined();
++    expect(s.partnerRepo.findByIdForUpdate).not.toHaveBeenCalled();
++  });
++
++  it("does not lock or query partners for a zero net delta", async () => {
++    const s = setup(100, 90);
++    await s.service.assertProjectedDeltas(
++      1,
++      [
++        { partnerId: 7, amount: 25 },
++        { partnerId: 7, amount: -25 },
++      ],
++      s.client
++    );
++    expect(s.partnerRepo.findByIdForUpdate).not.toHaveBeenCalled();
++    expect(s.creditRepo.getComponents).not.toHaveBeenCalled();
++  });
++
++  it("nets multiple changes for one partner before comparing the ceiling", async () => {
++    const s = setup(100, 80);
++    await s.service.assertProjectedDeltas(
++      1,
++      [
++        { partnerId: 7, amount: 30 },
++        { partnerId: 7, amount: -15 },
++      ],
++      s.client
++    );
++    expect(s.partnerRepo.findByIdForUpdate).toHaveBeenCalledTimes(1);
++  });
++
++  it("rejects the combined increase when individual changes would each fit", async () => {
++    const s = setup(100, 50);
++    await expect(
++      s.service.assertProjectedDeltas(
++        1,
++        [
++          { partnerId: 7, amount: 30 },
++          { partnerId: 7, amount: 25 },
++        ],
++        s.client
++      )
++    ).rejects.toBeInstanceOf(PartnerCreditLimitExceededError);
++  });
++
++  it("checks different partners independently", async () => {
++    const s = setup(100, 10);
++    await s.service.assertProjectedDeltas(
++      1,
++      [
++        { partnerId: 7, amount: 20 },
++        { partnerId: 9, amount: 30 },
++      ],
++      s.client
++    );
++    expect(s.partnerRepo.findByIdForUpdate).toHaveBeenCalledTimes(2);
++    expect(s.creditRepo.getComponents).toHaveBeenCalledTimes(2);
++  });
++
++  it("locks positive-delta partners in id order", async () => {
++    const s = setup(100, 0);
++    await s.service.assertProjectedDeltas(
++      1,
++      [
++        { partnerId: 9, amount: 10 },
++        { partnerId: 2, amount: 10 },
++        { partnerId: 6, amount: 10 },
++      ],
++      s.client
++    );
++    expect(s.partnerRepo.findByIdForUpdate.mock.calls.map((call: unknown[]) => call[1])).toEqual([2, 6, 9]);
++  });
++
++  it("skips the exposure query for an unlimited partner", async () => {
++    const s = setup(500, 200);
++    s.partnerRepo.findByIdForUpdate.mockResolvedValue(makePartner(7, null));
++    await s.service.assertProjectedDeltas(1, [{ partnerId: 7, amount: 100000 }], s.client);
++    expect(s.creditRepo.getComponents).not.toHaveBeenCalled();
++  });
++
++  it("throws not found when a positive-delta partner cannot be locked", async () => {
++    const s = setup();
++    s.partnerRepo.findByIdForUpdate.mockResolvedValue(null);
++    await expect(
++      s.service.assertProjectedDeltas(1, [{ partnerId: 404, amount: 1 }], s.client)
++    ).rejects.toBeInstanceOf(EntityNotFoundError);
++  });
++
++  it("throws not found when exposure disappears after the partner lock", async () => {
++    const s = setup();
++    s.creditRepo.getComponents.mockResolvedValue(null);
++    await expect(
++      s.service.assertProjectedDeltas(1, [{ partnerId: 7, amount: 1 }], s.client)
++    ).rejects.toBeInstanceOf(EntityNotFoundError);
++  });
++});
++
++const product = () =>
++  Product.hydrate({
++    id: 1,
++    companyId: 1,
++    productNo: "P-1",
++    name: "Widget",
++    unitType: "pcs",
++    boughtPrice: 5,
++    sellingPrice: 20,
++    isActive: true,
++  });
++
++function saleCreateSetup() {
++  const txManager: any = { run: jest.fn((op: (client: unknown) => unknown) => op({ tx: true })) };
++  const saleOrderRepo: any = {
++    createWithItemsPaymentsAndSideEffects: jest.fn(async ({ order }: { order: SaleOrder }) => {
++      const props = order.toPrimitives();
++      return {
++        order: SaleOrder.hydrate({
++          ...props,
++          id: 90,
++          items: props.items.map((item: any) => SaleOrderItem.hydrate(item)),
++        }),
++        paymentId: props.totalPaidAmount > 0 ? 33 : null,
++        shipmentId: null,
++      };
++    }),
++  };
++  const partnerRepo: any = {
++    findById: jest.fn().mockResolvedValue(makePartner(11, 500)),
++    update: jest.fn(),
++  };
++  const productRepo: any = { findByIds: jest.fn().mockResolvedValue([product()]) };
++  const accountTx: any = { executeBatch: jest.fn() };
++  const inventoryBalance: any = { findByProductsBranch: jest.fn().mockResolvedValue([]) };
++  const inventoryCost: any = { findByProducts: jest.fn().mockResolvedValue([]) };
++  const loanTx: any = { execute: jest.fn(), executeBatch: jest.fn() };
++  const credit: any = { assertProjectedDeltas: jest.fn().mockResolvedValue(undefined) };
++  const useCase = new CreateSaleOrderUseCase(
++    txManager,
++    saleOrderRepo,
++    partnerRepo,
++    productRepo,
++    accountTx,
++    inventoryBalance,
++    inventoryCost,
++    loanTx,
++    credit
++  );
++  return { useCase, saleOrderRepo, credit, loanTx, accountTx };
++}
++
++const saleInput = {
++  companyId: 1,
++  customerId: 11,
++  orderNo: "SO-CREDIT-1",
++  orderDate: new Date("2026-07-01"),
++  shipmentOption: ShipmentOption.SHIP_LATER,
++  branchId: 2,
++  items: [{ productId: 1, quantityOrdered: 5, unitPrice: 20 }],
++};
++
++describe("sale order credit-limit integration", () => {
++  it("checks the unpaid order amount before creating the sale", async () => {
++    const s = saleCreateSetup();
++    await s.useCase.execute(saleInput);
++    expect(s.credit.assertProjectedDeltas).toHaveBeenCalledWith(
++      1,
++      [{ partnerId: 11, amount: 100 }],
++      expect.anything()
++    );
++  });
++
++  it("subtracts cash paid at creation from the customer credit increase", async () => {
++    const s = saleCreateSetup();
++    await s.useCase.execute({
++      ...saleInput,
++      payments: [{ method: PaymentMethod.CASH, accountId: 5, amount: 40, date: new Date("2026-07-01") }],
++    });
++    expect(s.credit.assertProjectedDeltas.mock.calls[0][1]).toContainEqual({ partnerId: 11, amount: 60 });
++  });
++
++  it("adds a partner-funded payment as exposure for the funding partner", async () => {
++    const s = saleCreateSetup();
++    await s.useCase.execute({
++      ...saleInput,
++      payments: [{ method: PaymentMethod.PARTNER, partnerId: 21, amount: 25, date: new Date("2026-07-01") }],
++    });
++    expect(s.credit.assertProjectedDeltas.mock.calls[0][1]).toEqual([
++      { partnerId: 11, amount: 75 },
++      { partnerId: 21, amount: 25 },
++    ]);
++  });
++
++  it("checks a fully paid sale with zero customer increase so partner-funded deltas can still be enforced", async () => {
++    const s = saleCreateSetup();
++    await s.useCase.execute({
++      ...saleInput,
++      payments: [{ method: PaymentMethod.CASH, accountId: 5, amount: 100, date: new Date("2026-07-01") }],
++    });
++    expect(s.credit.assertProjectedDeltas.mock.calls[0][1]).toEqual([{ partnerId: 11, amount: 0 }]);
++  });
++
++  it("does not persist the order when the credit guard rejects it", async () => {
++    const s = saleCreateSetup();
++    s.credit.assertProjectedDeltas.mockRejectedValue(
++      new PartnerCreditLimitExceededError(11, 50, 0, 100)
++    );
++    await expect(s.useCase.execute(saleInput)).rejects.toMatchObject({
++      code: "PARTNER_CREDIT_LIMIT_EXCEEDED",
++    });
++    expect(s.saleOrderRepo.createWithItemsPaymentsAndSideEffects).not.toHaveBeenCalled();
++    expect(s.loanTx.execute).not.toHaveBeenCalled();
++  });
++});
++
++function salePaymentSetup(customerId = 11) {
++  const order = SaleOrder.hydrate({
++    id: 90,
++    companyId: 1,
++    customerId,
++    orderNo: "SO-90",
++    orderDate: new Date("2026-07-01"),
++    shipmentOption: ShipmentOption.SHIP_LATER,
++    branchId: 2,
++    totalItemsPrice: 100,
++    totalPaidAmount: 0,
++    profitAmount: 0,
++    status: DocumentStatus.OPEN,
++    items: [
++      SaleOrderItem.create({ productId: 1, quantityOrdered: 5, unitPrice: 20 }),
++    ],
++  });
++  const txManager: any = { run: jest.fn((op: (client: unknown) => unknown) => op({ tx: true })) };
++  const saleOrderRepo: any = {
++    findByIdForUpdate: jest.fn().mockResolvedValue(order),
++    update: jest.fn(),
++  };
++  const salePaymentRepo: any = {
++    create: jest.fn(async (payment: SalePayment) => {
++      const props = payment.toPrimitives();
++      return SalePayment.hydrate({ ...props, id: 70 });
++    }),
++  };
++  const accountTx: any = { execute: jest.fn() };
++  const loanTx: any = { execute: jest.fn() };
++  const credit: any = { assertProjectedDeltas: jest.fn().mockResolvedValue(undefined) };
++  const useCase = new RecordSalePaymentUseCase(
++    txManager,
++    saleOrderRepo,
++    salePaymentRepo,
++    accountTx,
++    loanTx,
++    credit
++  );
++  return { useCase, salePaymentRepo, saleOrderRepo, credit };
++}
++
++describe("sale payment credit-limit integration", () => {
++  it("treats an ordinary cash payment as a negative customer credit delta", async () => {
++    const s = salePaymentSetup();
++    await s.useCase.execute({
++      companyId: 1,
++      saleOrderId: 90,
++      lines: [{ method: PaymentMethod.CASH, accountId: 1, amount: 30, date: new Date("2026-07-02") }],
++    });
++    expect(s.credit.assertProjectedDeltas.mock.calls[0][1]).toEqual([{ partnerId: 11, amount: -30 }]);
++  });
++
++  it("nets a partner-funded payment against the customer reduction when both ids are the same", async () => {
++    const s = salePaymentSetup(11);
++    await s.useCase.execute({
++      companyId: 1,
++      saleOrderId: 90,
++      lines: [{ method: PaymentMethod.PARTNER, partnerId: 11, amount: 30, date: new Date("2026-07-02") }],
++    });
++    expect(s.credit.assertProjectedDeltas.mock.calls[0][1]).toEqual([
++      { partnerId: 11, amount: -30 },
++      { partnerId: 11, amount: 30 },
++    ]);
++  });
++
++  it("checks the funding partner before saving a partner-funded payment", async () => {
++    const s = salePaymentSetup();
++    s.credit.assertProjectedDeltas.mockRejectedValue(
++      new PartnerCreditLimitExceededError(22, 100, 90, 120)
++    );
++    await expect(
++      s.useCase.execute({
++        companyId: 1,
++        saleOrderId: 90,
++        lines: [{ method: PaymentMethod.PARTNER, partnerId: 22, amount: 30, date: new Date("2026-07-02") }],
++      })
++    ).rejects.toBeInstanceOf(PartnerCreditLimitExceededError);
++    expect(s.salePaymentRepo.create).not.toHaveBeenCalled();
++    expect(s.saleOrderRepo.update).not.toHaveBeenCalled();
++  });
++});
++
++const txManager = () => ({ run: jest.fn((op: (client: unknown) => unknown) => op({ tx: true })) } as any);
++
++function directLoanSetup() {
++  const partnerRepo: any = { findByIdForUpdate: jest.fn().mockResolvedValue(makePartner(5, 200)) };
++  const accountTx: any = { execute: jest.fn().mockResolvedValue({ id: 44 }) };
++  const loanTx: any = { execute: jest.fn() };
++  const eventRecorder: any = { record: jest.fn() };
++  const credit: any = { assertProjectedDeltas: jest.fn().mockResolvedValue(undefined) };
++  const useCase = new RecordDirectLoanUseCase(
++    txManager(),
++    accountTx,
++    loanTx,
++    partnerRepo,
++    eventRecorder,
++    credit
++  );
++  return { useCase, credit, accountTx, loanTx };
++}
++
++describe("manual loan credit-limit integration", () => {
++  const directInput = {
++    companyId: 1,
++    primaryPartnerId: 5,
++    accountId: 3,
++    date: new Date("2026-07-03"),
++    amount: 80,
++    loanDirection: "LENT" as const,
++  };
++
++  it("checks a direct LENT loan as a positive exposure delta", async () => {
++    const s = directLoanSetup();
++    await s.useCase.execute(directInput);
++    expect(s.credit.assertProjectedDeltas).toHaveBeenCalledWith(
++      1,
++      [{ partnerId: 5, amount: 80 }],
++      expect.anything()
++    );
++  });
++
++  it("does not credit-check a direct TAKEN loan because it reduces exposure", async () => {
++    const s = directLoanSetup();
++    await s.useCase.execute({ ...directInput, loanDirection: "TAKEN" });
++    expect(s.credit.assertProjectedDeltas).not.toHaveBeenCalled();
++  });
++
++  it("does not write account or loan transactions when a direct loan exceeds the limit", async () => {
++    const s = directLoanSetup();
++    s.credit.assertProjectedDeltas.mockRejectedValue(
++      new PartnerCreditLimitExceededError(5, 100, 50, 130)
++    );
++    await expect(s.useCase.execute(directInput)).rejects.toBeInstanceOf(PartnerCreditLimitExceededError);
++    expect(s.accountTx.execute).not.toHaveBeenCalled();
++    expect(s.loanTx.execute).not.toHaveBeenCalled();
++  });
++
++  it("checks the primary partner for a historical LENT entry", async () => {
++    const partnerRepo: any = { findByIdForUpdate: jest.fn().mockResolvedValue(makePartner(5, 200)) };
++    const loanTx: any = { execute: jest.fn() };
++    const events: any = { record: jest.fn() };
++    const credit: any = { assertProjectedDeltas: jest.fn().mockResolvedValue(undefined) };
++    const useCase = new RecordHistoricalLoanUseCase(txManager(), loanTx, partnerRepo, events, credit);
++    await useCase.execute({
++      companyId: 1,
++      primaryPartnerId: 5,
++      date: new Date("2026-07-03"),
++      amount: 75,
++      loanDirection: "LENT",
++    });
++    expect(credit.assertProjectedDeltas).toHaveBeenCalledWith(
++      1,
++      [{ partnerId: 5, amount: 75 }],
++      expect.anything()
++    );
++  });
++
++  it("does not credit-check a historical TAKEN entry", async () => {
++    const partnerRepo: any = { findByIdForUpdate: jest.fn().mockResolvedValue(makePartner(5, 200)) };
++    const credit: any = { assertProjectedDeltas: jest.fn() };
++    const useCase = new RecordHistoricalLoanUseCase(
++      txManager(),
++      { execute: jest.fn() } as any,
++      partnerRepo,
++      { record: jest.fn() } as any,
++      credit
++    );
++    await useCase.execute({
++      companyId: 1,
++      primaryPartnerId: 5,
++      date: new Date("2026-07-03"),
++      amount: 75,
++      loanDirection: "TAKEN",
++    });
++    expect(credit.assertProjectedDeltas).not.toHaveBeenCalled();
++  });
++
++  it("checks the primary partner for a P2P LENT transfer", async () => {
++    const partnerRepo: any = {
++      findByIdForUpdate: jest.fn((_company: number, id: number) => Promise.resolve(makePartner(id, 200))),
++    };
++    const credit: any = { assertProjectedDeltas: jest.fn().mockResolvedValue(undefined) };
++    const useCase = new RecordPartnerToPartnerLoanUseCase(
++      txManager(),
++      { execute: jest.fn() } as any,
++      partnerRepo,
++      { record: jest.fn() } as any,
++      credit
++    );
++    await useCase.execute({
++      companyId: 1,
++      primaryPartnerId: 8,
++      relatedPartnerId: 3,
++      date: new Date("2026-07-03"),
++      amount: 60,
++      loanDirection: "LENT",
++    });
++    expect(credit.assertProjectedDeltas).toHaveBeenCalledWith(
++      1,
++      [{ partnerId: 8, amount: 60 }],
++      expect.anything()
++    );
++  });
++
++  it("checks the related partner for a P2P TAKEN transfer", async () => {
++    const partnerRepo: any = {
++      findByIdForUpdate: jest.fn((_company: number, id: number) => Promise.resolve(makePartner(id, 200))),
++    };
++    const credit: any = { assertProjectedDeltas: jest.fn().mockResolvedValue(undefined) };
++    const useCase = new RecordPartnerToPartnerLoanUseCase(
++      txManager(),
++      { execute: jest.fn() } as any,
++      partnerRepo,
++      { record: jest.fn() } as any,
++      credit
++    );
++    await useCase.execute({
++      companyId: 1,
++      primaryPartnerId: 8,
++      relatedPartnerId: 3,
++      date: new Date("2026-07-03"),
++      amount: 60,
++      loanDirection: "TAKEN",
++    });
++    expect(credit.assertProjectedDeltas).toHaveBeenCalledWith(
++      1,
++      [{ partnerId: 3, amount: 60 }],
++      expect.anything()
++    );
++  });
++});
+diff --git a/src/modules/partners/domain/__tests__/PartnerCreditLimit.behavior.test.ts b/src/modules/partners/domain/__tests__/PartnerCreditLimit.behavior.test.ts
+new file mode 100644
+index 0000000..263f519
+--- /dev/null
++++ b/src/modules/partners/domain/__tests__/PartnerCreditLimit.behavior.test.ts
+@@ -0,0 +1,255 @@
++import { Partner } from "../Partner";
++import {
++  calculatePartnerCreditStatus,
++  normalizeMoney,
++  PartnerCreditLimitExceededError,
++  validateCreditLimitValue,
++} from "../PartnerCredit";
++import { ValidationError } from "../../../../shared/domain/DomainError";
++
++const baseComponents = {
++  partnerId: 17,
++  creditLimit: 1000 as number | null,
++  openSales: 400,
++  loans: 100,
++  payments: 150,
++};
++
++const partner = (creditLimit: number | null = null) =>
++  Partner.hydrate({
++    id: 17,
++    companyId: 3,
++    partnerNo: "PAR-000017",
++    fullName: "Northwind Customer",
++    phone: "555-017",
++    isCustomer: true,
++    isSupplier: false,
++    isLoanLender: false,
++    isLoanBorrower: false,
++    isWalkIn: false,
++    loanBalance: 0,
++    creditLimit,
++  });
++
++describe("partner credit exposure calculation", () => {
++  it("uses open sales plus loans minus payments", () => {
++    const status = calculatePartnerCreditStatus(baseComponents);
++    expect(status.exposure).toBe(350);
++  });
++
++  it("floors a negative raw exposure at zero", () => {
++    const status = calculatePartnerCreditStatus({
++      ...baseComponents,
++      openSales: 50,
++      loans: -200,
++      payments: 25,
++    });
++    expect(status.exposure).toBe(0);
++  });
++
++  it("keeps each exposure component in the public result", () => {
++    const status = calculatePartnerCreditStatus(baseComponents);
++    expect(status).toMatchObject({
++      partnerId: 17,
++      openSales: 400,
++      loans: 100,
++      payments: 150,
++    });
++  });
++
++  it("reports remaining credit when the partner is under a limit", () => {
++    const status = calculatePartnerCreditStatus(baseComponents);
++    expect(status.availableCredit).toBe(650);
++    expect(status.overLimit).toBe(false);
++  });
++
++  it("allows exposure exactly equal to the configured limit", () => {
++    const status = calculatePartnerCreditStatus({
++      ...baseComponents,
++      creditLimit: 350,
++    });
++    expect(status.exposure).toBe(350);
++    expect(status.availableCredit).toBe(0);
++    expect(status.overLimit).toBe(false);
++  });
++
++  it("reports negative available credit when the stored exposure is already over limit", () => {
++    const status = calculatePartnerCreditStatus({
++      ...baseComponents,
++      creditLimit: 300,
++    });
++    expect(status.availableCredit).toBe(-50);
++    expect(status.overLimit).toBe(true);
++  });
++
++  it("uses null available credit for an unlimited partner", () => {
++    const status = calculatePartnerCreditStatus({
++      ...baseComponents,
++      creditLimit: null,
++    });
++    expect(status.availableCredit).toBeNull();
++    expect(status.overLimit).toBe(false);
++  });
++
++  it("rounds monetary arithmetic to cents", () => {
++    const status = calculatePartnerCreditStatus({
++      partnerId: 1,
++      creditLimit: 0.3,
++      openSales: 0.1,
++      loans: 0.2,
++      payments: 0,
++    });
++    expect(status.exposure).toBe(0.3);
++    expect(status.availableCredit).toBe(0);
++  });
++
++  it("rejects non-finite exposure inputs", () => {
++    expect(() =>
++      calculatePartnerCreditStatus({
++        ...baseComponents,
++        loans: Number.POSITIVE_INFINITY,
++      })
++    ).toThrow(ValidationError);
++  });
++
++  it("rejects a negative limit in a raw status calculation", () => {
++    expect(() =>
++      calculatePartnerCreditStatus({
++        ...baseComponents,
++        creditLimit: -1,
++      })
++    ).toThrow("Credit limit cannot be negative");
++  });
++});
++
++describe("partner credit limit value rules", () => {
++  it("accepts null as the no-limit setting", () => {
++    expect(() => validateCreditLimitValue(null)).not.toThrow();
++  });
++
++  it("accepts a zero credit limit", () => {
++    expect(() => validateCreditLimitValue(0)).not.toThrow();
++  });
++
++  it("accepts a positive amount with two decimals", () => {
++    expect(() => validateCreditLimitValue(1234.56)).not.toThrow();
++  });
++
++  it("rejects a negative credit limit", () => {
++    expect(() => validateCreditLimitValue(-0.01)).toThrow(ValidationError);
++  });
++
++  it("rejects a credit limit with more than two decimals", () => {
++    expect(() => validateCreditLimitValue(12.345)).toThrow(
++      "Credit limit can have at most two decimal places"
++    );
++  });
++
++  it("rejects NaN as a credit limit", () => {
++    expect(() => validateCreditLimitValue(Number.NaN)).toThrow(
++      "Credit limit must be a finite number or null"
++    );
++  });
++
++  it("rejects infinity as a credit limit", () => {
++    expect(() => validateCreditLimitValue(Number.POSITIVE_INFINITY)).toThrow(
++      ValidationError
++    );
++  });
++
++  it("normalizes regular monetary amounts to cents", () => {
++    expect(normalizeMoney(12.345)).toBe(12.35);
++  });
++
++  it("normalizes floating point addition artifacts", () => {
++    expect(normalizeMoney(0.1 + 0.2)).toBe(0.3);
++  });
++});
++
++describe("partner credit limit persistence on the domain object", () => {
++  it("hydrates an existing configured limit", () => {
++    expect(partner(750).toPrimitives().creditLimit).toBe(750);
++  });
++
++  it("hydrates an unlimited partner as null", () => {
++    expect(partner(null).toPrimitives().creditLimit).toBeNull();
++  });
++
++  it("defaults a newly created partner to unlimited credit", () => {
++    const created = Partner.create({
++      companyId: 3,
++      partnerNo: "PAR-000018",
++      fullName: "Fresh Partner",
++      phone: "555-018",
++      isCustomer: false,
++      isSupplier: false,
++      isLoanLender: false,
++      isLoanBorrower: false,
++      isWalkIn: false,
++    });
++    expect(created.toPrimitives().creditLimit).toBeNull();
++  });
++
++  it("allows a newly created partner to start with a limit", () => {
++    const created = Partner.create({
++      companyId: 3,
++      partnerNo: "PAR-000019",
++      fullName: "Limited Partner",
++      phone: "555-019",
++      isCustomer: true,
++      isSupplier: false,
++      isLoanLender: false,
++      isLoanBorrower: false,
++      isWalkIn: false,
++      creditLimit: 250,
++    });
++    expect(created.toPrimitives().creditLimit).toBe(250);
++  });
++
++  it("updates an existing limit", () => {
++    const subject = partner(500);
++    subject.update({ creditLimit: 325.5 });
++    expect(subject.toPrimitives().creditLimit).toBe(325.5);
++  });
++
++  it("clears an existing limit with null", () => {
++    const subject = partner(500);
++    subject.update({ creditLimit: null });
++    expect(subject.toPrimitives().creditLimit).toBeNull();
++  });
++
++  it("does not change the limit when an unrelated field is updated", () => {
++    const subject = partner(500);
++    subject.update({ fullName: "Renamed Partner" });
++    expect(subject.toPrimitives().creditLimit).toBe(500);
++  });
++
++  it("rejects an invalid limit during hydration", () => {
++    expect(() => partner(-1)).toThrow(ValidationError);
++  });
++
++  it("rejects an invalid limit during update without persisting it", () => {
++    const subject = partner(500);
++    expect(() => subject.update({ creditLimit: 4.567 })).toThrow(ValidationError);
++  });
++});
++
++describe("partner credit limit exceeded error contract", () => {
++  it("uses a conflict status and stable public code", () => {
++    const err = new PartnerCreditLimitExceededError(9, 100, 80, 120);
++    expect(err.status).toBe(409);
++    expect(err.code).toBe("PARTNER_CREDIT_LIMIT_EXCEEDED");
++  });
++
++  it("includes the partner and projected amount in its message", () => {
++    const err = new PartnerCreditLimitExceededError(9, 100, 80, 120);
++    expect(err.message).toContain("Partner 9");
++    expect(err.message).toContain("120.00");
++  });
++
++  it("retains the current and projected exposure values", () => {
++    const err = new PartnerCreditLimitExceededError(9, 100, 80, 120);
++    expect(err.currentExposure).toBe(80);
++    expect(err.projectedExposure).toBe(120);
++  });
++});
+diff --git a/src/modules/partners/presentation/__tests__/PartnerCreditSchemas.behavior.test.ts b/src/modules/partners/presentation/__tests__/PartnerCreditSchemas.behavior.test.ts
+new file mode 100644
+index 0000000..6af77c1
+--- /dev/null
++++ b/src/modules/partners/presentation/__tests__/PartnerCreditSchemas.behavior.test.ts
+@@ -0,0 +1,64 @@
++import { partnerCreditLimitSchema } from "../PartnerSchemas";
++
++describe("partner credit limit request validation", () => {
++  it("accepts a positive integer limit", () => {
++    expect(partnerCreditLimitSchema.parse({ creditLimit: 1000 })).toEqual({ creditLimit: 1000 });
++  });
++
++  it("accepts a positive limit with cents", () => {
++    expect(partnerCreditLimitSchema.parse({ creditLimit: 1000.25 })).toEqual({ creditLimit: 1000.25 });
++  });
++
++  it("accepts zero as a hard no-credit ceiling", () => {
++    expect(partnerCreditLimitSchema.parse({ creditLimit: 0 })).toEqual({ creditLimit: 0 });
++  });
++
++  it("accepts null to clear the ceiling", () => {
++    expect(partnerCreditLimitSchema.parse({ creditLimit: null })).toEqual({ creditLimit: null });
++  });
++
++  it("requires the creditLimit property", () => {
++    const result = partnerCreditLimitSchema.safeParse({});
++    expect(result.success).toBe(false);
++  });
++
++  it("rejects a negative limit", () => {
++    const result = partnerCreditLimitSchema.safeParse({ creditLimit: -1 });
++    expect(result.success).toBe(false);
++    if (!result.success) {
++      expect(result.error.issues[0].message).toBe("Credit limit cannot be negative");
++    }
++  });
++
++  it("rejects a limit with more than two decimal places", () => {
++    const result = partnerCreditLimitSchema.safeParse({ creditLimit: 12.345 });
++    expect(result.success).toBe(false);
++    if (!result.success) {
++      expect(result.error.issues.some((issue) => issue.message.includes("two decimal"))).toBe(true);
++    }
++  });
++
++  it("rejects a numeric string instead of coercing it", () => {
++    expect(partnerCreditLimitSchema.safeParse({ creditLimit: "100" }).success).toBe(false);
++  });
++
++  it("rejects an empty string", () => {
++    expect(partnerCreditLimitSchema.safeParse({ creditLimit: "" }).success).toBe(false);
++  });
++
++  it("rejects NaN", () => {
++    expect(partnerCreditLimitSchema.safeParse({ creditLimit: Number.NaN }).success).toBe(false);
++  });
++
++  it("rejects positive infinity", () => {
++    expect(partnerCreditLimitSchema.safeParse({ creditLimit: Number.POSITIVE_INFINITY }).success).toBe(false);
++  });
++
++  it("rejects negative infinity", () => {
++    expect(partnerCreditLimitSchema.safeParse({ creditLimit: Number.NEGATIVE_INFINITY }).success).toBe(false);
++  });
++
++  it("strips unrelated request fields using the normal zod object behavior", () => {
++    expect(partnerCreditLimitSchema.parse({ creditLimit: 50, ignored: true })).toEqual({ creditLimit: 50 });
++  });
++});

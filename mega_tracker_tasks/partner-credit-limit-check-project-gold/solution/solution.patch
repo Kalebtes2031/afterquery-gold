@@ -1,0 +1,779 @@
+diff --git a/db/migrations/035_partner_credit_limit.sql b/db/migrations/035_partner_credit_limit.sql
+new file mode 100644
+index 0000000..9561078
+--- /dev/null
++++ b/db/migrations/035_partner_credit_limit.sql
+@@ -0,0 +1,8 @@
++-- Add an optional company-partner credit ceiling. NULL means that the
++-- partner has no configured ceiling and existing behavior remains unchanged.
++ALTER TABLE partner
++  ADD COLUMN credit_limit NUMERIC(18,2);
++
++ALTER TABLE partner
++  ADD CONSTRAINT ck_partner_credit_limit_nonnegative
++  CHECK (credit_limit IS NULL OR credit_limit >= 0);
+diff --git a/src/modules/finance/application/LoanUseCases.ts b/src/modules/finance/application/LoanUseCases.ts
+index 334db8d..05328c3 100644
+--- a/src/modules/finance/application/LoanUseCases.ts
++++ b/src/modules/finance/application/LoanUseCases.ts
+@@ -7,6 +7,7 @@ import { PartnerRepository } from "../../partners/domain/Partner";
+ import { EntityNotFoundError } from "../../../shared/domain/DomainError";
+ import { IdGenerator } from "../../../shared/infrastructure/utils/IdGenerator";
+ import { EventRecorder } from "../../../shared/application/EventRecorder";
++import { PartnerCreditLimitService } from "../../partners/application/PartnerCreditUseCases";
+ 
+ export type LoanDirection = "TAKEN" | "LENT";
+ 
+@@ -27,7 +28,8 @@ export class RecordDirectLoanUseCase {
+     private readonly accountTxService: RecordAccountTransactionUseCase,
+     private readonly recordLoanTransactionUseCase: RecordLoanTransactionUseCase,
+     private readonly partnerRepository: PartnerRepository,
+-    private readonly eventRecorder: EventRecorder
++    private readonly eventRecorder: EventRecorder,
++    private readonly partnerCreditLimitService?: PartnerCreditLimitService
+   ) {}
+ 
+   async execute(input: RecordDirectLoanInput): Promise<{ loanTransactionId?: number }> {
+@@ -36,6 +38,13 @@ export class RecordDirectLoanUseCase {
+       if (!partner) {
+         throw new EntityNotFoundError("Partner not found");
+       }
++      if (input.loanDirection === "LENT" && this.partnerCreditLimitService) {
++        await this.partnerCreditLimitService.assertProjectedDeltas(
++          input.companyId,
++          [{ partnerId: input.primaryPartnerId, amount: input.amount }],
++          client as any
++        );
++      }
+       // if (input.loanDirection === "TAKEN" && !partner.toPrimitives().isLoanLender) {
+       //   partner.update({ isLoanLender: true });
+       //   await this.partnerRepository.update(partner, client);
+@@ -107,7 +116,8 @@ export class RecordPartnerToPartnerLoanUseCase {
+     private readonly txManager: TransactionManager,
+     private readonly recordLoanTransactionUseCase: RecordLoanTransactionUseCase,
+     private readonly partnerRepository: PartnerRepository,
+-    private readonly eventRecorder: EventRecorder
++    private readonly eventRecorder: EventRecorder,
++    private readonly partnerCreditLimitService?: PartnerCreditLimitService
+   ) {}
+ 
+   async execute(input: RecordPartnerToPartnerLoanInput): Promise<{ }> {
+@@ -123,6 +133,17 @@ export class RecordPartnerToPartnerLoanUseCase {
+ 
+       const primaryPartner = input.primaryPartnerId === id1 ? p1 : p2;
+       const relatedPartner = input.relatedPartnerId === id1 ? p1 : p2;
++
++      if (this.partnerCreditLimitService) {
++        const increasingPartnerId = input.loanDirection === "LENT"
++          ? input.primaryPartnerId
++          : input.relatedPartnerId;
++        await this.partnerCreditLimitService.assertProjectedDeltas(
++          input.companyId,
++          [{ partnerId: increasingPartnerId, amount: input.amount }],
++          client as any
++        );
++      }
+       
+       // If loanDirection == TAKEN that mean the company is borrowing from the primary partner, 
+       // so the primary partner is the lender and the related partner is the borrower. 
+@@ -207,7 +228,8 @@ export class RecordHistoricalLoanUseCase {
+     private readonly txManager: TransactionManager,
+     private readonly recordLoanTransactionUseCase: RecordLoanTransactionUseCase,
+     private readonly partnerRepository: PartnerRepository,
+-    private readonly eventRecorder: EventRecorder
++    private readonly eventRecorder: EventRecorder,
++    private readonly partnerCreditLimitService?: PartnerCreditLimitService
+   ) {}
+ 
+   async execute(input: RecordHistoricalLoanInput): Promise<{ }> {
+@@ -216,6 +238,13 @@ export class RecordHistoricalLoanUseCase {
+       if (!partner) {
+         throw new EntityNotFoundError("Partner not found");
+       }
++      if (input.loanDirection === "LENT" && this.partnerCreditLimitService) {
++        await this.partnerCreditLimitService.assertProjectedDeltas(
++          input.companyId,
++          [{ partnerId: input.primaryPartnerId, amount: input.amount }],
++          client as any
++        );
++      }
+       // if (input.loanDirection === "TAKEN" && !partner.toPrimitives().isLoanLender) {
+       //   partner.update({ isLoanLender: true });
+       //   await this.partnerRepository.update(partner, client);
+diff --git a/src/modules/finance/presentation/FinanceRouter.ts b/src/modules/finance/presentation/FinanceRouter.ts
+index 9403857..f4e68f3 100644
+--- a/src/modules/finance/presentation/FinanceRouter.ts
++++ b/src/modules/finance/presentation/FinanceRouter.ts
+@@ -15,6 +15,8 @@ import { PgBusinessEventRepository } from "../../../shared/infrastructure/events
+ import { DbEventRecorder } from "../../../shared/application/EventRecorder";
+ import { sendErrorResponse } from "../../../shared/presentation/http/ErrorHandler";
+ import { recordLoanSchema, listTransactionsFiltersSchema, listAccountTransactionsQuerySchema } from "./FinanceSchemas";
++import { PgPartnerCreditExposureRepository } from "../../partners/infrastructure/PgPartnerCreditExposureRepository";
++import { PartnerCreditLimitService } from "../../partners/application/PartnerCreditUseCases";
+ 
+ const accountRepo = new PgAccountRepository();
+ const partnerRepo = new PgPartnerRepository();
+@@ -26,9 +28,11 @@ const eventRepository = new PgBusinessEventRepository();
+ const eventRecorder = new DbEventRecorder(eventRepository);
+ 
+ const recordLoanTxUseCase = new RecordLoanTransactionUseCase(txManager, partnerRepo, pgLoanTxRepo);
+-const recordDirectUseCase = new RecordDirectLoanUseCase(txManager, accountTxService, recordLoanTxUseCase, partnerRepo, eventRecorder);
+-const recordP2PUseCase = new RecordPartnerToPartnerLoanUseCase(txManager, recordLoanTxUseCase, partnerRepo, eventRecorder);
+-const recordHistoryUseCase = new RecordHistoricalLoanUseCase(txManager, recordLoanTxUseCase, partnerRepo, eventRecorder);
++const partnerCreditRepo = new PgPartnerCreditExposureRepository();
++const partnerCreditLimitService = new PartnerCreditLimitService(partnerRepo, partnerCreditRepo);
++const recordDirectUseCase = new RecordDirectLoanUseCase(txManager, accountTxService, recordLoanTxUseCase, partnerRepo, eventRecorder, partnerCreditLimitService);
++const recordP2PUseCase = new RecordPartnerToPartnerLoanUseCase(txManager, recordLoanTxUseCase, partnerRepo, eventRecorder, partnerCreditLimitService);
++const recordHistoryUseCase = new RecordHistoricalLoanUseCase(txManager, recordLoanTxUseCase, partnerRepo, eventRecorder, partnerCreditLimitService);
+ 
+ const listPartnerBalancesUseCase = new ListPartnerBalancesUseCase(partnerRepo);
+ const listTransactionsUseCase = new ListLoanTransactionsUseCase(pgLoanTxRepo);
+diff --git a/src/modules/partners/application/PartnerCreditUseCases.ts b/src/modules/partners/application/PartnerCreditUseCases.ts
+new file mode 100644
+index 0000000..d4c0acb
+--- /dev/null
++++ b/src/modules/partners/application/PartnerCreditUseCases.ts
+@@ -0,0 +1,138 @@
++import { PoolClient } from "pg";
++import { EntityNotFoundError, ValidationError } from "../../../shared/domain/DomainError";
++import { Partner, PartnerRepository } from "../domain/Partner";
++import {
++  calculatePartnerCreditStatus,
++  normalizeMoney,
++  PartnerCreditDelta,
++  PartnerCreditExposureRepository,
++  PartnerCreditLimitExceededError,
++  PartnerCreditStatus,
++  validateCreditLimitValue,
++} from "../domain/PartnerCredit";
++
++export class GetPartnerCreditStatusUseCase {
++  constructor(private readonly creditRepository: PartnerCreditExposureRepository) {}
++
++  async execute(companyId: number, partnerId: number): Promise<PartnerCreditStatus> {
++    const components = await this.creditRepository.getComponents(companyId, partnerId);
++    if (!components) {
++      throw new EntityNotFoundError("Partner not found");
++    }
++    return calculatePartnerCreditStatus(components);
++  }
++}
++
++export class SetPartnerCreditLimitUseCase {
++  constructor(private readonly partnerRepository: PartnerRepository) {}
++
++  async execute(
++    companyId: number,
++    partnerId: number,
++    creditLimit: number | null
++  ): Promise<{ partnerId: number; creditLimit: number | null }> {
++    validateCreditLimitValue(creditLimit);
++
++    const partner = await this.partnerRepository.findById(companyId, partnerId);
++    if (!partner) {
++      throw new EntityNotFoundError("Partner not found");
++    }
++
++    partner.update({ creditLimit });
++    const saved = await this.partnerRepository.update(partner);
++    return {
++      partnerId: saved.id!,
++      creditLimit: saved.toPrimitives().creditLimit ?? null,
++    };
++  }
++}
++
++/**
++ * Serializes credit-increasing mutations on the partner row, then compares
++ * the current observable exposure with the net increase the workflow is
++ * about to commit. A workflow can submit multiple deltas for one partner;
++ * they are netted before the check so a same-transaction payment can offset
++ * a same-transaction increase.
++ */
++export class PartnerCreditLimitService {
++  constructor(
++    private readonly partnerRepository: PartnerRepository,
++    private readonly creditRepository: PartnerCreditExposureRepository
++  ) {}
++
++  async getStatus(
++    companyId: number,
++    partnerId: number,
++    client?: PoolClient
++  ): Promise<PartnerCreditStatus> {
++    const components = await this.creditRepository.getComponents(companyId, partnerId, client);
++    if (!components) {
++      throw new EntityNotFoundError("Partner not found");
++    }
++    return calculatePartnerCreditStatus(components);
++  }
++
++  async assertProjectedDeltas(
++    companyId: number,
++    deltas: PartnerCreditDelta[],
++    client: PoolClient
++  ): Promise<void> {
++    const aggregated = this.aggregateDeltas(deltas);
++    const positivePartnerIds = Array.from(aggregated.entries())
++      .filter(([, amount]) => amount > 0)
++      .map(([partnerId]) => partnerId)
++      .sort((a, b) => a - b);
++
++    for (const partnerId of positivePartnerIds) {
++      const delta = aggregated.get(partnerId)!;
++      const partner = await this.partnerRepository.findByIdForUpdate(companyId, partnerId, client);
++      if (!partner) {
++        throw new EntityNotFoundError("Partner not found");
++      }
++      await this.assertPartnerDelta(companyId, partner, delta, client);
++    }
++  }
++
++  private aggregateDeltas(deltas: PartnerCreditDelta[]): Map<number, number> {
++    const result = new Map<number, number>();
++    for (const delta of deltas) {
++      if (!Number.isInteger(delta.partnerId) || delta.partnerId <= 0) {
++        throw new ValidationError("Partner id must be a positive integer");
++      }
++      const amount = normalizeMoney(delta.amount);
++      result.set(delta.partnerId, normalizeMoney((result.get(delta.partnerId) ?? 0) + amount));
++    }
++    return result;
++  }
++
++  private async assertPartnerDelta(
++    companyId: number,
++    partner: Partner,
++    delta: number,
++    client: PoolClient
++  ): Promise<void> {
++    const creditLimit = partner.toPrimitives().creditLimit ?? null;
++    if (creditLimit == null || delta <= 0) {
++      return;
++    }
++
++    const components = await this.creditRepository.getComponents(companyId, partner.id!, client);
++    if (!components) {
++      throw new EntityNotFoundError("Partner not found");
++    }
++
++    const status = calculatePartnerCreditStatus({
++      ...components,
++      creditLimit,
++    });
++    const projectedExposure = normalizeMoney(status.exposure + delta);
++    if (projectedExposure > creditLimit) {
++      throw new PartnerCreditLimitExceededError(
++        partner.id!,
++        creditLimit,
++        status.exposure,
++        projectedExposure
++      );
++    }
++  }
++}
+diff --git a/src/modules/partners/domain/Partner.ts b/src/modules/partners/domain/Partner.ts
+index 346b26e..336c2ed 100644
+--- a/src/modules/partners/domain/Partner.ts
++++ b/src/modules/partners/domain/Partner.ts
+@@ -1,4 +1,5 @@
+ import { ValidationError } from "../../../shared/domain/DomainError";
++import { validateCreditLimitValue } from "./PartnerCredit";
+ 
+ export interface PartnerProps {
+   id?: number;
+@@ -15,6 +16,7 @@ export interface PartnerProps {
+   isWalkIn: boolean;
+   loanBalance: number;
+   loanBalanceDirection?: string;
++  creditLimit?: number | null;
+   createdAt?: Date;
+ }
+ 
+@@ -27,12 +29,14 @@ export class Partner {
+     if (!this.props.fullName || this.props.fullName.trim() === "") {
+         throw new ValidationError("Partner full name is required");
+     }
++    validateCreditLimitValue(this.props.creditLimit ?? null);
+   }
+ 
+   static create(input: Omit<PartnerProps, "id" | "createdAt" | "loanBalance">): Partner {
+     return new Partner({
+       ...input,
+       loanBalance: 0,
++      creditLimit: input.creditLimit ?? null,
+       createdAt: new Date()
+     });
+   }
+@@ -67,6 +71,7 @@ export class Partner {
+     if (params.isLoanLender !== undefined) this.props.isLoanLender = params.isLoanLender;
+     if (params.isLoanBorrower !== undefined) this.props.isLoanBorrower = params.isLoanBorrower;
+     if (params.isWalkIn !== undefined) this.props.isWalkIn = params.isWalkIn;
++    if (params.creditLimit !== undefined) this.props.creditLimit = params.creditLimit;
+ 
+     this.validate();
+   }
+diff --git a/src/modules/partners/domain/PartnerCredit.ts b/src/modules/partners/domain/PartnerCredit.ts
+new file mode 100644
+index 0000000..f347221
+--- /dev/null
++++ b/src/modules/partners/domain/PartnerCredit.ts
+@@ -0,0 +1,97 @@
++import { PoolClient } from "pg";
++import { DomainError, ValidationError } from "../../../shared/domain/DomainError";
++
++export interface PartnerCreditComponents {
++  partnerId: number;
++  creditLimit: number | null;
++  openSales: number;
++  loans: number;
++  payments: number;
++}
++
++export interface PartnerCreditStatus extends PartnerCreditComponents {
++  exposure: number;
++  availableCredit: number | null;
++  overLimit: boolean;
++}
++
++export interface PartnerCreditExposureRepository {
++  getComponents(
++    companyId: number,
++    partnerId: number,
++    client?: PoolClient
++  ): Promise<PartnerCreditComponents | null>;
++}
++
++export interface PartnerCreditDelta {
++  partnerId: number;
++  amount: number;
++}
++
++export class PartnerCreditLimitExceededError extends DomainError {
++  readonly code = "PARTNER_CREDIT_LIMIT_EXCEEDED";
++  readonly status = 409;
++
++  constructor(
++    readonly partnerId: number,
++    readonly creditLimit: number,
++    readonly currentExposure: number,
++    readonly projectedExposure: number
++  ) {
++    super(
++      `Partner ${partnerId} credit limit ${creditLimit.toFixed(2)} would be exceeded by projected exposure ${projectedExposure.toFixed(2)}`
++    );
++  }
++}
++
++export function normalizeMoney(value: number): number {
++  if (!Number.isFinite(value)) {
++    throw new ValidationError("Credit amounts must be finite numbers");
++  }
++  return Math.round((value + Number.EPSILON) * 100) / 100;
++}
++
++export function calculatePartnerCreditStatus(
++  components: PartnerCreditComponents
++): PartnerCreditStatus {
++  const openSales = normalizeMoney(components.openSales);
++  const loans = normalizeMoney(components.loans);
++  const payments = normalizeMoney(components.payments);
++  const creditLimit = components.creditLimit == null
++    ? null
++    : normalizeMoney(components.creditLimit);
++
++  if (creditLimit != null && creditLimit < 0) {
++    throw new ValidationError("Credit limit cannot be negative");
++  }
++
++  const rawExposure = normalizeMoney(openSales + loans - payments);
++  const exposure = Math.max(0, rawExposure);
++  const availableCredit = creditLimit == null
++    ? null
++    : normalizeMoney(creditLimit - exposure);
++
++  return {
++    partnerId: components.partnerId,
++    creditLimit,
++    openSales,
++    loans,
++    payments,
++    exposure,
++    availableCredit,
++    overLimit: creditLimit != null && exposure > creditLimit,
++  };
++}
++
++export function validateCreditLimitValue(value: number | null): void {
++  if (value == null) return;
++  if (!Number.isFinite(value)) {
++    throw new ValidationError("Credit limit must be a finite number or null");
++  }
++  if (value < 0) {
++    throw new ValidationError("Credit limit cannot be negative");
++  }
++  if (Math.abs(Math.round(value * 100) - value * 100) > 1e-8) {
++    throw new ValidationError("Credit limit can have at most two decimal places");
++  }
++}
+diff --git a/src/modules/partners/infrastructure/PgPartnerCreditExposureRepository.ts b/src/modules/partners/infrastructure/PgPartnerCreditExposureRepository.ts
+new file mode 100644
+index 0000000..d932a0c
+--- /dev/null
++++ b/src/modules/partners/infrastructure/PgPartnerCreditExposureRepository.ts
+@@ -0,0 +1,61 @@
++import { PoolClient } from "pg";
++import { pgPool } from "../../../shared/infrastructure/db/pgPool";
++import {
++  PartnerCreditComponents,
++  PartnerCreditExposureRepository,
++} from "../domain/PartnerCredit";
++
++export class PgPartnerCreditExposureRepository implements PartnerCreditExposureRepository {
++  async getComponents(
++    companyId: number,
++    partnerId: number,
++    client?: PoolClient
++  ): Promise<PartnerCreditComponents | null> {
++    const db = client || pgPool;
++    const result = await db.query(
++      `WITH sales AS (
++         SELECT
++           so.customer_id AS partner_id,
++           COALESCE(SUM(so.total_items_price), 0)::numeric AS open_sales,
++           COALESCE(SUM(so.total_paid_amount), 0)::numeric AS payments
++         FROM sale_order so
++         WHERE so.company_id = $1
++           AND so.customer_id = $2
++           AND so.status <> 'CANCELLED'
++         GROUP BY so.customer_id
++       ),
++       loans AS (
++         SELECT
++           lt.partner_id,
++           COALESCE(SUM(lt.amount), 0)::numeric AS loan_amount
++         FROM loan_transaction lt
++         WHERE lt.company_id = $1
++           AND lt.partner_id = $2
++           AND lt.source_type NOT IN ('SALE', 'PURCHASE', 'PAYMENT')
++         GROUP BY lt.partner_id
++       )
++       SELECT
++         p.id AS partner_id,
++         p.credit_limit,
++         COALESCE(s.open_sales, 0) AS open_sales,
++         COALESCE(l.loan_amount, 0) AS loans,
++         COALESCE(s.payments, 0) AS payments
++       FROM partner p
++       LEFT JOIN sales s ON s.partner_id = p.id
++       LEFT JOIN loans l ON l.partner_id = p.id
++       WHERE p.company_id = $1
++         AND p.id = $2`,
++      [companyId, partnerId]
++    );
++
++    if (result.rowCount === 0) return null;
++    const row = result.rows[0];
++    return {
++      partnerId: Number(row.partner_id),
++      creditLimit: row.credit_limit == null ? null : Number(row.credit_limit),
++      openSales: Number(row.open_sales),
++      loans: Number(row.loans),
++      payments: Number(row.payments),
++    };
++  }
++}
+diff --git a/src/modules/partners/infrastructure/PgPartnerRepository.ts b/src/modules/partners/infrastructure/PgPartnerRepository.ts
+index 0c392b0..e4511f1 100644
+--- a/src/modules/partners/infrastructure/PgPartnerRepository.ts
++++ b/src/modules/partners/infrastructure/PgPartnerRepository.ts
+@@ -19,6 +19,7 @@ function mapRowToPartner(row: any): Partner {
+     isWalkIn: row.is_walk_in,
+     loanBalance: Number(row.loan_balance),
+     loanBalanceDirection: row.loan_balance_direction,
++    creditLimit: row.credit_limit == null ? null : Number(row.credit_limit),
+     createdAt: row.created_at,
+   };
+   return Partner.hydrate(props);
+@@ -32,9 +33,9 @@ export class PgPartnerRepository implements PartnerRepository {
+       `INSERT INTO partner (
+          company_id, partner_no, full_name, phone, address, note, 
+          is_customer, is_supplier, is_loan_lender, is_loan_borrower, is_walk_in,
+-         loan_balance
++         loan_balance, credit_limit
+        )
+-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
++       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        RETURNING *`,
+       [
+         p.companyId,
+@@ -49,6 +50,7 @@ export class PgPartnerRepository implements PartnerRepository {
+         p.isLoanBorrower,
+         p.isWalkIn,
+         p.loanBalance,
++        p.creditLimit ?? null,
+       ]
+     );
+     return mapRowToPartner(res.rows[0]);
+@@ -69,7 +71,8 @@ export class PgPartnerRepository implements PartnerRepository {
+            is_loan_lender = $10,
+            is_loan_borrower = $11,
+            is_walk_in = $12,
+-           loan_balance = $13
++           loan_balance = $13,
++           credit_limit = $14
+        WHERE company_id = $1 AND id = $2
+        RETURNING *`,
+       [
+@@ -86,6 +89,7 @@ export class PgPartnerRepository implements PartnerRepository {
+         p.isLoanBorrower,
+         p.isWalkIn,
+         p.loanBalance,
++        p.creditLimit ?? null,
+       ]
+     );
+ 
+diff --git a/src/modules/partners/presentation/PartnerRouter.ts b/src/modules/partners/presentation/PartnerRouter.ts
+index 05c44c1..c4fbee2 100644
+--- a/src/modules/partners/presentation/PartnerRouter.ts
++++ b/src/modules/partners/presentation/PartnerRouter.ts
+@@ -3,8 +3,10 @@ import { requireAuth } from "../../../shared/presentation/auth/requireAuth";
+ import { requirePermission } from "../../../shared/presentation/auth/requirePermission";
+ import { DbAccessPolicy } from "../../roles/infrastructure/DbAccessPolicy";
+ import { PgPartnerRepository } from "../infrastructure/PgPartnerRepository";
+-import { createPartnerSchema, updatePartnerSchema } from "./PartnerSchemas";
++import { createPartnerSchema, updatePartnerSchema, partnerCreditLimitSchema } from "./PartnerSchemas";
+ import { CreatePartnerUseCase, ListPartnersUseCase, UpdatePartnerUseCase, DeletePartnerUseCase } from "../application/PartnerUseCases";
++import { GetPartnerCreditStatusUseCase, SetPartnerCreditLimitUseCase } from "../application/PartnerCreditUseCases";
++import { PgPartnerCreditExposureRepository } from "../infrastructure/PgPartnerCreditExposureRepository";
+ import { sendErrorResponse } from "../../../shared/presentation/http/ErrorHandler";
+ import { PostgreSQLTransactionManager } from "../../../shared/infrastructure/transactions/TransactionManager";
+ import { PgBusinessEventRepository } from "../../../shared/infrastructure/events/PgBusinessEventRepository";
+@@ -22,6 +24,9 @@ const createPartnerUseCase = new CreatePartnerUseCase(txManager, partnerReposito
+ const updatePartnerUseCase = new UpdatePartnerUseCase(partnerRepository, eventRecorder);
+ const listPartnersUseCase = new ListPartnersUseCase(partnerRepository);
+ const deletePartnerUseCase = new DeletePartnerUseCase(partnerRepository);
++const partnerCreditRepository = new PgPartnerCreditExposureRepository();
++const getPartnerCreditStatusUseCase = new GetPartnerCreditStatusUseCase(partnerCreditRepository);
++const setPartnerCreditLimitUseCase = new SetPartnerCreditLimitUseCase(partnerRepository);
+ 
+ export const PartnerRouter = Router();
+ 
+@@ -150,6 +155,62 @@ PartnerRouter.get("/", requireAuth, requirePermission(accessPolicy, "PARTNERS",
+   }
+ });
+ 
++/**
++ * @openapi
++ * /api/v1/partners/{id}/credit:
++ *   get:
++ *     summary: Get the partner credit ceiling and current exposure
++ *     tags:
++ *       - Partners
++ *     security:
++ *       - bearerAuth: []
++ *     responses:
++ *       '200':
++ *         description: Partner credit status
++ */
++PartnerRouter.get("/:id/credit", requireAuth, requirePermission(accessPolicy, "PARTNERS", "view"), async (req: Request, res: Response) => {
++  try {
++    const companyId = parseCompanyId(req);
++    const partnerId = Number(req.params.id);
++    if (!partnerId || Number.isNaN(partnerId)) {
++      throw new ValidationError("Invalid partner id");
++    }
++
++    const result = await getPartnerCreditStatusUseCase.execute(companyId, partnerId);
++    res.json(result);
++  } catch (err) {
++    sendErrorResponse(res, err);
++  }
++});
++
++/**
++ * @openapi
++ * /api/v1/partners/{id}/credit-limit:
++ *   put:
++ *     summary: Set or clear a partner credit ceiling
++ *     tags:
++ *       - Partners
++ *     security:
++ *       - bearerAuth: []
++ *     responses:
++ *       '200':
++ *         description: Updated credit ceiling
++ */
++PartnerRouter.put("/:id/credit-limit", requireAuth, requirePermission(accessPolicy, "PARTNERS", "update"), async (req: Request, res: Response) => {
++  try {
++    const companyId = parseCompanyId(req);
++    const partnerId = Number(req.params.id);
++    if (!partnerId || Number.isNaN(partnerId)) {
++      throw new ValidationError("Invalid partner id");
++    }
++    const body = partnerCreditLimitSchema.parse(req.body);
++    const result = await setPartnerCreditLimitUseCase.execute(companyId, partnerId, body.creditLimit);
++    res.json(result);
++  } catch (err) {
++    sendErrorResponse(res, err);
++  }
++});
++
+ /**
+  * @openapi
+  * /api/v1/partners/{id}:
+diff --git a/src/modules/partners/presentation/PartnerSchemas.ts b/src/modules/partners/presentation/PartnerSchemas.ts
+index a0bce0d..b88f993 100644
+--- a/src/modules/partners/presentation/PartnerSchemas.ts
++++ b/src/modules/partners/presentation/PartnerSchemas.ts
+@@ -16,3 +16,14 @@ export const updatePartnerSchema = z.object({
+   address: z.string().optional().nullable(),
+   note: z.string().optional().nullable(),
+ });
++
++
++export const partnerCreditLimitSchema = z.object({
++  creditLimit: z.number()
++    .finite("Credit limit must be finite")
++    .min(0, "Credit limit cannot be negative")
++    .refine((value) => Math.abs(Math.round(value * 100) - value * 100) <= 1e-8, {
++      message: "Credit limit can have at most two decimal places",
++    })
++    .nullable(),
++});
+diff --git a/src/modules/sales/application/CreateSaleOrderUseCase.ts b/src/modules/sales/application/CreateSaleOrderUseCase.ts
+index 58e10ea..952388d 100644
+--- a/src/modules/sales/application/CreateSaleOrderUseCase.ts
++++ b/src/modules/sales/application/CreateSaleOrderUseCase.ts
+@@ -11,6 +11,7 @@ import { RecordLoanTransactionUseCase } from "../../finance/application/RecordLo
+ import { LoanTransactionSourceType } from "../../finance/domain/LoanTransaction";
+ import { ValidationError, EntityNotFoundError } from "../../../shared/domain/DomainError";
+ import { InventoryMovementService } from "../../inventory/domain/InventoryMovementService";
++import { PartnerCreditLimitService } from "../../partners/application/PartnerCreditUseCases";
+ 
+ export interface CreateSaleOrderInput {
+   companyId: number;
+@@ -50,7 +51,8 @@ export class CreateSaleOrderUseCase {
+     private readonly accountTxService: RecordAccountTransactionUseCase,
+     private readonly inventoryBalanceRepository: InventoryBalanceRepository,
+     private readonly inventoryCostRepository: InventoryCostRepository,
+-    private readonly recordLoanTransactionUseCase: RecordLoanTransactionUseCase
++    private readonly recordLoanTransactionUseCase: RecordLoanTransactionUseCase,
++    private readonly partnerCreditLimitService?: PartnerCreditLimitService
+   ) {}
+ 
+   async execute(input: CreateSaleOrderInput): Promise<{ saleOrderId: number }> {
+@@ -184,6 +186,23 @@ export class CreateSaleOrderUseCase {
+         }
+       }
+ 
++      if (this.partnerCreditLimitService) {
++        const creditDeltas = [{
++          partnerId: input.customerId,
++          amount: finalOrder.toPrimitives().totalItemsPrice - amountSettledAtCreation,
++        }];
++        for (const line of paymentLines) {
++          if (line.method === PaymentMethod.PARTNER && line.partnerId) {
++            creditDeltas.push({ partnerId: line.partnerId, amount: line.amount });
++          }
++        }
++        await this.partnerCreditLimitService.assertProjectedDeltas(
++          input.companyId,
++          creditDeltas,
++          client as any
++        );
++      }
++
+       const shipmentItems: Array<{
+         orderItemIndex: number;
+         productId: number;
+diff --git a/src/modules/sales/application/RecordSalePaymentUseCase.ts b/src/modules/sales/application/RecordSalePaymentUseCase.ts
+index 298dbce..09c46b3 100644
+--- a/src/modules/sales/application/RecordSalePaymentUseCase.ts
++++ b/src/modules/sales/application/RecordSalePaymentUseCase.ts
+@@ -6,6 +6,7 @@ import { RecordAccountTransactionUseCase } from "../../finance/application/Recor
+ import { RecordLoanTransactionUseCase } from "../../finance/application/RecordLoanTransactionUseCase";
+ import { LoanTransactionSourceType } from "../../finance/domain/LoanTransaction";
+ import { EntityNotFoundError, ValidationError } from "../../../shared/domain/DomainError";
++import { PartnerCreditLimitService } from "../../partners/application/PartnerCreditUseCases";
+ 
+ export interface RecordSalePaymentInput {
+   companyId: number;
+@@ -27,7 +28,8 @@ export class RecordSalePaymentUseCase {
+     private readonly saleOrderRepo: SaleOrderRepository,
+     private readonly salePaymentRepo: SalePaymentRepository,
+     private readonly accountTxService: RecordAccountTransactionUseCase,
+-    private readonly recordLoanTransactionUseCase: RecordLoanTransactionUseCase
++    private readonly recordLoanTransactionUseCase: RecordLoanTransactionUseCase,
++    private readonly partnerCreditLimitService?: PartnerCreditLimitService
+   ) {}
+ 
+   async execute(input: RecordSalePaymentInput): Promise<{ paymentId: number }> {
+@@ -59,6 +61,23 @@ export class RecordSalePaymentUseCase {
+         createdBy: input.createdBy
+       }, paymentLines);
+ 
++      if (this.partnerCreditLimitService) {
++        const creditDeltas = [{
++          partnerId: orderData.customerId,
++          amount: -paymentLines.reduce((sum, line) => sum + line.amount, 0),
++        }];
++        for (const line of paymentLines) {
++          if (line.method === PaymentMethod.PARTNER && line.partnerId) {
++            creditDeltas.push({ partnerId: line.partnerId, amount: line.amount });
++          }
++        }
++        await this.partnerCreditLimitService.assertProjectedDeltas(
++          input.companyId,
++          creditDeltas,
++          client as any
++        );
++      }
++
+       const savedPayment = await this.salePaymentRepo.create(payment, client);
+ 
+       // 3. Generate side effects
+diff --git a/src/modules/sales/presentation/SaleRouter.ts b/src/modules/sales/presentation/SaleRouter.ts
+index fc25a02..23dd4b1 100644
+--- a/src/modules/sales/presentation/SaleRouter.ts
++++ b/src/modules/sales/presentation/SaleRouter.ts
+@@ -29,6 +29,8 @@ import { sendErrorResponse } from "../../../shared/presentation/http/ErrorHandle
+ import { ValidationError } from "../../../shared/domain/DomainError";
+ import { PaymentMethod } from "../domain/SalePayment";
+ import { WarehouseService } from "../../inventory/application/WarehouseService";
++import { PgPartnerCreditExposureRepository } from "../../partners/infrastructure/PgPartnerCreditExposureRepository";
++import { PartnerCreditLimitService } from "../../partners/application/PartnerCreditUseCases";
+ 
+ const saleOrderRepo = new PgSaleOrderRepository();
+ const paymentRepo = new PgSalePaymentRepository();
+@@ -48,6 +50,8 @@ const recordInventoryTxUseCase = new RecordInventoryTransactionUseCase(inventory
+ const profitSummaryRepo = new PgProductProfitSummaryRepository();
+ const warehouseService = new WarehouseService(inventoryPendingRepo, inventoryCostRepo, productRepo, recordInventoryTxUseCase);
+ const recordLoanTxUseCase = new RecordLoanTransactionUseCase(txManager, partnerRepo, pgLoanTxRepo);
++const partnerCreditRepo = new PgPartnerCreditExposureRepository();
++const partnerCreditLimitService = new PartnerCreditLimitService(partnerRepo, partnerCreditRepo);
+ 
+ const createSaleOrderUseCase = new CreateSaleOrderUseCase(
+   txManager, 
+@@ -57,11 +61,19 @@ const createSaleOrderUseCase = new CreateSaleOrderUseCase(
+   accountTxService,
+   inventoryBalanceRepo,
+   inventoryCostRepo,
+-  recordLoanTxUseCase
++  recordLoanTxUseCase,
++  partnerCreditLimitService
+ );
+ const getSaleDetailsUseCase = new GetSaleDetailsUseCase(saleOrderRepo, paymentRepo, shipmentRepo);
+ const getNextSaleOrderNoUseCase = new GetNextSaleOrderNoUseCase(saleOrderRepo);
+-const recordSalePaymentUseCase = new RecordSalePaymentUseCase(txManager, saleOrderRepo, paymentRepo, accountTxService, recordLoanTxUseCase);
++const recordSalePaymentUseCase = new RecordSalePaymentUseCase(
++  txManager,
++  saleOrderRepo,
++  paymentRepo,
++  accountTxService,
++  recordLoanTxUseCase,
++  partnerCreditLimitService
++);
+ const recordShipmentUseCase = new RecordShipmentUseCase(
+   txManager, 
+   saleOrderRepo, 

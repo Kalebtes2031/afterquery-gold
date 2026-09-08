@@ -1,0 +1,825 @@
+diff --git a/src/modules/sales/application/__tests__/BranchStockReservation.behavior.test.ts b/src/modules/sales/application/__tests__/BranchStockReservation.behavior.test.ts
+new file mode 100644
+index 0000000..b9daa87
+--- /dev/null
++++ b/src/modules/sales/application/__tests__/BranchStockReservation.behavior.test.ts
+@@ -0,0 +1,505 @@
++import { BranchStockReservationUseCases } from "../BranchStockReservationUseCases";
++import {
++  BranchStockReservation,
++  BranchStockReservationEventType,
++  BranchStockReservationStatus,
++} from "../../domain/BranchStockReservation";
++import { Branch } from "../../../branches/domain/Branch";
++import { InventoryBalance } from "../../../inventory/domain/InventoryBalance";
++import { Product } from "../../../inventory/domain/Product";
++import { ConflictError, EntityNotFoundError, ValidationError } from "../../../../shared/domain/DomainError";
++import {
++  branchStockAvailabilityQuerySchema,
++  refreshBranchStockReservationSchema,
++  reserveBranchStockSchema,
++} from "../../presentation/SaleSchemas";
++
++const NOW = new Date("2026-07-01T10:00:00.000Z");
++const CLIENT = { marker: "tx-client" };
++
++function product(id: number, active = true) {
++  return Product.hydrate({
++    id,
++    companyId: 1,
++    productNo: `P-${id}`,
++    name: `Product ${id}`,
++    unitType: "pcs",
++    boughtPrice: 2,
++    sellingPrice: 3,
++    isActive: active,
++  });
++}
++
++function branch(id = 2, active = true) {
++  return Branch.hydrate({
++    id,
++    companyId: 1,
++    code: `B-${id}`,
++    name: `Branch ${id}`,
++    isWarehouse: false,
++    isActive: active,
++  });
++}
++
++function balance(productId: number, quantity: number, branchId = 2) {
++  return InventoryBalance.hydrate({ companyId: 1, branchId, productId, quantityOnHand: quantity });
++}
++
++function reservation(overrides: any = {}) {
++  return BranchStockReservation.hydrate({
++    id: 55,
++    companyId: 1,
++    draftKey: "draft-a",
++    branchId: 2,
++    status: BranchStockReservationStatus.ACTIVE,
++    expiresAt: new Date(NOW.getTime() + 15 * 60_000),
++    createdBy: 7,
++    createdAt: NOW,
++    updatedAt: NOW,
++    items: [{ productId: 10, quantity: 3 }],
++    ...overrides,
++  });
++}
++
++function deps() {
++  const repo = {
++    findByDraftKey: jest.fn().mockResolvedValue(null),
++    save: jest.fn().mockImplementation(async (r: BranchStockReservation) => {
++      const p = r.toPrimitives();
++      return BranchStockReservation.hydrate({ ...p, id: p.id ?? 55 });
++    }),
++    expireDue: jest.fn().mockResolvedValue(0),
++    sumActiveReserved: jest.fn().mockResolvedValue(new Map<number, number>()),
++    appendEvent: jest.fn().mockResolvedValue(undefined),
++    listEvents: jest.fn().mockResolvedValue([]),
++  } as any;
++  const balances = {
++    findByProductsBranch: jest.fn().mockResolvedValue([balance(10, 10), balance(11, 8)]),
++  } as any;
++  const products = {
++    findByIds: jest.fn().mockImplementation(async (_company: number, ids: number[]) => ids.map(id => product(id))),
++  } as any;
++  const branches = {
++    findById: jest.fn().mockResolvedValue(branch()),
++  } as any;
++  const tx = {
++    run: jest.fn().mockImplementation((cb: any) => cb(CLIENT)),
++  } as any;
++  const service = new BranchStockReservationUseCases(tx, repo, balances, products, branches, () => new Date(NOW));
++  return { repo, balances, products, branches, tx, service };
++}
++
++const reserveInput = (overrides: any = {}) => ({
++  companyId: 1,
++  draftKey: "draft-a",
++  branchId: 2,
++  createdBy: 7,
++  items: [{ productId: 10, quantity: 3 }],
++  ...overrides,
++});
++
++describe("branch stock reservation application behavior", () => {
++  it("reserves stock when requested quantity is within available branch stock", async () => {
++    const d = deps();
++    const result = await d.service.reserve(reserveInput());
++    expect(result.status).toBe(BranchStockReservationStatus.ACTIVE);
++    expect(result.items).toEqual([{ productId: 10, quantity: 3 }]);
++    expect(d.repo.save).toHaveBeenCalledTimes(1);
++  });
++
++  it("uses a 15 minute expiry by default", async () => {
++    const d = deps();
++    const result = await d.service.reserve(reserveInput());
++    expect(result.expiresAt).toEqual(new Date(NOW.getTime() + 15 * 60_000));
++  });
++
++  it("honors a custom reservation ttl", async () => {
++    const d = deps();
++    const result = await d.service.reserve(reserveInput({ ttlMinutes: 60 }));
++    expect(result.expiresAt).toEqual(new Date(NOW.getTime() + 60 * 60_000));
++  });
++
++  it("allows the minimum ttl of one minute", async () => {
++    const d = deps();
++    const result = await d.service.reserve(reserveInput({ ttlMinutes: 1 }));
++    expect(result.expiresAt).toEqual(new Date(NOW.getTime() + 60_000));
++  });
++
++  it("allows the maximum ttl of 120 minutes", async () => {
++    const d = deps();
++    const result = await d.service.reserve(reserveInput({ ttlMinutes: 120 }));
++    expect(result.expiresAt).toEqual(new Date(NOW.getTime() + 120 * 60_000));
++  });
++
++  it("rejects ttl zero before opening a transaction", async () => {
++    const d = deps();
++    await expect(d.service.reserve(reserveInput({ ttlMinutes: 0 }))).rejects.toBeInstanceOf(ValidationError);
++    expect(d.tx.run).not.toHaveBeenCalled();
++  });
++
++  it("rejects ttl above 120 before opening a transaction", async () => {
++    const d = deps();
++    await expect(d.service.reserve(reserveInput({ ttlMinutes: 121 }))).rejects.toBeInstanceOf(ValidationError);
++    expect(d.tx.run).not.toHaveBeenCalled();
++  });
++
++  it("rejects fractional ttl before opening a transaction", async () => {
++    const d = deps();
++    await expect(d.service.reserve(reserveInput({ ttlMinutes: 1.5 }))).rejects.toBeInstanceOf(ValidationError);
++  });
++
++  it("expires due reservations before evaluating a new reservation", async () => {
++    const d = deps();
++    await d.service.reserve(reserveInput());
++    expect(d.repo.expireDue).toHaveBeenCalledWith(1, NOW, CLIENT);
++    expect(d.repo.expireDue.mock.invocationCallOrder[0]).toBeLessThan(d.repo.sumActiveReserved.mock.invocationCallOrder[0]);
++  });
++
++  it("locks branch balances while checking reservation capacity", async () => {
++    const d = deps();
++    await d.service.reserve(reserveInput());
++    expect(d.balances.findByProductsBranch).toHaveBeenCalledWith(1, 2, [10], CLIENT, true);
++  });
++
++  it("subtracts quantities held by other active reservations", async () => {
++    const d = deps();
++    d.repo.sumActiveReserved.mockResolvedValue(new Map([[10, 8]]));
++    await expect(d.service.reserve(reserveInput({ items: [{ productId: 10, quantity: 3 }] }))).rejects.toBeInstanceOf(ConflictError);
++  });
++
++  it("allows a reservation exactly equal to available stock", async () => {
++    const d = deps();
++    d.repo.sumActiveReserved.mockResolvedValue(new Map([[10, 7]]));
++    await expect(d.service.reserve(reserveInput({ items: [{ productId: 10, quantity: 3 }] }))).resolves.toMatchObject({ status: "ACTIVE" });
++  });
++
++  it("reports requested and available quantity in a stock conflict", async () => {
++    const d = deps();
++    d.repo.sumActiveReserved.mockResolvedValue(new Map([[10, 9]]));
++    await expect(d.service.reserve(reserveInput())).rejects.toThrow("requested 3, available 1");
++  });
++
++  it("treats a missing branch balance as zero stock", async () => {
++    const d = deps();
++    d.balances.findByProductsBranch.mockResolvedValue([]);
++    await expect(d.service.reserve(reserveInput())).rejects.toBeInstanceOf(ConflictError);
++  });
++
++  it("validates every requested line before persisting anything", async () => {
++    const d = deps();
++    d.repo.sumActiveReserved.mockResolvedValue(new Map([[11, 8]]));
++    await expect(d.service.reserve(reserveInput({
++      items: [{ productId: 10, quantity: 1 }, { productId: 11, quantity: 1 }],
++    }))).rejects.toBeInstanceOf(ConflictError);
++    expect(d.repo.save).not.toHaveBeenCalled();
++    expect(d.repo.appendEvent).not.toHaveBeenCalled();
++  });
++
++  it("excludes the same draft reservation from reserved-by-others capacity", async () => {
++    const d = deps();
++    d.repo.findByDraftKey.mockResolvedValue(reservation());
++    await d.service.reserve(reserveInput({ items: [{ productId: 10, quantity: 9 }] }));
++    expect(d.repo.sumActiveReserved).toHaveBeenCalledWith(1, 2, [10], NOW, 55, CLIENT);
++  });
++
++  it("logs REPLACED when the same active draft changes its reservation", async () => {
++    const d = deps();
++    d.repo.findByDraftKey.mockResolvedValue(reservation());
++    await d.service.reserve(reserveInput({ items: [{ productId: 10, quantity: 4 }] }));
++    expect(d.repo.appendEvent).toHaveBeenCalledWith(expect.objectContaining({
++      eventType: BranchStockReservationEventType.REPLACED,
++      draftKey: "draft-a",
++    }), CLIENT);
++  });
++
++  it("logs RESERVED when a released draft key is reused", async () => {
++    const d = deps();
++    d.repo.findByDraftKey.mockResolvedValue(reservation({ status: BranchStockReservationStatus.RELEASED }));
++    await d.service.reserve(reserveInput());
++    expect(d.repo.appendEvent).toHaveBeenCalledWith(expect.objectContaining({
++      eventType: BranchStockReservationEventType.RESERVED,
++    }), CLIENT);
++  });
++
++  it("allows an existing draft reservation to move to another branch", async () => {
++    const d = deps();
++    d.repo.findByDraftKey.mockResolvedValue(reservation());
++    d.branches.findById.mockResolvedValue(branch(3));
++    d.balances.findByProductsBranch.mockResolvedValue([balance(10, 9, 3)]);
++    const result = await d.service.reserve(reserveInput({ branchId: 3 }));
++    expect(result.branchId).toBe(3);
++    expect(d.repo.sumActiveReserved).toHaveBeenCalledWith(1, 3, [10], NOW, 55, CLIENT);
++  });
++
++  it("records branch, expiry and item snapshot in the reservation event", async () => {
++    const d = deps();
++    await d.service.reserve(reserveInput());
++    expect(d.repo.appendEvent).toHaveBeenCalledWith(expect.objectContaining({
++      details: expect.objectContaining({
++        branchId: 2,
++        expiresAt: new Date(NOW.getTime() + 15 * 60_000).toISOString(),
++        items: [{ productId: 10, quantity: 3 }],
++      }),
++    }), CLIENT);
++  });
++
++  it("rejects a missing branch", async () => {
++    const d = deps();
++    d.branches.findById.mockResolvedValue(null);
++    await expect(d.service.reserve(reserveInput())).rejects.toBeInstanceOf(EntityNotFoundError);
++  });
++
++  it("rejects an inactive branch", async () => {
++    const d = deps();
++    d.branches.findById.mockResolvedValue(branch(2, false));
++    await expect(d.service.reserve(reserveInput())).rejects.toBeInstanceOf(ValidationError);
++  });
++
++  it("rejects a product that does not belong to the company", async () => {
++    const d = deps();
++    d.products.findByIds.mockResolvedValue([]);
++    await expect(d.service.reserve(reserveInput())).rejects.toBeInstanceOf(EntityNotFoundError);
++  });
++
++  it("rejects an inactive product", async () => {
++    const d = deps();
++    d.products.findByIds.mockResolvedValue([product(10, false)]);
++    await expect(d.service.reserve(reserveInput())).rejects.toBeInstanceOf(ValidationError);
++  });
++
++  it("trims the draft key before repository lookup and persistence", async () => {
++    const d = deps();
++    const result = await d.service.reserve(reserveInput({ draftKey: "  draft-a  " }));
++    expect(result.draftKey).toBe("draft-a");
++    expect(d.repo.findByDraftKey).toHaveBeenCalledWith(1, "draft-a", CLIENT, true);
++  });
++
++  it("releases an active reservation and appends one release event", async () => {
++    const d = deps();
++    d.repo.findByDraftKey.mockResolvedValue(reservation());
++    const result = await d.service.release(1, "draft-a", 12);
++    expect(result.status).toBe(BranchStockReservationStatus.RELEASED);
++    expect(d.repo.save).toHaveBeenCalledTimes(1);
++    expect(d.repo.appendEvent).toHaveBeenCalledWith(expect.objectContaining({
++      eventType: BranchStockReservationEventType.RELEASED,
++      createdBy: 12,
++    }), CLIENT);
++  });
++
++  it("makes releasing an already released reservation idempotent", async () => {
++    const d = deps();
++    d.repo.findByDraftKey.mockResolvedValue(reservation({ status: BranchStockReservationStatus.RELEASED }));
++    const result = await d.service.release(1, "draft-a", 12);
++    expect(result.status).toBe(BranchStockReservationStatus.RELEASED);
++    expect(d.repo.save).not.toHaveBeenCalled();
++    expect(d.repo.appendEvent).not.toHaveBeenCalled();
++  });
++
++  it("returns not found when releasing an unknown draft", async () => {
++    const d = deps();
++    d.repo.findByDraftKey.mockResolvedValue(null);
++    await expect(d.service.release(1, "missing")).rejects.toBeInstanceOf(EntityNotFoundError);
++  });
++
++  it("expires due reservations before release lookup", async () => {
++    const d = deps();
++    d.repo.findByDraftKey.mockResolvedValue(reservation({ status: BranchStockReservationStatus.EXPIRED }));
++    await d.service.release(1, "draft-a");
++    expect(d.repo.expireDue).toHaveBeenCalledWith(1, NOW, CLIENT);
++  });
++
++  it("refreshes an active reservation and emits REFRESHED", async () => {
++    const d = deps();
++    d.repo.findByDraftKey.mockResolvedValue(reservation());
++    const result = await d.service.refresh(1, "draft-a", 30, 8);
++    expect(result.expiresAt).toEqual(new Date(NOW.getTime() + 30 * 60_000));
++    expect(d.repo.appendEvent).toHaveBeenCalledWith(expect.objectContaining({
++      eventType: BranchStockReservationEventType.REFRESHED,
++      createdBy: 8,
++    }), CLIENT);
++  });
++
++  it("uses default ttl when refreshing without ttlMinutes", async () => {
++    const d = deps();
++    d.repo.findByDraftKey.mockResolvedValue(reservation());
++    const result = await d.service.refresh(1, "draft-a");
++    expect(result.expiresAt).toEqual(new Date(NOW.getTime() + 15 * 60_000));
++  });
++
++  it("rejects refreshing a released reservation", async () => {
++    const d = deps();
++    d.repo.findByDraftKey.mockResolvedValue(reservation({ status: BranchStockReservationStatus.RELEASED }));
++    await expect(d.service.refresh(1, "draft-a", 30)).rejects.toBeInstanceOf(ValidationError);
++    expect(d.repo.save).not.toHaveBeenCalled();
++  });
++
++  it("returns not found when refreshing an unknown draft", async () => {
++    const d = deps();
++    await expect(d.service.refresh(1, "missing", 30)).rejects.toBeInstanceOf(EntityNotFoundError);
++  });
++
++  it("gets a reservation after first sweeping expirations", async () => {
++    const d = deps();
++    d.repo.findByDraftKey.mockResolvedValue(reservation());
++    const result = await d.service.get(1, "draft-a");
++    expect(result.id).toBe(55);
++    expect(d.repo.expireDue).toHaveBeenCalledWith(1, NOW, CLIENT);
++  });
++
++  it("returns not found when getting an unknown draft", async () => {
++    const d = deps();
++    await expect(d.service.get(1, "missing")).rejects.toBeInstanceOf(EntityNotFoundError);
++  });
++
++  it("returns reservation ledger events in repository order", async () => {
++    const d = deps();
++    d.repo.findByDraftKey.mockResolvedValue(reservation());
++    d.repo.listEvents.mockResolvedValue([
++      { id: 1, companyId: 1, reservationId: 55, draftKey: "draft-a", eventType: BranchStockReservationEventType.RESERVED, eventAt: NOW },
++      { id: 2, companyId: 1, reservationId: 55, draftKey: "draft-a", eventType: BranchStockReservationEventType.REFRESHED, eventAt: new Date(NOW.getTime() + 1) },
++    ]);
++    const result = await d.service.events(1, "draft-a");
++    expect(result.map(x => x.eventType)).toEqual(["RESERVED", "REFRESHED"]);
++    expect(d.repo.listEvents).toHaveBeenCalledWith(1, "draft-a", CLIENT);
++  });
++
++  it("does not expose an event ledger for an unknown reservation", async () => {
++    const d = deps();
++    await expect(d.service.events(1, "missing")).rejects.toBeInstanceOf(EntityNotFoundError);
++    expect(d.repo.listEvents).not.toHaveBeenCalled();
++  });
++
++  it("availability subtracts active reservations from physical on-hand stock", async () => {
++    const d = deps();
++    d.repo.sumActiveReserved.mockResolvedValue(new Map([[10, 4], [11, 2]]));
++    const result = await d.service.availability(1, 2, [10, 11]);
++    expect(result).toEqual({
++      branchId: 2,
++      items: [
++        { productId: 10, onHand: 10, reserved: 4, available: 6 },
++        { productId: 11, onHand: 8, reserved: 2, available: 6 },
++      ],
++    });
++  });
++
++  it("availability reports zero on-hand for a product without a balance row", async () => {
++    const d = deps();
++    d.balances.findByProductsBranch.mockResolvedValue([]);
++    const result = await d.service.availability(1, 2, [10]);
++    expect(result.items[0]).toEqual({ productId: 10, onHand: 0, reserved: 0, available: 0 });
++  });
++
++  it("availability clamps negative mathematical availability to zero", async () => {
++    const d = deps();
++    d.repo.sumActiveReserved.mockResolvedValue(new Map([[10, 12]]));
++    const result = await d.service.availability(1, 2, [10]);
++    expect(result.items[0].available).toBe(0);
++  });
++
++  it("availability deduplicates repeated product ids", async () => {
++    const d = deps();
++    const result = await d.service.availability(1, 2, [10, 10, 11]);
++    expect(result.items.map(x => x.productId)).toEqual([10, 11]);
++    expect(d.repo.sumActiveReserved).toHaveBeenCalledWith(1, 2, [10, 11], NOW, null, CLIENT);
++  });
++
++  it("availability ignores released and expired reservations by delegating active-only totals", async () => {
++    const d = deps();
++    await d.service.availability(1, 2, [10]);
++    expect(d.repo.expireDue.mock.invocationCallOrder[0]).toBeLessThan(d.repo.sumActiveReserved.mock.invocationCallOrder[0]);
++  });
++
++  it("availability rejects an invalid branch id", async () => {
++    const d = deps();
++    await expect(d.service.availability(1, 0, [10])).rejects.toBeInstanceOf(ValidationError);
++  });
++
++  it("availability rejects an empty product list", async () => {
++    const d = deps();
++    await expect(d.service.availability(1, 2, [])).rejects.toBeInstanceOf(ValidationError);
++  });
++
++  it("availability rejects invalid product ids", async () => {
++    const d = deps();
++    await expect(d.service.availability(1, 2, [10, -1])).rejects.toBeInstanceOf(ValidationError);
++  });
++
++  it("availability rejects requests larger than 100 products", async () => {
++    const d = deps();
++    const ids = Array.from({ length: 101 }, (_, i) => i + 1);
++    await expect(d.service.availability(1, 2, ids)).rejects.toBeInstanceOf(ValidationError);
++  });
++});
++
++describe("branch stock reservation HTTP schema behavior", () => {
++  it("defaults reserve ttlMinutes to 15", () => {
++    const parsed = reserveBranchStockSchema.parse({
++      draftKey: "draft-a",
++      branchId: 2,
++      items: [{ productId: 10, quantity: 2 }],
++    });
++    expect(parsed.ttlMinutes).toBe(15);
++  });
++
++  it("trims a reserve draft key", () => {
++    const parsed = reserveBranchStockSchema.parse({
++      draftKey: "  draft-a  ",
++      branchId: 2,
++      items: [{ productId: 10, quantity: 2 }],
++    });
++    expect(parsed.draftKey).toBe("draft-a");
++  });
++
++  it("rejects duplicate product lines in reserve payloads", () => {
++    const result = reserveBranchStockSchema.safeParse({
++      draftKey: "draft-a",
++      branchId: 2,
++      items: [{ productId: 10, quantity: 1 }, { productId: 10, quantity: 2 }],
++    });
++    expect(result.success).toBe(false);
++  });
++
++  it("rejects an empty reserve item list", () => {
++    expect(reserveBranchStockSchema.safeParse({ draftKey: "draft-a", branchId: 2, items: [] }).success).toBe(false);
++  });
++
++  it("rejects non-positive reserve quantities", () => {
++    expect(reserveBranchStockSchema.safeParse({
++      draftKey: "draft-a",
++      branchId: 2,
++      items: [{ productId: 10, quantity: 0 }],
++    }).success).toBe(false);
++  });
++
++  it("accepts ttl bounds in reserve payloads", () => {
++    expect(reserveBranchStockSchema.safeParse({ draftKey: "a", branchId: 2, ttlMinutes: 1, items: [{ productId: 10, quantity: 1 }] }).success).toBe(true);
++    expect(reserveBranchStockSchema.safeParse({ draftKey: "a", branchId: 2, ttlMinutes: 120, items: [{ productId: 10, quantity: 1 }] }).success).toBe(true);
++  });
++
++  it("rejects ttl values outside reserve bounds", () => {
++    expect(reserveBranchStockSchema.safeParse({ draftKey: "a", branchId: 2, ttlMinutes: 0, items: [{ productId: 10, quantity: 1 }] }).success).toBe(false);
++    expect(reserveBranchStockSchema.safeParse({ draftKey: "a", branchId: 2, ttlMinutes: 121, items: [{ productId: 10, quantity: 1 }] }).success).toBe(false);
++  });
++
++  it("defaults refresh ttlMinutes to 15", () => {
++    expect(refreshBranchStockReservationSchema.parse({}).ttlMinutes).toBe(15);
++  });
++
++  it("rejects fractional refresh ttl", () => {
++    expect(refreshBranchStockReservationSchema.safeParse({ ttlMinutes: 2.5 }).success).toBe(false);
++  });
++
++  it("parses stock availability query ids from csv", () => {
++    const parsed = branchStockAvailabilityQuerySchema.parse({ branchId: "2", productIds: "10, 11,12" });
++    expect(parsed.branchId).toBe(2);
++    expect(parsed.productIds).toEqual([10, 11, 12]);
++  });
++
++  it("rejects non-numeric ids in availability query", () => {
++    expect(branchStockAvailabilityQuerySchema.safeParse({ branchId: "2", productIds: "10,nope" }).success).toBe(false);
++  });
++
++  it("rejects non-positive ids in availability query", () => {
++    expect(branchStockAvailabilityQuerySchema.safeParse({ branchId: "2", productIds: "10,0" }).success).toBe(false);
++  });
++});
+diff --git a/src/modules/sales/domain/__tests__/BranchStockReservation.behavior.test.ts b/src/modules/sales/domain/__tests__/BranchStockReservation.behavior.test.ts
+new file mode 100644
+index 0000000..4bb6ee0
+--- /dev/null
++++ b/src/modules/sales/domain/__tests__/BranchStockReservation.behavior.test.ts
+@@ -0,0 +1,308 @@
++import {
++  BranchStockReservation,
++  BranchStockReservationEventType,
++  BranchStockReservationStatus,
++  normalizeReservationQuantity,
++} from "../BranchStockReservation";
++import { ValidationError } from "../../../../shared/domain/DomainError";
++
++const NOW = new Date("2026-07-01T10:00:00.000Z");
++const LATER = new Date("2026-07-01T10:15:00.000Z");
++
++function make(overrides: any = {}) {
++  return BranchStockReservation.create({
++    companyId: 1,
++    draftKey: "draft-a",
++    branchId: 2,
++    expiresAt: LATER,
++    createdBy: 9,
++    items: [{ productId: 10, quantity: 3 }],
++    now: NOW,
++    ...overrides,
++  });
++}
++
++function hydrated(overrides: any = {}) {
++  return BranchStockReservation.hydrate({
++    id: 44,
++    companyId: 1,
++    draftKey: "draft-a",
++    branchId: 2,
++    status: BranchStockReservationStatus.ACTIVE,
++    expiresAt: LATER,
++    createdBy: 9,
++    createdAt: NOW,
++    updatedAt: NOW,
++    items: [{ productId: 10, quantity: 3 }],
++    ...overrides,
++  });
++}
++
++describe("branch stock reservation domain behavior", () => {
++  it("creates an active reservation for a future expiry", () => {
++    const reservation = make();
++    expect(reservation.status).toBe(BranchStockReservationStatus.ACTIVE);
++    expect(reservation.draftKey).toBe("draft-a");
++    expect(reservation.branchId).toBe(2);
++  });
++
++  it("trims surrounding whitespace from a draft key when creating", () => {
++    const reservation = make({ draftKey: "  checkout-7  " });
++    expect(reservation.draftKey).toBe("checkout-7");
++  });
++
++  it("normalizes reservation quantities to four decimal places", () => {
++    expect(normalizeReservationQuantity(1.23456)).toBe(1.2346);
++    expect(make({ items: [{ productId: 10, quantity: 2.34567 }] }).items[0].quantity).toBe(2.3457);
++  });
++
++  it("preserves an exact four-decimal reservation quantity", () => {
++    expect(normalizeReservationQuantity(4.125)).toBe(4.125);
++  });
++
++  it("rejects an empty draft key", () => {
++    expect(() => make({ draftKey: "   " })).toThrow(ValidationError);
++  });
++
++  it("rejects a draft key longer than 120 characters", () => {
++    expect(() => make({ draftKey: "x".repeat(121) })).toThrow(ValidationError);
++  });
++
++  it("accepts a draft key exactly 120 characters long", () => {
++    expect(make({ draftKey: "x".repeat(120) }).draftKey).toHaveLength(120);
++  });
++
++  it("rejects a non-positive company id", () => {
++    expect(() => make({ companyId: 0 })).toThrow(ValidationError);
++  });
++
++  it("rejects a non-integer company id", () => {
++    expect(() => make({ companyId: 1.5 })).toThrow(ValidationError);
++  });
++
++  it("rejects a non-positive branch id", () => {
++    expect(() => make({ branchId: -1 })).toThrow(ValidationError);
++  });
++
++  it("rejects a non-integer branch id", () => {
++    expect(() => make({ branchId: 2.25 })).toThrow(ValidationError);
++  });
++
++  it("requires at least one reserved item", () => {
++    expect(() => make({ items: [] })).toThrow(ValidationError);
++  });
++
++  it("rejects more than 100 reserved products", () => {
++    const items = Array.from({ length: 101 }, (_, i) => ({ productId: i + 1, quantity: 1 }));
++    expect(() => make({ items })).toThrow(ValidationError);
++  });
++
++  it("accepts exactly 100 reserved products", () => {
++    const items = Array.from({ length: 100 }, (_, i) => ({ productId: i + 1, quantity: 1 }));
++    expect(make({ items }).items).toHaveLength(100);
++  });
++
++  it("rejects duplicate products inside one reservation", () => {
++    expect(() => make({
++      items: [
++        { productId: 10, quantity: 1 },
++        { productId: 10, quantity: 2 },
++      ],
++    })).toThrow(ValidationError);
++  });
++
++  it("rejects a zero product id", () => {
++    expect(() => make({ items: [{ productId: 0, quantity: 1 }] })).toThrow(ValidationError);
++  });
++
++  it("rejects a fractional product id", () => {
++    expect(() => make({ items: [{ productId: 1.5, quantity: 1 }] })).toThrow(ValidationError);
++  });
++
++  it("rejects a zero reservation quantity", () => {
++    expect(() => make({ items: [{ productId: 10, quantity: 0 }] })).toThrow(ValidationError);
++  });
++
++  it("rejects a negative reservation quantity", () => {
++    expect(() => make({ items: [{ productId: 10, quantity: -0.1 }] })).toThrow(ValidationError);
++  });
++
++  it("rejects a non-finite reservation quantity", () => {
++    expect(() => make({ items: [{ productId: 10, quantity: Number.POSITIVE_INFINITY }] })).toThrow(ValidationError);
++  });
++
++  it("rejects an expiry equal to the current time", () => {
++    expect(() => make({ expiresAt: NOW })).toThrow(ValidationError);
++  });
++
++  it("rejects an expiry before the current time", () => {
++    expect(() => make({ expiresAt: new Date(NOW.getTime() - 1) })).toThrow(ValidationError);
++  });
++
++  it("reports REPLACED when replacing a still-active reservation", () => {
++    const reservation = hydrated();
++    const event = reservation.replace({
++      branchId: 2,
++      expiresAt: new Date(NOW.getTime() + 30 * 60_000),
++      items: [{ productId: 10, quantity: 5 }],
++      now: NOW,
++    });
++    expect(event).toBe(BranchStockReservationEventType.REPLACED);
++    expect(reservation.items[0].quantity).toBe(5);
++  });
++
++  it("reports RESERVED when reactivating a released reservation", () => {
++    const reservation = hydrated({ status: BranchStockReservationStatus.RELEASED });
++    const event = reservation.replace({
++      branchId: 2,
++      expiresAt: LATER,
++      items: [{ productId: 10, quantity: 2 }],
++      now: NOW,
++    });
++    expect(event).toBe(BranchStockReservationEventType.RESERVED);
++    expect(reservation.status).toBe(BranchStockReservationStatus.ACTIVE);
++  });
++
++  it("reports RESERVED when reactivating an expired reservation", () => {
++    const reservation = hydrated({ status: BranchStockReservationStatus.EXPIRED });
++    const event = reservation.replace({
++      branchId: 2,
++      expiresAt: LATER,
++      items: [{ productId: 10, quantity: 2 }],
++      now: NOW,
++    });
++    expect(event).toBe(BranchStockReservationEventType.RESERVED);
++  });
++
++  it("can replace the branch and complete item set", () => {
++    const reservation = hydrated();
++    reservation.replace({
++      branchId: 8,
++      expiresAt: LATER,
++      items: [
++        { productId: 11, quantity: 2 },
++        { productId: 12, quantity: 4 },
++      ],
++      now: NOW,
++    });
++    expect(reservation.branchId).toBe(8);
++    expect(reservation.items).toEqual([
++      { productId: 11, quantity: 2 },
++      { productId: 12, quantity: 4 },
++    ]);
++  });
++
++  it("validates duplicate products on replacement too", () => {
++    const reservation = hydrated();
++    expect(() => reservation.replace({
++      branchId: 2,
++      expiresAt: LATER,
++      items: [{ productId: 10, quantity: 1 }, { productId: 10, quantity: 2 }],
++      now: NOW,
++    })).toThrow(ValidationError);
++  });
++
++  it("rejects replacement with an expiry that is not in the future", () => {
++    const reservation = hydrated();
++    expect(() => reservation.replace({
++      branchId: 2,
++      expiresAt: NOW,
++      items: [{ productId: 10, quantity: 2 }],
++      now: NOW,
++    })).toThrow(ValidationError);
++  });
++
++  it("refreshes an active reservation to the supplied future expiry", () => {
++    const reservation = hydrated();
++    const next = new Date(NOW.getTime() + 60 * 60_000);
++    reservation.refresh(next, NOW);
++    expect(reservation.expiresAt).toEqual(next);
++  });
++
++  it("rejects refresh for a released reservation", () => {
++    const reservation = hydrated({ status: BranchStockReservationStatus.RELEASED });
++    expect(() => reservation.refresh(LATER, NOW)).toThrow(ValidationError);
++  });
++
++  it("rejects refresh for a reservation whose expiry has passed", () => {
++    const reservation = hydrated({ expiresAt: new Date(NOW.getTime() - 1) });
++    expect(() => reservation.refresh(LATER, NOW)).toThrow(ValidationError);
++    expect(reservation.status).toBe(BranchStockReservationStatus.EXPIRED);
++  });
++
++  it("rejects refresh when the new expiry is not after now", () => {
++    const reservation = hydrated();
++    expect(() => reservation.refresh(NOW, NOW)).toThrow(ValidationError);
++  });
++
++  it("releases an active reservation exactly once", () => {
++    const reservation = hydrated();
++    expect(reservation.release(NOW)).toBe(true);
++    expect(reservation.status).toBe(BranchStockReservationStatus.RELEASED);
++    expect(reservation.release(NOW)).toBe(false);
++  });
++
++  it("release marks an already-due active reservation expired instead of released", () => {
++    const reservation = hydrated({ expiresAt: NOW });
++    expect(reservation.release(NOW)).toBe(false);
++    expect(reservation.status).toBe(BranchStockReservationStatus.EXPIRED);
++  });
++
++  it("does not change a released reservation during expiry checks", () => {
++    const reservation = hydrated({
++      status: BranchStockReservationStatus.RELEASED,
++      expiresAt: new Date(NOW.getTime() - 60_000),
++    });
++    expect(reservation.expire(NOW)).toBe(false);
++    expect(reservation.status).toBe(BranchStockReservationStatus.RELEASED);
++  });
++
++  it("does not expire an active reservation before its deadline", () => {
++    const reservation = hydrated();
++    expect(reservation.expire(new Date(LATER.getTime() - 1))).toBe(false);
++    expect(reservation.status).toBe(BranchStockReservationStatus.ACTIVE);
++  });
++
++  it("expires an active reservation exactly at its deadline", () => {
++    const reservation = hydrated();
++    expect(reservation.expire(LATER)).toBe(true);
++    expect(reservation.status).toBe(BranchStockReservationStatus.EXPIRED);
++  });
++
++  it("expires an active reservation after its deadline", () => {
++    const reservation = hydrated();
++    expect(reservation.expire(new Date(LATER.getTime() + 1))).toBe(true);
++  });
++
++  it("isExpiredAt treats the deadline as expired", () => {
++    const reservation = hydrated();
++    expect(reservation.isExpiredAt(new Date(LATER.getTime() - 1))).toBe(false);
++    expect(reservation.isExpiredAt(LATER)).toBe(true);
++  });
++
++  it("returns defensive copies of reservation items", () => {
++    const reservation = hydrated();
++    const items = reservation.items;
++    items[0].quantity = 999;
++    expect(reservation.items[0].quantity).toBe(3);
++  });
++
++  it("returns defensive copies of expiry dates", () => {
++    const reservation = hydrated();
++    const date = reservation.expiresAt;
++    date.setUTCFullYear(2030);
++    expect(reservation.expiresAt.getUTCFullYear()).toBe(2026);
++  });
++
++  it("toPrimitives does not expose a mutable item array", () => {
++    const reservation = hydrated();
++    const primitive = reservation.toPrimitives();
++    primitive.items[0].quantity = 100;
++    expect(reservation.items[0].quantity).toBe(3);
++  });
++
++  it("hydrates an existing terminal status without changing it", () => {
++    expect(hydrated({ status: BranchStockReservationStatus.EXPIRED }).status).toBe(BranchStockReservationStatus.EXPIRED);
++    expect(hydrated({ status: BranchStockReservationStatus.RELEASED }).status).toBe(BranchStockReservationStatus.RELEASED);
++  });
++});
