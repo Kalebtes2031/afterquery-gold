@@ -1,0 +1,814 @@
+diff --git a/db/migrations/035_purchase_receive_overage_tolerance.sql b/db/migrations/035_purchase_receive_overage_tolerance.sql
+new file mode 100644
+index 0000000..a52fccf
+--- /dev/null
++++ b/db/migrations/035_purchase_receive_overage_tolerance.sql
+@@ -0,0 +1,66 @@
++-- Keep purchase receiving limits stable for the lifetime of each order.
++-- Existing orders retain the strict historical behavior with a zero-percent tolerance.
++ALTER TABLE purchase_order
++  ADD COLUMN IF NOT EXISTS receive_overage_tolerance_percent NUMERIC(8, 6) NOT NULL DEFAULT 0;
++
++ALTER TABLE purchase_order
++  DROP CONSTRAINT IF EXISTS purchase_order_receive_overage_tolerance_percent_check;
++
++ALTER TABLE purchase_order
++  ADD CONSTRAINT purchase_order_receive_overage_tolerance_percent_check
++  CHECK (
++    receive_overage_tolerance_percent >= 0
++    AND receive_overage_tolerance_percent <= 100
++  );
++
++-- The application performs the friendly preflight check, but keep the same
++-- cumulative invariant at the database boundary as protection for future
++-- import jobs or repository code that updates purchase_order_item directly.
++CREATE OR REPLACE FUNCTION enforce_purchase_receive_overage_limit()
++RETURNS TRIGGER
++LANGUAGE plpgsql
++AS $$
++DECLARE
++  tolerance_percent NUMERIC;
++  maximum_total NUMERIC;
++BEGIN
++  SELECT receive_overage_tolerance_percent
++    INTO tolerance_percent
++    FROM purchase_order
++   WHERE id = NEW.purchase_order_id;
++
++  IF tolerance_percent IS NULL THEN
++    tolerance_percent := 0;
++  END IF;
++
++  maximum_total := ROUND(
++    NEW.quantity_ordered * (1 + tolerance_percent / 100.0),
++    6
++  );
++
++  IF ROUND(NEW.quantity_received, 6) > maximum_total THEN
++    RAISE EXCEPTION
++      'purchase receive quantity % exceeds maximum % for order item %',
++      NEW.quantity_received,
++      maximum_total,
++      NEW.id
++      USING ERRCODE = '23514';
++  END IF;
++
++  NEW.quantity_received := ROUND(NEW.quantity_received, 6);
++  NEW.quantity_remaining := ROUND(
++    GREATEST(0::numeric, NEW.quantity_ordered - NEW.quantity_received),
++    6
++  );
++
++  RETURN NEW;
++END;
++$$;
++
++DROP TRIGGER IF EXISTS trg_purchase_receive_overage_limit ON purchase_order_item;
++
++CREATE TRIGGER trg_purchase_receive_overage_limit
++BEFORE INSERT OR UPDATE OF quantity_ordered, quantity_received, quantity_remaining
++ON purchase_order_item
++FOR EACH ROW
++EXECUTE FUNCTION enforce_purchase_receive_overage_limit();
+diff --git a/src/modules/purchases/application/CreatePurchaseOrderUseCase.ts b/src/modules/purchases/application/CreatePurchaseOrderUseCase.ts
+index 66461c9..c30115e 100644
+--- a/src/modules/purchases/application/CreatePurchaseOrderUseCase.ts
++++ b/src/modules/purchases/application/CreatePurchaseOrderUseCase.ts
+@@ -19,6 +19,7 @@ export interface CreatePurchaseOrderInput {
+   orderDate: Date;
+   expectedReceiveDate?: Date | null;
+   receiveOption: ReceiveOption;
++  receiveOverageTolerancePercent?: number;
+   branchId?: number | null;
+   note?: string | null;
+   createdBy?: number;
+@@ -110,6 +111,7 @@ export class CreatePurchaseOrderUseCase {
+         orderDate: input.orderDate,
+         expectedReceiveDate: input.expectedReceiveDate,
+         receiveOption: input.receiveOption,
++        receiveOverageTolerancePercent: input.receiveOverageTolerancePercent ?? 0,
+         branchId: input.branchId,
+         note: input.note,
+         createdBy: input.createdBy
+@@ -130,7 +132,7 @@ export class CreatePurchaseOrderUseCase {
+         receivedByIndex.push(qty);
+         if (qty > 0) {
+           receivedNowMap.set(it.productId, (receivedNowMap.get(it.productId) || 0) + qty);
+-          finalOrder.items[i].recordReceive(qty);
++          finalOrder.items[i].recordReceive(qty, finalOrder.receiveOverageTolerancePercent);
+         }
+       }
+ 
+diff --git a/src/modules/purchases/application/GetPurchaseDetailsUseCase.ts b/src/modules/purchases/application/GetPurchaseDetailsUseCase.ts
+index 8f053c9..e3036fb 100644
+--- a/src/modules/purchases/application/GetPurchaseDetailsUseCase.ts
++++ b/src/modules/purchases/application/GetPurchaseDetailsUseCase.ts
+@@ -18,11 +18,11 @@ export class GetPurchaseDetailsUseCase {
+ 
+     const payments = await this.paymentRepo.findByPurchaseOrderId(companyId, purchaseOrderId);
+     const receives = await this.receiveRepo.findByPurchaseOrderId(companyId, purchaseOrderId);
+-
+     return {
+       order: order.toPrimitives(),
+       payments: payments.map(p => p.toPrimitives()),
+-      receives: receives.map(r => r.toPrimitives())
++      receives: receives.map(r => r.toPrimitives()),
++      receiveAllowance: order.getReceiveAllowance()
+     };
+   }
+ }
+diff --git a/src/modules/purchases/application/RecordPurchaseReceiveUseCase.ts b/src/modules/purchases/application/RecordPurchaseReceiveUseCase.ts
+index d8d1b80..1095d5a 100644
+--- a/src/modules/purchases/application/RecordPurchaseReceiveUseCase.ts
++++ b/src/modules/purchases/application/RecordPurchaseReceiveUseCase.ts
+@@ -1,11 +1,12 @@
+ import { TransactionManager } from "../../../shared/infrastructure/transactions/TransactionManager";
+-import { DocumentStatus, PurchaseOrder, PurchaseOrderRepository } from "../domain/PurchaseOrder";
++import { DocumentStatus, PurchaseOrder, PurchaseOrderItem, PurchaseOrderRepository } from "../domain/PurchaseOrder";
+ import { PurchaseReceive, PurchaseReceiveItemProps, PurchaseReceiveRepository } from "../domain/PurchaseReceive";
+ import { ProductRepository } from "../../inventory/domain/Product";
+-import { InventoryTransaction, InventoryTransactionRepository, InventoryTxType } from "../../inventory/domain/InventoryTransaction";
++import { InventoryTransactionRepository } from "../../inventory/domain/InventoryTransaction";
+ import { InventoryPendingRepository } from "../../inventory/domain/InventoryPending";
+ import { EntityNotFoundError, ValidationError } from "../../../shared/domain/DomainError";
+ import { WarehouseService } from "../../inventory/application/WarehouseService";
++import { PurchaseReceivePolicy } from "../domain/PurchaseReceivePolicy";
+ 
+ export interface RecordPurchaseReceiveInput {
+   companyId: number;
+@@ -23,6 +24,12 @@ export interface RecordPurchaseReceiveInput {
+   }>;
+ }
+ 
++interface ValidatedReceiveLine {
++  input: RecordPurchaseReceiveInput["items"][number];
++  orderItem: PurchaseOrderItem;
++  pendingQuantityToRelease: number;
++}
++
+ export class RecordPurchaseReceiveUseCase {
+   constructor(
+     private readonly txManager: TransactionManager,
+@@ -36,8 +43,14 @@ export class RecordPurchaseReceiveUseCase {
+ 
+   async execute(input: RecordPurchaseReceiveInput): Promise<{ receiveId: number }> {
+     return this.txManager.run(async (client) => {
+-      // 1. Get PO with lock
+-      const order = await this.purchaseOrderRepo.findByIdForUpdate(input.companyId, input.purchaseOrderId, client);
++      // Lock the order first. The quantity check and the eventual item update must
++      // observe one serial view so two concurrent receipts cannot both spend the
++      // same remaining allowance.
++      const order = await this.purchaseOrderRepo.findByIdForUpdate(
++        input.companyId,
++        input.purchaseOrderId,
++        client
++      );
+       if (!order) {
+         throw new EntityNotFoundError("Purchase order not found");
+       }
+@@ -46,72 +59,114 @@ export class RecordPurchaseReceiveUseCase {
+         throw new ValidationError("Cannot receive items for a closed or cancelled order");
+       }
+ 
+-      // 2. Build the Receive Entity
+-      const receiveItems: Omit<PurchaseReceiveItemProps, "id" | "purchaseReceiveId">[] = input.items.map(item => ({
+-        purchaseOrderItemId: item.purchaseOrderItemId,
+-        productId: item.productId,
+-        quantityReceived: item.quantityReceived,
+-        unitCost: item.unitCost,
+-        description: item.description
+-      }));
+-
+-      const receive = PurchaseReceive.create({
+-        companyId: input.companyId,
+-        purchaseOrderId: input.purchaseOrderId,
+-        supplierId: order.toPrimitives().supplierId,
+-        branchId: input.branchId,
+-        receiveDate: input.receiveDate,
+-        note: input.note,
+-        createdBy: input.createdBy
+-      }, receiveItems);
+-
+-      // Save Receive Document
+-      const savedReceive = await this.purchaseReceiveRepo.create(receive, client);
++      // Validate every line and apply the domain quantity transitions before any
++      // receipt, stock, WAC, or pending mutation is written. Besides producing a
++      // cleaner error path, this keeps an invalid mixed payload from partially
++      // reaching collaborators that may later gain non-database side effects.
++      const validatedLines = this.validateAndApplyReceiveLines(order, input.items);
+ 
+-      const adjustPendingReceive = async (productId: number, delta: number) => {
+-        await this.inventoryPendingRepo.adjust(
+-          input.companyId,
+-          productId,
+-          input.branchId,
+-          delta,
+-          0,
+-          client
+-        );
+-      };
++      const receiveItems: Omit<PurchaseReceiveItemProps, "id" | "purchaseReceiveId">[] = validatedLines.map(
++        ({ input: line }) => ({
++          purchaseOrderItemId: line.purchaseOrderItemId,
++          productId: line.productId,
++          quantityReceived: PurchaseReceivePolicy.roundQuantity(line.quantityReceived),
++          unitCost: line.unitCost,
++          description: line.description
++        })
++      );
++
++      const receive = PurchaseReceive.create(
++        {
++          companyId: input.companyId,
++          purchaseOrderId: input.purchaseOrderId,
++          supplierId: order.toPrimitives().supplierId,
++          branchId: input.branchId,
++          receiveDate: input.receiveDate,
++          note: input.note,
++          createdBy: input.createdBy
++        },
++        receiveItems
++      );
+ 
+-      // 3. Move items from Pending to Physical stock via WarehouseService
++      const savedReceive = await this.purchaseReceiveRepo.create(receive, client);
++
++      // WarehouseService normally reduces pending by the physical quantity. That
++      // is correct for ordinary receipts but not for tolerated overage: pending is
++      // a commitment against the original PO quantity, so overage must never make
++      // it consume more than the outstanding ordered amount. Skip the service's
++      // generic pending adjustment and release the exact ordered remainder below.
+       await this.warehouseService.recordReceipt(
+         input.companyId,
+         input.branchId,
+         input.receiveDate,
+-        receiveItems.map(it => ({
+-          productId: it.productId,
+-          quantity: it.quantityReceived,
+-          unitCost: it.unitCost,
++        receiveItems.map((item) => ({
++          productId: item.productId,
++          quantity: item.quantityReceived,
++          unitCost: item.unitCost,
+           referenceId: savedReceive.id!,
+-          description: it.description
++          description: item.description
+         })),
+-        client
++        client,
++        { skipPendingUpdate: true }
+       );
+ 
+-      // Deduct from Pending
+-      for (const item of receiveItems) {
+-        await adjustPendingReceive(item.productId, -item.quantityReceived);
+-      }
+-
+-      // 4. Update PO Status and Items
+-      for (const inputItem of input.items) {
+-        const orderItem = order.items.find(i => i.id === inputItem.purchaseOrderItemId);
+-        if (orderItem) {
+-          orderItem.recordReceive(inputItem.quantityReceived);
+-        }
++      for (const line of validatedLines) {
++        if (line.pendingQuantityToRelease <= 0) continue;
++        await this.inventoryPendingRepo.adjust(
++          input.companyId,
++          line.input.productId,
++          input.branchId,
++          -line.pendingQuantityToRelease,
++          0,
++          client
++        );
+       }
+ 
+-      const allReceived = order.items.every(i => i.quantityRemaining === 0);
++      const allReceived = order.items.every((item) => item.quantityRemaining === 0);
+       order.updateStatus(allReceived ? DocumentStatus.CLOSED : DocumentStatus.PARTIALLY_RECEIVED);
+       await this.purchaseOrderRepo.update(order, client);
+ 
+       return { receiveId: savedReceive.id! };
+     });
+   }
++
++  private validateAndApplyReceiveLines(
++    order: PurchaseOrder,
++    inputItems: RecordPurchaseReceiveInput["items"]
++  ): ValidatedReceiveLine[] {
++    const seenOrderItemIds = new Set<number>();
++    const validated: ValidatedReceiveLine[] = [];
++
++    for (const inputItem of inputItems) {
++      if (seenOrderItemIds.has(inputItem.purchaseOrderItemId)) {
++        throw new ValidationError(
++          `Purchase order item ${inputItem.purchaseOrderItemId} appears more than once in the receipt`
++        );
++      }
++      seenOrderItemIds.add(inputItem.purchaseOrderItemId);
++
++      const orderItem = order.items.find((item) => item.id === inputItem.purchaseOrderItemId);
++      if (!orderItem) {
++        throw new ValidationError(`Purchase order item ${inputItem.purchaseOrderItemId} not found`);
++      }
++      if (orderItem.productId !== inputItem.productId) {
++        throw new ValidationError(
++          `Product ${inputItem.productId} does not match purchase order item ${inputItem.purchaseOrderItemId}`
++        );
++      }
++
++      const orderedRemainingBefore = orderItem.quantityRemaining;
++      orderItem.recordReceive(inputItem.quantityReceived, order.receiveOverageTolerancePercent);
++
++      validated.push({
++        input: inputItem,
++        orderItem,
++        pendingQuantityToRelease: PurchaseReceivePolicy.roundQuantity(
++          Math.min(orderedRemainingBefore, inputItem.quantityReceived)
++        )
++      });
++    }
++
++    return validated;
++  }
+ }
+diff --git a/src/modules/purchases/domain/PurchaseOrder.ts b/src/modules/purchases/domain/PurchaseOrder.ts
+index 026aae3..310cc3b 100644
+--- a/src/modules/purchases/domain/PurchaseOrder.ts
++++ b/src/modules/purchases/domain/PurchaseOrder.ts
+@@ -1,5 +1,6 @@
+ import { ValidationError } from "../../../shared/domain/DomainError";
+ import { PaginatedResult, CursorPageRequest } from "../../../shared/domain/Pagination";
++import { PurchaseReceivePolicy } from "./PurchaseReceivePolicy";
+ 
+ export enum ReceiveOption {
+   RECEIVED_ALL = "RECEIVED_ALL",
+@@ -77,13 +78,24 @@ export class PurchaseOrderItem {
+     return this.props.quantityRemaining ?? this.props.quantityOrdered;
+   }
+ 
+-  recordReceive(qty: number): void {
+-    if (qty <= 0) throw new ValidationError("Receive quantity must be positive");
+-    if (qty > this.quantityRemaining) {
+-      throw new ValidationError(`Cannot receive ${qty} units, only ${this.quantityRemaining} remaining`);
+-    }
+-    this.props.quantityReceived = (this.props.quantityReceived ?? 0) + qty;
+-    this.props.quantityRemaining = (this.props.quantityRemaining ?? this.props.quantityOrdered) - qty;
++  recordReceive(qty: number, tolerancePercent: number = 0): void {
++    const allowance = PurchaseReceivePolicy.assertCanReceive({
++      quantityOrdered: this.quantityOrdered,
++      quantityReceived: this.quantityReceived,
++      quantityRequested: qty,
++      tolerancePercent
++    });
++
++    this.props.quantityReceived = allowance.quantityReceivedAfter;
++    this.props.quantityRemaining = allowance.orderedRemainingAfter;
++  }
++
++  receivableQuantity(tolerancePercent: number = 0): number {
++    return PurchaseReceivePolicy.calculateAvailableWithinTolerance(
++      this.quantityOrdered,
++      this.quantityReceived,
++      tolerancePercent
++    );
+   }
+ 
+   get unitCost(): number {
+@@ -107,6 +119,7 @@ export interface PurchaseOrderProps {
+   orderDate: Date;
+   expectedReceiveDate?: Date | null;
+   receiveOption: ReceiveOption;
++  receiveOverageTolerancePercent?: number;
+   branchId?: number | null;
+   note?: string | null;
+   totalItemsCost: number;
+@@ -130,6 +143,10 @@ export class PurchaseOrder {
+       throw new ValidationError("Branch ID is required");
+     }
+ 
++    this.props.receiveOverageTolerancePercent = PurchaseReceivePolicy.normalizeTolerancePercent(
++      this.props.receiveOverageTolerancePercent
++    );
++
+     const calculatedTotal = this.props.items.reduce((sum, item) => sum + item.subtotalCost, 0);
+     if (Math.abs(this.props.totalItemsCost - calculatedTotal) > 0.01) {
+       throw new ValidationError("Total items cost must match the sum of item subtotals");
+@@ -196,6 +213,24 @@ export class PurchaseOrder {
+     return this.props.status;
+   }
+ 
++  get receiveOverageTolerancePercent(): number {
++    return this.props.receiveOverageTolerancePercent ?? 0;
++  }
++
++  getReceiveAllowance(): import("./PurchaseReceivePolicy").PurchaseReceiveOrderAllowance {
++    const canReceive = this.status !== DocumentStatus.CLOSED && this.status !== DocumentStatus.CANCELLED;
++    return PurchaseReceivePolicy.summarizeOrder(
++      this.props.items.map((item) => ({
++        purchaseOrderItemId: item.id,
++        productId: item.productId,
++        quantityOrdered: item.quantityOrdered,
++        quantityReceived: item.quantityReceived
++      })),
++      this.receiveOverageTolerancePercent,
++      canReceive
++    );
++  }
++
+   toPrimitives(): any {
+     return {
+       ...this.props,
+diff --git a/src/modules/purchases/domain/PurchaseReceivePolicy.ts b/src/modules/purchases/domain/PurchaseReceivePolicy.ts
+new file mode 100644
+index 0000000..c1f6112
+--- /dev/null
++++ b/src/modules/purchases/domain/PurchaseReceivePolicy.ts
+@@ -0,0 +1,237 @@
++import { ValidationError } from "../../../shared/domain/DomainError";
++
++/**
++ * Purchase quantities are stored as PostgreSQL numeric values but become
++ * JavaScript numbers in the domain. Keeping all receive-limit arithmetic at a
++ * fixed precision prevents tiny binary floating point differences from
++ * turning a boundary receipt into an overage.
++ */
++export const RECEIVE_QUANTITY_DECIMAL_PLACES = 6;
++export const MAX_RECEIVE_OVERAGE_TOLERANCE_PERCENT = 100;
++
++const QUANTITY_SCALE = 10 ** RECEIVE_QUANTITY_DECIMAL_PLACES;
++
++export interface PurchaseReceiveAllowanceInput {
++  quantityOrdered: number;
++  quantityReceived: number;
++  quantityRequested: number;
++  tolerancePercent?: number | null;
++}
++
++
++export interface PurchaseReceiveOrderLineSnapshot {
++  purchaseOrderItemId?: number;
++  productId: number;
++  quantityOrdered: number;
++  quantityReceived: number;
++}
++
++export interface PurchaseReceiveOrderLineAllowance {
++  purchaseOrderItemId?: number;
++  productId: number;
++  quantityOrdered: number;
++  quantityReceived: number;
++  quantityRemaining: number;
++  toleranceQuantity: number;
++  maximumReceivableTotal: number;
++  quantityReceivable: number;
++  overageReceived: number;
++  atOrderedQuantity: boolean;
++  atToleranceLimit: boolean;
++}
++
++export interface PurchaseReceiveOrderAllowance {
++  tolerancePercent: number;
++  canReceive: boolean;
++  totalOrdered: number;
++  totalReceived: number;
++  totalRemaining: number;
++  totalReceivable: number;
++  totalOverageReceived: number;
++  items: PurchaseReceiveOrderLineAllowance[];
++}
++
++export interface PurchaseReceiveAllowance {
++  quantityOrdered: number;
++  quantityReceivedBefore: number;
++  quantityRequested: number;
++  quantityReceivedAfter: number;
++  orderedRemainingBefore: number;
++  orderedRemainingAfter: number;
++  tolerancePercent: number;
++  toleranceQuantity: number;
++  maximumReceivableTotal: number;
++  availableWithinToleranceBefore: number;
++  overageAfter: number;
++  exceedsTolerance: boolean;
++}
++
++/**
++ * Pure receiving math shared by purchase creation and later receipt posting.
++ *
++ * The tolerance is deliberately calculated from the original ordered
++ * quantity, never from the shrinking remaining quantity. This means a 5%
++ * tolerance on an order line for 100 units always caps cumulative receipts at
++ * 105, regardless of how many partial receipts are posted.
++ */
++export class PurchaseReceivePolicy {
++  static roundQuantity(value: number): number {
++    if (!Number.isFinite(value)) {
++      throw new ValidationError("Receive quantity must be a finite number");
++    }
++
++    // Number.EPSILON helps values such as 1.005 land on the expected side of
++    // the integer rounding boundary without changing the six-decimal contract.
++    const adjusted = value >= 0 ? value + Number.EPSILON : value - Number.EPSILON;
++    return Math.round(adjusted * QUANTITY_SCALE) / QUANTITY_SCALE;
++  }
++
++  static normalizeTolerancePercent(value?: number | null): number {
++    const tolerance = value ?? 0;
++    if (!Number.isFinite(tolerance) || tolerance < 0 || tolerance > MAX_RECEIVE_OVERAGE_TOLERANCE_PERCENT) {
++      throw new ValidationError(
++        `Receive overage tolerance must be between 0 and ${MAX_RECEIVE_OVERAGE_TOLERANCE_PERCENT} percent`
++      );
++    }
++    return this.roundQuantity(tolerance);
++  }
++
++  static calculateMaximumReceivableTotal(quantityOrdered: number, tolerancePercent?: number | null): number {
++    this.assertOrderedQuantity(quantityOrdered);
++    const tolerance = this.normalizeTolerancePercent(tolerancePercent);
++    const toleranceQuantity = quantityOrdered * (tolerance / 100);
++    return this.roundQuantity(quantityOrdered + toleranceQuantity);
++  }
++
++  static calculateAvailableWithinTolerance(
++    quantityOrdered: number,
++    quantityReceived: number,
++    tolerancePercent?: number | null
++  ): number {
++    this.assertOrderedQuantity(quantityOrdered);
++    this.assertAlreadyReceivedQuantity(quantityReceived);
++    const maximum = this.calculateMaximumReceivableTotal(quantityOrdered, tolerancePercent);
++    return this.roundQuantity(Math.max(0, maximum - this.roundQuantity(quantityReceived)));
++  }
++
++  static evaluate(input: PurchaseReceiveAllowanceInput): PurchaseReceiveAllowance {
++    this.assertOrderedQuantity(input.quantityOrdered);
++    this.assertAlreadyReceivedQuantity(input.quantityReceived);
++    this.assertRequestedQuantity(input.quantityRequested);
++
++    const quantityOrdered = this.roundQuantity(input.quantityOrdered);
++    const quantityReceivedBefore = this.roundQuantity(input.quantityReceived);
++    const quantityRequested = this.roundQuantity(input.quantityRequested);
++    const tolerancePercent = this.normalizeTolerancePercent(input.tolerancePercent);
++    const toleranceQuantity = this.roundQuantity(quantityOrdered * (tolerancePercent / 100));
++    const maximumReceivableTotal = this.roundQuantity(quantityOrdered + toleranceQuantity);
++    const availableWithinToleranceBefore = this.roundQuantity(
++      Math.max(0, maximumReceivableTotal - quantityReceivedBefore)
++    );
++    const quantityReceivedAfter = this.roundQuantity(quantityReceivedBefore + quantityRequested);
++    const orderedRemainingBefore = this.roundQuantity(
++      Math.max(0, quantityOrdered - quantityReceivedBefore)
++    );
++    const orderedRemainingAfter = this.roundQuantity(
++      Math.max(0, quantityOrdered - quantityReceivedAfter)
++    );
++    const overageAfter = this.roundQuantity(
++      Math.max(0, quantityReceivedAfter - quantityOrdered)
++    );
++
++    return {
++      quantityOrdered,
++      quantityReceivedBefore,
++      quantityRequested,
++      quantityReceivedAfter,
++      orderedRemainingBefore,
++      orderedRemainingAfter,
++      tolerancePercent,
++      toleranceQuantity,
++      maximumReceivableTotal,
++      availableWithinToleranceBefore,
++      overageAfter,
++      exceedsTolerance: quantityReceivedAfter > maximumReceivableTotal
++    };
++  }
++
++  static summarizeOrder(
++    lines: PurchaseReceiveOrderLineSnapshot[],
++    tolerancePercent?: number | null,
++    canReceive: boolean = true
++  ): PurchaseReceiveOrderAllowance {
++    const tolerance = this.normalizeTolerancePercent(tolerancePercent);
++    const items = lines.map((line): PurchaseReceiveOrderLineAllowance => {
++      this.assertOrderedQuantity(line.quantityOrdered);
++      this.assertAlreadyReceivedQuantity(line.quantityReceived);
++
++      const quantityOrdered = this.roundQuantity(line.quantityOrdered);
++      const quantityReceived = this.roundQuantity(line.quantityReceived);
++      const maximumReceivableTotal = this.calculateMaximumReceivableTotal(quantityOrdered, tolerance);
++      const toleranceQuantity = this.roundQuantity(maximumReceivableTotal - quantityOrdered);
++      const mathematicalReceivable = this.calculateAvailableWithinTolerance(
++        quantityOrdered,
++        quantityReceived,
++        tolerance
++      );
++      const quantityRemaining = this.roundQuantity(Math.max(0, quantityOrdered - quantityReceived));
++      const overageReceived = this.roundQuantity(Math.max(0, quantityReceived - quantityOrdered));
++
++      return {
++        purchaseOrderItemId: line.purchaseOrderItemId,
++        productId: line.productId,
++        quantityOrdered,
++        quantityReceived,
++        quantityRemaining,
++        toleranceQuantity,
++        maximumReceivableTotal,
++        quantityReceivable: canReceive ? mathematicalReceivable : 0,
++        overageReceived,
++        atOrderedQuantity: quantityReceived >= quantityOrdered,
++        atToleranceLimit: quantityReceived >= maximumReceivableTotal
++      };
++    });
++
++    const sum = (selector: (item: PurchaseReceiveOrderLineAllowance) => number): number =>
++      this.roundQuantity(items.reduce((total, item) => total + selector(item), 0));
++
++    return {
++      tolerancePercent: tolerance,
++      canReceive,
++      totalOrdered: sum((item) => item.quantityOrdered),
++      totalReceived: sum((item) => item.quantityReceived),
++      totalRemaining: sum((item) => item.quantityRemaining),
++      totalReceivable: sum((item) => item.quantityReceivable),
++      totalOverageReceived: sum((item) => item.overageReceived),
++      items
++    };
++  }
++
++  static assertCanReceive(input: PurchaseReceiveAllowanceInput): PurchaseReceiveAllowance {
++    const allowance = this.evaluate(input);
++    if (allowance.exceedsTolerance) {
++      throw new ValidationError(
++        `Cannot receive ${allowance.quantityRequested} units; only ${allowance.availableWithinToleranceBefore} remain within the ${allowance.tolerancePercent}% receive tolerance`
++      );
++    }
++    return allowance;
++  }
++
++  private static assertOrderedQuantity(value: number): void {
++    if (!Number.isFinite(value) || value <= 0) {
++      throw new ValidationError("Quantity ordered must be greater than zero");
++    }
++  }
++
++  private static assertAlreadyReceivedQuantity(value: number): void {
++    if (!Number.isFinite(value) || value < 0) {
++      throw new ValidationError("Quantity already received cannot be negative");
++    }
++  }
++
++  private static assertRequestedQuantity(value: number): void {
++    if (!Number.isFinite(value) || value <= 0) {
++      throw new ValidationError("Receive quantity must be positive");
++    }
++  }
++}
+diff --git a/src/modules/purchases/infrastructure/PgPurchaseOrderRepository.ts b/src/modules/purchases/infrastructure/PgPurchaseOrderRepository.ts
+index 159b029..b64cf7b 100644
+--- a/src/modules/purchases/infrastructure/PgPurchaseOrderRepository.ts
++++ b/src/modules/purchases/infrastructure/PgPurchaseOrderRepository.ts
+@@ -44,6 +44,7 @@ function mapRowToOrder(
+     orderDate: orderRow.order_date,
+     expectedReceiveDate: orderRow.expected_receive_date,
+     receiveOption: orderRow.receive_option as ReceiveOption,
++    receiveOverageTolerancePercent: Number(orderRow.receive_overage_tolerance_percent ?? 0),
+     branchId: orderRow.branch_id ? Number(orderRow.branch_id) : undefined,
+     note: orderRow.note,
+     totalItemsCost: Number(orderRow.total_items_cost),
+@@ -70,10 +71,10 @@ export class PgPurchaseOrderRepository implements PurchaseOrderRepository {
+     const res = await runner.query(
+       `INSERT INTO purchase_order (
+          company_id, supplier_id, order_no, order_date, expected_receive_date,
+-         receive_option, branch_id, note, total_items_cost, total_paid_amount,
++         receive_option, receive_overage_tolerance_percent, branch_id, note, total_items_cost, total_paid_amount,
+          status, created_by, created_at
+        )
+-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
++       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        RETURNING id`,
+       [
+         p.companyId,
+@@ -82,6 +83,7 @@ export class PgPurchaseOrderRepository implements PurchaseOrderRepository {
+         p.orderDate,
+         p.expectedReceiveDate ?? null,
+         p.receiveOption,
++        p.receiveOverageTolerancePercent ?? 0,
+         p.branchId ?? null,
+         p.note ?? null,
+         p.totalItemsCost,
+@@ -458,10 +460,10 @@ export class PgPurchaseOrderRepository implements PurchaseOrderRepository {
+     const res = await runner.query(
+       `INSERT INTO purchase_order (
+          company_id, supplier_id, order_no, order_date, expected_receive_date,
+-         receive_option, branch_id, note, total_items_cost, total_paid_amount,
++         receive_option, receive_overage_tolerance_percent, branch_id, note, total_items_cost, total_paid_amount,
+          status, created_by
+        )
+-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
++       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        RETURNING *`,
+       [
+         p.companyId,
+@@ -470,6 +472,7 @@ export class PgPurchaseOrderRepository implements PurchaseOrderRepository {
+         p.orderDate,
+         p.expectedReceiveDate ?? null,
+         p.receiveOption,
++        p.receiveOverageTolerancePercent ?? 0,
+         p.branchId ?? null,
+         p.note ?? null,
+         p.totalItemsCost,
+diff --git a/src/modules/purchases/presentation/PurchaseRouter.ts b/src/modules/purchases/presentation/PurchaseRouter.ts
+index 81583f6..6014f5e 100644
+--- a/src/modules/purchases/presentation/PurchaseRouter.ts
++++ b/src/modules/purchases/presentation/PurchaseRouter.ts
+@@ -130,6 +130,7 @@ PurchaseRouter.get("/next-order-no", requireAuth, async (req: Request, res: Resp
+  *               orderDate: { type: string, format: date-time }
+  *               expectedReceiveDate: { type: string, format: date-time, nullable: true }
+  *               receiveOption: { type: string, enum: [ALL, PARTIAL, NONE] }
++ *               receiveOverageTolerancePercent: { type: number, minimum: 0, maximum: 100, default: 0 }
+  *               branchId: { type: integer, nullable: true }
+  *               note: { type: string, nullable: true }
+  *               items:
+@@ -171,6 +172,7 @@ PurchaseRouter.post("/", requireAuth, requirePermission(accessPolicy, "PURCHASES
+       orderDate: body.orderDate,
+       expectedReceiveDate: body.expectedReceiveDate,
+       receiveOption: body.receiveOption as any,
++      receiveOverageTolerancePercent: body.receiveOverageTolerancePercent,
+       branchId: body.branchId,
+       note: body.note,
+       items: body.items,
+@@ -239,7 +241,46 @@ PurchaseRouter.get("/", requireAuth, requirePermission(accessPolicy, "PURCHASES"
+  *         schema: { type: integer }
+  *     responses:
+  *       '200':
+- *         description: Purchase order details
++ *         description: Purchase order details including the current receive allowance
++ *         content:
++ *           application/json:
++ *             schema:
++ *               type: object
++ *               properties:
++ *                 order:
++ *                   type: object
++ *                 payments:
++ *                   type: array
++ *                   items: { type: object }
++ *                 receives:
++ *                   type: array
++ *                   items: { type: object }
++ *                 receiveAllowance:
++ *                   type: object
++ *                   properties:
++ *                     tolerancePercent: { type: number }
++ *                     canReceive: { type: boolean }
++ *                     totalOrdered: { type: number }
++ *                     totalReceived: { type: number }
++ *                     totalRemaining: { type: number }
++ *                     totalReceivable: { type: number }
++ *                     totalOverageReceived: { type: number }
++ *                     items:
++ *                       type: array
++ *                       items:
++ *                         type: object
++ *                         properties:
++ *                           purchaseOrderItemId: { type: integer }
++ *                           productId: { type: integer }
++ *                           quantityOrdered: { type: number }
++ *                           quantityReceived: { type: number }
++ *                           quantityRemaining: { type: number }
++ *                           toleranceQuantity: { type: number }
++ *                           maximumReceivableTotal: { type: number }
++ *                           quantityReceivable: { type: number }
++ *                           overageReceived: { type: number }
++ *                           atOrderedQuantity: { type: boolean }
++ *                           atToleranceLimit: { type: boolean }
+  */
+ PurchaseRouter.get("/:id", requireAuth, requirePermission(accessPolicy, "PURCHASES", "view"), async (req: Request, res: Response) => {
+   try {
+diff --git a/src/modules/purchases/presentation/PurchaseSchemas.ts b/src/modules/purchases/presentation/PurchaseSchemas.ts
+index f2fadb4..9ed8c1e 100644
+--- a/src/modules/purchases/presentation/PurchaseSchemas.ts
++++ b/src/modules/purchases/presentation/PurchaseSchemas.ts
+@@ -18,6 +18,7 @@ export const createPurchaseOrderSchema = z.object({
+     .optional()
+     .transform((str) => (str == null ? null : new Date(str))),
+   receiveOption: z.nativeEnum(ReceiveOption),
++  receiveOverageTolerancePercent: z.number().min(0).max(100).optional().default(0),
+   branchId: createOptionalPositiveInt(),
+   note: createOptionalLongText(),
+   items: z
+@@ -73,4 +74,16 @@ export const recordPurchaseReceiveSchema = z.object({
+       })
+     )
+     .min(1, "At least one received item required")
++}).superRefine((value, ctx) => {
++  const seen = new Set<number>();
++  value.items.forEach((item, index) => {
++    if (seen.has(item.purchaseOrderItemId)) {
++      ctx.addIssue({
++        code: z.ZodIssueCode.custom,
++        path: ["items", index, "purchaseOrderItemId"],
++        message: "A purchase order item can only appear once in a receipt"
++      });
++    }
++    seen.add(item.purchaseOrderItemId);
++  });
+ });

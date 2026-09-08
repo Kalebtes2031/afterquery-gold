@@ -1,0 +1,649 @@
+diff --git a/src/modules/purchases/application/__tests__/PurchaseReceiveOverage.behavior.test.ts b/src/modules/purchases/application/__tests__/PurchaseReceiveOverage.behavior.test.ts
+new file mode 100644
+index 0000000..55fb37a
+--- /dev/null
++++ b/src/modules/purchases/application/__tests__/PurchaseReceiveOverage.behavior.test.ts
+@@ -0,0 +1,373 @@
++import { CreatePurchaseOrderUseCase } from "../CreatePurchaseOrderUseCase";
++import { GetPurchaseDetailsUseCase } from "../GetPurchaseDetailsUseCase";
++import { RecordPurchaseReceiveUseCase } from "../RecordPurchaseReceiveUseCase";
++import { DocumentStatus, PurchaseOrder, PurchaseOrderItem, ReceiveOption } from "../../domain/PurchaseOrder";
++import { PurchaseReceive } from "../../domain/PurchaseReceive";
++import { Partner } from "../../../partners/domain/Partner";
++import { Product } from "../../../inventory/domain/Product";
++
++const makeOrderItem = (over: Partial<any> = {}) => PurchaseOrderItem.hydrate({
++  id: 11,
++  purchaseOrderId: 7,
++  productId: 101,
++  quantityOrdered: 100,
++  unitCost: 2,
++  subtotalCost: 200,
++  quantityReceived: 0,
++  quantityRemaining: 100,
++  ...over,
++});
++
++const makeOrder = (over: Partial<any> = {}, items: PurchaseOrderItem[] = [makeOrderItem()]) => PurchaseOrder.hydrate({
++  id: 7,
++  companyId: 1,
++  supplierId: 4,
++  orderNo: "PO-TOL-1",
++  orderDate: new Date("2026-07-01T00:00:00.000Z"),
++  expectedReceiveDate: null,
++  receiveOption: ReceiveOption.RECEIVE_LATER,
++  receiveOverageTolerancePercent: 5,
++  branchId: 2,
++  note: null,
++  totalItemsCost: items.reduce((sum, item) => sum + item.subtotalCost, 0),
++  totalPaidAmount: 0,
++  status: DocumentStatus.OPEN,
++  createdBy: 9,
++  createdAt: new Date("2026-07-01T00:00:00.000Z"),
++  items,
++  ...over,
++} as any);
++
++const receiveInput = (over: Partial<any> = {}) => ({
++  companyId: 1,
++  purchaseOrderId: 7,
++  branchId: 2,
++  receiveDate: new Date("2026-07-02T00:00:00.000Z"),
++  note: null,
++  createdBy: 9,
++  items: [{
++    purchaseOrderItemId: 11,
++    productId: 101,
++    quantityReceived: 105,
++    unitCost: 2,
++    description: null,
++  }],
++  ...over,
++});
++
++function receiveHarness(order: PurchaseOrder) {
++  const client = { token: "client" } as any;
++  const txManager = {
++    run: jest.fn(async (callback: any) => callback(client)),
++  };
++  const purchaseOrderRepo = {
++    findByIdForUpdate: jest.fn().mockResolvedValue(order),
++    update: jest.fn(async (updated: PurchaseOrder) => updated),
++  };
++  const purchaseReceiveRepo = {
++    create: jest.fn(async (receive: PurchaseReceive) => {
++      (receive as any).props.id = 700;
++      return receive;
++    }),
++  };
++  const inventoryPendingRepo = {
++    adjust: jest.fn().mockResolvedValue(undefined),
++  };
++  const warehouseService = {
++    recordReceipt: jest.fn().mockResolvedValue(undefined),
++  };
++
++  const useCase = new RecordPurchaseReceiveUseCase(
++    txManager as any,
++    purchaseOrderRepo as any,
++    purchaseReceiveRepo as any,
++    {} as any,
++    {} as any,
++    inventoryPendingRepo as any,
++    warehouseService as any,
++  );
++
++  return {
++    client,
++    txManager,
++    purchaseOrderRepo,
++    purchaseReceiveRepo,
++    inventoryPendingRepo,
++    warehouseService,
++    useCase,
++  };
++}
++
++describe("record purchase receive overage behavior", () => {
++  it("accepts a receipt exactly at the purchase order tolerance boundary", async () => {
++    const h = receiveHarness(makeOrder());
++    await expect(h.useCase.execute(receiveInput())).resolves.toEqual({ receiveId: 700 });
++  });
++
++  it("persists cumulative received quantity including tolerated overage", async () => {
++    const order = makeOrder();
++    const h = receiveHarness(order);
++    await h.useCase.execute(receiveInput());
++    const saved = h.purchaseOrderRepo.update.mock.calls[0][0] as PurchaseOrder;
++    expect(saved.items[0].quantityReceived).toBe(105);
++  });
++
++  it("clamps persisted ordered remaining to zero after tolerated overage", async () => {
++    const h = receiveHarness(makeOrder());
++    await h.useCase.execute(receiveInput());
++    const saved = h.purchaseOrderRepo.update.mock.calls[0][0] as PurchaseOrder;
++    expect(saved.items[0].quantityRemaining).toBe(0);
++  });
++
++  it("closes an order when its original ordered quantity is fulfilled even with tolerance left conceptually", async () => {
++    const h = receiveHarness(makeOrder());
++    await h.useCase.execute(receiveInput({ items: [{ purchaseOrderItemId: 11, productId: 101, quantityReceived: 100, unitCost: 2 }] }));
++    const saved = h.purchaseOrderRepo.update.mock.calls[0][0] as PurchaseOrder;
++    expect(saved.status).toBe(DocumentStatus.CLOSED);
++    expect((saved as any).getReceiveAllowance().canReceive).toBe(false);
++  });
++
++  it("accepts the remaining tolerance after an earlier partial receipt", async () => {
++    const order = makeOrder({}, [makeOrderItem({ quantityReceived: 90, quantityRemaining: 10 })]);
++    const h = receiveHarness(order);
++    await expect(h.useCase.execute(receiveInput({ items: [{ purchaseOrderItemId: 11, productId: 101, quantityReceived: 15, unitCost: 2 }] }))).resolves.toEqual({ receiveId: 700 });
++  });
++
++  it("rejects cumulative quantity above the tolerance boundary", async () => {
++    const h = receiveHarness(makeOrder());
++    await expect(h.useCase.execute(receiveInput({ items: [{ purchaseOrderItemId: 11, productId: 101, quantityReceived: 105.000001, unitCost: 2 }] }))).rejects.toThrow(/tolerance/i);
++  });
++
++  it("rejects a cumulative overage after prior partial receipts", async () => {
++    const order = makeOrder({}, [makeOrderItem({ quantityReceived: 99, quantityRemaining: 1 })]);
++    const h = receiveHarness(order);
++    await expect(h.useCase.execute(receiveInput({ items: [{ purchaseOrderItemId: 11, productId: 101, quantityReceived: 6.000001, unitCost: 2 }] }))).rejects.toThrow(/tolerance/i);
++  });
++
++  it("rejects overage before creating the receipt document", async () => {
++    const h = receiveHarness(makeOrder());
++    await expect(h.useCase.execute(receiveInput({ items: [{ purchaseOrderItemId: 11, productId: 101, quantityReceived: 106, unitCost: 2 }] }))).rejects.toThrow();
++    expect(h.purchaseReceiveRepo.create).not.toHaveBeenCalled();
++  });
++
++  it("rejects overage before recording physical inventory", async () => {
++    const h = receiveHarness(makeOrder());
++    await expect(h.useCase.execute(receiveInput({ items: [{ purchaseOrderItemId: 11, productId: 101, quantityReceived: 106, unitCost: 2 }] }))).rejects.toThrow();
++    expect(h.warehouseService.recordReceipt).not.toHaveBeenCalled();
++  });
++
++  it("rejects overage before changing pending inventory", async () => {
++    const h = receiveHarness(makeOrder());
++    await expect(h.useCase.execute(receiveInput({ items: [{ purchaseOrderItemId: 11, productId: 101, quantityReceived: 106, unitCost: 2 }] }))).rejects.toThrow();
++    expect(h.inventoryPendingRepo.adjust).not.toHaveBeenCalled();
++  });
++
++  it("rejects an item id that does not belong to the purchase order before side effects", async () => {
++    const h = receiveHarness(makeOrder());
++    await expect(h.useCase.execute(receiveInput({ items: [{ purchaseOrderItemId: 999, productId: 101, quantityReceived: 1, unitCost: 2 }] }))).rejects.toThrow(/not found/i);
++    expect(h.purchaseReceiveRepo.create).not.toHaveBeenCalled();
++  });
++
++  it("rejects a product id that does not match its purchase order item before side effects", async () => {
++    const h = receiveHarness(makeOrder());
++    await expect(h.useCase.execute(receiveInput({ items: [{ purchaseOrderItemId: 11, productId: 999, quantityReceived: 1, unitCost: 2 }] }))).rejects.toThrow(/does not match/i);
++    expect(h.warehouseService.recordReceipt).not.toHaveBeenCalled();
++  });
++
++  it("rejects duplicate purchase order item ids in a direct use case call", async () => {
++    const h = receiveHarness(makeOrder());
++    await expect(h.useCase.execute(receiveInput({ items: [
++      { purchaseOrderItemId: 11, productId: 101, quantityReceived: 1, unitCost: 2 },
++      { purchaseOrderItemId: 11, productId: 101, quantityReceived: 2, unitCost: 2 },
++    ] }))).rejects.toThrow(/more than once/i);
++  });
++
++  it("validates the whole mixed receipt before saving any accepted prefix", async () => {
++    const items = [
++      makeOrderItem({ id: 11, productId: 101 }),
++      makeOrderItem({ id: 12, productId: 102, quantityOrdered: 10, unitCost: 3, subtotalCost: 30, quantityRemaining: 10 }),
++    ];
++    const h = receiveHarness(makeOrder({}, items));
++    await expect(h.useCase.execute(receiveInput({ items: [
++      { purchaseOrderItemId: 11, productId: 101, quantityReceived: 1, unitCost: 2 },
++      { purchaseOrderItemId: 999, productId: 102, quantityReceived: 1, unitCost: 3 },
++    ] }))).rejects.toThrow(/not found/i);
++    expect(h.purchaseReceiveRepo.create).not.toHaveBeenCalled();
++  });
++
++  it("asks WarehouseService to skip its generic pending adjustment", async () => {
++    const h = receiveHarness(makeOrder());
++    await h.useCase.execute(receiveInput());
++    expect(h.warehouseService.recordReceipt.mock.calls[0][5]).toEqual({ skipPendingUpdate: true });
++  });
++
++  it("moves the full tolerated physical quantity into the warehouse", async () => {
++    const h = receiveHarness(makeOrder());
++    await h.useCase.execute(receiveInput());
++    expect(h.warehouseService.recordReceipt.mock.calls[0][3][0].quantity).toBe(105);
++  });
++
++  it("releases pending only for the original ordered quantity when overage is received", async () => {
++    const h = receiveHarness(makeOrder());
++    await h.useCase.execute(receiveInput());
++    expect(h.inventoryPendingRepo.adjust).toHaveBeenCalledWith(1, 101, 2, -100, 0, h.client);
++  });
++
++  it("releases only the original remaining commitment after a partial receipt", async () => {
++    const order = makeOrder({}, [makeOrderItem({ quantityReceived: 95, quantityRemaining: 5 })]);
++    const h = receiveHarness(order);
++    await h.useCase.execute(receiveInput({ items: [{ purchaseOrderItemId: 11, productId: 101, quantityReceived: 10, unitCost: 2 }] }));
++    expect(h.inventoryPendingRepo.adjust).toHaveBeenCalledWith(1, 101, 2, -5, 0, h.client);
++  });
++
++  it("does not create pending demand for tolerated overage", async () => {
++    const order = makeOrder({}, [makeOrderItem({ quantityReceived: 100, quantityRemaining: 0 })]);
++    order.updateStatus(DocumentStatus.PARTIALLY_RECEIVED);
++    const h = receiveHarness(order);
++    await h.useCase.execute(receiveInput({ items: [{ purchaseOrderItemId: 11, productId: 101, quantityReceived: 5, unitCost: 2 }] }));
++    expect(h.inventoryPendingRepo.adjust).not.toHaveBeenCalled();
++  });
++
++  it("normalizes accepted receipt quantities to six decimal places before persistence", async () => {
++    const order = makeOrder({ receiveOverageTolerancePercent: 10 }, [makeOrderItem({ quantityOrdered: 3, subtotalCost: 6, quantityReceived: 2, quantityRemaining: 1 })]);
++    const h = receiveHarness(order);
++    await h.useCase.execute(receiveInput({ items: [{ purchaseOrderItemId: 11, productId: 101, quantityReceived: 1.1000004, unitCost: 2 }] }));
++    const receive = h.purchaseReceiveRepo.create.mock.calls[0][0] as PurchaseReceive;
++    expect(receive.toPrimitives().items[0].quantityReceived).toBe(1.1);
++  });
++});
++
++describe("purchase details receive allowance behavior", () => {
++  const detailsHarness = (order: PurchaseOrder) => {
++    const purchaseOrderRepo = { findById: jest.fn().mockResolvedValue(order) };
++    const paymentRepo = { findByPurchaseOrderId: jest.fn().mockResolvedValue([]) };
++    const receiveRepo = { findByPurchaseOrderId: jest.fn().mockResolvedValue([]) };
++    const useCase = new GetPurchaseDetailsUseCase(purchaseOrderRepo as any, paymentRepo as any, receiveRepo as any);
++    return { useCase };
++  };
++
++  it("adds receiveAllowance to purchase details", async () => {
++    const result = await detailsHarness(makeOrder()).useCase.execute(1, 7);
++    expect(result.receiveAllowance).toBeDefined();
++  });
++
++  it("reports the purchase order tolerance in purchase details", async () => {
++    const result = await detailsHarness(makeOrder({ receiveOverageTolerancePercent: 8 })).useCase.execute(1, 7);
++    expect(result.receiveAllowance.tolerancePercent).toBe(8);
++  });
++
++  it("reports the cumulative maximum and current receivable amount per line", async () => {
++    const order = makeOrder({}, [makeOrderItem({ quantityReceived: 90, quantityRemaining: 10 })]);
++    const result = await detailsHarness(order).useCase.execute(1, 7);
++    expect(result.receiveAllowance.items[0]).toEqual(expect.objectContaining({
++      maximumReceivableTotal: 105,
++      quantityRemaining: 10,
++      quantityReceivable: 15,
++    }));
++  });
++
++  it("reports zero receivable amount after the order is closed", async () => {
++    const order = makeOrder({ status: DocumentStatus.CLOSED }, [makeOrderItem({ quantityReceived: 100, quantityRemaining: 0 })]);
++    const result = await detailsHarness(order).useCase.execute(1, 7);
++    expect(result.receiveAllowance.canReceive).toBe(false);
++    expect(result.receiveAllowance.totalReceivable).toBe(0);
++  });
++});
++
++describe("purchase creation applies receive overage tolerance", () => {
++  function createHarness() {
++    const supplier = Partner.create({
++      companyId: 1,
++      fullName: "Supplier",
++      partnerNo: "SUP-1",
++      isSupplier: true,
++      isCustomer: false,
++      isLoanLender: false,
++      isLoanBorrower: false,
++      isWalkIn: false,
++    });
++    const product = Product.hydrate({
++      id: 101,
++      companyId: 1,
++      productNo: "P-101",
++      name: "Widget",
++      unitType: "pcs",
++      boughtPrice: 2,
++      sellingPrice: 3,
++      description: null,
++      reorderLevel: null,
++      isActive: true,
++    });
++    const txManager = { run: jest.fn(async (callback: any) => callback({ token: "client" } as any)) };
++    const purchaseOrderRepository = {
++      createWithItemsPaymentsAndSideEffects: jest.fn(async ({ order }: any) => PurchaseOrder.hydrate({
++        ...order.toPrimitives(),
++        id: 77,
++        items: order.toPrimitives().items.map((item: any, index: number) => ({ ...item, id: index + 1, purchaseOrderId: 77 })),
++      })),
++    } as any;
++    purchaseOrderRepository.createWithItemsPaymentsAndSideEffects.mockImplementation(async ({ order }: any) => ({
++      order: PurchaseOrder.hydrate({
++        ...order.toPrimitives(),
++        id: 77,
++        items: order.toPrimitives().items.map((item: any, index: number) => ({ ...item, id: index + 1, purchaseOrderId: 77 })),
++      }),
++      paymentId: null,
++      receiveId: 88,
++    }));
++    const partnerRepository = { findById: jest.fn().mockResolvedValue(supplier), update: jest.fn() };
++    const productRepository = { findByIds: jest.fn().mockResolvedValue([product]) };
++    const accountTxService = { executeBatch: jest.fn() };
++    const recordLoanTransactionUseCase = { execute: jest.fn(), executeBatch: jest.fn() };
++    const inventoryBalanceRepository = { findByProductsBranch: jest.fn().mockResolvedValue([]) };
++    const inventoryCostRepository = { findByProducts: jest.fn().mockResolvedValue([]) };
++    const useCase = new CreatePurchaseOrderUseCase(
++      txManager as any,
++      purchaseOrderRepository,
++      partnerRepository as any,
++      productRepository as any,
++      accountTxService as any,
++      recordLoanTransactionUseCase as any,
++      inventoryBalanceRepository as any,
++      inventoryCostRepository as any,
++    );
++    return { useCase, purchaseOrderRepository };
++  }
++
++  const createInput = (quantityReceived: number, tolerance: number) => ({
++    companyId: 1,
++    supplierId: 4,
++    orderNo: "PO-CREATE-TOL",
++    orderDate: new Date("2026-07-01T00:00:00.000Z"),
++    expectedReceiveDate: new Date("2026-07-02T00:00:00.000Z"),
++    receiveOption: ReceiveOption.RECEIVED_PARTIALLY,
++    receiveOverageTolerancePercent: tolerance,
++    branchId: 2,
++    items: [{ productId: 101, quantityOrdered: 100, unitCost: 2, quantityReceived }],
++    payments: null,
++  } as any);
++
++  it("allows an initial partial receipt up to the configured tolerance", async () => {
++    const h = createHarness();
++    await expect(h.useCase.execute(createInput(105, 5))).resolves.toEqual({ purchaseOrderId: 77 });
++  });
++
++  it("persists the configured receive tolerance on purchase creation", async () => {
++    const h = createHarness();
++    await h.useCase.execute(createInput(105, 5));
++    const bundle = h.purchaseOrderRepository.createWithItemsPaymentsAndSideEffects.mock.calls[0][0];
++    expect(bundle.order.toPrimitives().receiveOverageTolerancePercent).toBe(5);
++  });
++
++  it("closes a purchase created with an initial tolerated overage", async () => {
++    const h = createHarness();
++    await h.useCase.execute(createInput(105, 5));
++    const bundle = h.purchaseOrderRepository.createWithItemsPaymentsAndSideEffects.mock.calls[0][0];
++    expect(bundle.order.status).toBe(DocumentStatus.CLOSED);
++  });
++
++  it("rejects an initial receipt above tolerance with a tolerance-specific error", async () => {
++    const h = createHarness();
++    await expect(h.useCase.execute(createInput(105.000001, 5))).rejects.toThrow(/tolerance/i);
++  });
++});
+diff --git a/src/modules/purchases/domain/__tests__/PurchaseReceiveOverage.behavior.test.ts b/src/modules/purchases/domain/__tests__/PurchaseReceiveOverage.behavior.test.ts
+new file mode 100644
+index 0000000..becc8b7
+--- /dev/null
++++ b/src/modules/purchases/domain/__tests__/PurchaseReceiveOverage.behavior.test.ts
+@@ -0,0 +1,264 @@
++import { DocumentStatus, PurchaseOrder, PurchaseOrderItem, ReceiveOption } from "../PurchaseOrder";
++import { ValidationError } from "../../../../shared/domain/DomainError";
++import { createPurchaseOrderSchema, recordPurchaseReceiveSchema } from "../../presentation/PurchaseSchemas";
++
++const makeItem = (over: Partial<any> = {}) => PurchaseOrderItem.hydrate({
++  id: 11,
++  purchaseOrderId: 7,
++  productId: 101,
++  quantityOrdered: 100,
++  unitCost: 2,
++  subtotalCost: 200,
++  quantityReceived: 0,
++  quantityRemaining: 100,
++  ...over,
++});
++
++const makeOrder = (over: Partial<any> = {}, items: PurchaseOrderItem[] = [makeItem()]) => PurchaseOrder.hydrate({
++  id: 7,
++  companyId: 1,
++  supplierId: 4,
++  orderNo: "PO-TOL-1",
++  orderDate: new Date("2026-07-01T00:00:00.000Z"),
++  expectedReceiveDate: null,
++  receiveOption: ReceiveOption.RECEIVE_LATER,
++  receiveOverageTolerancePercent: 5,
++  branchId: 2,
++  note: null,
++  totalItemsCost: items.reduce((sum, item) => sum + item.subtotalCost, 0),
++  totalPaidAmount: 0,
++  status: DocumentStatus.OPEN,
++  createdBy: 9,
++  createdAt: new Date("2026-07-01T00:00:00.000Z"),
++  items,
++  ...over,
++} as any);
++
++const createPayload = (over: Record<string, unknown> = {}) => ({
++  supplierId: 4,
++  orderNo: "PO-TOL-1",
++  orderDate: "2026-07-01T00:00:00.000Z",
++  receiveOption: "RECEIVE_LATER",
++  branchId: 2,
++  items: [{ productId: 101, quantityOrdered: 100, unitCost: 2 }],
++  ...over,
++});
++
++describe("purchase receive overage domain behavior", () => {
++  it("defaults a newly created purchase order to zero receive overage tolerance", () => {
++    const order = PurchaseOrder.create({
++      companyId: 1,
++      supplierId: 4,
++      orderNo: "PO-DEFAULT",
++      orderDate: new Date(),
++      receiveOption: ReceiveOption.RECEIVE_LATER,
++      branchId: 2,
++    }, [{ productId: 101, quantityOrdered: 10, unitCost: 2 }]);
++
++    expect(order.toPrimitives().receiveOverageTolerancePercent).toBe(0);
++  });
++
++  it("rejects a negative receive overage tolerance in the purchase order domain", () => {
++    expect(() => PurchaseOrder.create({
++      companyId: 1,
++      supplierId: 4,
++      orderNo: "PO-NEG",
++      orderDate: new Date(),
++      receiveOption: ReceiveOption.RECEIVE_LATER,
++      branchId: 2,
++      receiveOverageTolerancePercent: -0.01,
++    } as any, [{ productId: 101, quantityOrdered: 10, unitCost: 2 }])).toThrow(ValidationError);
++  });
++
++  it("rejects a receive overage tolerance above one hundred percent", () => {
++    expect(() => PurchaseOrder.create({
++      companyId: 1,
++      supplierId: 4,
++      orderNo: "PO-HIGH",
++      orderDate: new Date(),
++      receiveOption: ReceiveOption.RECEIVE_LATER,
++      branchId: 2,
++      receiveOverageTolerancePercent: 100.000001,
++    } as any, [{ productId: 101, quantityOrdered: 10, unitCost: 2 }])).toThrow(/tolerance/i);
++  });
++
++  it("accepts an over-receipt exactly at a five percent cumulative limit", () => {
++    const item = makeItem();
++    (item.recordReceive as any)(105, 5);
++    expect(item.quantityReceived).toBe(105);
++  });
++
++  it("clamps ordered remaining to zero when a tolerated overage is accepted", () => {
++    const item = makeItem();
++    (item.recordReceive as any)(105, 5);
++    expect(item.quantityRemaining).toBe(0);
++  });
++
++  it("rejects a receipt one micro-unit beyond the configured tolerance", () => {
++    const item = makeItem();
++    expect(() => (item.recordReceive as any)(105.000001, 5)).toThrow(/tolerance/i);
++  });
++
++  it("uses the original ordered quantity as the tolerance base after a partial receipt", () => {
++    const item = makeItem({ quantityReceived: 90, quantityRemaining: 10 });
++    (item.recordReceive as any)(15, 5);
++    expect(item.quantityReceived).toBe(105);
++  });
++
++  it("does not compound tolerance from the shrinking remaining quantity", () => {
++    const item = makeItem({ quantityReceived: 90, quantityRemaining: 10 });
++    expect(() => (item.recordReceive as any)(15.000001, 5)).toThrow(/tolerance/i);
++  });
++
++  it("allows a decimal overage exactly on a ten percent boundary", () => {
++    const item = makeItem({ quantityOrdered: 7, subtotalCost: 14, quantityRemaining: 7 });
++    (item.recordReceive as any)(7.7, 10);
++    expect(item.quantityReceived).toBe(7.7);
++  });
++
++  it("rounds cumulative receive math to six decimal places", () => {
++    const item = makeItem({ quantityOrdered: 3, subtotalCost: 6, quantityReceived: 2, quantityRemaining: 1 });
++    (item.recordReceive as any)(1.1000004, 3.333333);
++    expect(item.quantityReceived).toBe(3.1);
++  });
++
++  it("reports the full receivable quantity including tolerance before any receipt", () => {
++    const item = makeItem();
++    expect((item as any).receivableQuantity(5)).toBe(105);
++  });
++
++  it("reports only the unused cumulative allowance after prior receipts", () => {
++    const item = makeItem({ quantityReceived: 99, quantityRemaining: 1 });
++    expect((item as any).receivableQuantity(5)).toBe(6);
++  });
++
++  it("reports zero receivable quantity after the tolerance cap has been consumed", () => {
++    const item = makeItem({ quantityReceived: 105, quantityRemaining: 0 });
++    expect((item as any).receivableQuantity(5)).toBe(0);
++  });
++
++  it("exposes a purchase-order receive allowance using the stored tolerance", () => {
++    const order = makeOrder();
++    const allowance = (order as any).getReceiveAllowance();
++    expect(allowance.tolerancePercent).toBe(5);
++    expect(allowance.items[0].maximumReceivableTotal).toBe(105);
++    expect(allowance.items[0].quantityReceivable).toBe(105);
++  });
++
++  it("includes original remaining and tolerated availability as separate allowance values", () => {
++    const order = makeOrder({}, [makeItem({ quantityReceived: 90, quantityRemaining: 10 })]);
++    const item = (order as any).getReceiveAllowance().items[0];
++    expect(item.quantityRemaining).toBe(10);
++    expect(item.quantityReceivable).toBe(15);
++  });
++
++  it("shows already received overage separately from ordered remaining", () => {
++    const order = makeOrder({}, [makeItem({ quantityReceived: 103, quantityRemaining: 0 })]);
++    const item = (order as any).getReceiveAllowance().items[0];
++    expect(item.overageReceived).toBe(3);
++    expect(item.quantityRemaining).toBe(0);
++  });
++
++  it("marks a line at the original ordered quantity before the tolerance cap", () => {
++    const order = makeOrder({}, [makeItem({ quantityReceived: 100, quantityRemaining: 0 })]);
++    const item = (order as any).getReceiveAllowance().items[0];
++    expect(item.atOrderedQuantity).toBe(true);
++    expect(item.atToleranceLimit).toBe(false);
++  });
++
++  it("marks a line at the tolerance cap when cumulative receipts reach the maximum", () => {
++    const order = makeOrder({}, [makeItem({ quantityReceived: 105, quantityRemaining: 0 })]);
++    const item = (order as any).getReceiveAllowance().items[0];
++    expect(item.atToleranceLimit).toBe(true);
++  });
++
++  it("returns zero receivable allowance for a closed purchase order", () => {
++    const order = makeOrder({ status: DocumentStatus.CLOSED }, [makeItem({ quantityReceived: 100, quantityRemaining: 0 })]);
++    const allowance = (order as any).getReceiveAllowance();
++    expect(allowance.canReceive).toBe(false);
++    expect(allowance.items[0].quantityReceivable).toBe(0);
++  });
++
++  it("returns zero receivable allowance for a cancelled purchase order", () => {
++    const order = makeOrder({ status: DocumentStatus.CANCELLED });
++    const allowance = (order as any).getReceiveAllowance();
++    expect(allowance.canReceive).toBe(false);
++    expect(allowance.totalReceivable).toBe(0);
++  });
++
++  it("summarizes receive allowance across multiple order lines", () => {
++    const items = [
++      makeItem({ id: 11, productId: 101, quantityOrdered: 100, subtotalCost: 200, quantityReceived: 90, quantityRemaining: 10 }),
++      makeItem({ id: 12, productId: 102, quantityOrdered: 20, unitCost: 5, subtotalCost: 100, quantityReceived: 5, quantityRemaining: 15 }),
++    ];
++    const allowance = (makeOrder({}, items) as any).getReceiveAllowance();
++    expect(allowance.totalOrdered).toBe(120);
++    expect(allowance.totalReceived).toBe(95);
++    expect(allowance.totalRemaining).toBe(25);
++    expect(allowance.totalReceivable).toBe(31);
++  });
++
++  it("summarizes cumulative overage across multiple order lines", () => {
++    const items = [
++      makeItem({ id: 11, productId: 101, quantityReceived: 102, quantityRemaining: 0 }),
++      makeItem({ id: 12, productId: 102, quantityOrdered: 20, unitCost: 5, subtotalCost: 100, quantityReceived: 21, quantityRemaining: 0 }),
++    ];
++    const allowance = (makeOrder({}, items) as any).getReceiveAllowance();
++    expect(allowance.totalOverageReceived).toBe(3);
++  });
++});
++
++describe("purchase receive overage request validation", () => {
++  it("defaults receiveOverageTolerancePercent to zero on purchase creation input", () => {
++    const parsed: any = createPurchaseOrderSchema.parse(createPayload());
++    expect(parsed.receiveOverageTolerancePercent).toBe(0);
++  });
++
++  it("preserves an explicit decimal receive overage tolerance", () => {
++    const parsed: any = createPurchaseOrderSchema.parse(createPayload({ receiveOverageTolerancePercent: 7.5 }));
++    expect(parsed.receiveOverageTolerancePercent).toBe(7.5);
++  });
++
++  it("accepts a zero percent receive overage tolerance", () => {
++    const parsed: any = createPurchaseOrderSchema.parse(createPayload({ receiveOverageTolerancePercent: 0 }));
++    expect(parsed.receiveOverageTolerancePercent).toBe(0);
++  });
++
++  it("accepts a one hundred percent receive overage tolerance boundary", () => {
++    const parsed: any = createPurchaseOrderSchema.parse(createPayload({ receiveOverageTolerancePercent: 100 }));
++    expect(parsed.receiveOverageTolerancePercent).toBe(100);
++  });
++
++  it("rejects a negative receive overage tolerance at the request boundary", () => {
++    expect(createPurchaseOrderSchema.safeParse(createPayload({ receiveOverageTolerancePercent: -1 })).success).toBe(false);
++  });
++
++  it("rejects a receive overage tolerance greater than one hundred at the request boundary", () => {
++    expect(createPurchaseOrderSchema.safeParse(createPayload({ receiveOverageTolerancePercent: 100.1 })).success).toBe(false);
++  });
++
++  it("rejects duplicate purchase order item ids in one receipt payload", () => {
++    const result = recordPurchaseReceiveSchema.safeParse({
++      branchId: 2,
++      receiveDate: "2026-07-02T00:00:00.000Z",
++      items: [
++        { purchaseOrderItemId: 11, productId: 101, quantityReceived: 1, unitCost: 2 },
++        { purchaseOrderItemId: 11, productId: 101, quantityReceived: 2, unitCost: 2 },
++      ],
++    });
++    expect(result.success).toBe(false);
++  });
++
++  it("points duplicate receipt validation at the repeated purchaseOrderItemId", () => {
++    const result = recordPurchaseReceiveSchema.safeParse({
++      branchId: 2,
++      receiveDate: "2026-07-02T00:00:00.000Z",
++      items: [
++        { purchaseOrderItemId: 11, productId: 101, quantityReceived: 1, unitCost: 2 },
++        { purchaseOrderItemId: 11, productId: 101, quantityReceived: 2, unitCost: 2 },
++      ],
++    });
++    expect(result.success).toBe(false);
++    if (!result.success) expect(result.error.issues[0].path).toEqual(["items", 1, "purchaseOrderItemId"]);
++  });
++});
