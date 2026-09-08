@@ -1,0 +1,9 @@
+Fix account balance drift by treating the stored account balance as a cached value and rebuilding the authoritative balance from the account ledger.
+
+`GET /api/v1/finance/accounts/:id/balance` must keep its current `{balance}` response shape, but the value should be reconstructed as the account's `openingBalance` plus every account transaction amount except transactions whose `sourceType` is `OPENING_BALANCE`. Opening-balance transactions are audit rows and must not be counted a second time. This rule must also work for older accounts that have no opening-balance transaction.
+
+Add `GET /api/v1/finance/accounts/reconciliation`. It accepts optional `accountId` and `driftOnly` query parameters. The response is `{summary, accounts}`. Each account entry includes `accountId`, `accountHolderName`, `accountType`, `isActive`, `openingBalance`, `storedBalance`, `ledgerBalance`, signed `drift` (`storedBalance - ledgerBalance`), and `inSync`. The summary includes `totalAccounts`, `driftedAccounts`, `storedTotal`, `ledgerTotal`, and signed `netDrift`. `driftOnly=true` filters the returned account rows but does not change the summary for the scanned selection. A requested account outside the company returns 404.
+
+Add `POST /api/v1/finance/accounts/:id/reconcile` to repair only the stored balance from the ledger. Reconciliation must lock the account and calculate the ledger balance in the same transaction so normal postings cannot race the correction. Do not create a synthetic account transaction. Return `{accountId, previousStoredBalance, ledgerBalance, balance, drift, repaired}`; an already-correct account returns `repaired: false` without rewriting it. Normalize reconciliation amounts to cents so floating-point noise never creates false drift. Reading reconciliation requires FINANCE view permission; repairing requires FINANCE update permission.
+
+IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.

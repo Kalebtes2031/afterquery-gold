@@ -1,0 +1,930 @@
+diff --git a/src/modules/expenses/application/__tests__/ExpenseApprovalWorkflow.behavior.test.ts b/src/modules/expenses/application/__tests__/ExpenseApprovalWorkflow.behavior.test.ts
+new file mode 100644
+index 0000000..e8da356
+--- /dev/null
++++ b/src/modules/expenses/application/__tests__/ExpenseApprovalWorkflow.behavior.test.ts
+@@ -0,0 +1,517 @@
++import { Expense, ExpensePayment, ExpenseType, PaymentMethod } from "../../domain/Expense";
++import {
++  ExpenseApprovalAction,
++  ExpenseApprovalBand,
++  ExpenseApprovalDecision,
++  ExpenseStatus
++} from "../../domain/ExpenseApproval";
++import {
++  ApproveExpenseUseCase,
++  GetExpenseApprovalHistoryUseCase,
++  ListExpenseApprovalBandsUseCase,
++  RejectExpenseUseCase,
++  SetExpenseApprovalBandsUseCase,
++  SubmitExpenseUseCase
++} from "../ExpenseApprovalUseCases";
++import { RecordExpenseUseCase } from "../RecordExpenseUseCase";
++
++function makeExpense(overrides: Partial<any> = {}): Expense {
++  return Expense.hydrate({
++    id: 50,
++    companyId: 2,
++    expenseDate: new Date("2026-08-20"),
++    reason: "Generator service",
++    expenseType: ExpenseType.WORK,
++    totalAmount: 600,
++    note: null,
++    createdBy: 10,
++    createdAt: new Date("2026-08-20T12:00:00Z"),
++    requiresApproval: true,
++    status: ExpenseStatus.DRAFT,
++    ...overrides
++  });
++}
++
++function makeBand(overrides: Partial<any> = {}): ExpenseApprovalBand {
++  return ExpenseApprovalBand.hydrate({
++    id: 1,
++    companyId: 2,
++    roleId: 8,
++    minAmount: 0,
++    maxAmount: 1000,
++    canSubmit: true,
++    canApprove: true,
++    canReject: true,
++    createdAt: new Date("2026-08-01"),
++    ...overrides
++  });
++}
++
++function payment(lines: any[]): ExpensePayment {
++  return ExpensePayment.hydrate({
++    id: 70,
++    companyId: 2,
++    expenseId: 50,
++    createdBy: 10,
++    createdAt: new Date("2026-08-20"),
++    lines
++  });
++}
++
++function txManager() {
++  return {
++    run: jest.fn(async (callback: any) => callback({ marker: "client" }))
++  } as any;
++}
++
++function workflowRepo(current: Expense = makeExpense()) {
++  return {
++    findExpenseForUpdate: jest.fn().mockResolvedValue(current),
++    updateStatus: jest.fn().mockResolvedValue(undefined),
++    addDecision: jest.fn(async (decision: ExpenseApprovalDecision) => decision),
++    listDecisions: jest.fn().mockResolvedValue([])
++  } as any;
++}
++
++function bandRepo(bands: ExpenseApprovalBand[] = [makeBand()]) {
++  return {
++    replaceForRole: jest.fn(async (_companyId: number, _roleId: number, incoming: ExpenseApprovalBand[]) => incoming),
++    list: jest.fn().mockResolvedValue(bands)
++  } as any;
++}
++
++function employeeRepo(roleId = 8) {
++  return {
++    findByUserId: jest.fn().mockResolvedValue({ roleId })
++  } as any;
++}
++
++describe("approval band application behavior", () => {
++  it("replaces all bands for a role after confirming the role belongs to the company", async () => {
++    const roleRepo = { findById: jest.fn().mockResolvedValue({ id: 8 }) } as any;
++    const bands = bandRepo([]);
++    const useCase = new SetExpenseApprovalBandsUseCase(roleRepo, bands);
++
++    const result = await useCase.execute(2, 8, [{
++      minAmount: 0,
++      maxAmount: 2500,
++      canSubmit: true,
++      canApprove: false,
++      canReject: false
++    }]);
++
++    expect(roleRepo.findById).toHaveBeenCalledWith(2, 8);
++    expect(bands.replaceForRole).toHaveBeenCalledTimes(1);
++    expect(result[0]).toEqual(expect.objectContaining({ companyId: 2, roleId: 8, maxAmount: 2500 }));
++  });
++
++  it("uses an empty list to clear the role's approval bands", async () => {
++    const roleRepo = { findById: jest.fn().mockResolvedValue({ id: 8 }) } as any;
++    const bands = bandRepo([]);
++    const useCase = new SetExpenseApprovalBandsUseCase(roleRepo, bands);
++
++    const result = await useCase.execute(2, 8, []);
++
++    expect(result).toEqual([]);
++    expect(bands.replaceForRole.mock.calls[0][2]).toEqual([]);
++  });
++
++  it("does not configure a role from another company", async () => {
++    const roleRepo = { findById: jest.fn().mockResolvedValue(null) } as any;
++    const bands = bandRepo([]);
++    const useCase = new SetExpenseApprovalBandsUseCase(roleRepo, bands);
++
++    await expect(useCase.execute(2, 999, [])).rejects.toThrow("Role not found");
++    expect(bands.replaceForRole).not.toHaveBeenCalled();
++  });
++
++  it("returns company bands and forwards an optional role filter", async () => {
++    const bands = bandRepo([makeBand()]);
++    const useCase = new ListExpenseApprovalBandsUseCase(bands);
++
++    const result = await useCase.execute(2, 8);
++
++    expect(bands.list).toHaveBeenCalledWith(2, 8);
++    expect(result).toHaveLength(1);
++    expect(result[0].roleId).toBe(8);
++  });
++});
++
++describe("submitting approval-required expenses", () => {
++  it("moves the creator's draft to submitted and records the actor, role and amount", async () => {
++    const tx = txManager();
++    const workflow = workflowRepo();
++    const bands = bandRepo();
++    const employees = employeeRepo();
++    const useCase = new SubmitExpenseUseCase(tx, workflow, bands, employees);
++
++    const result = await useCase.execute(2, 50, { userId: 10, isOwner: false });
++
++    expect(result).toEqual({ expenseId: 50, status: ExpenseStatus.SUBMITTED });
++    expect(workflow.updateStatus).toHaveBeenCalledWith(2, 50, ExpenseStatus.SUBMITTED, expect.anything());
++    const decision = workflow.addDecision.mock.calls[0][0].toPrimitives();
++    expect(decision).toEqual(expect.objectContaining({
++      action: ExpenseApprovalAction.SUBMITTED,
++      actorUserId: 10,
++      actorRoleId: 8,
++      amount: 600
++    }));
++  });
++
++  it("checks a non-owner's current employee role", async () => {
++    const tx = txManager();
++    const workflow = workflowRepo();
++    const bands = bandRepo();
++    const employees = employeeRepo(8);
++    const useCase = new SubmitExpenseUseCase(tx, workflow, bands, employees);
++
++    await useCase.execute(2, 50, { userId: 10, isOwner: false });
++
++    expect(employees.findByUserId).toHaveBeenCalledWith(2, 10, expect.anything());
++    expect(bands.list).toHaveBeenCalledWith(2, 8, expect.anything());
++  });
++
++  it("does not require an employee row or band lookup for an owner", async () => {
++    const tx = txManager();
++    const workflow = workflowRepo(makeExpense({ createdBy: 99 }));
++    const bands = bandRepo([]);
++    const employees = employeeRepo();
++    const useCase = new SubmitExpenseUseCase(tx, workflow, bands, employees);
++
++    await useCase.execute(2, 50, { userId: 99, isOwner: true });
++
++    expect(employees.findByUserId).not.toHaveBeenCalled();
++    expect(bands.list).not.toHaveBeenCalled();
++  });
++
++  it("does not update state or history when the submit band does not allow the amount", async () => {
++    const tx = txManager();
++    const workflow = workflowRepo();
++    const bands = bandRepo([makeBand({ maxAmount: 599 })]);
++    const useCase = new SubmitExpenseUseCase(tx, workflow, bands, employeeRepo());
++
++    await expect(useCase.execute(2, 50, { userId: 10, isOwner: false }))
++      .rejects.toThrow("not allowed to submit");
++
++    expect(workflow.updateStatus).not.toHaveBeenCalled();
++    expect(workflow.addDecision).not.toHaveBeenCalled();
++  });
++
++  it("returns not found without writing when the expense is outside the company", async () => {
++    const tx = txManager();
++    const workflow = workflowRepo();
++    workflow.findExpenseForUpdate.mockResolvedValue(null);
++    const useCase = new SubmitExpenseUseCase(tx, workflow, bandRepo(), employeeRepo());
++
++    await expect(useCase.execute(2, 50, { userId: 10, isOwner: false })).rejects.toThrow("Expense not found");
++    expect(workflow.updateStatus).not.toHaveBeenCalled();
++  });
++});
++
++describe("approving and posting expenses", () => {
++  function setup(options: { expense?: Expense; storedPayments?: ExpensePayment[]; bands?: ExpenseApprovalBand[] } = {}) {
++    const tx = txManager();
++    const workflow = workflowRepo(options.expense ?? makeExpense({ status: ExpenseStatus.SUBMITTED }));
++    const bands = bandRepo(options.bands ?? [makeBand()]);
++    const employees = employeeRepo();
++    const payments = {
++      findByExpenseId: jest.fn().mockResolvedValue(options.storedPayments ?? [payment([
++        { method: PaymentMethod.CASH, accountId: 5, amount: 600, date: new Date("2026-08-20"), description: null }
++      ])])
++    } as any;
++    const accountTx = { executeBatch: jest.fn().mockResolvedValue(undefined) } as any;
++    const loanTx = { executeBatch: jest.fn().mockResolvedValue(undefined) } as any;
++    const partners = { findByIdForUpdate: jest.fn() } as any;
++    const useCase = new ApproveExpenseUseCase(tx, workflow, bands, employees, payments, accountTx, loanTx, partners);
++    return { tx, workflow, bands, employees, payments, accountTx, loanTx, partners, useCase };
++  }
++
++  it("posts a stored cash payment and then marks the expense approved", async () => {
++    const s = setup();
++
++    const result = await s.useCase.execute(2, 50, { userId: 20, isOwner: false });
++
++    expect(result).toEqual({ expenseId: 50, status: ExpenseStatus.APPROVED });
++    expect(s.payments.findByExpenseId).toHaveBeenCalledWith(2, 50, expect.anything());
++    expect(s.accountTx.executeBatch).toHaveBeenCalledTimes(1);
++    const posted = s.accountTx.executeBatch.mock.calls[0][0][0].toPrimitives();
++    expect(posted).toEqual(expect.objectContaining({ accountId: 5, amount: -600, sourceType: "EXPENSE_PAYMENT", sourceId: 70 }));
++    expect(s.workflow.updateStatus).toHaveBeenCalledWith(2, 50, ExpenseStatus.APPROVED, expect.anything());
++  });
++
++  it("records the approver's role and the expense amount in history", async () => {
++    const s = setup();
++
++    await s.useCase.execute(2, 50, { userId: 20, isOwner: false });
++
++    const decision = s.workflow.addDecision.mock.calls[0][0].toPrimitives();
++    expect(decision).toEqual(expect.objectContaining({
++      action: ExpenseApprovalAction.APPROVED,
++      actorUserId: 20,
++      actorRoleId: 8,
++      amount: 600
++    }));
++  });
++
++  it("posts a partner payment through the loan ledger", async () => {
++    const stored = payment([
++      { method: PaymentMethod.PARTNER, partnerId: 33, amount: 600, date: new Date("2026-08-20"), description: "Partner covered it" }
++    ]);
++    const s = setup({ storedPayments: [stored] });
++    s.partners.findByIdForUpdate.mockResolvedValue({ id: 33, toPrimitives: () => ({ id: 33, loanBalance: 0 }) });
++
++    await s.useCase.execute(2, 50, { userId: 20, isOwner: false });
++
++    expect(s.partners.findByIdForUpdate).toHaveBeenCalledWith(2, 33, expect.anything());
++    expect(s.loanTx.executeBatch).toHaveBeenCalledTimes(1);
++    const loan = s.loanTx.executeBatch.mock.calls[0][0][0];
++    expect(loan).toEqual(expect.objectContaining({ partnerId: 33, amount: -600, sourceId: 50, createdBy: 10 }));
++    expect(s.accountTx.executeBatch).not.toHaveBeenCalled();
++  });
++
++  it("posts mixed payment lines without changing their amounts", async () => {
++    const stored = payment([
++      { method: PaymentMethod.CASH, accountId: 5, amount: 200, date: new Date("2026-08-20") },
++      { method: PaymentMethod.BANK, accountId: 6, amount: 150, date: new Date("2026-08-20") },
++      { method: PaymentMethod.PARTNER, partnerId: 33, amount: 250, date: new Date("2026-08-20") }
++    ]);
++    const s = setup({ storedPayments: [stored] });
++    s.partners.findByIdForUpdate.mockResolvedValue({ id: 33, toPrimitives: () => ({ id: 33, loanBalance: 0 }) });
++
++    await s.useCase.execute(2, 50, { userId: 20, isOwner: false });
++
++    const accountAmounts = s.accountTx.executeBatch.mock.calls[0][0].map((t: any) => t.toPrimitives().amount);
++    expect(accountAmounts).toEqual([-200, -150]);
++    expect(s.loanTx.executeBatch.mock.calls[0][0][0].amount).toBe(-250);
++  });
++
++  it("does not post when stored payment intent is missing", async () => {
++    const s = setup({ storedPayments: [] });
++
++    await expect(s.useCase.execute(2, 50, { userId: 20, isOwner: false }))
++      .rejects.toThrow("Stored expense payments do not equal total expense amount");
++
++    expect(s.accountTx.executeBatch).not.toHaveBeenCalled();
++    expect(s.loanTx.executeBatch).not.toHaveBeenCalled();
++    expect(s.workflow.updateStatus).not.toHaveBeenCalled();
++  });
++
++  it("does not post when stored payment intent no longer totals to the expense", async () => {
++    const s = setup({ storedPayments: [payment([
++      { method: PaymentMethod.CASH, accountId: 5, amount: 599, date: new Date("2026-08-20") }
++    ])] });
++
++    await expect(s.useCase.execute(2, 50, { userId: 20, isOwner: false }))
++      .rejects.toThrow("Stored expense payments do not equal total expense amount");
++
++    expect(s.accountTx.executeBatch).not.toHaveBeenCalled();
++    expect(s.workflow.updateStatus).not.toHaveBeenCalled();
++  });
++
++  it("leaves state unchanged when account posting fails", async () => {
++    const s = setup();
++    s.accountTx.executeBatch.mockRejectedValue(new Error("account write failed"));
++
++    await expect(s.useCase.execute(2, 50, { userId: 20, isOwner: false }))
++      .rejects.toThrow("account write failed");
++
++    expect(s.workflow.updateStatus).not.toHaveBeenCalled();
++    expect(s.workflow.addDecision).not.toHaveBeenCalled();
++  });
++
++  it("leaves state unchanged when partner posting fails", async () => {
++    const s = setup({ storedPayments: [payment([
++      { method: PaymentMethod.PARTNER, partnerId: 33, amount: 600, date: new Date("2026-08-20") }
++    ])] });
++    s.partners.findByIdForUpdate.mockResolvedValue({ id: 33, toPrimitives: () => ({ id: 33, loanBalance: 0 }) });
++    s.loanTx.executeBatch.mockRejectedValue(new Error("loan write failed"));
++
++    await expect(s.useCase.execute(2, 50, { userId: 20, isOwner: false }))
++      .rejects.toThrow("loan write failed");
++
++    expect(s.workflow.updateStatus).not.toHaveBeenCalled();
++    expect(s.workflow.addDecision).not.toHaveBeenCalled();
++  });
++
++  it("never reads or posts payment intent when the approver is the creator", async () => {
++    const s = setup();
++
++    await expect(s.useCase.execute(2, 50, { userId: 10, isOwner: false }))
++      .rejects.toThrow("cannot approve or reject their own expense");
++
++    expect(s.payments.findByExpenseId).not.toHaveBeenCalled();
++    expect(s.accountTx.executeBatch).not.toHaveBeenCalled();
++  });
++
++  it("lets an owner approve someone else's submitted expense without approval bands", async () => {
++    const s = setup({ bands: [] });
++
++    await expect(s.useCase.execute(2, 50, { userId: 99, isOwner: true })).resolves.toEqual({
++      expenseId: 50,
++      status: ExpenseStatus.APPROVED
++    });
++    expect(s.bands.list).not.toHaveBeenCalled();
++    expect(s.employees.findByUserId).not.toHaveBeenCalled();
++  });
++
++  it("does not approve the same expense after it is already approved", async () => {
++    const s = setup({ expense: makeExpense({ status: ExpenseStatus.APPROVED }) });
++
++    await expect(s.useCase.execute(2, 50, { userId: 20, isOwner: false }))
++      .rejects.toThrow("Only submitted expenses can be approved or rejected");
++
++    expect(s.payments.findByExpenseId).not.toHaveBeenCalled();
++    expect(s.accountTx.executeBatch).not.toHaveBeenCalled();
++  });
++});
++
++describe("rejecting expenses", () => {
++  it("moves a submitted expense to rejected and saves the trimmed reason", async () => {
++    const tx = txManager();
++    const workflow = workflowRepo(makeExpense({ status: ExpenseStatus.SUBMITTED }));
++    const useCase = new RejectExpenseUseCase(tx, workflow, bandRepo(), employeeRepo());
++
++    const result = await useCase.execute(2, 50, { userId: 20, isOwner: false }, "  receipt is missing  ");
++
++    expect(result).toEqual({ expenseId: 50, status: ExpenseStatus.REJECTED });
++    expect(workflow.updateStatus).toHaveBeenCalledWith(2, 50, ExpenseStatus.REJECTED, expect.anything());
++    expect(workflow.addDecision.mock.calls[0][0].toPrimitives()).toEqual(expect.objectContaining({
++      action: ExpenseApprovalAction.REJECTED,
++      actorUserId: 20,
++      actorRoleId: 8,
++      reason: "receipt is missing"
++    }));
++  });
++
++  it("rejects an empty reason before changing state", async () => {
++    const tx = txManager();
++    const workflow = workflowRepo(makeExpense({ status: ExpenseStatus.SUBMITTED }));
++    const useCase = new RejectExpenseUseCase(tx, workflow, bandRepo(), employeeRepo());
++
++    await expect(useCase.execute(2, 50, { userId: 20, isOwner: false }, "   "))
++      .rejects.toThrow("Rejection reason is required");
++
++    expect(workflow.updateStatus).not.toHaveBeenCalled();
++    expect(workflow.addDecision).not.toHaveBeenCalled();
++  });
++
++  it("allows an owner to reject another user's submitted expense without bands", async () => {
++    const tx = txManager();
++    const workflow = workflowRepo(makeExpense({ status: ExpenseStatus.SUBMITTED }));
++    const bands = bandRepo([]);
++    const employees = employeeRepo();
++    const useCase = new RejectExpenseUseCase(tx, workflow, bands, employees);
++
++    await useCase.execute(2, 50, { userId: 99, isOwner: true }, "Duplicate request");
++
++    expect(bands.list).not.toHaveBeenCalled();
++    expect(employees.findByUserId).not.toHaveBeenCalled();
++    expect(workflow.updateStatus).toHaveBeenCalled();
++  });
++});
++
++describe("approval history", () => {
++  it("returns stored decisions in repository order", async () => {
++    const first = ExpenseApprovalDecision.hydrate({
++      id: 1,
++      companyId: 2,
++      expenseId: 50,
++      action: ExpenseApprovalAction.SUBMITTED,
++      actorUserId: 10,
++      actorRoleId: 8,
++      amount: 600,
++      reason: null,
++      createdAt: new Date("2026-08-20T12:00:00Z")
++    });
++    const second = ExpenseApprovalDecision.hydrate({
++      id: 2,
++      companyId: 2,
++      expenseId: 50,
++      action: ExpenseApprovalAction.APPROVED,
++      actorUserId: 20,
++      actorRoleId: 8,
++      amount: 600,
++      reason: null,
++      createdAt: new Date("2026-08-20T13:00:00Z")
++    });
++    const workflow = workflowRepo();
++    workflow.listDecisions.mockResolvedValue([first, second]);
++    const expenses = { findById: jest.fn().mockResolvedValue(makeExpense()) } as any;
++    const useCase = new GetExpenseApprovalHistoryUseCase(workflow, expenses);
++
++    const result = await useCase.execute(2, 50);
++
++    expect(result.map((d) => d.action)).toEqual([ExpenseApprovalAction.SUBMITTED, ExpenseApprovalAction.APPROVED]);
++  });
++
++  it("does not expose another company's expense history", async () => {
++    const workflow = workflowRepo();
++    const expenses = { findById: jest.fn().mockResolvedValue(null) } as any;
++    const useCase = new GetExpenseApprovalHistoryUseCase(workflow, expenses);
++
++    await expect(useCase.execute(2, 50)).rejects.toThrow("Expense not found");
++    expect(workflow.listDecisions).not.toHaveBeenCalled();
++  });
++});
++
++describe("recording an expense that requires approval", () => {
++  function setupRecorder() {
++    const tx = txManager();
++    const expenses = {
++      save: jest.fn(async (e: Expense) => Expense.hydrate({ ...e.toPrimitives(), id: 50 }))
++    } as any;
++    const payments = {
++      savePayment: jest.fn(async (p: ExpensePayment) => ExpensePayment.hydrate({ ...p.toPrimitives(), id: 70 }))
++    } as any;
++    const accountTx = { executeBatch: jest.fn() } as any;
++    const loanTx = { executeBatch: jest.fn() } as any;
++    const partners = { findByIdForUpdate: jest.fn() } as any;
++    const useCase = new RecordExpenseUseCase(tx, expenses, payments, accountTx, loanTx, partners);
++    return { tx, expenses, payments, accountTx, loanTx, partners, useCase };
++  }
++
++  const input = {
++    companyId: 2,
++    expenseDate: new Date("2026-08-20"),
++    reason: "Generator service",
++    expenseType: ExpenseType.WORK,
++    totalAmount: 600,
++    createdBy: 10,
++    payments: [
++      { method: PaymentMethod.CASH, accountId: 5, amount: 600, date: new Date("2026-08-20") }
++    ]
++  };
++
++  it("stores approval-required payment lines as intent without posting them", async () => {
++    const s = setupRecorder();
++
++    const result = await s.useCase.execute({ ...input, requiresApproval: true });
++
++    expect(result).toEqual({ expenseId: 50, status: ExpenseStatus.DRAFT });
++    expect(s.payments.savePayment).toHaveBeenCalledTimes(1);
++    expect(s.accountTx.executeBatch).not.toHaveBeenCalled();
++    expect(s.loanTx.executeBatch).not.toHaveBeenCalled();
++  });
++
++  it("persists approval-required expenses as drafts", async () => {
++    const s = setupRecorder();
++
++    await s.useCase.execute({ ...input, requiresApproval: true });
++
++    const saved = s.expenses.save.mock.calls[0][0] as Expense;
++    expect(saved.requiresApproval).toBe(true);
++    expect(saved.status).toBe(ExpenseStatus.DRAFT);
++  });
++
++  it("keeps the legacy response and immediate account posting when approval is not requested", async () => {
++    const s = setupRecorder();
++
++    const result = await s.useCase.execute(input);
++
++    expect(result).toEqual({ expenseId: 50 });
++    expect(s.accountTx.executeBatch).toHaveBeenCalledTimes(1);
++    const saved = s.expenses.save.mock.calls[0][0] as Expense;
++    expect(saved.requiresApproval).toBe(false);
++    expect(saved.status).toBe(ExpenseStatus.POSTED);
++  });
++});
+diff --git a/src/modules/expenses/domain/__tests__/ExpenseApprovalGate.behavior.test.ts b/src/modules/expenses/domain/__tests__/ExpenseApprovalGate.behavior.test.ts
+new file mode 100644
+index 0000000..4c75e53
+--- /dev/null
++++ b/src/modules/expenses/domain/__tests__/ExpenseApprovalGate.behavior.test.ts
+@@ -0,0 +1,302 @@
++import { Expense, ExpenseType } from "../Expense";
++import {
++  ExpenseApprovalAction,
++  ExpenseApprovalBand,
++  ExpenseApprovalDecision,
++  ExpenseApprovalGate,
++  ExpenseStatus
++} from "../ExpenseApproval";
++
++function expense(overrides: Partial<any> = {}): Expense {
++  return Expense.hydrate({
++    id: 44,
++    companyId: 7,
++    expenseDate: new Date("2026-08-01"),
++    reason: "Warehouse repair",
++    expenseType: ExpenseType.WORK,
++    totalAmount: 500,
++    createdBy: 11,
++    createdAt: new Date("2026-08-01T10:00:00Z"),
++    requiresApproval: true,
++    status: ExpenseStatus.DRAFT,
++    ...overrides
++  });
++}
++
++function band(overrides: Partial<any> = {}): ExpenseApprovalBand {
++  return ExpenseApprovalBand.create({
++    companyId: 7,
++    roleId: 3,
++    minAmount: 0,
++    maxAmount: 1000,
++    canSubmit: true,
++    canApprove: true,
++    canReject: true,
++    ...overrides
++  });
++}
++
++const employee = { userId: 11, isOwner: false, roleId: 3 };
++const manager = { userId: 12, isOwner: false, roleId: 3 };
++const owner = { userId: 99, isOwner: true, roleId: null };
++
++describe("ExpenseApprovalBand amount rules", () => {
++  it("matches an amount exactly at the minimum", () => {
++    expect(band({ minAmount: 500, maxAmount: 900 }).matches(500, "approve")).toBe(true);
++  });
++
++  it("matches an amount exactly at the maximum", () => {
++    expect(band({ minAmount: 100, maxAmount: 500 }).matches(500, "approve")).toBe(true);
++  });
++
++  it("treats a null maximum as unbounded", () => {
++    expect(band({ minAmount: 1000, maxAmount: null }).matches(9000000, "approve")).toBe(true);
++  });
++
++  it("does not match below the minimum", () => {
++    expect(band({ minAmount: 501 }).matches(500, "approve")).toBe(false);
++  });
++
++  it("does not match above a finite maximum", () => {
++    expect(band({ maxAmount: 499 }).matches(500, "approve")).toBe(false);
++  });
++
++  it("checks the permission for the requested action", () => {
++    const onlySubmit = band({ canSubmit: true, canApprove: false, canReject: false });
++    expect(onlySubmit.matches(500, "submit")).toBe(true);
++    expect(onlySubmit.matches(500, "approve")).toBe(false);
++    expect(onlySubmit.matches(500, "reject")).toBe(false);
++  });
++
++  it("rejects a negative minimum", () => {
++    expect(() => band({ minAmount: -0.01 })).toThrow("minimum amount must be zero or greater");
++  });
++
++  it("rejects a maximum below the minimum", () => {
++    expect(() => band({ minAmount: 500, maxAmount: 499.99 })).toThrow("maximum amount must be greater than or equal");
++  });
++
++  it("rejects a band with no allowed action", () => {
++    expect(() => band({ canSubmit: false, canApprove: false, canReject: false })).toThrow("must allow at least one action");
++  });
++});
++
++describe("ExpenseApprovalGate submission rules", () => {
++  it("lets the creator submit when their role has a matching submit band", () => {
++    expect(() => ExpenseApprovalGate.assertCanSubmit(expense(), employee, [band()])).not.toThrow();
++  });
++
++  it("denies submission by somebody other than the creator", () => {
++    expect(() => ExpenseApprovalGate.assertCanSubmit(expense(), manager, [band()]))
++      .toThrow("Only the expense creator can submit it");
++  });
++
++  it("lets an owner submit their own draft without any bands", () => {
++    expect(() => ExpenseApprovalGate.assertCanSubmit(expense({ createdBy: 99 }), owner, [])).not.toThrow();
++  });
++
++  it("still requires an owner to be the creator when submitting", () => {
++    expect(() => ExpenseApprovalGate.assertCanSubmit(expense({ createdBy: 11 }), owner, []))
++      .toThrow("Only the expense creator can submit it");
++  });
++
++  it("denies a non-owner with no employee role", () => {
++    expect(() => ExpenseApprovalGate.assertCanSubmit(expense(), { ...employee, roleId: null }, [band()]))
++      .toThrow("employee role is required");
++  });
++
++  it("denies a role whose band does not cover the amount", () => {
++    expect(() => ExpenseApprovalGate.assertCanSubmit(expense(), employee, [band({ maxAmount: 499.99 })]))
++      .toThrow("not allowed to submit");
++  });
++
++  it("denies a role whose amount band lacks submit permission", () => {
++    expect(() => ExpenseApprovalGate.assertCanSubmit(expense(), employee, [band({ canSubmit: false })]))
++      .toThrow("not allowed to submit");
++  });
++
++  it("does not allow a submitted expense to be submitted again", () => {
++    expect(() => ExpenseApprovalGate.assertCanSubmit(expense({ status: ExpenseStatus.SUBMITTED }), employee, [band()]))
++      .toThrow("Only draft expenses can be submitted");
++  });
++
++  it("does not put a legacy posted expense into the approval flow", () => {
++    expect(() => ExpenseApprovalGate.assertCanSubmit(
++      expense({ requiresApproval: false, status: ExpenseStatus.POSTED }),
++      employee,
++      [band()]
++    )).toThrow("does not require approval");
++  });
++});
++
++describe("ExpenseApprovalGate approve and reject rules", () => {
++  const submitted = () => expense({ status: ExpenseStatus.SUBMITTED });
++
++  it("lets a different employee approve with a matching band", () => {
++    expect(() => ExpenseApprovalGate.assertCanApprove(submitted(), manager, [band()])).not.toThrow();
++  });
++
++  it("lets a different employee reject with a matching band", () => {
++    expect(() => ExpenseApprovalGate.assertCanReject(submitted(), manager, [band()])).not.toThrow();
++  });
++
++  it("never lets a creator approve their own expense", () => {
++    expect(() => ExpenseApprovalGate.assertCanApprove(submitted(), employee, [band()]))
++      .toThrow("cannot approve or reject their own expense");
++  });
++
++  it("never lets an owner approve their own expense", () => {
++    expect(() => ExpenseApprovalGate.assertCanApprove(
++      Expense.hydrate({ ...submitted().toPrimitives(), createdBy: 99 }),
++      owner,
++      []
++    )).toThrow("cannot approve or reject their own expense");
++  });
++
++  it("lets an owner approve somebody else's submitted expense without bands", () => {
++    expect(() => ExpenseApprovalGate.assertCanApprove(submitted(), owner, [])).not.toThrow();
++  });
++
++  it("lets an owner reject somebody else's submitted expense without bands", () => {
++    expect(() => ExpenseApprovalGate.assertCanReject(submitted(), owner, [])).not.toThrow();
++  });
++
++  it("denies approval when a matching band only grants rejection", () => {
++    expect(() => ExpenseApprovalGate.assertCanApprove(
++      submitted(),
++      manager,
++      [band({ canApprove: false, canReject: true })]
++    )).toThrow("not allowed to approve");
++  });
++
++  it("denies rejection when a matching band only grants approval", () => {
++    expect(() => ExpenseApprovalGate.assertCanReject(
++      submitted(),
++      manager,
++      [band({ canReject: false, canApprove: true })]
++    )).toThrow("not allowed to reject");
++  });
++
++  it("does not let a draft be approved", () => {
++    expect(() => ExpenseApprovalGate.assertCanApprove(expense(), manager, [band()]))
++      .toThrow("Only submitted expenses can be approved or rejected");
++  });
++
++  it("does not let an approved expense be rejected later", () => {
++    expect(() => ExpenseApprovalGate.assertCanReject(
++      expense({ status: ExpenseStatus.APPROVED }),
++      manager,
++      [band()]
++    )).toThrow("Only submitted expenses can be approved or rejected");
++  });
++
++  it("uses any matching band for the actor role", () => {
++    const bands = [
++      band({ minAmount: 0, maxAmount: 100, canApprove: true }),
++      band({ minAmount: 101, maxAmount: 1000, canApprove: true })
++    ];
++    expect(() => ExpenseApprovalGate.assertCanApprove(submitted(), manager, bands)).not.toThrow();
++  });
++
++  it("does not borrow permission from another role's band", () => {
++    expect(() => ExpenseApprovalGate.assertCanApprove(
++      submitted(),
++      manager,
++      [band({ roleId: 4 })]
++    )).toThrow("not allowed to approve");
++  });
++});
++
++describe("Expense approval decisions", () => {
++  it("trims and keeps a rejection reason", () => {
++    const decision = ExpenseApprovalDecision.create({
++      companyId: 7,
++      expenseId: 44,
++      action: ExpenseApprovalAction.REJECTED,
++      actorUserId: 12,
++      actorRoleId: 3,
++      amount: 500,
++      reason: "  missing receipt  "
++    });
++    expect(decision.toPrimitives().reason).toBe("missing receipt");
++  });
++
++  it("rejects an empty rejection reason", () => {
++    expect(() => ExpenseApprovalDecision.create({
++      companyId: 7,
++      expenseId: 44,
++      action: ExpenseApprovalAction.REJECTED,
++      actorUserId: 12,
++      actorRoleId: 3,
++      amount: 500,
++      reason: "   "
++    })).toThrow("Rejection reason is required");
++  });
++
++  it("rejects a rejection reason longer than 1000 characters", () => {
++    expect(() => ExpenseApprovalDecision.create({
++      companyId: 7,
++      expenseId: 44,
++      action: ExpenseApprovalAction.REJECTED,
++      actorUserId: 12,
++      actorRoleId: 3,
++      amount: 500,
++      reason: "x".repeat(1001)
++    })).toThrow("1000 characters or fewer");
++  });
++
++  it("allows exactly 1000 characters in a rejection reason", () => {
++    const reason = "x".repeat(1000);
++    const decision = ExpenseApprovalDecision.create({
++      companyId: 7,
++      expenseId: 44,
++      action: ExpenseApprovalAction.REJECTED,
++      actorUserId: 12,
++      actorRoleId: 3,
++      amount: 500,
++      reason
++    });
++    expect(decision.toPrimitives().reason).toHaveLength(1000);
++  });
++
++  it("allows submit and approve decisions without a reason", () => {
++    for (const action of [ExpenseApprovalAction.SUBMITTED, ExpenseApprovalAction.APPROVED]) {
++      expect(() => ExpenseApprovalDecision.create({
++        companyId: 7,
++        expenseId: 44,
++        action,
++        actorUserId: 12,
++        actorRoleId: 3,
++        amount: 500,
++        reason: null
++      })).not.toThrow();
++    }
++  });
++});
++
++describe("Expense approval state defaults", () => {
++  it("keeps ordinary expenses posted by default", () => {
++    const ordinary = Expense.create({
++      companyId: 7,
++      expenseDate: new Date("2026-08-01"),
++      reason: "Fuel",
++      expenseType: ExpenseType.WORK,
++      totalAmount: 50
++    });
++    expect(ordinary.requiresApproval).toBe(false);
++    expect(ordinary.status).toBe(ExpenseStatus.POSTED);
++  });
++
++  it("starts approval-required expenses as drafts", () => {
++    const approvalRequired = Expense.create({
++      companyId: 7,
++      expenseDate: new Date("2026-08-01"),
++      reason: "Fuel",
++      expenseType: ExpenseType.WORK,
++      totalAmount: 50,
++      requiresApproval: true
++    });
++    expect(approvalRequired.requiresApproval).toBe(true);
++    expect(approvalRequired.status).toBe(ExpenseStatus.DRAFT);
++  });
++});
+diff --git a/src/modules/expenses/presentation/__tests__/ExpenseApprovalSchemas.behavior.test.ts b/src/modules/expenses/presentation/__tests__/ExpenseApprovalSchemas.behavior.test.ts
+new file mode 100644
+index 0000000..12ea103
+--- /dev/null
++++ b/src/modules/expenses/presentation/__tests__/ExpenseApprovalSchemas.behavior.test.ts
+@@ -0,0 +1,93 @@
++import {
++  listExpenseApprovalBandsSchema,
++  recordExpenseSchema,
++  rejectExpenseSchema,
++  setExpenseApprovalBandsSchema
++} from "../ExpenseSchemas";
++
++const expenseBody = {
++  expenseDate: "2026-08-20",
++  reason: "Generator service",
++  expenseType: "WORK",
++  totalAmount: 600,
++  payments: [
++    { method: "CASH", accountId: 5, amount: 600, date: "2026-08-20" }
++  ]
++};
++
++describe("expense approval request schemas", () => {
++  it("defaults requiresApproval to false for existing callers", () => {
++    expect(recordExpenseSchema.parse(expenseBody).requiresApproval).toBe(false);
++  });
++
++  it("accepts requiresApproval true", () => {
++    expect(recordExpenseSchema.parse({ ...expenseBody, requiresApproval: true }).requiresApproval).toBe(true);
++  });
++
++  it("rejects non-boolean requiresApproval values", () => {
++    expect(recordExpenseSchema.safeParse({ ...expenseBody, requiresApproval: "yes" }).success).toBe(false);
++  });
++
++  it("accepts an empty band list so a role can be cleared", () => {
++    expect(setExpenseApprovalBandsSchema.parse({ bands: [] })).toEqual({ bands: [] });
++  });
++
++  it("accepts an unbounded band with a null maximum", () => {
++    const result = setExpenseApprovalBandsSchema.parse({
++      bands: [{
++        minAmount: 1000,
++        maxAmount: null,
++        canSubmit: false,
++        canApprove: true,
++        canReject: true
++      }]
++    });
++    expect(result.bands[0].maxAmount).toBeNull();
++  });
++
++  it("requires all three action flags on each band", () => {
++    expect(setExpenseApprovalBandsSchema.safeParse({
++      bands: [{ minAmount: 0, maxAmount: 100, canSubmit: true, canApprove: true }]
++    }).success).toBe(false);
++  });
++
++  it("rejects a negative band minimum before application validation", () => {
++    expect(setExpenseApprovalBandsSchema.safeParse({
++      bands: [{ minAmount: -1, maxAmount: 100, canSubmit: true, canApprove: false, canReject: false }]
++    }).success).toBe(false);
++  });
++
++  it("rejects a negative finite maximum", () => {
++    expect(setExpenseApprovalBandsSchema.safeParse({
++      bands: [{ minAmount: 0, maxAmount: -1, canSubmit: true, canApprove: false, canReject: false }]
++    }).success).toBe(false);
++  });
++
++  it("coerces a roleId query parameter to a positive number", () => {
++    expect(listExpenseApprovalBandsSchema.parse({ roleId: "8" }).roleId).toBe(8);
++  });
++
++  it("normalizes an omitted roleId filter the same way as other optional query ids", () => {
++    expect(listExpenseApprovalBandsSchema.parse({}).roleId).toBeNull();
++  });
++
++  it("rejects zero as a roleId filter", () => {
++    expect(listExpenseApprovalBandsSchema.safeParse({ roleId: "0" }).success).toBe(false);
++  });
++
++  it("trims a rejection reason", () => {
++    expect(rejectExpenseSchema.parse({ reason: "  missing receipt  " }).reason).toBe("missing receipt");
++  });
++
++  it("rejects an empty rejection reason", () => {
++    expect(rejectExpenseSchema.safeParse({ reason: "   " }).success).toBe(false);
++  });
++
++  it("accepts a rejection reason of exactly 1000 characters", () => {
++    expect(rejectExpenseSchema.safeParse({ reason: "x".repeat(1000) }).success).toBe(true);
++  });
++
++  it("rejects a rejection reason longer than 1000 characters", () => {
++    expect(rejectExpenseSchema.safeParse({ reason: "x".repeat(1001) }).success).toBe(false);
++  });
++});

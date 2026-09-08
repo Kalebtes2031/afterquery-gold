@@ -1,0 +1,17 @@
+version = "1"
+
+[task]
+name = "reporting-period-close-lock"
+category = "enhancement"
+display_title = "Reporting period close lock"
+description = "Add company-scoped period-close eligibility and block backdated financial and inventory mutations after reporting is closed."
+base_commit = "0b40f7e7515a05dbcadff4942d353af4ef02954f"
+attempt_timeout_seconds = 5400
+verification_timeout_seconds = 1800
+
+[repository]
+workdir = "/app"
+
+[verifier]
+config = "tests/config.json"
+test_script = "tests/test.sh"

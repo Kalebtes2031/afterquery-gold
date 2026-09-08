@@ -1,0 +1,17 @@
+version = "1"
+
+[task]
+name = "expense-approval-gate"
+category = "feature"
+display_title = "Expense approval gate"
+description = "Add role- and amount-based approval for expenses, deferring financial posting until an authorized approval decision."
+base_commit = "0b40f7e7515a05dbcadff4942d353af4ef02954f"
+attempt_timeout_seconds = 5400
+verification_timeout_seconds = 1800
+
+[repository]
+workdir = "/app"
+
+[verifier]
+config = "tests/config.json"
+test_script = "tests/test.sh"

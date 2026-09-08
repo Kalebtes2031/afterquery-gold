@@ -1,0 +1,1284 @@
+diff --git a/db/migrations/035_expense_approval_gate.sql b/db/migrations/035_expense_approval_gate.sql
+new file mode 100644
+index 0000000..eedff1a
+--- /dev/null
++++ b/db/migrations/035_expense_approval_gate.sql
+@@ -0,0 +1,57 @@
++-- Expense approval workflow and role/amount approval bands.
++
++CREATE TYPE expense_approval_status AS ENUM (
++  'POSTED',
++  'DRAFT',
++  'SUBMITTED',
++  'APPROVED',
++  'REJECTED'
++);
++
++CREATE TYPE expense_approval_action AS ENUM (
++  'SUBMITTED',
++  'APPROVED',
++  'REJECTED'
++);
++
++ALTER TABLE expense
++  ADD COLUMN requires_approval BOOLEAN NOT NULL DEFAULT FALSE,
++  ADD COLUMN approval_status expense_approval_status NOT NULL DEFAULT 'POSTED',
++  ADD COLUMN approval_updated_at TIMESTAMPTZ;
++
++CREATE TABLE expense_approval_band (
++  id          BIGSERIAL PRIMARY KEY,
++  company_id  BIGINT NOT NULL REFERENCES company(id) ON DELETE CASCADE,
++  role_id     BIGINT NOT NULL REFERENCES role(id) ON DELETE CASCADE,
++  min_amount  NUMERIC(18,2) NOT NULL,
++  max_amount  NUMERIC(18,2),
++  can_submit  BOOLEAN NOT NULL DEFAULT FALSE,
++  can_approve BOOLEAN NOT NULL DEFAULT FALSE,
++  can_reject  BOOLEAN NOT NULL DEFAULT FALSE,
++  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++  CONSTRAINT chk_expense_approval_band_min CHECK (min_amount >= 0),
++  CONSTRAINT chk_expense_approval_band_max CHECK (max_amount IS NULL OR max_amount >= min_amount),
++  CONSTRAINT chk_expense_approval_band_action CHECK (can_submit OR can_approve OR can_reject)
++);
++
++CREATE INDEX idx_expense_approval_band_company_role_amount
++  ON expense_approval_band(company_id, role_id, min_amount, max_amount);
++
++CREATE TABLE expense_approval_decision (
++  id            BIGSERIAL PRIMARY KEY,
++  company_id    BIGINT NOT NULL REFERENCES company(id) ON DELETE CASCADE,
++  expense_id    BIGINT NOT NULL REFERENCES expense(id) ON DELETE CASCADE,
++  action        expense_approval_action NOT NULL,
++  actor_user_id BIGINT NOT NULL REFERENCES user_account(id),
++  actor_role_id BIGINT REFERENCES role(id),
++  amount        NUMERIC(18,2) NOT NULL,
++  reason        TEXT,
++  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++  CONSTRAINT chk_expense_approval_decision_amount CHECK (amount > 0),
++  CONSTRAINT chk_expense_rejection_reason CHECK (
++    action <> 'REJECTED' OR (reason IS NOT NULL AND length(btrim(reason)) BETWEEN 1 AND 1000)
++  )
++);
++
++CREATE INDEX idx_expense_approval_decision_history
++  ON expense_approval_decision(company_id, expense_id, created_at ASC, id ASC);
+diff --git a/src/modules/expenses/application/ExpenseApprovalUseCases.ts b/src/modules/expenses/application/ExpenseApprovalUseCases.ts
+new file mode 100644
+index 0000000..8abdb04
+--- /dev/null
++++ b/src/modules/expenses/application/ExpenseApprovalUseCases.ts
+@@ -0,0 +1,268 @@
++import { PoolClient } from "pg";
++import { TransactionManager } from "../../../shared/infrastructure/transactions/TransactionManager";
++import { EntityNotFoundError, ValidationError } from "../../../shared/domain/DomainError";
++import { RoleRepository } from "../../roles/domain/Role";
++import { EmployeeRepository } from "../../employees/domain/Employee";
++import { Partner, PartnerRepository } from "../../partners/domain/Partner";
++import { AccountTransaction } from "../../finance/domain/AccountTransaction";
++import { RecordAccountTransactionUseCase } from "../../finance/application/RecordAccountTransactionUseCase";
++import { RecordLoanTransactionUseCase } from "../../finance/application/RecordLoanTransactionUseCase";
++import { LoanTransactionSourceType } from "../../finance/domain/LoanTransaction";
++import { ExpensePaymentRepository, PaymentMethod } from "../domain/Expense";
++import {
++  ExpenseApprovalAction,
++  ExpenseApprovalActor,
++  ExpenseApprovalBand,
++  ExpenseApprovalBandRepository,
++  ExpenseApprovalDecision,
++  ExpenseApprovalGate,
++  ExpenseApprovalWorkflowRepository,
++  ExpenseStatus
++} from "../domain/ExpenseApproval";
++
++export interface ApprovalBandInput {
++  minAmount: number;
++  maxAmount: number | null;
++  canSubmit: boolean;
++  canApprove: boolean;
++  canReject: boolean;
++}
++
++export class SetExpenseApprovalBandsUseCase {
++  constructor(
++    private readonly roleRepo: RoleRepository,
++    private readonly bandRepo: ExpenseApprovalBandRepository
++  ) {}
++
++  async execute(companyId: number, roleId: number, inputs: ApprovalBandInput[]): Promise<any[]> {
++    const role = await this.roleRepo.findById(companyId, roleId);
++    if (!role) throw new EntityNotFoundError("Role not found");
++
++    const bands = inputs.map((input) => ExpenseApprovalBand.create({
++      companyId,
++      roleId,
++      minAmount: input.minAmount,
++      maxAmount: input.maxAmount,
++      canSubmit: input.canSubmit,
++      canApprove: input.canApprove,
++      canReject: input.canReject
++    }));
++
++    const saved = await this.bandRepo.replaceForRole(companyId, roleId, bands);
++    return saved.map((band) => band.toPrimitives());
++  }
++}
++
++export class ListExpenseApprovalBandsUseCase {
++  constructor(private readonly bandRepo: ExpenseApprovalBandRepository) {}
++
++  async execute(companyId: number, roleId?: number | null): Promise<any[]> {
++    const bands = await this.bandRepo.list(companyId, roleId ?? null);
++    return bands.map((band) => band.toPrimitives());
++  }
++}
++
++export interface ApprovalActorInput {
++  userId: number;
++  isOwner: boolean;
++}
++
++abstract class ExpenseApprovalActionUseCase {
++  constructor(
++    protected readonly txManager: TransactionManager,
++    protected readonly workflowRepo: ExpenseApprovalWorkflowRepository,
++    protected readonly bandRepo: ExpenseApprovalBandRepository,
++    protected readonly employeeRepo: EmployeeRepository
++  ) {}
++
++  protected async resolveActor(companyId: number, input: ApprovalActorInput, client: PoolClient): Promise<ExpenseApprovalActor> {
++    if (input.isOwner) {
++      return { userId: input.userId, isOwner: true, roleId: null };
++    }
++    const employee = await this.employeeRepo.findByUserId(companyId, input.userId, client);
++    return {
++      userId: input.userId,
++      isOwner: false,
++      roleId: employee?.roleId ?? null
++    };
++  }
++
++  protected async bandsFor(companyId: number, actor: ExpenseApprovalActor, client: PoolClient): Promise<ExpenseApprovalBand[]> {
++    if (actor.isOwner || !actor.roleId) return [];
++    return this.bandRepo.list(companyId, actor.roleId, client);
++  }
++}
++
++export class SubmitExpenseUseCase extends ExpenseApprovalActionUseCase {
++  async execute(companyId: number, expenseId: number, actorInput: ApprovalActorInput): Promise<{ expenseId: number; status: ExpenseStatus }> {
++    return this.txManager.run(async (client) => {
++      const expense = await this.workflowRepo.findExpenseForUpdate(companyId, expenseId, client);
++      if (!expense) throw new EntityNotFoundError("Expense not found");
++
++      const actor = await this.resolveActor(companyId, actorInput, client);
++      const bands = await this.bandsFor(companyId, actor, client);
++      ExpenseApprovalGate.assertCanSubmit(expense, actor, bands);
++
++      await this.workflowRepo.updateStatus(companyId, expenseId, ExpenseStatus.SUBMITTED, client);
++      await this.workflowRepo.addDecision(ExpenseApprovalDecision.create({
++        companyId,
++        expenseId,
++        action: ExpenseApprovalAction.SUBMITTED,
++        actorUserId: actor.userId,
++        actorRoleId: actor.roleId,
++        amount: expense.totalAmount,
++        reason: null
++      }), client);
++
++      return { expenseId, status: ExpenseStatus.SUBMITTED };
++    });
++  }
++}
++
++export class ApproveExpenseUseCase extends ExpenseApprovalActionUseCase {
++  constructor(
++    txManager: TransactionManager,
++    workflowRepo: ExpenseApprovalWorkflowRepository,
++    bandRepo: ExpenseApprovalBandRepository,
++    employeeRepo: EmployeeRepository,
++    private readonly paymentRepo: ExpensePaymentRepository,
++    private readonly accountTxService: RecordAccountTransactionUseCase,
++    private readonly recordLoanTransactionUseCase: RecordLoanTransactionUseCase,
++    private readonly partnerRepo: PartnerRepository
++  ) {
++    super(txManager, workflowRepo, bandRepo, employeeRepo);
++  }
++
++  async execute(companyId: number, expenseId: number, actorInput: ApprovalActorInput): Promise<{ expenseId: number; status: ExpenseStatus }> {
++    return this.txManager.run(async (client) => {
++      const expense = await this.workflowRepo.findExpenseForUpdate(companyId, expenseId, client);
++      if (!expense) throw new EntityNotFoundError("Expense not found");
++
++      const actor = await this.resolveActor(companyId, actorInput, client);
++      const bands = await this.bandsFor(companyId, actor, client);
++      ExpenseApprovalGate.assertCanApprove(expense, actor, bands);
++
++      const payments = await this.paymentRepo.findByExpenseId(companyId, expenseId, client);
++      const lines = payments.flatMap((payment) => {
++        const paymentId = payment.toPrimitives().id;
++        return payment.toPrimitives().lines.map((line: any) => ({ ...line, expensePaymentId: paymentId }));
++      });
++      const total = lines.reduce((sum, line) => sum + Number(line.amount), 0);
++      if (lines.length === 0 || Math.abs(total - expense.totalAmount) > 0.01) {
++        throw new ValidationError("Stored expense payments do not equal total expense amount");
++      }
++
++      const partnerIds = Array.from(new Set(
++        lines.filter((line) => line.method === PaymentMethod.PARTNER).map((line) => line.partnerId!)
++      ));
++      const lockedPartners: Partner[] = [];
++      for (const partnerId of partnerIds) {
++        const partner = await this.partnerRepo.findByIdForUpdate(companyId, partnerId, client);
++        if (!partner) throw new EntityNotFoundError("Partner not found");
++        lockedPartners.push(partner);
++      }
++
++      const accountTxs: AccountTransaction[] = [];
++      const loanInputs: Array<{
++        companyId: number;
++        partnerId: number;
++        transactionDate: Date;
++        amount: number;
++        sourceType: LoanTransactionSourceType;
++        sourceId?: number | null;
++        description?: string | null;
++        createdBy?: number | null;
++      }> = [];
++
++      for (const line of lines) {
++        if (line.method === PaymentMethod.CASH || line.method === PaymentMethod.BANK) {
++          if (!line.accountId) throw new ValidationError("Stored bank or cash payment is missing an account");
++          accountTxs.push(AccountTransaction.create({
++            companyId,
++            accountId: line.accountId,
++            date: line.date,
++            amount: -Number(line.amount),
++            description: line.description || `Expense: ${expense.reason}`,
++            sourceType: "EXPENSE_PAYMENT",
++            sourceId: line.expensePaymentId
++          }));
++        } else if (line.method === PaymentMethod.PARTNER) {
++          if (!line.partnerId) throw new ValidationError("Stored partner payment is missing a partner");
++          loanInputs.push({
++            companyId,
++            partnerId: line.partnerId,
++            transactionDate: line.date,
++            amount: -Number(line.amount),
++            sourceType: LoanTransactionSourceType.EXPENSE,
++            sourceId: expenseId,
++            description: line.description || `Expense paid by partner: ${expense.reason}`,
++            createdBy: expense.createdBy ?? undefined
++          });
++        }
++      }
++
++      if (accountTxs.length > 0) await this.accountTxService.executeBatch(accountTxs, client);
++      if (loanInputs.length > 0) {
++        await this.recordLoanTransactionUseCase.executeBatch(loanInputs, client, lockedPartners);
++      }
++
++      await this.workflowRepo.updateStatus(companyId, expenseId, ExpenseStatus.APPROVED, client);
++      await this.workflowRepo.addDecision(ExpenseApprovalDecision.create({
++        companyId,
++        expenseId,
++        action: ExpenseApprovalAction.APPROVED,
++        actorUserId: actor.userId,
++        actorRoleId: actor.roleId,
++        amount: expense.totalAmount,
++        reason: null
++      }), client);
++
++      return { expenseId, status: ExpenseStatus.APPROVED };
++    });
++  }
++}
++
++export class RejectExpenseUseCase extends ExpenseApprovalActionUseCase {
++  async execute(
++    companyId: number,
++    expenseId: number,
++    actorInput: ApprovalActorInput,
++    reason: string
++  ): Promise<{ expenseId: number; status: ExpenseStatus }> {
++    return this.txManager.run(async (client) => {
++      const expense = await this.workflowRepo.findExpenseForUpdate(companyId, expenseId, client);
++      if (!expense) throw new EntityNotFoundError("Expense not found");
++
++      const actor = await this.resolveActor(companyId, actorInput, client);
++      const bands = await this.bandsFor(companyId, actor, client);
++      ExpenseApprovalGate.assertCanReject(expense, actor, bands);
++
++      const decision = ExpenseApprovalDecision.create({
++        companyId,
++        expenseId,
++        action: ExpenseApprovalAction.REJECTED,
++        actorUserId: actor.userId,
++        actorRoleId: actor.roleId,
++        amount: expense.totalAmount,
++        reason
++      });
++      await this.workflowRepo.updateStatus(companyId, expenseId, ExpenseStatus.REJECTED, client);
++      await this.workflowRepo.addDecision(decision, client);
++      return { expenseId, status: ExpenseStatus.REJECTED };
++    });
++  }
++}
++
++export class GetExpenseApprovalHistoryUseCase {
++  constructor(
++    private readonly workflowRepo: ExpenseApprovalWorkflowRepository,
++    private readonly expenseRepo: { findById(companyId: number, expenseId: number): Promise<any> }
++  ) {}
++
++  async execute(companyId: number, expenseId: number): Promise<any[]> {
++    const expense = await this.expenseRepo.findById(companyId, expenseId);
++    if (!expense) throw new EntityNotFoundError("Expense not found");
++    const decisions = await this.workflowRepo.listDecisions(companyId, expenseId);
++    return decisions.map((decision) => decision.toPrimitives());
++  }
++}
+diff --git a/src/modules/expenses/application/RecordExpenseUseCase.ts b/src/modules/expenses/application/RecordExpenseUseCase.ts
+index 6ddae1c..85b0c88 100644
+--- a/src/modules/expenses/application/RecordExpenseUseCase.ts
++++ b/src/modules/expenses/application/RecordExpenseUseCase.ts
+@@ -6,6 +6,7 @@ import { RecordLoanTransactionUseCase } from "../../finance/application/RecordLo
+ import { LoanTransactionSourceType } from "../../finance/domain/LoanTransaction";
+ import { ValidationError } from "../../../shared/domain/DomainError";
+ import { PartnerRepository, Partner } from "../../partners/domain/Partner";
++import { ExpenseStatus } from "../domain/ExpenseApproval";
+ 
+ export interface RecordExpenseInput {
+   companyId: number;
+@@ -16,6 +17,7 @@ export interface RecordExpenseInput {
+   note?: string | null;
+   partnerId?: number | null;
+   createdBy?: number;
++  requiresApproval?: boolean;
+   payments?:
+     | Array<{
+         method: PaymentMethod;
+@@ -38,7 +40,7 @@ export class RecordExpenseUseCase {
+     private readonly partnerRepo: PartnerRepository
+   ) {}
+ 
+-  async execute(input: RecordExpenseInput): Promise<{ expenseId: number }> {
++  async execute(input: RecordExpenseInput): Promise<{ expenseId: number; status?: ExpenseStatus }> {
+     return this.txManager.run(async (client) => {
+       const payments = input.payments ?? [];
+       
+@@ -83,7 +85,9 @@ export class RecordExpenseUseCase {
+         totalAmount: input.totalAmount,
+         note: input.note,
+         partnerId: input.partnerId,
+-        createdBy: input.createdBy
++        createdBy: input.createdBy,
++        requiresApproval: input.requiresApproval ?? false,
++        status: input.requiresApproval ? ExpenseStatus.DRAFT : ExpenseStatus.POSTED
+       });
+ 
+       const savedExpense = await this.expenseRepo.save(expense, client);
+@@ -99,6 +103,12 @@ export class RecordExpenseUseCase {
+ 
+         const savedPayment = await this.paymentRepo.savePayment(payment, client);
+ 
++        // Approval-required expenses keep their payment lines as intent only.
++        // Financial ledgers are posted atomically by the approval use case.
++        if (input.requiresApproval) {
++          return { expenseId, status: ExpenseStatus.DRAFT };
++        }
++
+         // 4. Financial Side Effects
+         const accountTxs: AccountTransaction[] = [];
+         const loanInputs: Array<{
+@@ -144,7 +154,9 @@ export class RecordExpenseUseCase {
+           await this.recordLoanTransactionUseCase.executeBatch(loanInputs, client, lockedPartners);
+         }
+       }
+-      return { expenseId };
++      return input.requiresApproval
++        ? { expenseId, status: ExpenseStatus.DRAFT }
++        : { expenseId };
+     });
+   }
+ }
+diff --git a/src/modules/expenses/domain/Expense.ts b/src/modules/expenses/domain/Expense.ts
+index 8e52093..e8d8e2e 100644
+--- a/src/modules/expenses/domain/Expense.ts
++++ b/src/modules/expenses/domain/Expense.ts
+@@ -1,5 +1,6 @@
+ import { ValidationError } from "../../../shared/domain/DomainError";
+ import { PaginatedResult } from "../../../shared/domain/Pagination";
++import { ExpenseStatus } from "./ExpenseApproval";
+ 
+ export enum ExpenseType {
+   WORK = "WORK",
+@@ -64,6 +65,8 @@ export interface ExpenseProps {
+   partnerId?: number | null;
+   createdBy?: number | null;
+   createdAt?: Date;
++  requiresApproval?: boolean;
++  status?: ExpenseStatus;
+ }
+ 
+ export class Expense {
+@@ -81,18 +84,33 @@ export class Expense {
+   }
+ 
+   static create(input: Omit<ExpenseProps, "id" | "createdAt">): Expense {
++    const requiresApproval = input.requiresApproval ?? false;
+     return new Expense({
+       ...input,
++      requiresApproval,
++      status: input.status ?? (requiresApproval ? ExpenseStatus.DRAFT : ExpenseStatus.POSTED),
+       createdAt: new Date()
+     });
+   }
+ 
+   static hydrate(props: ExpenseProps): Expense {
+-    return new Expense(props);
++    const requiresApproval = props.requiresApproval ?? false;
++    return new Expense({
++      ...props,
++      requiresApproval,
++      status: props.status ?? (requiresApproval ? ExpenseStatus.DRAFT : ExpenseStatus.POSTED)
++    });
+   }
+ 
+   get id(): number | undefined { return this.props.id; }
++  get companyId(): number { return this.props.companyId; }
+   get totalAmount(): number { return this.props.totalAmount; }
++  get createdBy(): number | undefined | null { return this.props.createdBy; }
++  get reason(): string { return this.props.reason; }
++  get requiresApproval(): boolean { return this.props.requiresApproval ?? false; }
++  get status(): ExpenseStatus {
++    return this.props.status ?? (this.requiresApproval ? ExpenseStatus.DRAFT : ExpenseStatus.POSTED);
++  }
+ 
+   toPrimitives(): ExpenseProps {
+     return { ...this.props };
+@@ -157,5 +175,5 @@ export interface ExpenseRepository {
+ 
+ export interface ExpensePaymentRepository {
+   savePayment(payment: ExpensePayment, client?: import("pg").PoolClient): Promise<ExpensePayment>;
+-  findByExpenseId(companyId: number, expenseId: number): Promise<ExpensePayment[]>;
++  findByExpenseId(companyId: number, expenseId: number, client?: import("pg").PoolClient): Promise<ExpensePayment[]>;
+ }
+diff --git a/src/modules/expenses/domain/ExpenseApproval.ts b/src/modules/expenses/domain/ExpenseApproval.ts
+new file mode 100644
+index 0000000..16e437c
+--- /dev/null
++++ b/src/modules/expenses/domain/ExpenseApproval.ts
+@@ -0,0 +1,192 @@
++import { PoolClient } from "pg";
++import { ConflictError, ForbiddenError, ValidationError } from "../../../shared/domain/DomainError";
++import type { Expense } from "./Expense";
++
++export enum ExpenseStatus {
++  POSTED = "POSTED",
++  DRAFT = "DRAFT",
++  SUBMITTED = "SUBMITTED",
++  APPROVED = "APPROVED",
++  REJECTED = "REJECTED"
++}
++
++export enum ExpenseApprovalAction {
++  SUBMITTED = "SUBMITTED",
++  APPROVED = "APPROVED",
++  REJECTED = "REJECTED"
++}
++
++export type ExpenseApprovalPermission = "submit" | "approve" | "reject";
++
++export interface ExpenseApprovalBandProps {
++  id?: number;
++  companyId: number;
++  roleId: number;
++  minAmount: number;
++  maxAmount: number | null;
++  canSubmit: boolean;
++  canApprove: boolean;
++  canReject: boolean;
++  createdAt?: Date;
++}
++
++export class ExpenseApprovalBand {
++  private constructor(private readonly props: ExpenseApprovalBandProps) {
++    this.validate();
++  }
++
++  static create(input: Omit<ExpenseApprovalBandProps, "id" | "createdAt">): ExpenseApprovalBand {
++    return new ExpenseApprovalBand(input);
++  }
++
++  static hydrate(props: ExpenseApprovalBandProps): ExpenseApprovalBand {
++    return new ExpenseApprovalBand(props);
++  }
++
++  private validate(): void {
++    if (!Number.isFinite(this.props.minAmount) || this.props.minAmount < 0) {
++      throw new ValidationError("Approval band minimum amount must be zero or greater");
++    }
++    if (this.props.maxAmount !== null) {
++      if (!Number.isFinite(this.props.maxAmount) || this.props.maxAmount < this.props.minAmount) {
++        throw new ValidationError("Approval band maximum amount must be greater than or equal to its minimum amount");
++      }
++    }
++    if (!this.props.canSubmit && !this.props.canApprove && !this.props.canReject) {
++      throw new ValidationError("Approval band must allow at least one action");
++    }
++  }
++
++  matches(amount: number, action: ExpenseApprovalPermission): boolean {
++    if (amount < this.props.minAmount) return false;
++    if (this.props.maxAmount !== null && amount > this.props.maxAmount) return false;
++    if (action === "submit") return this.props.canSubmit;
++    if (action === "approve") return this.props.canApprove;
++    return this.props.canReject;
++  }
++
++  toPrimitives(): ExpenseApprovalBandProps {
++    return { ...this.props };
++  }
++}
++
++export interface ExpenseApprovalActor {
++  userId: number;
++  isOwner: boolean;
++  roleId: number | null;
++}
++
++export class ExpenseApprovalGate {
++  static assertCanSubmit(expense: Expense, actor: ExpenseApprovalActor, bands: ExpenseApprovalBand[]): void {
++    this.assertApprovalExpense(expense);
++    if (expense.status !== ExpenseStatus.DRAFT) {
++      throw new ConflictError("Only draft expenses can be submitted");
++    }
++    if (expense.createdBy !== actor.userId) {
++      throw new ForbiddenError("Only the expense creator can submit it");
++    }
++    this.assertBandPermission(expense.totalAmount, actor, bands, "submit");
++  }
++
++  static assertCanApprove(expense: Expense, actor: ExpenseApprovalActor, bands: ExpenseApprovalBand[]): void {
++    this.assertDecisionAllowed(expense, actor);
++    this.assertBandPermission(expense.totalAmount, actor, bands, "approve");
++  }
++
++  static assertCanReject(expense: Expense, actor: ExpenseApprovalActor, bands: ExpenseApprovalBand[]): void {
++    this.assertDecisionAllowed(expense, actor);
++    this.assertBandPermission(expense.totalAmount, actor, bands, "reject");
++  }
++
++  private static assertApprovalExpense(expense: Expense): void {
++    if (!expense.requiresApproval) {
++      throw new ConflictError("This expense does not require approval");
++    }
++  }
++
++  private static assertDecisionAllowed(expense: Expense, actor: ExpenseApprovalActor): void {
++    this.assertApprovalExpense(expense);
++    if (expense.status !== ExpenseStatus.SUBMITTED) {
++      throw new ConflictError("Only submitted expenses can be approved or rejected");
++    }
++    if (expense.createdBy === actor.userId) {
++      throw new ForbiddenError("An expense creator cannot approve or reject their own expense");
++    }
++  }
++
++  private static assertBandPermission(
++    amount: number,
++    actor: ExpenseApprovalActor,
++    bands: ExpenseApprovalBand[],
++    action: ExpenseApprovalPermission
++  ): void {
++    if (actor.isOwner) return;
++    if (!actor.roleId) {
++      throw new ForbiddenError("An employee role is required for expense approval actions");
++    }
++    const allowed = bands.some((band) => {
++      const p = band.toPrimitives();
++      return p.roleId === actor.roleId && band.matches(amount, action);
++    });
++    if (!allowed) {
++      throw new ForbiddenError(`Role is not allowed to ${action} an expense of this amount`);
++    }
++  }
++}
++
++export interface ExpenseApprovalDecisionProps {
++  id?: number;
++  companyId: number;
++  expenseId: number;
++  action: ExpenseApprovalAction;
++  actorUserId: number;
++  actorRoleId: number | null;
++  amount: number;
++  reason?: string | null;
++  createdAt?: Date;
++}
++
++export class ExpenseApprovalDecision {
++  private constructor(private readonly props: ExpenseApprovalDecisionProps) {
++    if (!Number.isFinite(props.amount) || props.amount <= 0) {
++      throw new ValidationError("Approval decision amount must be positive");
++    }
++    if (props.action === ExpenseApprovalAction.REJECTED) {
++      const reason = props.reason?.trim() ?? "";
++      if (reason.length === 0) throw new ValidationError("Rejection reason is required");
++      if (reason.length > 1000) throw new ValidationError("Rejection reason must be 1000 characters or fewer");
++      this.props.reason = reason;
++    } else if (props.reason != null) {
++      this.props.reason = props.reason.trim() || null;
++    }
++  }
++
++  static create(input: Omit<ExpenseApprovalDecisionProps, "id" | "createdAt">): ExpenseApprovalDecision {
++    return new ExpenseApprovalDecision({ ...input, createdAt: new Date() });
++  }
++
++  static hydrate(props: ExpenseApprovalDecisionProps): ExpenseApprovalDecision {
++    return new ExpenseApprovalDecision(props);
++  }
++
++  toPrimitives(): ExpenseApprovalDecisionProps {
++    return { ...this.props };
++  }
++}
++
++export interface ExpenseApprovalBandRepository {
++  replaceForRole(
++    companyId: number,
++    roleId: number,
++    bands: ExpenseApprovalBand[],
++    client?: PoolClient
++  ): Promise<ExpenseApprovalBand[]>;
++  list(companyId: number, roleId?: number | null, client?: PoolClient): Promise<ExpenseApprovalBand[]>;
++}
++
++export interface ExpenseApprovalWorkflowRepository {
++  findExpenseForUpdate(companyId: number, expenseId: number, client: PoolClient): Promise<Expense | null>;
++  updateStatus(companyId: number, expenseId: number, status: ExpenseStatus, client: PoolClient): Promise<void>;
++  addDecision(decision: ExpenseApprovalDecision, client: PoolClient): Promise<ExpenseApprovalDecision>;
++  listDecisions(companyId: number, expenseId: number): Promise<ExpenseApprovalDecision[]>;
++}
+diff --git a/src/modules/expenses/infrastructure/PgExpenseApprovalRepository.ts b/src/modules/expenses/infrastructure/PgExpenseApprovalRepository.ts
+new file mode 100644
+index 0000000..6b03ac6
+--- /dev/null
++++ b/src/modules/expenses/infrastructure/PgExpenseApprovalRepository.ts
+@@ -0,0 +1,154 @@
++import { PoolClient } from "pg";
++import { pgPool } from "../../../shared/infrastructure/db/pgPool";
++import { Expense, ExpenseType } from "../domain/Expense";
++import {
++  ExpenseApprovalAction,
++  ExpenseApprovalBand,
++  ExpenseApprovalBandRepository,
++  ExpenseApprovalDecision,
++  ExpenseApprovalWorkflowRepository,
++  ExpenseStatus
++} from "../domain/ExpenseApproval";
++
++export class PgExpenseApprovalRepository implements ExpenseApprovalBandRepository, ExpenseApprovalWorkflowRepository {
++  async replaceForRole(
++    companyId: number,
++    roleId: number,
++    bands: ExpenseApprovalBand[],
++    client?: PoolClient
++  ): Promise<ExpenseApprovalBand[]> {
++    const operation = async (db: PoolClient | typeof pgPool): Promise<ExpenseApprovalBand[]> => {
++      await db.query(
++        "DELETE FROM expense_approval_band WHERE company_id = $1 AND role_id = $2",
++        [companyId, roleId]
++      );
++      const saved: ExpenseApprovalBand[] = [];
++      for (const band of bands) {
++        const p = band.toPrimitives();
++        const result = await db.query(
++          `INSERT INTO expense_approval_band
++             (company_id, role_id, min_amount, max_amount, can_submit, can_approve, can_reject)
++           VALUES ($1,$2,$3,$4,$5,$6,$7)
++           RETURNING *`,
++          [companyId, roleId, p.minAmount, p.maxAmount, p.canSubmit, p.canApprove, p.canReject]
++        );
++        saved.push(this.mapBand(result.rows[0]));
++      }
++      return saved;
++    };
++
++    if (client) return operation(client);
++    const dbClient = await pgPool.connect();
++    try {
++      await dbClient.query("BEGIN");
++      const result = await operation(dbClient);
++      await dbClient.query("COMMIT");
++      return result;
++    } catch (error) {
++      await dbClient.query("ROLLBACK");
++      throw error;
++    } finally {
++      dbClient.release();
++    }
++  }
++
++  async list(companyId: number, roleId?: number | null, client?: PoolClient): Promise<ExpenseApprovalBand[]> {
++    const db = client || pgPool;
++    const params: any[] = [companyId];
++    let sql = "SELECT * FROM expense_approval_band WHERE company_id = $1";
++    if (roleId != null) {
++      params.push(roleId);
++      sql += ` AND role_id = $${params.length}`;
++    }
++    sql += " ORDER BY role_id ASC, min_amount ASC, id ASC";
++    const result = await db.query(sql, params);
++    return result.rows.map((row) => this.mapBand(row));
++  }
++
++  async findExpenseForUpdate(companyId: number, expenseId: number, client: PoolClient): Promise<Expense | null> {
++    const result = await client.query(
++      "SELECT * FROM expense WHERE company_id = $1 AND id = $2 FOR UPDATE",
++      [companyId, expenseId]
++    );
++    if (result.rowCount === 0) return null;
++    return this.mapExpense(result.rows[0]);
++  }
++
++  async updateStatus(companyId: number, expenseId: number, status: ExpenseStatus, client: PoolClient): Promise<void> {
++    await client.query(
++      `UPDATE expense
++       SET approval_status = $3, approval_updated_at = NOW()
++       WHERE company_id = $1 AND id = $2`,
++      [companyId, expenseId, status]
++    );
++  }
++
++  async addDecision(decision: ExpenseApprovalDecision, client: PoolClient): Promise<ExpenseApprovalDecision> {
++    const p = decision.toPrimitives();
++    const result = await client.query(
++      `INSERT INTO expense_approval_decision
++         (company_id, expense_id, action, actor_user_id, actor_role_id, amount, reason)
++       VALUES ($1,$2,$3,$4,$5,$6,$7)
++       RETURNING *`,
++      [p.companyId, p.expenseId, p.action, p.actorUserId, p.actorRoleId, p.amount, p.reason ?? null]
++    );
++    return this.mapDecision(result.rows[0]);
++  }
++
++  async listDecisions(companyId: number, expenseId: number): Promise<ExpenseApprovalDecision[]> {
++    const result = await pgPool.query(
++      `SELECT d.*
++       FROM expense_approval_decision d
++       JOIN expense e ON e.id = d.expense_id AND e.company_id = d.company_id
++       WHERE d.company_id = $1 AND d.expense_id = $2
++       ORDER BY d.created_at ASC, d.id ASC`,
++      [companyId, expenseId]
++    );
++    return result.rows.map((row) => this.mapDecision(row));
++  }
++
++  private mapBand(row: any): ExpenseApprovalBand {
++    return ExpenseApprovalBand.hydrate({
++      id: Number(row.id),
++      companyId: Number(row.company_id),
++      roleId: Number(row.role_id),
++      minAmount: Number(row.min_amount),
++      maxAmount: row.max_amount == null ? null : Number(row.max_amount),
++      canSubmit: Boolean(row.can_submit),
++      canApprove: Boolean(row.can_approve),
++      canReject: Boolean(row.can_reject),
++      createdAt: row.created_at
++    });
++  }
++
++  private mapExpense(row: any): Expense {
++    return Expense.hydrate({
++      id: Number(row.id),
++      companyId: Number(row.company_id),
++      expenseDate: row.expense_date,
++      reason: row.reason,
++      expenseType: row.expense_type as ExpenseType,
++      totalAmount: Number(row.total_amount),
++      note: row.note,
++      partnerId: row.partner_id == null ? null : Number(row.partner_id),
++      createdBy: row.created_by == null ? null : Number(row.created_by),
++      createdAt: row.created_at,
++      requiresApproval: Boolean(row.requires_approval),
++      status: row.approval_status as ExpenseStatus
++    });
++  }
++
++  private mapDecision(row: any): ExpenseApprovalDecision {
++    return ExpenseApprovalDecision.hydrate({
++      id: Number(row.id),
++      companyId: Number(row.company_id),
++      expenseId: Number(row.expense_id),
++      action: row.action as ExpenseApprovalAction,
++      actorUserId: Number(row.actor_user_id),
++      actorRoleId: row.actor_role_id == null ? null : Number(row.actor_role_id),
++      amount: Number(row.amount),
++      reason: row.reason,
++      createdAt: row.created_at
++    });
++  }
++}
+diff --git a/src/modules/expenses/infrastructure/PgExpenseRepository.ts b/src/modules/expenses/infrastructure/PgExpenseRepository.ts
+index d7e28e5..a619529 100644
+--- a/src/modules/expenses/infrastructure/PgExpenseRepository.ts
++++ b/src/modules/expenses/infrastructure/PgExpenseRepository.ts
+@@ -3,6 +3,14 @@ import { pgPool } from "../../../shared/infrastructure/db/pgPool";
+ import { Expense, ExpenseRepository, ExpensePayment, ExpensePaymentRepository, ExpenseType, PaymentMethod, ExpensePaymentLine } from "../domain/Expense";
+ import { PaginatedResult } from "../../../shared/domain/Pagination";
+ import { CursorPager } from "../../../shared/infrastructure/pagination/CursorPager";
++import { ExpenseStatus } from "../domain/ExpenseApproval";
++
++function approvalFields(row: any): { requiresApproval: boolean; status: ExpenseStatus } {
++  return {
++    requiresApproval: Boolean(row.requires_approval),
++    status: (row.approval_status as ExpenseStatus) || ExpenseStatus.POSTED
++  };
++}
+ 
+ export class PgExpenseRepository implements ExpenseRepository, ExpensePaymentRepository {
+   async save(expense: Expense, client?: PoolClient): Promise<Expense> {
+@@ -10,10 +18,15 @@ export class PgExpenseRepository implements ExpenseRepository, ExpensePaymentRep
+     const p = expense.toPrimitives();
+ 
+     const result = await db.query(
+-      `INSERT INTO expense (company_id, expense_date, reason, expense_type, total_amount, note, partner_id, created_by)
+-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
++      `INSERT INTO expense
++         (company_id, expense_date, reason, expense_type, total_amount, note, partner_id, created_by, requires_approval, approval_status)
++       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        RETURNING id, created_at`,
+-      [p.companyId, p.expenseDate, p.reason, p.expenseType, p.totalAmount, p.note || null, p.partnerId || null, p.createdBy || null]
++      [
++        p.companyId, p.expenseDate, p.reason, p.expenseType, p.totalAmount, p.note || null,
++        p.partnerId || null, p.createdBy || null, p.requiresApproval ?? false,
++        p.status ?? ExpenseStatus.POSTED
++      ]
+     );
+ 
+     return Expense.hydrate({
+@@ -43,7 +56,8 @@ export class PgExpenseRepository implements ExpenseRepository, ExpensePaymentRep
+       note: row.note,
+       partnerId: row.partner_id ? parseInt(row.partner_id, 10) : undefined,
+       createdBy: row.created_by ? parseInt(row.created_by, 10) : undefined,
+-      createdAt: row.created_at
++      createdAt: row.created_at,
++      ...approvalFields(row)
+     });
+   }
+ 
+@@ -81,7 +95,8 @@ export class PgExpenseRepository implements ExpenseRepository, ExpensePaymentRep
+       note: row.note,
+       partnerId: row.partner_id ? parseInt(row.partner_id, 10) : undefined,
+       createdBy: row.created_by ? parseInt(row.created_by, 10) : undefined,
+-      createdAt: row.created_at
++      createdAt: row.created_at,
++      ...approvalFields(row)
+     }));
+ 
+     let nextCursor: string | null = null;
+@@ -125,8 +140,9 @@ export class PgExpenseRepository implements ExpenseRepository, ExpensePaymentRep
+     });
+   }
+ 
+-  async findByExpenseId(companyId: number, expenseId: number): Promise<ExpensePayment[]> {
+-    const paymentsRes = await pgPool.query(
++  async findByExpenseId(companyId: number, expenseId: number, client?: PoolClient): Promise<ExpensePayment[]> {
++    const db = client || pgPool;
++    const paymentsRes = await db.query(
+       `SELECT * FROM expense_payment WHERE expense_id = $1 AND company_id = $2 ORDER BY created_at DESC, id DESC`,
+       [expenseId, companyId]
+     );
+@@ -134,7 +150,7 @@ export class PgExpenseRepository implements ExpenseRepository, ExpensePaymentRep
+     if (paymentsRes.rows.length === 0) return [];
+ 
+     const paymentIds = paymentsRes.rows.map(r => parseInt(r.id, 10));
+-    const linesRes = await pgPool.query(
++    const linesRes = await db.query(
+       `SELECT * FROM expense_payment_line WHERE expense_payment_id = ANY($1::bigint[])`,
+       [paymentIds]
+     );
+diff --git a/src/modules/expenses/presentation/ExpenseRouter.ts b/src/modules/expenses/presentation/ExpenseRouter.ts
+index 363fa2a..6591df4 100644
+--- a/src/modules/expenses/presentation/ExpenseRouter.ts
++++ b/src/modules/expenses/presentation/ExpenseRouter.ts
+@@ -3,20 +3,41 @@ import { requireAuth } from "../../../shared/presentation/auth/requireAuth";
+ import { requirePermission } from "../../../shared/presentation/auth/requirePermission";
+ import { DbAccessPolicy } from "../../roles/infrastructure/DbAccessPolicy";
+ import { PgExpenseRepository } from "../infrastructure/PgExpenseRepository";
++import { PgExpenseApprovalRepository } from "../infrastructure/PgExpenseApprovalRepository";
+ import { RecordExpenseUseCase } from "../application/RecordExpenseUseCase";
+ import { GetExpenseDetailsUseCase, ListExpensesUseCase } from "../application/GetExpenseDetailsUseCase";
++import {
++  ApproveExpenseUseCase,
++  GetExpenseApprovalHistoryUseCase,
++  ListExpenseApprovalBandsUseCase,
++  RejectExpenseUseCase,
++  SetExpenseApprovalBandsUseCase,
++  SubmitExpenseUseCase
++} from "../application/ExpenseApprovalUseCases";
+ import { PgAccountTransactionRepository } from "../../finance/infrastructure/PgFinanceRepositories";
+ import { RecordAccountTransactionUseCase } from "../../finance/application/RecordAccountTransactionUseCase";
+ import { PgAccountRepository } from "../../accounts/infrastructure/PgAccountRepository";
+ import { PgLoanTransactionRepository } from "../../finance/infrastructure/PgLoanTransactionRepository";
+ import { PgPartnerRepository } from "../../partners/infrastructure/PgPartnerRepository";
++import { PgEmployeeRepository } from "../../employees/infrastructure/PgEmployeeRepository";
++import { PgRoleRepository } from "../../roles/infrastructure/PgRoleRepository";
+ import { RecordLoanTransactionUseCase } from "../../finance/application/RecordLoanTransactionUseCase";
+ import { PostgreSQLTransactionManager } from "../../../shared/infrastructure/transactions/TransactionManager";
+ import { sendErrorResponse } from "../../../shared/presentation/http/ErrorHandler";
+-import { recordExpenseSchema, listExpensesFiltersSchema } from "./ExpenseSchemas";
++import { ValidationError } from "../../../shared/domain/DomainError";
++import {
++  listExpenseApprovalBandsSchema,
++  listExpensesFiltersSchema,
++  recordExpenseSchema,
++  rejectExpenseSchema,
++  setExpenseApprovalBandsSchema
++} from "./ExpenseSchemas";
+ 
+ const repo = new PgExpenseRepository();
++const approvalRepo = new PgExpenseApprovalRepository();
+ const partnerRepo = new PgPartnerRepository();
++const employeeRepo = new PgEmployeeRepository();
++const roleRepo = new PgRoleRepository();
+ const accountTxRepo = new PgAccountTransactionRepository();
+ const accountRepo = new PgAccountRepository();
+ const accountTxService = new RecordAccountTransactionUseCase(accountRepo, accountTxRepo);
+@@ -24,9 +45,31 @@ const txManager = new PostgreSQLTransactionManager();
+ const pgLoanTxRepo = new PgLoanTransactionRepository();
+ const recordLoanTxUseCase = new RecordLoanTransactionUseCase(txManager, partnerRepo, pgLoanTxRepo);
+ 
+-const recordUseCase = new RecordExpenseUseCase(txManager, repo, repo, accountTxService, recordLoanTxUseCase, partnerRepo);
++const recordUseCase = new RecordExpenseUseCase(
++  txManager,
++  repo,
++  repo,
++  accountTxService,
++  recordLoanTxUseCase,
++  partnerRepo
++);
+ const getDetailsUseCase = new GetExpenseDetailsUseCase(repo, repo);
+ const listUseCase = new ListExpensesUseCase(repo);
++const setApprovalBandsUseCase = new SetExpenseApprovalBandsUseCase(roleRepo, approvalRepo);
++const listApprovalBandsUseCase = new ListExpenseApprovalBandsUseCase(approvalRepo);
++const submitExpenseUseCase = new SubmitExpenseUseCase(txManager, approvalRepo, approvalRepo, employeeRepo);
++const approveExpenseUseCase = new ApproveExpenseUseCase(
++  txManager,
++  approvalRepo,
++  approvalRepo,
++  employeeRepo,
++  repo,
++  accountTxService,
++  recordLoanTxUseCase,
++  partnerRepo
++);
++const rejectExpenseUseCase = new RejectExpenseUseCase(txManager, approvalRepo, approvalRepo, employeeRepo);
++const getApprovalHistoryUseCase = new GetExpenseApprovalHistoryUseCase(approvalRepo, repo);
+ 
+ const accessPolicy = new DbAccessPolicy();
+ export const ExpenseRouter = Router();
+@@ -35,99 +78,182 @@ function parseCompanyId(req: Request): number {
+   return req.auth!.companyId;
+ }
+ 
+-function parseUserId(req: Request): number | undefined {
++function parseUserId(req: Request): number {
+   return req.auth!.userId;
+ }
+ 
+-/**
+- * @openapi
+- * /api/v1/expenses:
+- *   post:
+- *     summary: Record a new expense with payment info
+- *     tags:
+- *       - Expenses
+- *     security:
+- *       - bearerAuth: []
+- *     responses:
+- *       '201':
+- *         description: Expense recorded
+- *       '400':
+- *         description: Validation error
+- */
+-ExpenseRouter.post("/", requireAuth, requirePermission(accessPolicy, "EXPENSES", "create"), async (req: Request, res: Response) => {
+-  try {
+-    const companyId = parseCompanyId(req);
+-    const createdBy = parseUserId(req);
+-    const body = recordExpenseSchema.parse(req.body);
++function parsePositiveId(value: string, label: string): number {
++  const id = Number(value);
++  if (!Number.isInteger(id) || id <= 0) throw new ValidationError(`Invalid ${label}`);
++  return id;
++}
++
++ExpenseRouter.post(
++  "/",
++  requireAuth,
++  requirePermission(accessPolicy, "EXPENSES", "create"),
++  async (req: Request, res: Response) => {
++    try {
++      const companyId = parseCompanyId(req);
++      const body = recordExpenseSchema.parse(req.body);
++      const result = await recordUseCase.execute({
++        companyId,
++        createdBy: parseUserId(req),
++        expenseDate: body.expenseDate,
++        reason: body.reason,
++        expenseType: body.expenseType,
++        totalAmount: body.totalAmount,
++        note: body.note,
++        requiresApproval: body.requiresApproval,
++        payments: body.payments?.map((p) => ({
++          method: p.method,
++          accountId: p.accountId,
++          partnerId: p.partnerId,
++          amount: p.amount,
++          date: p.date,
++          description: p.description
++        }))
++      });
++      res.status(201).json(result);
++    } catch (err) {
++      sendErrorResponse(res, err);
++    }
++  }
++);
++
++ExpenseRouter.get(
++  "/",
++  requireAuth,
++  requirePermission(accessPolicy, "EXPENSES", "view"),
++  async (req: Request, res: Response) => {
++    try {
++      const query = listExpensesFiltersSchema.parse(req.query);
++      const result = await listUseCase.execute(parseCompanyId(req), {
++        limit: query.limit ?? undefined,
++        cursor: query.cursor ?? undefined
++      });
++      res.json(result);
++    } catch (err) {
++      sendErrorResponse(res, err);
++    }
++  }
++);
++
++ExpenseRouter.put(
++  "/approval-bands/:roleId",
++  requireAuth,
++  requirePermission(accessPolicy, "EXPENSES", "update"),
++  async (req: Request, res: Response) => {
++    try {
++      const roleId = parsePositiveId(req.params.roleId, "role id");
++      const body = setExpenseApprovalBandsSchema.parse(req.body);
++      const bands = await setApprovalBandsUseCase.execute(parseCompanyId(req), roleId, body.bands);
++      res.json({ bands });
++    } catch (err) {
++      sendErrorResponse(res, err);
++    }
++  }
++);
++
++ExpenseRouter.get(
++  "/approval-bands",
++  requireAuth,
++  requirePermission(accessPolicy, "EXPENSES", "view"),
++  async (req: Request, res: Response) => {
++    try {
++      const query = listExpenseApprovalBandsSchema.parse(req.query);
++      const bands = await listApprovalBandsUseCase.execute(parseCompanyId(req), query.roleId);
++      res.json({ bands });
++    } catch (err) {
++      sendErrorResponse(res, err);
++    }
++  }
++);
+ 
+-    const result = await recordUseCase.execute({
+-      companyId,
+-      createdBy,
+-      expenseDate: body.expenseDate,
+-      reason: body.reason,
+-      expenseType: body.expenseType as any,
+-      totalAmount: body.totalAmount,
+-      note: body.note,
+-      payments: body.payments?.map(p => ({
+-        method: p.method as any,
+-        accountId: p.accountId,
+-        partnerId: p.partnerId,
+-        amount: p.amount,
+-        date: p.date,
+-        description: p.description
+-      }))
+-    });
++ExpenseRouter.post(
++  "/:id/submit",
++  requireAuth,
++  requirePermission(accessPolicy, "EXPENSES", "create"),
++  async (req: Request, res: Response) => {
++    try {
++      const result = await submitExpenseUseCase.execute(
++        parseCompanyId(req),
++        parsePositiveId(req.params.id, "expense id"),
++        { userId: parseUserId(req), isOwner: req.auth!.isOwner }
++      );
++      res.json(result);
++    } catch (err) {
++      sendErrorResponse(res, err);
++    }
++  }
++);
++
++ExpenseRouter.post(
++  "/:id/approve",
++  requireAuth,
++  requirePermission(accessPolicy, "EXPENSES", "update"),
++  async (req: Request, res: Response) => {
++    try {
++      const result = await approveExpenseUseCase.execute(
++        parseCompanyId(req),
++        parsePositiveId(req.params.id, "expense id"),
++        { userId: parseUserId(req), isOwner: req.auth!.isOwner }
++      );
++      res.json(result);
++    } catch (err) {
++      sendErrorResponse(res, err);
++    }
++  }
++);
+ 
+-    res.status(201).json(result);
+-  } catch (err) {
+-    sendErrorResponse(res, err);
++ExpenseRouter.post(
++  "/:id/reject",
++  requireAuth,
++  requirePermission(accessPolicy, "EXPENSES", "update"),
++  async (req: Request, res: Response) => {
++    try {
++      const body = rejectExpenseSchema.parse(req.body);
++      const result = await rejectExpenseUseCase.execute(
++        parseCompanyId(req),
++        parsePositiveId(req.params.id, "expense id"),
++        { userId: parseUserId(req), isOwner: req.auth!.isOwner },
++        body.reason
++      );
++      res.json(result);
++    } catch (err) {
++      sendErrorResponse(res, err);
++    }
+   }
+-});
++);
+ 
+-/**
+- * @openapi
+- * /api/v1/expenses:
+- *   get:
+- *     summary: List all expenses
+- *     tags:
+- *       - Expenses
+- *     security:
+- *       - bearerAuth: []
+- *     responses:
+- *       '200':
+- *         description: List of expenses
+- */
+-ExpenseRouter.get("/", requireAuth, requirePermission(accessPolicy, "EXPENSES", "view"), async (req: Request, res: Response) => {
+-  try {
+-    const companyId = parseCompanyId(req);
+-    const query = listExpensesFiltersSchema.parse(req.query);
+-    const result = await listUseCase.execute(companyId, {
+-      limit: query.limit ?? undefined,
+-      cursor: query.cursor ?? undefined
+-    });
+-    res.json(result);
+-  } catch (err) {
+-    sendErrorResponse(res, err);
++ExpenseRouter.get(
++  "/:id/approval-history",
++  requireAuth,
++  requirePermission(accessPolicy, "EXPENSES", "view"),
++  async (req: Request, res: Response) => {
++    try {
++      const decisions = await getApprovalHistoryUseCase.execute(
++        parseCompanyId(req),
++        parsePositiveId(req.params.id, "expense id")
++      );
++      res.json({ decisions });
++    } catch (err) {
++      sendErrorResponse(res, err);
++    }
+   }
+-});
++);
+ 
+-/**
+- * @openapi
+- * /api/v1/expenses/{id}:
+- *   get:
+- *     summary: Get expense details with payment lines
+- *     tags:
+- *       - Expenses
+- *     security:
+- *       - bearerAuth: []
+- */
+-ExpenseRouter.get("/:id", requireAuth, requirePermission(accessPolicy, "EXPENSES", "view"), async (req: Request, res: Response) => {
+-  try {
+-    const companyId = parseCompanyId(req);
+-    const id = Number(req.params.id);
+-    const result = await getDetailsUseCase.execute(companyId, id);
+-    res.json(result);
+-  } catch (err) {
+-    sendErrorResponse(res, err);
++ExpenseRouter.get(
++  "/:id",
++  requireAuth,
++  requirePermission(accessPolicy, "EXPENSES", "view"),
++  async (req: Request, res: Response) => {
++    try {
++      const id = parsePositiveId(req.params.id, "expense id");
++      const result = await getDetailsUseCase.execute(parseCompanyId(req), id);
++      res.json(result);
++    } catch (err) {
++      sendErrorResponse(res, err);
++    }
+   }
+-});
++);
+diff --git a/src/modules/expenses/presentation/ExpenseSchemas.ts b/src/modules/expenses/presentation/ExpenseSchemas.ts
+index 6ecb3fe..f9d7062 100644
+--- a/src/modules/expenses/presentation/ExpenseSchemas.ts
++++ b/src/modules/expenses/presentation/ExpenseSchemas.ts
+@@ -15,6 +15,7 @@ export const recordExpenseSchema = z.object({
+   expenseType: z.nativeEnum(ExpenseType),
+   totalAmount: z.number().positive(),
+   note: createOptionalLongText(),
++  requiresApproval: z.boolean().optional().default(false),
+   payments: createOptionalArray(
+     z.object({
+       method: z.nativeEnum(PaymentMethod),
+@@ -31,3 +32,22 @@ export const listExpensesFiltersSchema = z.object({
+   limit: queryOptionalPositiveInt(),
+   cursor: queryOptionalNonEmptyString()
+ });
++
++
++export const setExpenseApprovalBandsSchema = z.object({
++  bands: z.array(z.object({
++    minAmount: z.number().nonnegative(),
++    maxAmount: z.number().nonnegative().nullable(),
++    canSubmit: z.boolean(),
++    canApprove: z.boolean(),
++    canReject: z.boolean()
++  }))
++});
++
++export const listExpenseApprovalBandsSchema = z.object({
++  roleId: queryOptionalPositiveInt()
++});
++
++export const rejectExpenseSchema = z.object({
++  reason: z.string().trim().min(1).max(1000)
++});

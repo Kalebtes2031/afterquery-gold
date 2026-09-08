@@ -1,0 +1,1062 @@
+diff --git a/db/migrations/035_reporting_period_close.sql b/db/migrations/035_reporting_period_close.sql
+new file mode 100644
+index 0000000..653d935
+--- /dev/null
++++ b/db/migrations/035_reporting_period_close.sql
+@@ -0,0 +1,13 @@
++-- Company-scoped reporting close history. The most recent closed_through date is
++-- the active lock boundary; prior rows are retained as an audit trail.
++CREATE TABLE reporting_period_close (
++  id             BIGSERIAL PRIMARY KEY,
++  company_id     BIGINT NOT NULL REFERENCES company(id) ON DELETE CASCADE,
++  closed_through DATE NOT NULL,
++  closed_by      BIGINT REFERENCES user_account(id),
++  closed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++  CONSTRAINT uq_reporting_period_close_company_date UNIQUE (company_id, closed_through)
++);
++
++CREATE INDEX idx_reporting_period_close_current
++  ON reporting_period_close (company_id, closed_through DESC, id DESC);
+diff --git a/src/modules/accounts/application/TransferBetweenAccountsUseCase.ts b/src/modules/accounts/application/TransferBetweenAccountsUseCase.ts
+index f9e4a1b..02a75f8 100644
+--- a/src/modules/accounts/application/TransferBetweenAccountsUseCase.ts
++++ b/src/modules/accounts/application/TransferBetweenAccountsUseCase.ts
+@@ -4,6 +4,7 @@ import { RecordAccountTransactionUseCase } from "../../finance/application/Recor
+ import { TransactionManager } from "../../../shared/infrastructure/transactions/TransactionManager";
+ import { EventRecorder } from "../../../shared/application/EventRecorder";
+ import { ValidationError, EntityNotFoundError, InsufficientFundsError } from "../../../shared/domain/DomainError";
++import { allowAllReportingPeriods, ReportingPeriodWriteGuard } from "../../reporting/application/ReportingPeriodGuard";
+ 
+ export interface TransferBetweenAccountsInput {
+   companyId: number;
+@@ -20,7 +21,8 @@ export class TransferBetweenAccountsUseCase {
+     private readonly financeTxRepo: AccountTransactionRepository,
+     private readonly recordAccountTransactionUseCase: RecordAccountTransactionUseCase,
+     private readonly txManager: TransactionManager,
+-    private readonly eventRecorder: EventRecorder
++    private readonly eventRecorder: EventRecorder,
++    private readonly reportingPeriodGuard: ReportingPeriodWriteGuard = allowAllReportingPeriods
+   ) {}
+ 
+   async execute(input: TransferBetweenAccountsInput): Promise<void> {
+@@ -28,6 +30,8 @@ export class TransferBetweenAccountsUseCase {
+       throw new ValidationError("Transfer amount must be positive");
+     }
+ 
++    await this.reportingPeriodGuard.assertOpen(input.companyId, [input.date]);
++
+     await this.txManager.run(async (client) => {
+       // 1. Lock accounts in deterministic order to prevent deadlocks
+       const [firstId, secondId] = [input.fromAccountId, input.toAccountId].sort((a, b) => a - b);
+diff --git a/src/modules/accounts/presentation/AccountRouter.ts b/src/modules/accounts/presentation/AccountRouter.ts
+index 735bd51..3d08cb4 100644
+--- a/src/modules/accounts/presentation/AccountRouter.ts
++++ b/src/modules/accounts/presentation/AccountRouter.ts
+@@ -11,6 +11,8 @@ import { createAccountSchema, transferSchema, editAccountSchema } from "./Accoun
+ import { PgBusinessEventRepository } from "../../../shared/infrastructure/events/PgBusinessEventRepository";
+ import { DbEventRecorder } from "../../../shared/application/EventRecorder";
+ import { sendErrorResponse } from "../../../shared/presentation/http/ErrorHandler";
++import { PgReportingPeriodCloseRepository } from "../../reporting/infrastructure/PgReportingPeriodCloseRepository";
++import { ReportingPeriodGuard } from "../../reporting/application/ReportingPeriodGuard";
+ import { PgAccountTransactionRepository } from "../../finance/infrastructure/PgFinanceRepositories";
+ import { RecordAccountTransactionUseCase } from "../../finance/application/RecordAccountTransactionUseCase";
+ 
+@@ -20,6 +22,7 @@ const txManager = new PostgreSQLTransactionManager();
+ const businessEventRepository = new PgBusinessEventRepository();
+ const eventRecorder = new DbEventRecorder(businessEventRepository);
+ const recordAccountTransactionUseCase = new RecordAccountTransactionUseCase(accountRepository, financeAccountTxRepository);
++const reportingPeriodGuard = new ReportingPeriodGuard(new PgReportingPeriodCloseRepository());
+ 
+ const createAccountUseCase = new CreateAccountUseCase(
+   accountRepository,
+@@ -32,7 +35,8 @@ const transferBetweenAccountsUseCase = new TransferBetweenAccountsUseCase(
+   financeAccountTxRepository,
+   recordAccountTransactionUseCase,
+   txManager,
+-  eventRecorder
++  eventRecorder,
++  reportingPeriodGuard
+ );
+ 
+ const editAccountUseCase = new EditAccountUseCase(
+diff --git a/src/modules/expenses/application/RecordExpenseUseCase.ts b/src/modules/expenses/application/RecordExpenseUseCase.ts
+index 6ddae1c..87e1b6c 100644
+--- a/src/modules/expenses/application/RecordExpenseUseCase.ts
++++ b/src/modules/expenses/application/RecordExpenseUseCase.ts
+@@ -6,6 +6,7 @@ import { RecordLoanTransactionUseCase } from "../../finance/application/RecordLo
+ import { LoanTransactionSourceType } from "../../finance/domain/LoanTransaction";
+ import { ValidationError } from "../../../shared/domain/DomainError";
+ import { PartnerRepository, Partner } from "../../partners/domain/Partner";
++import { allowAllReportingPeriods, ReportingPeriodWriteGuard } from "../../reporting/application/ReportingPeriodGuard";
+ 
+ export interface RecordExpenseInput {
+   companyId: number;
+@@ -35,10 +36,16 @@ export class RecordExpenseUseCase {
+     private readonly paymentRepo: ExpensePaymentRepository,
+     private readonly accountTxService: RecordAccountTransactionUseCase,
+     private readonly recordLoanTransactionUseCase: RecordLoanTransactionUseCase,
+-    private readonly partnerRepo: PartnerRepository
++    private readonly partnerRepo: PartnerRepository,
++    private readonly reportingPeriodGuard: ReportingPeriodWriteGuard = allowAllReportingPeriods
+   ) {}
+ 
+   async execute(input: RecordExpenseInput): Promise<{ expenseId: number }> {
++    await this.reportingPeriodGuard.assertOpen(input.companyId, [
++      input.expenseDate,
++      ...(input.payments ?? []).map((payment) => payment.date)
++    ]);
++
+     return this.txManager.run(async (client) => {
+       const payments = input.payments ?? [];
+       
+diff --git a/src/modules/expenses/presentation/ExpenseRouter.ts b/src/modules/expenses/presentation/ExpenseRouter.ts
+index 363fa2a..25e81cd 100644
+--- a/src/modules/expenses/presentation/ExpenseRouter.ts
++++ b/src/modules/expenses/presentation/ExpenseRouter.ts
+@@ -13,6 +13,8 @@ import { PgPartnerRepository } from "../../partners/infrastructure/PgPartnerRepo
+ import { RecordLoanTransactionUseCase } from "../../finance/application/RecordLoanTransactionUseCase";
+ import { PostgreSQLTransactionManager } from "../../../shared/infrastructure/transactions/TransactionManager";
+ import { sendErrorResponse } from "../../../shared/presentation/http/ErrorHandler";
++import { PgReportingPeriodCloseRepository } from "../../reporting/infrastructure/PgReportingPeriodCloseRepository";
++import { ReportingPeriodGuard } from "../../reporting/application/ReportingPeriodGuard";
+ import { recordExpenseSchema, listExpensesFiltersSchema } from "./ExpenseSchemas";
+ 
+ const repo = new PgExpenseRepository();
+@@ -23,8 +25,9 @@ const accountTxService = new RecordAccountTransactionUseCase(accountRepo, accoun
+ const txManager = new PostgreSQLTransactionManager();
+ const pgLoanTxRepo = new PgLoanTransactionRepository();
+ const recordLoanTxUseCase = new RecordLoanTransactionUseCase(txManager, partnerRepo, pgLoanTxRepo);
++const reportingPeriodGuard = new ReportingPeriodGuard(new PgReportingPeriodCloseRepository());
+ 
+-const recordUseCase = new RecordExpenseUseCase(txManager, repo, repo, accountTxService, recordLoanTxUseCase, partnerRepo);
++const recordUseCase = new RecordExpenseUseCase(txManager, repo, repo, accountTxService, recordLoanTxUseCase, partnerRepo, reportingPeriodGuard);
+ const getDetailsUseCase = new GetExpenseDetailsUseCase(repo, repo);
+ const listUseCase = new ListExpensesUseCase(repo);
+ 
+diff --git a/src/modules/finance/application/LoanUseCases.ts b/src/modules/finance/application/LoanUseCases.ts
+index 334db8d..05b38b4 100644
+--- a/src/modules/finance/application/LoanUseCases.ts
++++ b/src/modules/finance/application/LoanUseCases.ts
+@@ -7,6 +7,7 @@ import { PartnerRepository } from "../../partners/domain/Partner";
+ import { EntityNotFoundError } from "../../../shared/domain/DomainError";
+ import { IdGenerator } from "../../../shared/infrastructure/utils/IdGenerator";
+ import { EventRecorder } from "../../../shared/application/EventRecorder";
++import { allowAllReportingPeriods, ReportingPeriodWriteGuard } from "../../reporting/application/ReportingPeriodGuard";
+ 
+ export type LoanDirection = "TAKEN" | "LENT";
+ 
+@@ -27,10 +28,12 @@ export class RecordDirectLoanUseCase {
+     private readonly accountTxService: RecordAccountTransactionUseCase,
+     private readonly recordLoanTransactionUseCase: RecordLoanTransactionUseCase,
+     private readonly partnerRepository: PartnerRepository,
+-    private readonly eventRecorder: EventRecorder
++    private readonly eventRecorder: EventRecorder,
++    private readonly reportingPeriodGuard: ReportingPeriodWriteGuard = allowAllReportingPeriods
+   ) {}
+ 
+   async execute(input: RecordDirectLoanInput): Promise<{ loanTransactionId?: number }> {
++    await this.reportingPeriodGuard.assertOpen(input.companyId, [input.date]);
+     return this.txManager.run(async (client) => {
+       const partner = await this.partnerRepository.findByIdForUpdate(input.companyId, input.primaryPartnerId, client);
+       if (!partner) {
+@@ -107,10 +110,12 @@ export class RecordPartnerToPartnerLoanUseCase {
+     private readonly txManager: TransactionManager,
+     private readonly recordLoanTransactionUseCase: RecordLoanTransactionUseCase,
+     private readonly partnerRepository: PartnerRepository,
+-    private readonly eventRecorder: EventRecorder
++    private readonly eventRecorder: EventRecorder,
++    private readonly reportingPeriodGuard: ReportingPeriodWriteGuard = allowAllReportingPeriods
+   ) {}
+ 
+   async execute(input: RecordPartnerToPartnerLoanInput): Promise<{ }> {
++    await this.reportingPeriodGuard.assertOpen(input.companyId, [input.date]);
+     return this.txManager.run(async (client) => {
+       const [id1, id2] = [input.primaryPartnerId, input.relatedPartnerId].sort((a, b) => a - b);
+       
+@@ -207,10 +212,12 @@ export class RecordHistoricalLoanUseCase {
+     private readonly txManager: TransactionManager,
+     private readonly recordLoanTransactionUseCase: RecordLoanTransactionUseCase,
+     private readonly partnerRepository: PartnerRepository,
+-    private readonly eventRecorder: EventRecorder
++    private readonly eventRecorder: EventRecorder,
++    private readonly reportingPeriodGuard: ReportingPeriodWriteGuard = allowAllReportingPeriods
+   ) {}
+ 
+   async execute(input: RecordHistoricalLoanInput): Promise<{ }> {
++    await this.reportingPeriodGuard.assertOpen(input.companyId, [input.date]);
+     return this.txManager.run(async (client) => {
+       const partner = await this.partnerRepository.findByIdForUpdate(input.companyId, input.primaryPartnerId, client);
+       if (!partner) {
+diff --git a/src/modules/finance/presentation/FinanceRouter.ts b/src/modules/finance/presentation/FinanceRouter.ts
+index 9403857..7e34491 100644
+--- a/src/modules/finance/presentation/FinanceRouter.ts
++++ b/src/modules/finance/presentation/FinanceRouter.ts
+@@ -14,6 +14,8 @@ import { PostgreSQLTransactionManager } from "../../../shared/infrastructure/tra
+ import { PgBusinessEventRepository } from "../../../shared/infrastructure/events/PgBusinessEventRepository";
+ import { DbEventRecorder } from "../../../shared/application/EventRecorder";
+ import { sendErrorResponse } from "../../../shared/presentation/http/ErrorHandler";
++import { PgReportingPeriodCloseRepository } from "../../reporting/infrastructure/PgReportingPeriodCloseRepository";
++import { ReportingPeriodGuard } from "../../reporting/application/ReportingPeriodGuard";
+ import { recordLoanSchema, listTransactionsFiltersSchema, listAccountTransactionsQuerySchema } from "./FinanceSchemas";
+ 
+ const accountRepo = new PgAccountRepository();
+@@ -26,9 +28,10 @@ const eventRepository = new PgBusinessEventRepository();
+ const eventRecorder = new DbEventRecorder(eventRepository);
+ 
+ const recordLoanTxUseCase = new RecordLoanTransactionUseCase(txManager, partnerRepo, pgLoanTxRepo);
+-const recordDirectUseCase = new RecordDirectLoanUseCase(txManager, accountTxService, recordLoanTxUseCase, partnerRepo, eventRecorder);
+-const recordP2PUseCase = new RecordPartnerToPartnerLoanUseCase(txManager, recordLoanTxUseCase, partnerRepo, eventRecorder);
+-const recordHistoryUseCase = new RecordHistoricalLoanUseCase(txManager, recordLoanTxUseCase, partnerRepo, eventRecorder);
++const reportingPeriodGuard = new ReportingPeriodGuard(new PgReportingPeriodCloseRepository());
++const recordDirectUseCase = new RecordDirectLoanUseCase(txManager, accountTxService, recordLoanTxUseCase, partnerRepo, eventRecorder, reportingPeriodGuard);
++const recordP2PUseCase = new RecordPartnerToPartnerLoanUseCase(txManager, recordLoanTxUseCase, partnerRepo, eventRecorder, reportingPeriodGuard);
++const recordHistoryUseCase = new RecordHistoricalLoanUseCase(txManager, recordLoanTxUseCase, partnerRepo, eventRecorder, reportingPeriodGuard);
+ 
+ const listPartnerBalancesUseCase = new ListPartnerBalancesUseCase(partnerRepo);
+ const listTransactionsUseCase = new ListLoanTransactionsUseCase(pgLoanTxRepo);
+diff --git a/src/modules/inventory/application/CreateInventoryAdjustmentUseCase.ts b/src/modules/inventory/application/CreateInventoryAdjustmentUseCase.ts
+index e677a7e..40e4738 100644
+--- a/src/modules/inventory/application/CreateInventoryAdjustmentUseCase.ts
++++ b/src/modules/inventory/application/CreateInventoryAdjustmentUseCase.ts
+@@ -3,6 +3,7 @@ import { InventoryTransaction, InventoryTxType } from "../domain/InventoryTransa
+ import { TransactionManager } from "../../../shared/infrastructure/transactions/TransactionManager";
+ import { ValidationError } from "../../../shared/domain/DomainError";
+ import { RecordInventoryTransactionUseCase } from "./RecordInventoryTransactionUseCase";
++import { allowAllReportingPeriods, ReportingPeriodWriteGuard } from "../../reporting/application/ReportingPeriodGuard";
+ 
+ export interface CreateInventoryAdjustmentInput {
+   companyId: number;
+@@ -23,10 +24,12 @@ export class CreateInventoryAdjustmentUseCase {
+   constructor(
+     private readonly txManager: TransactionManager,
+     private readonly adjustmentRepo: InventoryAdjustmentRepository,
+-    private readonly recordInventoryTxUseCase: RecordInventoryTransactionUseCase
++    private readonly recordInventoryTxUseCase: RecordInventoryTransactionUseCase,
++    private readonly reportingPeriodGuard: ReportingPeriodWriteGuard = allowAllReportingPeriods
+   ) {}
+ 
+   async execute(input: CreateInventoryAdjustmentInput): Promise<{ adjustmentId: number }> {
++    await this.reportingPeriodGuard.assertOpen(input.companyId, [input.orderDate]);
+     return this.txManager.run(async (client) => {
+       // 1. Create Adjustment Aggregate
+       const adjustment = InventoryAdjustment.create({
+diff --git a/src/modules/inventory/presentation/AdjustmentRouter.ts b/src/modules/inventory/presentation/AdjustmentRouter.ts
+index f2f12b0..8147175 100644
+--- a/src/modules/inventory/presentation/AdjustmentRouter.ts
++++ b/src/modules/inventory/presentation/AdjustmentRouter.ts
+@@ -12,6 +12,8 @@ import { RecordInventoryTransactionUseCase } from "../application/RecordInventor
+ import { PostgreSQLTransactionManager } from "../../../shared/infrastructure/transactions/TransactionManager";
+ import { createAdjustmentSchema } from "./AdjustmentSchemas";
+ import { sendErrorResponse } from "../../../shared/presentation/http/ErrorHandler";
++import { PgReportingPeriodCloseRepository } from "../../reporting/infrastructure/PgReportingPeriodCloseRepository";
++import { ReportingPeriodGuard } from "../../reporting/application/ReportingPeriodGuard";
+ import { EntityNotFoundError } from "../../../shared/domain/DomainError";
+ 
+ const accessPolicy = new DbAccessPolicy();
+@@ -21,8 +23,9 @@ const inventoryBalanceRepo = new PgInventoryBalanceRepository();
+ const costRepo = new PgInventoryCostRepository();
+ const recordInventoryTxUseCase = new RecordInventoryTransactionUseCase(inventoryBalanceRepo, costRepo, inventoryTxRepo);
+ const txManager = new PostgreSQLTransactionManager();
++const reportingPeriodGuard = new ReportingPeriodGuard(new PgReportingPeriodCloseRepository());
+ 
+-const createUseCase = new CreateInventoryAdjustmentUseCase(txManager, adjustmentRepo, recordInventoryTxUseCase);
++const createUseCase = new CreateInventoryAdjustmentUseCase(txManager, adjustmentRepo, recordInventoryTxUseCase, reportingPeriodGuard);
+ 
+ export const AdjustmentRouter = Router();
+ 
+diff --git a/src/modules/purchases/application/CreatePurchaseOrderUseCase.ts b/src/modules/purchases/application/CreatePurchaseOrderUseCase.ts
+index 66461c9..166ff56 100644
+--- a/src/modules/purchases/application/CreatePurchaseOrderUseCase.ts
++++ b/src/modules/purchases/application/CreatePurchaseOrderUseCase.ts
+@@ -10,6 +10,7 @@ import { TransactionManager } from "../../../shared/infrastructure/transactions/
+ import { RecordLoanTransactionUseCase } from "../../finance/application/RecordLoanTransactionUseCase";
+ import { LoanTransactionSourceType } from "../../finance/domain/LoanTransaction";
+ import { ValidationError, EntityNotFoundError } from "../../../shared/domain/DomainError";
++import { allowAllReportingPeriods, ReportingPeriodWriteGuard } from "../../reporting/application/ReportingPeriodGuard";
+ import { InventoryMovementService } from "../../inventory/domain/InventoryMovementService";
+ 
+ export interface CreatePurchaseOrderInput {
+@@ -48,10 +49,17 @@ export class CreatePurchaseOrderUseCase {
+     private readonly accountTxService: RecordAccountTransactionUseCase,
+     private readonly recordLoanTransactionUseCase: RecordLoanTransactionUseCase,
+     private readonly inventoryBalanceRepository: InventoryBalanceRepository,
+-    private readonly inventoryCostRepository: InventoryCostRepository
++    private readonly inventoryCostRepository: InventoryCostRepository,
++    private readonly reportingPeriodGuard: ReportingPeriodWriteGuard = allowAllReportingPeriods
+   ) {}
+ 
+   async execute(input: CreatePurchaseOrderInput): Promise<{ purchaseOrderId: number }> {
++    const periodDates: Date[] = [input.orderDate, ...(input.payments ?? []).map((payment) => payment.date)];
++    const receivesImmediately = input.receiveOption !== ReceiveOption.RECEIVE_LATER &&
++      (input.receiveOption === ReceiveOption.RECEIVED_ALL || input.items.some((item) => (item.quantityReceived ?? 0) > 0));
++    if (receivesImmediately) periodDates.push(input.expectedReceiveDate ?? input.orderDate);
++    await this.reportingPeriodGuard.assertOpen(input.companyId, periodDates);
++
+     return this.txManager.run(async (client) => {
+       // 0. Validation
+       if (!input.branchId) {
+diff --git a/src/modules/purchases/application/RecordPurchasePaymentUseCase.ts b/src/modules/purchases/application/RecordPurchasePaymentUseCase.ts
+index 40579f4..b211eb8 100644
+--- a/src/modules/purchases/application/RecordPurchasePaymentUseCase.ts
++++ b/src/modules/purchases/application/RecordPurchasePaymentUseCase.ts
+@@ -6,6 +6,7 @@ import { RecordAccountTransactionUseCase } from "../../finance/application/Recor
+ import { RecordLoanTransactionUseCase } from "../../finance/application/RecordLoanTransactionUseCase";
+ import { LoanTransactionSourceType } from "../../finance/domain/LoanTransaction";
+ import { EntityNotFoundError, ValidationError } from "../../../shared/domain/DomainError";
++import { allowAllReportingPeriods, ReportingPeriodWriteGuard } from "../../reporting/application/ReportingPeriodGuard";
+ 
+ export interface RecordPurchasePaymentInput {
+   companyId: number;
+@@ -27,10 +28,12 @@ export class RecordPurchasePaymentUseCase {
+     private readonly purchaseOrderRepo: PurchaseOrderRepository,
+     private readonly purchasePaymentRepo: PurchasePaymentRepository,
+     private readonly accountTxService: RecordAccountTransactionUseCase,
+-    private readonly recordLoanTransactionUseCase: RecordLoanTransactionUseCase
++    private readonly recordLoanTransactionUseCase: RecordLoanTransactionUseCase,
++    private readonly reportingPeriodGuard: ReportingPeriodWriteGuard = allowAllReportingPeriods
+   ) {}
+ 
+   async execute(input: RecordPurchasePaymentInput): Promise<{ paymentId: number }> {
++    await this.reportingPeriodGuard.assertOpen(input.companyId, input.lines.map((line) => line.date));
+     return this.txManager.run(async (client) => {
+       // 1. Retrieve PO with FOR UPDATE lock
+       const order = await this.purchaseOrderRepo.findByIdForUpdate(input.companyId, input.purchaseOrderId, client);
+diff --git a/src/modules/purchases/application/RecordPurchaseReceiveUseCase.ts b/src/modules/purchases/application/RecordPurchaseReceiveUseCase.ts
+index d8d1b80..e5c53ac 100644
+--- a/src/modules/purchases/application/RecordPurchaseReceiveUseCase.ts
++++ b/src/modules/purchases/application/RecordPurchaseReceiveUseCase.ts
+@@ -6,6 +6,7 @@ import { InventoryTransaction, InventoryTransactionRepository, InventoryTxType }
+ import { InventoryPendingRepository } from "../../inventory/domain/InventoryPending";
+ import { EntityNotFoundError, ValidationError } from "../../../shared/domain/DomainError";
+ import { WarehouseService } from "../../inventory/application/WarehouseService";
++import { allowAllReportingPeriods, ReportingPeriodWriteGuard } from "../../reporting/application/ReportingPeriodGuard";
+ 
+ export interface RecordPurchaseReceiveInput {
+   companyId: number;
+@@ -31,10 +32,12 @@ export class RecordPurchaseReceiveUseCase {
+     private readonly productRepo: ProductRepository,
+     private readonly inventoryTxRepo: InventoryTransactionRepository,
+     private readonly inventoryPendingRepo: InventoryPendingRepository,
+-    private readonly warehouseService: WarehouseService
++    private readonly warehouseService: WarehouseService,
++    private readonly reportingPeriodGuard: ReportingPeriodWriteGuard = allowAllReportingPeriods
+   ) {}
+ 
+   async execute(input: RecordPurchaseReceiveInput): Promise<{ receiveId: number }> {
++    await this.reportingPeriodGuard.assertOpen(input.companyId, [input.receiveDate]);
+     return this.txManager.run(async (client) => {
+       // 1. Get PO with lock
+       const order = await this.purchaseOrderRepo.findByIdForUpdate(input.companyId, input.purchaseOrderId, client);
+diff --git a/src/modules/purchases/presentation/PurchaseRouter.ts b/src/modules/purchases/presentation/PurchaseRouter.ts
+index 81583f6..9c6fb71 100644
+--- a/src/modules/purchases/presentation/PurchaseRouter.ts
++++ b/src/modules/purchases/presentation/PurchaseRouter.ts
+@@ -25,6 +25,8 @@ import { PgInventoryBalanceRepository } from "../../inventory/infrastructure/PgI
+ import { RecordInventoryTransactionUseCase } from "../../inventory/application/RecordInventoryTransactionUseCase";
+ import { PostgreSQLTransactionManager } from "../../../shared/infrastructure/transactions/TransactionManager";
+ import { sendErrorResponse } from "../../../shared/presentation/http/ErrorHandler";
++import { PgReportingPeriodCloseRepository } from "../../reporting/infrastructure/PgReportingPeriodCloseRepository";
++import { ReportingPeriodGuard } from "../../reporting/application/ReportingPeriodGuard";
+ import { ValidationError } from "../../../shared/domain/DomainError";
+ import { WarehouseService } from "../../inventory/application/WarehouseService";
+ 
+@@ -45,6 +47,7 @@ const inventoryBalanceRepo = new PgInventoryBalanceRepository();
+ const recordInventoryTxUseCase = new RecordInventoryTransactionUseCase(inventoryBalanceRepo, inventoryCostRepo, inventoryTxRepo);
+ const warehouseService = new WarehouseService(inventoryPendingRepo, inventoryCostRepo, productRepo, recordInventoryTxUseCase);
+ const recordLoanTxUseCase = new RecordLoanTransactionUseCase(txManager, partnerRepo, pgLoanTxRepo);
++const reportingPeriodGuard = new ReportingPeriodGuard(new PgReportingPeriodCloseRepository());
+ 
+ const createPurchaseOrderUseCase = new CreatePurchaseOrderUseCase(
+   txManager, 
+@@ -54,11 +57,12 @@ const createPurchaseOrderUseCase = new CreatePurchaseOrderUseCase(
+   accountTxService,
+   recordLoanTxUseCase,
+   inventoryBalanceRepo,
+-  inventoryCostRepo
++  inventoryCostRepo,
++  reportingPeriodGuard
+ );
+ const getPurchaseDetailsUseCase = new GetPurchaseDetailsUseCase(poRepo, paymentRepo, receiveRepo);
+ const getNextPurchaseOrderNoUseCase = new GetNextPurchaseOrderNoUseCase(poRepo);
+-const recordPurchasePaymentUseCase = new RecordPurchasePaymentUseCase(txManager, poRepo, paymentRepo, accountTxService, recordLoanTxUseCase);
++const recordPurchasePaymentUseCase = new RecordPurchasePaymentUseCase(txManager, poRepo, paymentRepo, accountTxService, recordLoanTxUseCase, reportingPeriodGuard);
+ const recordPurchaseReceiveUseCase = new RecordPurchaseReceiveUseCase(
+   txManager,
+   poRepo,
+@@ -66,7 +70,8 @@ const recordPurchaseReceiveUseCase = new RecordPurchaseReceiveUseCase(
+   productRepo,
+   inventoryTxRepo,
+   inventoryPendingRepo,
+-  warehouseService
++  warehouseService,
++  reportingPeriodGuard
+ );
+ 
+ const accessPolicy = new DbAccessPolicy();
+diff --git a/src/modules/reporting/application/ReportingPeriodCloseUseCases.ts b/src/modules/reporting/application/ReportingPeriodCloseUseCases.ts
+new file mode 100644
+index 0000000..a6d7ca2
+--- /dev/null
++++ b/src/modules/reporting/application/ReportingPeriodCloseUseCases.ts
+@@ -0,0 +1,108 @@
++import { TransactionManager } from "../../../shared/infrastructure/transactions/TransactionManager";
++import {
++  PeriodCloseBlocker,
++  ReportingPeriodAlreadyClosedError,
++  ReportingPeriodCloseBlockedError,
++  ReportingPeriodState,
++  formatBusinessDate,
++  normalizeBusinessDate
++} from "../domain/ReportingPeriodClose";
++import { ReportingPeriodCloseRepository } from "../domain/ReportingPeriodCloseRepository";
++
++export interface ReportingPeriodStatusOutput {
++  closedThrough: string | null;
++  closedAt: string | null;
++  closedBy: number | null;
++}
++
++export interface ReportingPeriodEligibilityOutput {
++  throughDate: string;
++  closedThrough: string | null;
++  eligible: boolean;
++  blockers: PeriodCloseBlocker[];
++}
++
++function stateFromRecord(companyId: number, record: Awaited<ReturnType<ReportingPeriodCloseRepository["getCurrent"]>>): ReportingPeriodState {
++  return record ? ReportingPeriodState.hydrate(record) : ReportingPeriodState.open(companyId);
++}
++
++function statusFromState(state: ReportingPeriodState): ReportingPeriodStatusOutput {
++  const p = state.toPrimitives();
++  return {
++    closedThrough: p.closedThrough ? formatBusinessDate(p.closedThrough) : null,
++    closedAt: p.closedAt ? p.closedAt.toISOString() : null,
++    closedBy: p.closedBy
++  };
++}
++
++function positiveBlockers(blockers: PeriodCloseBlocker[]): PeriodCloseBlocker[] {
++  return blockers.filter((blocker) => blocker.count > 0);
++}
++
++export class GetReportingPeriodCloseUseCase {
++  constructor(private readonly repository: ReportingPeriodCloseRepository) {}
++
++  async execute(companyId: number): Promise<ReportingPeriodStatusOutput> {
++    const current = await this.repository.getCurrent(companyId);
++    return statusFromState(stateFromRecord(companyId, current));
++  }
++}
++
++export class CheckReportingPeriodCloseEligibilityUseCase {
++  constructor(private readonly repository: ReportingPeriodCloseRepository) {}
++
++  async execute(companyId: number, throughDate: Date): Promise<ReportingPeriodEligibilityOutput> {
++    const requested = normalizeBusinessDate(throughDate);
++    const current = stateFromRecord(companyId, await this.repository.getCurrent(companyId));
++    const currentProps = current.toPrimitives();
++
++    if (currentProps.closedThrough) {
++      try {
++        current.assertCanAdvanceTo(requested);
++      } catch (error) {
++        if (error instanceof ReportingPeriodAlreadyClosedError) {
++          return {
++            throughDate: formatBusinessDate(requested),
++            closedThrough: formatBusinessDate(currentProps.closedThrough),
++            eligible: false,
++            blockers: [{ type: "ALREADY_CLOSED", count: 1 }]
++          };
++        }
++        throw error;
++      }
++    }
++
++    const blockers = positiveBlockers(await this.repository.getEligibilityBlockers(companyId, requested));
++    return {
++      throughDate: formatBusinessDate(requested),
++      closedThrough: currentProps.closedThrough ? formatBusinessDate(currentProps.closedThrough) : null,
++      eligible: blockers.length === 0,
++      blockers
++    };
++  }
++}
++
++export class CloseReportingPeriodUseCase {
++  constructor(
++    private readonly txManager: TransactionManager,
++    private readonly repository: ReportingPeriodCloseRepository
++  ) {}
++
++  async execute(companyId: number, throughDate: Date, closedBy?: number | null): Promise<ReportingPeriodStatusOutput> {
++    const requested = normalizeBusinessDate(throughDate);
++
++    return this.txManager.run(async (client) => {
++      await this.repository.acquireCompanyCloseLock(companyId, client);
++      const current = stateFromRecord(companyId, await this.repository.getCurrent(companyId, client));
++      current.assertCanAdvanceTo(requested);
++
++      const blockers = positiveBlockers(await this.repository.getEligibilityBlockers(companyId, requested, client));
++      if (blockers.length > 0) {
++        throw new ReportingPeriodCloseBlockedError(blockers);
++      }
++
++      const saved = await this.repository.insertClose(companyId, requested, closedBy ?? null, client);
++      return statusFromState(ReportingPeriodState.hydrate(saved));
++    });
++  }
++}
+diff --git a/src/modules/reporting/application/ReportingPeriodGuard.ts b/src/modules/reporting/application/ReportingPeriodGuard.ts
+new file mode 100644
+index 0000000..766f33b
+--- /dev/null
++++ b/src/modules/reporting/application/ReportingPeriodGuard.ts
+@@ -0,0 +1,27 @@
++import { ReportingPeriodState } from "../domain/ReportingPeriodClose";
++import { ReportingPeriodCloseRepository } from "../domain/ReportingPeriodCloseRepository";
++
++export interface ReportingPeriodWriteGuard {
++  assertOpen(companyId: number, dates: Date[]): Promise<void>;
++}
++
++export const allowAllReportingPeriods: ReportingPeriodWriteGuard = {
++  async assertOpen(): Promise<void> {
++    return;
++  }
++};
++
++export class ReportingPeriodGuard implements ReportingPeriodWriteGuard {
++  constructor(private readonly repository: ReportingPeriodCloseRepository) {}
++
++  async assertOpen(companyId: number, dates: Date[]): Promise<void> {
++    if (dates.length === 0) return;
++    const current = await this.repository.getCurrent(companyId);
++    if (!current) return;
++
++    const state = ReportingPeriodState.hydrate(current);
++    for (const date of dates) {
++      state.assertOpen(date);
++    }
++  }
++}
+diff --git a/src/modules/reporting/domain/ReportingPeriodClose.ts b/src/modules/reporting/domain/ReportingPeriodClose.ts
+new file mode 100644
+index 0000000..6ebb14f
+--- /dev/null
++++ b/src/modules/reporting/domain/ReportingPeriodClose.ts
+@@ -0,0 +1,136 @@
++import { DomainError, ValidationError } from "../../../shared/domain/DomainError";
++
++export type PeriodCloseBlockerType = "OPEN_SALES" | "OPEN_PURCHASES" | "ALREADY_CLOSED";
++
++export interface PeriodCloseBlocker {
++  type: PeriodCloseBlockerType;
++  count: number;
++}
++
++export interface ReportingPeriodCloseRecord {
++  id?: number;
++  companyId: number;
++  closedThrough: Date;
++  closedAt: Date;
++  closedBy: number | null;
++}
++
++function assertValidDate(value: Date): void {
++  if (!(value instanceof Date) || Number.isNaN(value.getTime())) {
++    throw new ValidationError("A valid business date is required");
++  }
++}
++
++export function normalizeBusinessDate(value: Date): Date {
++  assertValidDate(value);
++  return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), value.getUTCDate()));
++}
++
++export function formatBusinessDate(value: Date): string {
++  return normalizeBusinessDate(value).toISOString().slice(0, 10);
++}
++
++export function compareBusinessDates(left: Date, right: Date): number {
++  const a = normalizeBusinessDate(left).getTime();
++  const b = normalizeBusinessDate(right).getTime();
++  return a === b ? 0 : a < b ? -1 : 1;
++}
++
++export class ReportingPeriodClosedError extends DomainError {
++  readonly code = "REPORTING_PERIOD_CLOSED";
++  readonly status = 409;
++
++  constructor(readonly businessDate: Date, readonly closedThrough: Date) {
++    super(
++      `Reporting period is closed through ${formatBusinessDate(closedThrough)}; ` +
++      `${formatBusinessDate(businessDate)} cannot be changed`
++    );
++  }
++}
++
++export class ReportingPeriodAlreadyClosedError extends DomainError {
++  readonly code = "PERIOD_ALREADY_CLOSED";
++  readonly status = 409;
++
++  constructor(readonly requestedThrough: Date, readonly closedThrough: Date) {
++    super(
++      `Reporting period is already closed through ${formatBusinessDate(closedThrough)}; ` +
++      `cannot close through ${formatBusinessDate(requestedThrough)}`
++    );
++  }
++}
++
++export class ReportingPeriodCloseBlockedError extends DomainError {
++  readonly code = "PERIOD_CLOSE_BLOCKED";
++  readonly status = 409;
++
++  constructor(readonly blockers: PeriodCloseBlocker[]) {
++    const summary = blockers
++      .filter((blocker) => blocker.count > 0)
++      .map((blocker) => `${blocker.type}:${blocker.count}`)
++      .join(", ");
++    super(summary ? `Reporting period cannot be closed (${summary})` : "Reporting period cannot be closed");
++  }
++}
++
++export class ReportingPeriodState {
++  private constructor(
++    readonly companyId: number,
++    readonly closedThrough: Date | null,
++    readonly closedAt: Date | null,
++    readonly closedBy: number | null
++  ) {}
++
++  static open(companyId: number): ReportingPeriodState {
++    if (!Number.isInteger(companyId) || companyId <= 0) {
++      throw new ValidationError("Company ID must be a positive integer");
++    }
++    return new ReportingPeriodState(companyId, null, null, null);
++  }
++
++  static hydrate(record: ReportingPeriodCloseRecord): ReportingPeriodState {
++    if (!Number.isInteger(record.companyId) || record.companyId <= 0) {
++      throw new ValidationError("Company ID must be a positive integer");
++    }
++    assertValidDate(record.closedThrough);
++    assertValidDate(record.closedAt);
++    return new ReportingPeriodState(
++      record.companyId,
++      normalizeBusinessDate(record.closedThrough),
++      new Date(record.closedAt.getTime()),
++      record.closedBy ?? null
++    );
++  }
++
++  isClosed(date: Date): boolean {
++    if (!this.closedThrough) return false;
++    return compareBusinessDates(date, this.closedThrough) <= 0;
++  }
++
++  assertOpen(date: Date): void {
++    if (this.closedThrough && this.isClosed(date)) {
++      throw new ReportingPeriodClosedError(date, this.closedThrough);
++    }
++  }
++
++  assertCanAdvanceTo(date: Date): void {
++    const requested = normalizeBusinessDate(date);
++    if (this.closedThrough && compareBusinessDates(requested, this.closedThrough) <= 0) {
++      throw new ReportingPeriodAlreadyClosedError(requested, this.closedThrough);
++    }
++  }
++
++  toPrimitives(): {
++    companyId: number;
++    closedThrough: Date | null;
++    closedAt: Date | null;
++    closedBy: number | null;
++  } {
++    return {
++      companyId: this.companyId,
++      closedThrough: this.closedThrough ? new Date(this.closedThrough.getTime()) : null,
++      closedAt: this.closedAt ? new Date(this.closedAt.getTime()) : null,
++      closedBy: this.closedBy
++    };
++  }
++}
+diff --git a/src/modules/reporting/domain/ReportingPeriodCloseRepository.ts b/src/modules/reporting/domain/ReportingPeriodCloseRepository.ts
+new file mode 100644
+index 0000000..b671fcf
+--- /dev/null
++++ b/src/modules/reporting/domain/ReportingPeriodCloseRepository.ts
+@@ -0,0 +1,14 @@
++import { PoolClient } from "pg";
++import { PeriodCloseBlocker, ReportingPeriodCloseRecord } from "./ReportingPeriodClose";
++
++export interface ReportingPeriodCloseRepository {
++  acquireCompanyCloseLock(companyId: number, client: PoolClient): Promise<void>;
++  getCurrent(companyId: number, client?: PoolClient): Promise<ReportingPeriodCloseRecord | null>;
++  getEligibilityBlockers(companyId: number, throughDate: Date, client?: PoolClient): Promise<PeriodCloseBlocker[]>;
++  insertClose(
++    companyId: number,
++    throughDate: Date,
++    closedBy: number | null,
++    client: PoolClient
++  ): Promise<ReportingPeriodCloseRecord>;
++}
+diff --git a/src/modules/reporting/infrastructure/PgReportingPeriodCloseRepository.ts b/src/modules/reporting/infrastructure/PgReportingPeriodCloseRepository.ts
+new file mode 100644
+index 0000000..b93d63e
+--- /dev/null
++++ b/src/modules/reporting/infrastructure/PgReportingPeriodCloseRepository.ts
+@@ -0,0 +1,98 @@
++import { PoolClient } from "pg";
++import { pgPool } from "../../../shared/infrastructure/db/pgPool";
++import {
++  PeriodCloseBlocker,
++  ReportingPeriodCloseRecord,
++  normalizeBusinessDate
++} from "../domain/ReportingPeriodClose";
++import { ReportingPeriodCloseRepository } from "../domain/ReportingPeriodCloseRepository";
++
++type Queryable = {
++  query(text: string, params?: any[]): Promise<{ rowCount: number | null; rows: any[] }>;
++};
++
++function parseDatabaseDate(value: unknown): Date {
++  if (value instanceof Date) {
++    return new Date(Date.UTC(value.getFullYear(), value.getMonth(), value.getDate()));
++  }
++  const text = String(value);
++  const dateOnly = text.match(/^\d{4}-\d{2}-\d{2}/)?.[0];
++  if (!dateOnly) {
++    return new Date(NaN);
++  }
++  return new Date(`${dateOnly}T00:00:00.000Z`);
++}
++
++function mapRecord(row: any): ReportingPeriodCloseRecord {
++  return {
++    id: Number(row.id),
++    companyId: Number(row.company_id),
++    closedThrough: parseDatabaseDate(row.closed_through),
++    closedAt: new Date(row.closed_at),
++    closedBy: row.closed_by == null ? null : Number(row.closed_by)
++  };
++}
++
++export class PgReportingPeriodCloseRepository implements ReportingPeriodCloseRepository {
++  private db(client?: PoolClient): Queryable {
++    return client ?? pgPool;
++  }
++
++  async acquireCompanyCloseLock(companyId: number, client: PoolClient): Promise<void> {
++    await client.query("SELECT pg_advisory_xact_lock($1)", [companyId]);
++  }
++
++  async getCurrent(companyId: number, client?: PoolClient): Promise<ReportingPeriodCloseRecord | null> {
++    const result = await this.db(client).query(
++      `SELECT id, company_id, closed_through, closed_at, closed_by
++       FROM reporting_period_close
++       WHERE company_id = $1
++       ORDER BY closed_through DESC, id DESC
++       LIMIT 1`,
++      [companyId]
++    );
++    return result.rowCount ? mapRecord(result.rows[0]) : null;
++  }
++
++  async getEligibilityBlockers(companyId: number, throughDate: Date, client?: PoolClient): Promise<PeriodCloseBlocker[]> {
++    const date = normalizeBusinessDate(throughDate);
++    const result = await this.db(client).query(
++      `SELECT
++         (SELECT COUNT(*)::int
++            FROM sale_order
++           WHERE company_id = $1
++             AND order_date <= $2::date
++             AND status NOT IN ('CLOSED', 'CANCELLED')) AS open_sales,
++         (SELECT COUNT(*)::int
++            FROM purchase_order
++           WHERE company_id = $1
++             AND order_date <= $2::date
++             AND status NOT IN ('CLOSED', 'CANCELLED')) AS open_purchases`,
++      [companyId, formatDateParameter(date)]
++    );
++    const row = result.rows[0] ?? { open_sales: 0, open_purchases: 0 };
++    return [
++      { type: "OPEN_SALES", count: Number(row.open_sales ?? 0) },
++      { type: "OPEN_PURCHASES", count: Number(row.open_purchases ?? 0) }
++    ];
++  }
++
++  async insertClose(
++    companyId: number,
++    throughDate: Date,
++    closedBy: number | null,
++    client: PoolClient
++  ): Promise<ReportingPeriodCloseRecord> {
++    const result = await client.query(
++      `INSERT INTO reporting_period_close (company_id, closed_through, closed_by)
++       VALUES ($1, $2::date, $3)
++       RETURNING id, company_id, closed_through, closed_at, closed_by`,
++      [companyId, formatDateParameter(throughDate), closedBy]
++    );
++    return mapRecord(result.rows[0]);
++  }
++}
++
++function formatDateParameter(value: Date): string {
++  return normalizeBusinessDate(value).toISOString().slice(0, 10);
++}
+diff --git a/src/modules/reporting/presentation/ReportingPeriodCloseSchemas.ts b/src/modules/reporting/presentation/ReportingPeriodCloseSchemas.ts
+new file mode 100644
+index 0000000..b125617
+--- /dev/null
++++ b/src/modules/reporting/presentation/ReportingPeriodCloseSchemas.ts
+@@ -0,0 +1,26 @@
++import { z } from "zod";
++
++function dateOnlySchema() {
++  return z.string()
++    .regex(/^\d{4}-\d{2}-\d{2}$/, "Date must use YYYY-MM-DD")
++    .superRefine((value, ctx) => {
++      const [year, month, day] = value.split("-").map(Number);
++      const parsed = new Date(Date.UTC(year, month - 1, day));
++      const same = parsed.getUTCFullYear() === year && parsed.getUTCMonth() === month - 1 && parsed.getUTCDate() === day;
++      if (!same) {
++        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Date is not a valid calendar day" });
++      }
++    })
++    .transform((value) => {
++      const [year, month, day] = value.split("-").map(Number);
++      return new Date(Date.UTC(year, month - 1, day));
++    });
++}
++
++export const ReportingPeriodCloseEligibilityQuerySchema = z.object({
++  throughDate: dateOnlySchema()
++});
++
++export const CloseReportingPeriodBodySchema = z.object({
++  throughDate: dateOnlySchema()
++});
+diff --git a/src/modules/reporting/presentation/ReportingRouter.ts b/src/modules/reporting/presentation/ReportingRouter.ts
+index cbb2503..c99dea8 100644
+--- a/src/modules/reporting/presentation/ReportingRouter.ts
++++ b/src/modules/reporting/presentation/ReportingRouter.ts
+@@ -40,6 +40,17 @@ import { GetMainReceivablesOverviewUseCase } from "../application/GetMainReceiva
+ import { GetMainPayablesOverviewUseCase } from "../application/GetMainPayablesOverviewUseCase";
+ import { GetMainReceivablesInvoicesUseCase } from "../application/GetMainReceivablesInvoicesUseCase";
+ import { GetMainPayablesBillsUseCase } from "../application/GetMainPayablesBillsUseCase";
++import { PgReportingPeriodCloseRepository } from "../infrastructure/PgReportingPeriodCloseRepository";
++import {
++  CheckReportingPeriodCloseEligibilityUseCase,
++  CloseReportingPeriodUseCase,
++  GetReportingPeriodCloseUseCase
++} from "../application/ReportingPeriodCloseUseCases";
++import { PostgreSQLTransactionManager } from "../../../shared/infrastructure/transactions/TransactionManager";
++import {
++  CloseReportingPeriodBodySchema,
++  ReportingPeriodCloseEligibilityQuerySchema
++} from "./ReportingPeriodCloseSchemas";
+ import { 
+   AlertsQuerySchema,
+   HomeInventoryLeaderboardQuerySchema,
+@@ -111,10 +122,66 @@ const getTopSellingReportUseCase = new GetTopSellingReportUseCase(reportingRepo)
+ const getMostProfitableReportUseCase = new GetMostProfitableReportUseCase(reportingRepo);
+ const getSlowMovingReportUseCase = new GetSlowMovingReportUseCase(reportingRepo);
+ const getLowStockReportUseCase = new GetLowStockReportUseCase(reportingRepo);
++const reportingPeriodCloseRepo = new PgReportingPeriodCloseRepository();
++const reportingPeriodTxManager = new PostgreSQLTransactionManager();
++const getReportingPeriodCloseUseCase = new GetReportingPeriodCloseUseCase(reportingPeriodCloseRepo);
++const checkReportingPeriodCloseEligibilityUseCase = new CheckReportingPeriodCloseEligibilityUseCase(reportingPeriodCloseRepo);
++const closeReportingPeriodUseCase = new CloseReportingPeriodUseCase(reportingPeriodTxManager, reportingPeriodCloseRepo);
+ 
+ const accessPolicy = new DbAccessPolicy();
+ export const ReportingRouter = Router();
+ 
++ReportingRouter.get(
++  "/period-close",
++  requireAuth,
++  requirePermission(accessPolicy, "REPORTING", "view"),
++  async (req: Request, res: Response) => {
++    try {
++      const result = await getReportingPeriodCloseUseCase.execute(req.auth!.companyId);
++      res.json(result);
++    } catch (err) {
++      sendErrorResponse(res, err);
++    }
++  }
++);
++
++ReportingRouter.get(
++  "/period-close/eligibility",
++  requireAuth,
++  requirePermission(accessPolicy, "REPORTING", "view"),
++  async (req: Request, res: Response) => {
++    try {
++      const query = ReportingPeriodCloseEligibilityQuerySchema.parse(req.query);
++      const result = await checkReportingPeriodCloseEligibilityUseCase.execute(
++        req.auth!.companyId,
++        query.throughDate
++      );
++      res.json(result);
++    } catch (err) {
++      sendErrorResponse(res, err);
++    }
++  }
++);
++
++ReportingRouter.post(
++  "/period-close",
++  requireAuth,
++  requirePermission(accessPolicy, "REPORTING", "update"),
++  async (req: Request, res: Response) => {
++    try {
++      const body = CloseReportingPeriodBodySchema.parse(req.body);
++      const result = await closeReportingPeriodUseCase.execute(
++        req.auth!.companyId,
++        body.throughDate,
++        req.auth!.userId
++      );
++      res.status(201).json(result);
++    } catch (err) {
++      sendErrorResponse(res, err);
++    }
++  }
++);
++
+ /**
+  * @openapi
+  * /api/v1/reporting/home/kpis:
+diff --git a/src/modules/sales/application/CreateSaleOrderUseCase.ts b/src/modules/sales/application/CreateSaleOrderUseCase.ts
+index 58e10ea..09aa68e 100644
+--- a/src/modules/sales/application/CreateSaleOrderUseCase.ts
++++ b/src/modules/sales/application/CreateSaleOrderUseCase.ts
+@@ -11,6 +11,7 @@ import { RecordLoanTransactionUseCase } from "../../finance/application/RecordLo
+ import { LoanTransactionSourceType } from "../../finance/domain/LoanTransaction";
+ import { ValidationError, EntityNotFoundError } from "../../../shared/domain/DomainError";
+ import { InventoryMovementService } from "../../inventory/domain/InventoryMovementService";
++import { allowAllReportingPeriods, ReportingPeriodWriteGuard } from "../../reporting/application/ReportingPeriodGuard";
+ 
+ export interface CreateSaleOrderInput {
+   companyId: number;
+@@ -50,7 +51,8 @@ export class CreateSaleOrderUseCase {
+     private readonly accountTxService: RecordAccountTransactionUseCase,
+     private readonly inventoryBalanceRepository: InventoryBalanceRepository,
+     private readonly inventoryCostRepository: InventoryCostRepository,
+-    private readonly recordLoanTransactionUseCase: RecordLoanTransactionUseCase
++    private readonly recordLoanTransactionUseCase: RecordLoanTransactionUseCase,
++    private readonly reportingPeriodGuard: ReportingPeriodWriteGuard = allowAllReportingPeriods
+   ) {}
+ 
+   async execute(input: CreateSaleOrderInput): Promise<{ saleOrderId: number }> {
+@@ -61,6 +63,12 @@ export class CreateSaleOrderUseCase {
+     if (!input.branchId) {
+       throw new ValidationError("Branch ID is required for inventory allocation");
+     }
++
++    const periodDates: Date[] = [input.orderDate, ...(input.payments ?? []).map((payment) => payment.date)];
++    const shipsImmediately = input.shipmentOption !== ShipmentOption.SHIP_LATER &&
++      (input.shipmentOption === ShipmentOption.SHIPPED_ALL || input.items.some((item) => (item.quantityShipped ?? 0) > 0));
++    if (shipsImmediately) periodDates.push(input.shipmentDate ?? input.orderDate);
++    await this.reportingPeriodGuard.assertOpen(input.companyId, periodDates);
+     
+     return this.txManager.run(async (client) => {
+       // 1. Validate Customer
+diff --git a/src/modules/sales/application/RecordSalePaymentUseCase.ts b/src/modules/sales/application/RecordSalePaymentUseCase.ts
+index 298dbce..b7b6756 100644
+--- a/src/modules/sales/application/RecordSalePaymentUseCase.ts
++++ b/src/modules/sales/application/RecordSalePaymentUseCase.ts
+@@ -6,6 +6,7 @@ import { RecordAccountTransactionUseCase } from "../../finance/application/Recor
+ import { RecordLoanTransactionUseCase } from "../../finance/application/RecordLoanTransactionUseCase";
+ import { LoanTransactionSourceType } from "../../finance/domain/LoanTransaction";
+ import { EntityNotFoundError, ValidationError } from "../../../shared/domain/DomainError";
++import { allowAllReportingPeriods, ReportingPeriodWriteGuard } from "../../reporting/application/ReportingPeriodGuard";
+ 
+ export interface RecordSalePaymentInput {
+   companyId: number;
+@@ -27,10 +28,12 @@ export class RecordSalePaymentUseCase {
+     private readonly saleOrderRepo: SaleOrderRepository,
+     private readonly salePaymentRepo: SalePaymentRepository,
+     private readonly accountTxService: RecordAccountTransactionUseCase,
+-    private readonly recordLoanTransactionUseCase: RecordLoanTransactionUseCase
++    private readonly recordLoanTransactionUseCase: RecordLoanTransactionUseCase,
++    private readonly reportingPeriodGuard: ReportingPeriodWriteGuard = allowAllReportingPeriods
+   ) {}
+ 
+   async execute(input: RecordSalePaymentInput): Promise<{ paymentId: number }> {
++    await this.reportingPeriodGuard.assertOpen(input.companyId, input.lines.map((line) => line.date));
+     return this.txManager.run(async (client) => {
+       // 1. Retrieve SO with FOR UPDATE lock
+       const order = await this.saleOrderRepo.findByIdForUpdate(input.companyId, input.saleOrderId, client);
+diff --git a/src/modules/sales/application/RecordShipmentUseCase.ts b/src/modules/sales/application/RecordShipmentUseCase.ts
+index 7893fe8..093265a 100644
+--- a/src/modules/sales/application/RecordShipmentUseCase.ts
++++ b/src/modules/sales/application/RecordShipmentUseCase.ts
+@@ -8,6 +8,7 @@ import { InventoryCostRepository } from "../../inventory/domain/InventoryCost";
+ import { EntityNotFoundError, ValidationError } from "../../../shared/domain/DomainError";
+ import { WarehouseService } from "../../inventory/application/WarehouseService";
+ import { ProductProfitSummaryRepository } from "../../reporting/domain/ProductProfitSummaryRepository";
++import { allowAllReportingPeriods, ReportingPeriodWriteGuard } from "../../reporting/application/ReportingPeriodGuard";
+ 
+ export interface RecordShipmentInput {
+   companyId: number;
+@@ -35,10 +36,12 @@ export class RecordShipmentUseCase {
+     private readonly inventoryPendingRepo: InventoryPendingRepository,
+     private readonly inventoryCostRepo: InventoryCostRepository,
+     private readonly warehouseService: WarehouseService,
+-    private readonly profitSummaryRepo: ProductProfitSummaryRepository
++    private readonly profitSummaryRepo: ProductProfitSummaryRepository,
++    private readonly reportingPeriodGuard: ReportingPeriodWriteGuard = allowAllReportingPeriods
+   ) {}
+ 
+   async execute(input: RecordShipmentInput): Promise<{ shipmentId: number }> {
++    await this.reportingPeriodGuard.assertOpen(input.companyId, [input.shipmentDate]);
+     return this.txManager.run(async (client) => {
+       const adjustPendingShipment = async (productId: number, delta: number) => {
+         await this.inventoryPendingRepo.adjust(
+diff --git a/src/modules/sales/presentation/SaleRouter.ts b/src/modules/sales/presentation/SaleRouter.ts
+index fc25a02..891c107 100644
+--- a/src/modules/sales/presentation/SaleRouter.ts
++++ b/src/modules/sales/presentation/SaleRouter.ts
+@@ -26,6 +26,8 @@ import { RecordInventoryTransactionUseCase } from "../../inventory/application/R
+ import { PgProductProfitSummaryRepository } from "../../reporting/infrastructure/PgProductProfitSummaryRepository";
+ import { PostgreSQLTransactionManager } from "../../../shared/infrastructure/transactions/TransactionManager";
+ import { sendErrorResponse } from "../../../shared/presentation/http/ErrorHandler";
++import { PgReportingPeriodCloseRepository } from "../../reporting/infrastructure/PgReportingPeriodCloseRepository";
++import { ReportingPeriodGuard } from "../../reporting/application/ReportingPeriodGuard";
+ import { ValidationError } from "../../../shared/domain/DomainError";
+ import { PaymentMethod } from "../domain/SalePayment";
+ import { WarehouseService } from "../../inventory/application/WarehouseService";
+@@ -48,6 +50,7 @@ const recordInventoryTxUseCase = new RecordInventoryTransactionUseCase(inventory
+ const profitSummaryRepo = new PgProductProfitSummaryRepository();
+ const warehouseService = new WarehouseService(inventoryPendingRepo, inventoryCostRepo, productRepo, recordInventoryTxUseCase);
+ const recordLoanTxUseCase = new RecordLoanTransactionUseCase(txManager, partnerRepo, pgLoanTxRepo);
++const reportingPeriodGuard = new ReportingPeriodGuard(new PgReportingPeriodCloseRepository());
+ 
+ const createSaleOrderUseCase = new CreateSaleOrderUseCase(
+   txManager, 
+@@ -57,11 +60,12 @@ const createSaleOrderUseCase = new CreateSaleOrderUseCase(
+   accountTxService,
+   inventoryBalanceRepo,
+   inventoryCostRepo,
+-  recordLoanTxUseCase
++  recordLoanTxUseCase,
++  reportingPeriodGuard
+ );
+ const getSaleDetailsUseCase = new GetSaleDetailsUseCase(saleOrderRepo, paymentRepo, shipmentRepo);
+ const getNextSaleOrderNoUseCase = new GetNextSaleOrderNoUseCase(saleOrderRepo);
+-const recordSalePaymentUseCase = new RecordSalePaymentUseCase(txManager, saleOrderRepo, paymentRepo, accountTxService, recordLoanTxUseCase);
++const recordSalePaymentUseCase = new RecordSalePaymentUseCase(txManager, saleOrderRepo, paymentRepo, accountTxService, recordLoanTxUseCase, reportingPeriodGuard);
+ const recordShipmentUseCase = new RecordShipmentUseCase(
+   txManager, 
+   saleOrderRepo, 
+@@ -71,7 +75,8 @@ const recordShipmentUseCase = new RecordShipmentUseCase(
+   inventoryPendingRepo,
+   inventoryCostRepo,
+   warehouseService,
+-  profitSummaryRepo
++  profitSummaryRepo,
++  reportingPeriodGuard
+ );
+ 
+ const accessPolicy = new DbAccessPolicy();

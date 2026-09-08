@@ -1,0 +1,626 @@
+diff --git a/src/modules/finance/application/ListFinanceUseCase.ts b/src/modules/finance/application/ListFinanceUseCase.ts
+index 79cc85b..8eef77b 100644
+--- a/src/modules/finance/application/ListFinanceUseCase.ts
++++ b/src/modules/finance/application/ListFinanceUseCase.ts
+@@ -1,8 +1,17 @@
+-import { AccountTransactionRepository } from "../domain/AccountTransaction";
++import { AccountTransaction, AccountTransactionRepository } from "../domain/AccountTransaction";
+ import { AccountRepository } from "../../accounts/domain/AccountRepository";
+ import { LoanTransactionRepository, LoanTransactionSourceType } from "../domain/LoanTransaction";
+ import { PartnerRepository } from "../../partners/domain/Partner";
+ import { EntityNotFoundError } from "../../../shared/domain/DomainError";
++import { TransactionManager } from "../../../shared/infrastructure/transactions/TransactionManager";
++import {
++  AccountBalanceReconciliationItem,
++  AccountBalanceReconciliationResult,
++  ReconcileAccountBalanceResult,
++  buildAccountBalanceReconciliation,
++  roundMoney,
++  summarizeAccountBalanceReconciliations
++} from "../domain/AccountBalanceReconciliation";
+ import formatDateToYMD from "../../../shared/infrastructure/utils/formatDateToYMD";
+ 
+ export class ListPartnerBalancesUseCase {
+@@ -86,11 +95,151 @@ export class GetAccountBalanceUseCase {
+     if (!account) {
+       throw new EntityNotFoundError("Account not found");
+     }
++    // Prefer reconstructing from the ledger so callers never expose a stale
++    // denormalized account.balance. The fallback keeps compatibility with
++    // alternate repository adapters that have not yet added the scan method.
++    if (typeof this.accountTxRepo.listForReconciliation === "function") {
++      const transactions = await this.accountTxRepo.listForReconciliation(
++        companyId,
++        [accountId]
++      );
++      const reconciliation = buildAccountBalanceReconciliation(account, transactions);
++      return { balance: reconciliation.ledgerBalance };
++    }
++
+     const balance = await this.accountTxRepo.getBalance(companyId, accountId);
+     return { balance };
+   }
+ }
+ 
++export interface GetAccountBalanceReconciliationOptions {
++  accountId?: number | null;
++  driftOnly?: boolean;
++}
++
++/**
++ * Builds a company-scoped reconciliation view from immutable opening balances
++ * and account transaction amounts. The account.balance column is intentionally
++ * treated as a cached value so it can be compared rather than trusted.
++ */
++export class GetAccountBalanceReconciliationUseCase {
++  constructor(
++    private readonly accountRepo: AccountRepository,
++    private readonly accountTxRepo: AccountTransactionRepository
++  ) {}
++
++  async execute(
++    companyId: number,
++    options: GetAccountBalanceReconciliationOptions = {}
++  ): Promise<AccountBalanceReconciliationResult> {
++    const accounts = await this.loadAccounts(companyId, options.accountId ?? null);
++    const accountIds = accounts
++      .map(account => account.id)
++      .filter((id): id is number => id !== undefined);
++
++    const transactions = accountIds.length === 0
++      ? []
++      : await this.accountTxRepo.listForReconciliation(companyId, accountIds);
++
++    const transactionsByAccount = this.groupTransactions(companyId, transactions);
++    const reconciliations = accounts.map(account =>
++      buildAccountBalanceReconciliation(
++        account,
++        account.id === undefined ? [] : (transactionsByAccount.get(account.id) ?? [])
++      )
++    );
++
++    const summary = summarizeAccountBalanceReconciliations(reconciliations);
++    const visibleAccounts = options.driftOnly
++      ? reconciliations.filter(item => !item.inSync)
++      : reconciliations;
++
++    return {
++      summary,
++      accounts: visibleAccounts
++    };
++  }
++
++  private async loadAccounts(companyId: number, accountId: number | null) {
++    if (accountId !== null) {
++      const account = await this.accountRepo.findById(companyId, accountId);
++      if (!account) {
++        throw new EntityNotFoundError("Account not found");
++      }
++      return [account];
++    }
++
++    return this.accountRepo.listByCompany(companyId);
++  }
++
++  private groupTransactions(
++    companyId: number,
++    transactions: AccountTransaction[]
++  ): Map<number, AccountTransaction[]> {
++    const grouped = new Map<number, AccountTransaction[]>();
++
++    for (const transaction of transactions) {
++      const props = transaction.toPrimitives();
++      if (props.companyId !== companyId) continue;
++
++      const list = grouped.get(props.accountId) ?? [];
++      list.push(transaction);
++      grouped.set(props.accountId, list);
++    }
++
++    return grouped;
++  }
++}
++
++/**
++ * Repairs only the denormalized account.balance field. The ledger itself is
++ * never rewritten and no synthetic transaction is created during a repair.
++ * The account row is locked before reconstruction so normal posting paths that
++ * also lock accounts cannot race the correction.
++ */
++export class ReconcileAccountBalanceUseCase {
++  constructor(
++    private readonly accountRepo: AccountRepository,
++    private readonly accountTxRepo: AccountTransactionRepository,
++    private readonly txManager: TransactionManager
++  ) {}
++
++  async execute(
++    companyId: number,
++    accountId: number
++  ): Promise<ReconcileAccountBalanceResult> {
++    return this.txManager.run(async client => {
++      const account = await this.accountRepo.findByIdWithLock(companyId, accountId, client);
++      if (!account) {
++        throw new EntityNotFoundError("Account not found");
++      }
++
++      const transactions = await this.accountTxRepo.listForReconciliation(
++        companyId,
++        [accountId],
++        client
++      );
++      const reconciliation = buildAccountBalanceReconciliation(account, transactions);
++      const previousStoredBalance = reconciliation.storedBalance;
++      const repaired = !reconciliation.inSync;
++
++      if (repaired) {
++        account.updateBalance(reconciliation.ledgerBalance);
++        await this.accountRepo.save(account, client);
++      }
++
++      return {
++        accountId,
++        previousStoredBalance,
++        ledgerBalance: reconciliation.ledgerBalance,
++        balance: roundMoney(account.balance),
++        drift: reconciliation.drift,
++        repaired
++      };
++    });
++  }
++}
++
+ export class GetCompanyBalanceSummaryUseCase {
+   constructor(
+     private readonly accountRepo: AccountRepository,
+diff --git a/src/modules/finance/domain/AccountBalanceReconciliation.ts b/src/modules/finance/domain/AccountBalanceReconciliation.ts
+new file mode 100644
+index 0000000..3ac9757
+--- /dev/null
++++ b/src/modules/finance/domain/AccountBalanceReconciliation.ts
+@@ -0,0 +1,126 @@
++import { Account } from "../../accounts/domain/Account";
++import { AccountTransaction } from "./AccountTransaction";
++
++/**
++ * Reconciliation treats the account row as a cached/denormalized balance and
++ * the immutable opening balance plus ledger movements as the source of truth.
++ * OPENING_BALANCE transactions are audit rows for the opening amount, so they
++ * must never be added a second time during reconstruction.
++ */
++export interface AccountBalanceReconciliationItem {
++  accountId: number;
++  accountHolderName: string;
++  accountType: "BANK" | "CASH";
++  isActive: boolean;
++  openingBalance: number;
++  storedBalance: number;
++  ledgerBalance: number;
++  drift: number;
++  inSync: boolean;
++}
++
++export interface AccountBalanceReconciliationSummary {
++  totalAccounts: number;
++  driftedAccounts: number;
++  storedTotal: number;
++  ledgerTotal: number;
++  netDrift: number;
++}
++
++export interface AccountBalanceReconciliationResult {
++  summary: AccountBalanceReconciliationSummary;
++  accounts: AccountBalanceReconciliationItem[];
++}
++
++export interface ReconcileAccountBalanceResult {
++  accountId: number;
++  previousStoredBalance: number;
++  ledgerBalance: number;
++  balance: number;
++  drift: number;
++  repaired: boolean;
++}
++
++/**
++ * PostgreSQL stores these monetary values at two decimal places. JavaScript
++ * arithmetic can still produce values such as 0.30000000000000004, so every
++ * externally observable reconciliation number is normalized to cents.
++ */
++export function roundMoney(value: number): number {
++  if (!Number.isFinite(value)) return value;
++  const nudged = value + Math.sign(value || 1) * Number.EPSILON;
++  return Math.round(nudged * 100) / 100;
++}
++
++export function reconstructLedgerBalance(
++  account: Account,
++  transactions: AccountTransaction[]
++): number {
++  const accountId = account.id;
++  let balance = Number(account.openingBalance);
++
++  for (const transaction of transactions) {
++    const props = transaction.toPrimitives();
++
++    // Reconciliation callers normally pre-filter by company/account, but the
++    // pure calculation deliberately refuses to let unrelated rows leak in.
++    if (accountId !== undefined && props.accountId !== accountId) continue;
++    if (props.companyId !== account.companyId) continue;
++
++    // Current accounts record their opening balance twice: once on account
++    // and once as an OPENING_BALANCE ledger audit row. The account field is
++    // immutable and is counted exactly once for both current and legacy data.
++    if (props.sourceType === "OPENING_BALANCE") continue;
++
++    balance = roundMoney(balance + Number(props.amount));
++  }
++
++  return roundMoney(balance);
++}
++
++export function buildAccountBalanceReconciliation(
++  account: Account,
++  transactions: AccountTransaction[]
++): AccountBalanceReconciliationItem {
++  if (account.id === undefined) {
++    throw new Error("Cannot reconcile an account without an id");
++  }
++
++  const ledgerBalance = reconstructLedgerBalance(account, transactions);
++  const storedBalance = roundMoney(Number(account.balance));
++  const drift = roundMoney(storedBalance - ledgerBalance);
++
++  return {
++    accountId: account.id,
++    accountHolderName: account.accountHolderName,
++    accountType: account.accountType,
++    isActive: account.isActive,
++    openingBalance: roundMoney(Number(account.openingBalance)),
++    storedBalance,
++    ledgerBalance,
++    drift,
++    inSync: drift === 0
++  };
++}
++
++export function summarizeAccountBalanceReconciliations(
++  items: AccountBalanceReconciliationItem[]
++): AccountBalanceReconciliationSummary {
++  let storedTotal = 0;
++  let ledgerTotal = 0;
++  let driftedAccounts = 0;
++
++  for (const item of items) {
++    storedTotal = roundMoney(storedTotal + item.storedBalance);
++    ledgerTotal = roundMoney(ledgerTotal + item.ledgerBalance);
++    if (!item.inSync) driftedAccounts += 1;
++  }
++
++  return {
++    totalAccounts: items.length,
++    driftedAccounts,
++    storedTotal: roundMoney(storedTotal),
++    ledgerTotal: roundMoney(ledgerTotal),
++    netDrift: roundMoney(storedTotal - ledgerTotal)
++  };
++}
+diff --git a/src/modules/finance/domain/AccountTransaction.ts b/src/modules/finance/domain/AccountTransaction.ts
+index 4582d6c..9a0bd42 100644
+--- a/src/modules/finance/domain/AccountTransaction.ts
++++ b/src/modules/finance/domain/AccountTransaction.ts
+@@ -53,6 +53,11 @@ export interface AccountTransactionRepository {
+     accountId: number, 
+     options?: { limit?: number; cursor?: string | null }
+   ): Promise<PaginatedResult<AccountTransaction>>;
++  listForReconciliation(
++    companyId: number,
++    accountIds?: number[] | null,
++    client?: import("pg").PoolClient
++  ): Promise<AccountTransaction[]>;
+   getBalance(companyId: number, accountId: number, client?: import("pg").PoolClient): Promise<number>;
+   hasTransactions(companyId: number, accountId: number, client?: import("pg").PoolClient): Promise<boolean>;
+   deleteForAccount(companyId: number, accountId: number, client?: import("pg").PoolClient): Promise<void>;
+diff --git a/src/modules/finance/infrastructure/PgFinanceRepositories.ts b/src/modules/finance/infrastructure/PgFinanceRepositories.ts
+index 227d85c..f38b8be 100644
+--- a/src/modules/finance/infrastructure/PgFinanceRepositories.ts
++++ b/src/modules/finance/infrastructure/PgFinanceRepositories.ts
+@@ -128,12 +128,54 @@ export class PgAccountTransactionRepository implements AccountTransactionReposit
+     };
+   }
+ 
++  async listForReconciliation(
++    companyId: number,
++    accountIds?: number[] | null,
++    client?: PoolClient
++  ): Promise<AccountTransaction[]> {
++    if (accountIds && accountIds.length === 0) return [];
++
++    const db = client || pgPool;
++    const params: any[] = [companyId];
++    let query = `
++      SELECT *
++      FROM account_transaction
++      WHERE company_id = $1
++    `;
++
++    if (accountIds) {
++      params.push(accountIds);
++      query += ` AND account_id = ANY($2::bigint[])`;
++    }
++
++    query += ` ORDER BY account_id ASC, date ASC, id ASC`;
++
++    const result = await db.query(query, params);
++    return result.rows.map(mapRowToAccountTransaction);
++  }
++
+   async getBalance(companyId: number, accountId: number, client?: PoolClient): Promise<number> {
+     const db = client || pgPool;
+     const result = await db.query(
+-      `SELECT balance FROM account WHERE company_id = $1 AND id = $2`,
++      `SELECT
++         a.opening_balance + COALESCE(
++           SUM(
++             CASE
++               WHEN at.source_type = 'OPENING_BALANCE' THEN 0
++               ELSE at.amount
++             END
++           ),
++           0
++         ) AS balance
++       FROM account a
++       LEFT JOIN account_transaction at
++         ON at.company_id = a.company_id
++        AND at.account_id = a.id
++       WHERE a.company_id = $1 AND a.id = $2
++       GROUP BY a.id, a.opening_balance`,
+       [companyId, accountId]
+     );
++
+     if (result.rowCount === 0) return 0;
+     return parseFloat(result.rows[0].balance);
+   }
+diff --git a/src/modules/finance/presentation/FinanceRouter.ts b/src/modules/finance/presentation/FinanceRouter.ts
+index 9403857..3607532 100644
+--- a/src/modules/finance/presentation/FinanceRouter.ts
++++ b/src/modules/finance/presentation/FinanceRouter.ts
+@@ -9,12 +9,12 @@ import { PgPartnerRepository } from "../../partners/infrastructure/PgPartnerRepo
+ import { RecordLoanTransactionUseCase } from "../application/RecordLoanTransactionUseCase";
+ import { RecordAccountTransactionUseCase } from "../application/RecordAccountTransactionUseCase";
+ import { RecordDirectLoanUseCase, RecordPartnerToPartnerLoanUseCase, RecordHistoricalLoanUseCase } from "../application/LoanUseCases";
+-import { ListPartnerBalancesUseCase, ListLoanTransactionsUseCase, GetPartnerTransactionHistoryUseCase, ListAccountTransactionsUseCase, GetAccountBalanceUseCase, GetCompanyBalanceSummaryUseCase } from "../application/ListFinanceUseCase";
++import { ListPartnerBalancesUseCase, ListLoanTransactionsUseCase, GetPartnerTransactionHistoryUseCase, ListAccountTransactionsUseCase, GetAccountBalanceUseCase, GetCompanyBalanceSummaryUseCase, GetAccountBalanceReconciliationUseCase, ReconcileAccountBalanceUseCase } from "../application/ListFinanceUseCase";
+ import { PostgreSQLTransactionManager } from "../../../shared/infrastructure/transactions/TransactionManager";
+ import { PgBusinessEventRepository } from "../../../shared/infrastructure/events/PgBusinessEventRepository";
+ import { DbEventRecorder } from "../../../shared/application/EventRecorder";
+ import { sendErrorResponse } from "../../../shared/presentation/http/ErrorHandler";
+-import { recordLoanSchema, listTransactionsFiltersSchema, listAccountTransactionsQuerySchema } from "./FinanceSchemas";
++import { recordLoanSchema, listTransactionsFiltersSchema, listAccountTransactionsQuerySchema, accountReconciliationQuerySchema } from "./FinanceSchemas";
+ 
+ const accountRepo = new PgAccountRepository();
+ const partnerRepo = new PgPartnerRepository();
+@@ -37,6 +37,8 @@ const getPartnerHistoryUseCase = new GetPartnerTransactionHistoryUseCase(pgLoanT
+ const listAccountTxsUseCase = new ListAccountTransactionsUseCase(accountTxRepo);
+ const getAccountBalanceUseCase = new GetAccountBalanceUseCase(accountRepo, accountTxRepo);
+ const getCompanyBalanceSummaryUseCase = new GetCompanyBalanceSummaryUseCase(accountRepo, accountTxRepo);
++const getAccountBalanceReconciliationUseCase = new GetAccountBalanceReconciliationUseCase(accountRepo, accountTxRepo);
++const reconcileAccountBalanceUseCase = new ReconcileAccountBalanceUseCase(accountRepo, accountTxRepo, txManager);
+ 
+ const accessPolicy = new DbAccessPolicy();
+ export const FinanceRouter = Router();
+@@ -223,6 +225,99 @@ FinanceRouter.get("/partners/:id/history", requireAuth, requirePermission(access
+   }
+ });
+ 
++/**
++ * @openapi
++ * /api/v1/finance/accounts/reconciliation:
++ *   get:
++ *     summary: Compare stored account balances with reconstructed ledger balances
++ *     tags:
++ *       - Finance
++ *     security:
++ *       - bearerAuth: []
++ *     parameters:
++ *       - in: query
++ *         name: accountId
++ *         required: false
++ *         schema:
++ *           type: integer
++ *           minimum: 1
++ *       - in: query
++ *         name: driftOnly
++ *         required: false
++ *         schema:
++ *           type: boolean
++ *           default: false
++ *     responses:
++ *       200:
++ *         description: Account balance reconciliation report
++ *         content:
++ *           application/json:
++ *             schema:
++ *               $ref: '#/components/schemas/AccountBalanceReconciliationReport'
++ *       404:
++ *         description: Filtered account not found
++ */
++FinanceRouter.get(
++  "/accounts/reconciliation",
++  requireAuth,
++  requirePermission(accessPolicy, "FINANCE", "view"),
++  async (req: Request, res: Response) => {
++    try {
++      const companyId = parseCompanyId(req);
++      const query = accountReconciliationQuerySchema.parse(req.query);
++      const result = await getAccountBalanceReconciliationUseCase.execute(companyId, {
++        accountId: query.accountId,
++        driftOnly: query.driftOnly
++      });
++      res.json(result);
++    } catch (err) {
++      sendErrorResponse(res, err);
++    }
++  }
++);
++
++/**
++ * @openapi
++ * /api/v1/finance/accounts/{id}/reconcile:
++ *   post:
++ *     summary: Repair a stored account balance from its ledger
++ *     tags:
++ *       - Finance
++ *     security:
++ *       - bearerAuth: []
++ *     parameters:
++ *       - in: path
++ *         name: id
++ *         required: true
++ *         schema:
++ *           type: integer
++ *           minimum: 1
++ *     responses:
++ *       200:
++ *         description: Reconciliation result
++ *         content:
++ *           application/json:
++ *             schema:
++ *               $ref: '#/components/schemas/AccountBalanceRepairResult'
++ *       404:
++ *         description: Account not found
++ */
++FinanceRouter.post(
++  "/accounts/:id/reconcile",
++  requireAuth,
++  requirePermission(accessPolicy, "FINANCE", "update"),
++  async (req: Request, res: Response) => {
++    try {
++      const companyId = parseCompanyId(req);
++      const accountId = Number(req.params.id);
++      const result = await reconcileAccountBalanceUseCase.execute(companyId, accountId);
++      res.json(result);
++    } catch (err) {
++      sendErrorResponse(res, err);
++    }
++  }
++);
++
+ /**
+  * @openapi
+  * /api/v1/finance/accounts/{id}/transactions:
+diff --git a/src/modules/finance/presentation/FinanceSchemas.ts b/src/modules/finance/presentation/FinanceSchemas.ts
+index e710e27..d877526 100644
+--- a/src/modules/finance/presentation/FinanceSchemas.ts
++++ b/src/modules/finance/presentation/FinanceSchemas.ts
+@@ -37,6 +37,18 @@ export const listAccountTransactionsQuerySchema = z.object({
+   cursor: queryOptionalNonEmptyString()
+ });
+ 
++const queryBoolean = z.preprocess((value: unknown) => {
++  if (value === undefined || value === null || value === "") return false;
++  if (value === true || value === "true" || value === "1") return true;
++  if (value === false || value === "false" || value === "0") return false;
++  return value;
++}, z.boolean());
++
++export const accountReconciliationQuerySchema = z.object({
++  accountId: queryOptionalPositiveInt(),
++  driftOnly: queryBoolean
++});
++
+ /**
+  * @openapi
+  * components:
+@@ -112,4 +124,91 @@ export const listAccountTransactionsQuerySchema = z.object({
+  *           items: { $ref: '#/components/schemas/AccountTransaction' }
+  *         nextCursor: { type: string, nullable: true }
+  *         hasMore: { type: boolean }
++ *     AccountBalanceReconciliationItem:
++ *       type: object
++ *       required:
++ *         - accountId
++ *         - accountHolderName
++ *         - accountType
++ *         - isActive
++ *         - openingBalance
++ *         - storedBalance
++ *         - ledgerBalance
++ *         - drift
++ *         - inSync
++ *       properties:
++ *         accountId:
++ *           type: integer
++ *         accountHolderName:
++ *           type: string
++ *         accountType:
++ *           type: string
++ *           enum: [BANK, CASH]
++ *         isActive:
++ *           type: boolean
++ *         openingBalance:
++ *           type: number
++ *         storedBalance:
++ *           type: number
++ *         ledgerBalance:
++ *           type: number
++ *         drift:
++ *           type: number
++ *           description: Signed stored balance minus reconstructed ledger balance.
++ *         inSync:
++ *           type: boolean
++ *     AccountBalanceReconciliationSummary:
++ *       type: object
++ *       required:
++ *         - totalAccounts
++ *         - driftedAccounts
++ *         - storedTotal
++ *         - ledgerTotal
++ *         - netDrift
++ *       properties:
++ *         totalAccounts:
++ *           type: integer
++ *         driftedAccounts:
++ *           type: integer
++ *         storedTotal:
++ *           type: number
++ *         ledgerTotal:
++ *           type: number
++ *         netDrift:
++ *           type: number
++ *           description: Signed stored total minus reconstructed ledger total.
++ *     AccountBalanceReconciliationReport:
++ *       type: object
++ *       required:
++ *         - summary
++ *         - accounts
++ *       properties:
++ *         summary:
++ *           $ref: '#/components/schemas/AccountBalanceReconciliationSummary'
++ *         accounts:
++ *           type: array
++ *           items:
++ *             $ref: '#/components/schemas/AccountBalanceReconciliationItem'
++ *     AccountBalanceRepairResult:
++ *       type: object
++ *       required:
++ *         - accountId
++ *         - previousStoredBalance
++ *         - ledgerBalance
++ *         - balance
++ *         - drift
++ *         - repaired
++ *       properties:
++ *         accountId:
++ *           type: integer
++ *         previousStoredBalance:
++ *           type: number
++ *         ledgerBalance:
++ *           type: number
++ *         balance:
++ *           type: number
++ *         drift:
++ *           type: number
++ *         repaired:
++ *           type: boolean
+  */

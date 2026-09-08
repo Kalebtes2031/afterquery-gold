@@ -1,0 +1,9 @@
+Add a company-level reporting close so completed periods can be frozen without making the whole application read-only.
+
+Expose `GET /api/v1/reporting/period-close` to return `{closedThrough, closedAt, closedBy}`, using nulls when nothing has been closed. `GET /api/v1/reporting/period-close/eligibility?throughDate=YYYY-MM-DD` should return `{throughDate, closedThrough, eligible, blockers}`. A close is blocked by sale orders or purchase orders dated on or before the requested boundary unless they are `CLOSED` or `CANCELLED`; report those as `OPEN_SALES` and `OPEN_PURCHASES` blockers with counts. A boundary at or before the current close is ineligible with `ALREADY_CLOSED`.
+
+`POST /api/v1/reporting/period-close` accepts `{"throughDate":"YYYY-MM-DD"}` and advances the company’s boundary, returning the new close status with 201. Dates must be real calendar days in that exact format. The boundary may only move forward. Repeating or moving it backwards returns 409 with `PERIOD_ALREADY_CLOSED`; attempting a close with open-document blockers returns 409 with `PERIOD_CLOSE_BLOCKED`. Keep close history and record who performed each close. Reporting view permission is enough to read status/eligibility; closing requires reporting update permission.
+
+Once closed, reject any protected business date on or before `closedThrough` with 409 and `REPORTING_PERIOD_CLOSED`. Apply that rule to expense dates and expense payment lines; sale order dates, sale payment lines, and actual shipment dates; purchase order dates, purchase payment lines, and actual receipt dates; inventory adjustment dates; account transfer dates; and direct, partner-to-partner, and historical loan dates. For create-order flows, planned ship/receive dates do not count until stock actually moves. Dates after the boundary and unrelated master-data changes keep their existing behavior.
+
+IMPORTANT: Please work on this in a new branch from main and commit everything when you are done.

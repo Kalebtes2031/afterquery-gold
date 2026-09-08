@@ -1,0 +1,1067 @@
+diff --git a/src/modules/reporting/application/__tests__/ReportingPeriodCloseWorkflow.behavior.test.ts b/src/modules/reporting/application/__tests__/ReportingPeriodCloseWorkflow.behavior.test.ts
+new file mode 100644
+index 0000000..a60a277
+--- /dev/null
++++ b/src/modules/reporting/application/__tests__/ReportingPeriodCloseWorkflow.behavior.test.ts
+@@ -0,0 +1,322 @@
++import {
++  CheckReportingPeriodCloseEligibilityUseCase,
++  CloseReportingPeriodUseCase,
++  GetReportingPeriodCloseUseCase
++} from "../ReportingPeriodCloseUseCases";
++import { ReportingPeriodGuard } from "../ReportingPeriodGuard";
++import {
++  ReportingPeriodAlreadyClosedError,
++  ReportingPeriodCloseBlockedError,
++  ReportingPeriodClosedError
++} from "../../domain/ReportingPeriodClose";
++
++const closedRecord = (overrides: Record<string, unknown> = {}) => ({
++  id: 8,
++  companyId: 5,
++  closedThrough: new Date("2026-08-31"),
++  closedAt: new Date("2026-09-02T09:15:00Z"),
++  closedBy: 41,
++  ...overrides
++});
++
++function repository(overrides: Record<string, unknown> = {}) {
++  return {
++    acquireCompanyCloseLock: jest.fn().mockResolvedValue(undefined),
++    getCurrent: jest.fn().mockResolvedValue(null),
++    getEligibilityBlockers: jest.fn().mockResolvedValue([
++      { type: "OPEN_SALES", count: 0 },
++      { type: "OPEN_PURCHASES", count: 0 }
++    ]),
++    insertClose: jest.fn().mockResolvedValue(closedRecord()),
++    ...overrides
++  } as any;
++}
++
++function txManager(client: any = { transaction: "client" }) {
++  return {
++    run: jest.fn(async (callback: any) => callback(client))
++  } as any;
++}
++
++describe("reporting period close status", () => {
++  it("returns null close fields for a company that has never closed a period", async () => {
++    const repo = repository();
++    const result = await new GetReportingPeriodCloseUseCase(repo).execute(5);
++    expect(result).toEqual({ closedThrough: null, closedAt: null, closedBy: null });
++  });
++
++  it("returns the latest close boundary as a date-only string", async () => {
++    const repo = repository({ getCurrent: jest.fn().mockResolvedValue(closedRecord()) });
++    const result = await new GetReportingPeriodCloseUseCase(repo).execute(5);
++    expect(result.closedThrough).toBe("2026-08-31");
++  });
++
++  it("returns close time as an ISO timestamp", async () => {
++    const repo = repository({ getCurrent: jest.fn().mockResolvedValue(closedRecord()) });
++    const result = await new GetReportingPeriodCloseUseCase(repo).execute(5);
++    expect(result.closedAt).toBe("2026-09-02T09:15:00.000Z");
++  });
++
++  it("returns the user who closed the current boundary", async () => {
++    const repo = repository({ getCurrent: jest.fn().mockResolvedValue(closedRecord()) });
++    const result = await new GetReportingPeriodCloseUseCase(repo).execute(5);
++    expect(result.closedBy).toBe(41);
++  });
++
++  it("keeps a null closer for system-created close records", async () => {
++    const repo = repository({ getCurrent: jest.fn().mockResolvedValue(closedRecord({ closedBy: null })) });
++    const result = await new GetReportingPeriodCloseUseCase(repo).execute(5);
++    expect(result.closedBy).toBeNull();
++  });
++});
++
++describe("period-close eligibility", () => {
++  it("marks a never-closed company eligible when no open documents block it", async () => {
++    const repo = repository();
++    const result = await new CheckReportingPeriodCloseEligibilityUseCase(repo).execute(5, new Date("2026-08-31"));
++    expect(result).toEqual({
++      throughDate: "2026-08-31",
++      closedThrough: null,
++      eligible: true,
++      blockers: []
++    });
++  });
++
++  it("returns open sales as a blocker", async () => {
++    const repo = repository({
++      getEligibilityBlockers: jest.fn().mockResolvedValue([
++        { type: "OPEN_SALES", count: 4 },
++        { type: "OPEN_PURCHASES", count: 0 }
++      ])
++    });
++    const result = await new CheckReportingPeriodCloseEligibilityUseCase(repo).execute(5, new Date("2026-08-31"));
++    expect(result.eligible).toBe(false);
++    expect(result.blockers).toEqual([{ type: "OPEN_SALES", count: 4 }]);
++  });
++
++  it("returns open purchases as a blocker", async () => {
++    const repo = repository({
++      getEligibilityBlockers: jest.fn().mockResolvedValue([
++        { type: "OPEN_SALES", count: 0 },
++        { type: "OPEN_PURCHASES", count: 2 }
++      ])
++    });
++    const result = await new CheckReportingPeriodCloseEligibilityUseCase(repo).execute(5, new Date("2026-08-31"));
++    expect(result.blockers).toEqual([{ type: "OPEN_PURCHASES", count: 2 }]);
++  });
++
++  it("returns both document blockers when both categories are open", async () => {
++    const repo = repository({
++      getEligibilityBlockers: jest.fn().mockResolvedValue([
++        { type: "OPEN_SALES", count: 1 },
++        { type: "OPEN_PURCHASES", count: 3 }
++      ])
++    });
++    const result = await new CheckReportingPeriodCloseEligibilityUseCase(repo).execute(5, new Date("2026-08-31"));
++    expect(result.blockers).toHaveLength(2);
++    expect(result.eligible).toBe(false);
++  });
++
++  it("drops zero-count blocker categories from the response", async () => {
++    const repo = repository({
++      getEligibilityBlockers: jest.fn().mockResolvedValue([
++        { type: "OPEN_SALES", count: 0 },
++        { type: "OPEN_PURCHASES", count: 6 }
++      ])
++    });
++    const result = await new CheckReportingPeriodCloseEligibilityUseCase(repo).execute(5, new Date("2026-08-31"));
++    expect(result.blockers).not.toContainEqual({ type: "OPEN_SALES", count: 0 });
++  });
++
++  it("passes the company and normalized boundary to blocker lookup", async () => {
++    const getEligibilityBlockers = jest.fn().mockResolvedValue([]);
++    const repo = repository({ getEligibilityBlockers });
++    await new CheckReportingPeriodCloseEligibilityUseCase(repo).execute(23, new Date("2026-08-31T22:00:00Z"));
++    expect(getEligibilityBlockers).toHaveBeenCalledWith(23, new Date("2026-08-31T00:00:00.000Z"));
++  });
++
++  it("reports the existing boundary while checking a later period", async () => {
++    const repo = repository({ getCurrent: jest.fn().mockResolvedValue(closedRecord()) });
++    const result = await new CheckReportingPeriodCloseEligibilityUseCase(repo).execute(5, new Date("2026-09-30"));
++    expect(result.closedThrough).toBe("2026-08-31");
++    expect(result.eligible).toBe(true);
++  });
++
++  it("marks the current boundary ineligible as already closed", async () => {
++    const lookup = jest.fn();
++    const repo = repository({
++      getCurrent: jest.fn().mockResolvedValue(closedRecord()),
++      getEligibilityBlockers: lookup
++    });
++    const result = await new CheckReportingPeriodCloseEligibilityUseCase(repo).execute(5, new Date("2026-08-31"));
++    expect(result.eligible).toBe(false);
++    expect(result.blockers).toEqual([{ type: "ALREADY_CLOSED", count: 1 }]);
++    expect(lookup).not.toHaveBeenCalled();
++  });
++
++  it("marks an earlier requested boundary ineligible as already closed", async () => {
++    const repo = repository({ getCurrent: jest.fn().mockResolvedValue(closedRecord()) });
++    const result = await new CheckReportingPeriodCloseEligibilityUseCase(repo).execute(5, new Date("2026-07-31"));
++    expect(result.blockers).toEqual([{ type: "ALREADY_CLOSED", count: 1 }]);
++    expect(result.closedThrough).toBe("2026-08-31");
++  });
++});
++
++describe("closing a reporting period", () => {
++  it("serializes close attempts with a company-scoped transaction lock", async () => {
++    const client = { id: "tx" };
++    const repo = repository();
++    await new CloseReportingPeriodUseCase(txManager(client), repo).execute(5, new Date("2026-08-31"), 41);
++    expect(repo.acquireCompanyCloseLock).toHaveBeenCalledWith(5, client);
++  });
++
++  it("checks the current close within the same transaction", async () => {
++    const client = { id: "tx" };
++    const repo = repository();
++    await new CloseReportingPeriodUseCase(txManager(client), repo).execute(5, new Date("2026-08-31"), 41);
++    expect(repo.getCurrent).toHaveBeenCalledWith(5, client);
++  });
++
++  it("checks blockers inside the close transaction", async () => {
++    const client = { id: "tx" };
++    const repo = repository();
++    await new CloseReportingPeriodUseCase(txManager(client), repo).execute(5, new Date("2026-08-31"), 41);
++    expect(repo.getEligibilityBlockers).toHaveBeenCalledWith(5, new Date("2026-08-31T00:00:00.000Z"), client);
++  });
++
++  it("persists the new boundary and closer only after eligibility succeeds", async () => {
++    const client = { id: "tx" };
++    const repo = repository();
++    await new CloseReportingPeriodUseCase(txManager(client), repo).execute(5, new Date("2026-08-31"), 41);
++    expect(repo.insertClose).toHaveBeenCalledWith(5, new Date("2026-08-31T00:00:00.000Z"), 41, client);
++  });
++
++  it("uses null when no closer is supplied", async () => {
++    const repo = repository();
++    await new CloseReportingPeriodUseCase(txManager(), repo).execute(5, new Date("2026-08-31"));
++    expect(repo.insertClose.mock.calls[0][2]).toBeNull();
++  });
++
++  it("returns the saved boundary rather than constructing a timestamp itself", async () => {
++    const repo = repository({
++      insertClose: jest.fn().mockResolvedValue(closedRecord({ closedThrough: new Date("2026-09-30"), closedBy: 55 }))
++    });
++    const result = await new CloseReportingPeriodUseCase(txManager(), repo).execute(5, new Date("2026-09-30"), 55);
++    expect(result.closedThrough).toBe("2026-09-30");
++    expect(result.closedBy).toBe(55);
++  });
++
++  it("rejects a repeated close boundary before checking document blockers", async () => {
++    const repo = repository({ getCurrent: jest.fn().mockResolvedValue(closedRecord()) });
++    await expect(
++      new CloseReportingPeriodUseCase(txManager(), repo).execute(5, new Date("2026-08-31"), 41)
++    ).rejects.toBeInstanceOf(ReportingPeriodAlreadyClosedError);
++    expect(repo.getEligibilityBlockers).not.toHaveBeenCalled();
++    expect(repo.insertClose).not.toHaveBeenCalled();
++  });
++
++  it("rejects a backwards close boundary", async () => {
++    const repo = repository({ getCurrent: jest.fn().mockResolvedValue(closedRecord()) });
++    await expect(
++      new CloseReportingPeriodUseCase(txManager(), repo).execute(5, new Date("2026-07-31"), 41)
++    ).rejects.toBeInstanceOf(ReportingPeriodAlreadyClosedError);
++  });
++
++  it("rejects closing while an open sale remains in the requested period", async () => {
++    const repo = repository({
++      getEligibilityBlockers: jest.fn().mockResolvedValue([{ type: "OPEN_SALES", count: 1 }])
++    });
++    await expect(
++      new CloseReportingPeriodUseCase(txManager(), repo).execute(5, new Date("2026-08-31"), 41)
++    ).rejects.toBeInstanceOf(ReportingPeriodCloseBlockedError);
++    expect(repo.insertClose).not.toHaveBeenCalled();
++  });
++
++  it("rejects closing while an open purchase remains in the requested period", async () => {
++    const repo = repository({
++      getEligibilityBlockers: jest.fn().mockResolvedValue([{ type: "OPEN_PURCHASES", count: 2 }])
++    });
++    await expect(
++      new CloseReportingPeriodUseCase(txManager(), repo).execute(5, new Date("2026-08-31"), 41)
++    ).rejects.toMatchObject({ code: "PERIOD_CLOSE_BLOCKED", status: 409 });
++  });
++
++  it("ignores zero-count blocker rows returned by storage", async () => {
++    const repo = repository({
++      getEligibilityBlockers: jest.fn().mockResolvedValue([
++        { type: "OPEN_SALES", count: 0 },
++        { type: "OPEN_PURCHASES", count: 0 }
++      ])
++    });
++    await new CloseReportingPeriodUseCase(txManager(), repo).execute(5, new Date("2026-08-31"), 41);
++    expect(repo.insertClose).toHaveBeenCalledTimes(1);
++  });
++
++  it("does not swallow an insert failure", async () => {
++    const failure = new Error("write failed");
++    const repo = repository({ insertClose: jest.fn().mockRejectedValue(failure) });
++    await expect(
++      new CloseReportingPeriodUseCase(txManager(), repo).execute(5, new Date("2026-08-31"), 41)
++    ).rejects.toBe(failure);
++  });
++});
++
++describe("reporting period mutation guard", () => {
++  it("does not query storage for an empty date set", async () => {
++    const repo = repository();
++    await new ReportingPeriodGuard(repo).assertOpen(5, []);
++    expect(repo.getCurrent).not.toHaveBeenCalled();
++  });
++
++  it("allows every date when the company has no close record", async () => {
++    const repo = repository();
++    await expect(
++      new ReportingPeriodGuard(repo).assertOpen(5, [new Date("2020-01-01"), new Date("2026-08-31")])
++    ).resolves.toBeUndefined();
++  });
++
++  it("allows a business date after the current boundary", async () => {
++    const repo = repository({ getCurrent: jest.fn().mockResolvedValue(closedRecord()) });
++    await expect(new ReportingPeriodGuard(repo).assertOpen(5, [new Date("2026-09-01")])).resolves.toBeUndefined();
++  });
++
++  it("rejects the exact boundary day", async () => {
++    const repo = repository({ getCurrent: jest.fn().mockResolvedValue(closedRecord()) });
++    await expect(new ReportingPeriodGuard(repo).assertOpen(5, [new Date("2026-08-31")]))
++      .rejects.toBeInstanceOf(ReportingPeriodClosedError);
++  });
++
++  it("rejects an earlier business date", async () => {
++    const repo = repository({ getCurrent: jest.fn().mockResolvedValue(closedRecord()) });
++    await expect(new ReportingPeriodGuard(repo).assertOpen(5, [new Date("2026-08-01")]))
++      .rejects.toMatchObject({ code: "REPORTING_PERIOD_CLOSED", status: 409 });
++  });
++
++  it("rejects a request when any one of several dates falls in the closed period", async () => {
++    const repo = repository({ getCurrent: jest.fn().mockResolvedValue(closedRecord()) });
++    await expect(new ReportingPeriodGuard(repo).assertOpen(5, [
++      new Date("2026-09-02"),
++      new Date("2026-08-20"),
++      new Date("2026-09-03")
++    ])).rejects.toBeInstanceOf(ReportingPeriodClosedError);
++  });
++
++  it("loads the close boundary only once for a multi-date request", async () => {
++    const getCurrent = jest.fn().mockResolvedValue(closedRecord());
++    const repo = repository({ getCurrent });
++    await expect(new ReportingPeriodGuard(repo).assertOpen(5, [
++      new Date("2026-09-01"),
++      new Date("2026-09-02"),
++      new Date("2026-09-03")
++    ])).resolves.toBeUndefined();
++    expect(getCurrent).toHaveBeenCalledTimes(1);
++    expect(getCurrent).toHaveBeenCalledWith(5);
++  });
++
++  it("uses each company's own close boundary", async () => {
++    const getCurrent = jest.fn(async (companyId: number) => companyId === 7 ? closedRecord({ companyId: 7 }) : null);
++    const repo = repository({ getCurrent });
++    await expect(new ReportingPeriodGuard(repo).assertOpen(6, [new Date("2026-08-01")])).resolves.toBeUndefined();
++    await expect(new ReportingPeriodGuard(repo).assertOpen(7, [new Date("2026-08-01")])).rejects.toBeInstanceOf(ReportingPeriodClosedError);
++  });
++});
+diff --git a/src/modules/reporting/application/__tests__/ReportingPeriodMutationMatrix.behavior.test.ts b/src/modules/reporting/application/__tests__/ReportingPeriodMutationMatrix.behavior.test.ts
+new file mode 100644
+index 0000000..65b3334
+--- /dev/null
++++ b/src/modules/reporting/application/__tests__/ReportingPeriodMutationMatrix.behavior.test.ts
+@@ -0,0 +1,463 @@
++import { RecordExpenseUseCase } from "../../../expenses/application/RecordExpenseUseCase";
++import { ExpenseType, PaymentMethod as ExpensePaymentMethod } from "../../../expenses/domain/Expense";
++import { CreateSaleOrderUseCase } from "../../../sales/application/CreateSaleOrderUseCase";
++import { RecordSalePaymentUseCase } from "../../../sales/application/RecordSalePaymentUseCase";
++import { RecordShipmentUseCase } from "../../../sales/application/RecordShipmentUseCase";
++import { ShipmentOption } from "../../../sales/domain/SaleOrder";
++import { PaymentMethod as SalePaymentMethod } from "../../../sales/domain/SalePayment";
++import { CreatePurchaseOrderUseCase } from "../../../purchases/application/CreatePurchaseOrderUseCase";
++import { RecordPurchasePaymentUseCase } from "../../../purchases/application/RecordPurchasePaymentUseCase";
++import { RecordPurchaseReceiveUseCase } from "../../../purchases/application/RecordPurchaseReceiveUseCase";
++import { ReceiveOption } from "../../../purchases/domain/PurchaseOrder";
++import { PaymentMethod as PurchasePaymentMethod } from "../../../purchases/domain/PurchasePayment";
++import { CreateInventoryAdjustmentUseCase } from "../../../inventory/application/CreateInventoryAdjustmentUseCase";
++import { AdjustmentType } from "../../../inventory/domain/InventoryAdjustment";
++import { TransferBetweenAccountsUseCase } from "../../../accounts/application/TransferBetweenAccountsUseCase";
++import {
++  RecordDirectLoanUseCase,
++  RecordHistoricalLoanUseCase,
++  RecordPartnerToPartnerLoanUseCase
++} from "../../../finance/application/LoanUseCases";
++
++const denied = new Error("period guard rejected the write");
++
++function txManager() {
++  return { run: jest.fn() } as any;
++}
++
++function rejectingGuard() {
++  return { assertOpen: jest.fn().mockRejectedValue(denied) } as any;
++}
++
++async function expectGuarded(call: Promise<unknown>, tx: any) {
++  await expect(call).rejects.toBe(denied);
++  expect(tx.run).not.toHaveBeenCalled();
++}
++
++describe("expense and account mutation period locks", () => {
++  it("checks the expense date and every payment date before recording an expense", async () => {
++    const tx = txManager();
++    const guard = rejectingGuard();
++    const useCase = new RecordExpenseUseCase(tx, null as any, null as any, null as any, null as any, null as any, guard);
++    const expenseDate = new Date("2026-09-03");
++    const cashDate = new Date("2026-08-30");
++    const partnerDate = new Date("2026-09-04");
++    const call = useCase.execute({
++      companyId: 3,
++      expenseDate,
++      reason: "Freight",
++      expenseType: ExpenseType.WORK,
++      totalAmount: 100,
++      payments: [
++        { method: ExpensePaymentMethod.CASH, accountId: 8, amount: 40, date: cashDate },
++        { method: ExpensePaymentMethod.PARTNER, partnerId: 9, amount: 60, date: partnerDate }
++      ]
++    });
++    await expectGuarded(call, tx);
++    expect(guard.assertOpen).toHaveBeenCalledWith(3, [expenseDate, cashDate, partnerDate]);
++  });
++
++  it("checks the expense date even when a zero-value expense has no payment rows", async () => {
++    const tx = txManager();
++    const guard = rejectingGuard();
++    const useCase = new RecordExpenseUseCase(tx, null as any, null as any, null as any, null as any, null as any, guard);
++    const date = new Date("2026-08-31");
++    await expectGuarded(useCase.execute({
++      companyId: 3,
++      expenseDate: date,
++      reason: "Adjustment",
++      expenseType: ExpenseType.WORK,
++      totalAmount: 0,
++      payments: []
++    }), tx);
++    expect(guard.assertOpen).toHaveBeenCalledWith(3, [date]);
++  });
++
++  it("checks an account transfer's effective date before locking accounts", async () => {
++    const tx = txManager();
++    const guard = rejectingGuard();
++    const useCase = new TransferBetweenAccountsUseCase(null as any, null as any, null as any, tx, null as any, guard);
++    const date = new Date("2026-08-31");
++    await expectGuarded(useCase.execute({
++      companyId: 7,
++      fromAccountId: 1,
++      toAccountId: 2,
++      amount: 25,
++      date
++    }), tx);
++    expect(guard.assertOpen).toHaveBeenCalledWith(7, [date]);
++  });
++
++  it("keeps transfer validation ahead of the period lookup for an invalid amount", async () => {
++    const tx = txManager();
++    const guard = rejectingGuard();
++    const useCase = new TransferBetweenAccountsUseCase(null as any, null as any, null as any, tx, null as any, guard);
++    await expect(useCase.execute({
++      companyId: 7,
++      fromAccountId: 1,
++      toAccountId: 2,
++      amount: 0,
++      date: new Date("2026-08-31")
++    })).rejects.not.toBe(denied);
++    expect(guard.assertOpen).not.toHaveBeenCalled();
++  });
++});
++
++describe("sale mutation period locks", () => {
++  function createSale(guard: any, tx: any) {
++    return new CreateSaleOrderUseCase(
++      tx, null as any, null as any, null as any, null as any,
++      null as any, null as any, null as any, guard
++    );
++  }
++
++  it("checks the order date when creating a sale order", async () => {
++    const tx = txManager();
++    const guard = rejectingGuard();
++    const orderDate = new Date("2026-08-31");
++    await expectGuarded(createSale(guard, tx).execute({
++      companyId: 4,
++      customerId: 2,
++      orderNo: "SO-1",
++      orderDate,
++      shipmentOption: ShipmentOption.SHIP_LATER,
++      branchId: 1,
++      items: [{ productId: 5, quantityOrdered: 2, unitPrice: 10 }]
++    }), tx);
++    expect(guard.assertOpen).toHaveBeenCalledWith(4, [orderDate]);
++  });
++
++  it("checks nested sale payment dates during order creation", async () => {
++    const tx = txManager();
++    const guard = rejectingGuard();
++    const orderDate = new Date("2026-09-05");
++    const paymentDate = new Date("2026-08-31");
++    await expectGuarded(createSale(guard, tx).execute({
++      companyId: 4,
++      customerId: 2,
++      orderNo: "SO-2",
++      orderDate,
++      shipmentOption: ShipmentOption.SHIP_LATER,
++      branchId: 1,
++      items: [{ productId: 5, quantityOrdered: 2, unitPrice: 10 }],
++      payments: [{ method: SalePaymentMethod.CASH, accountId: 7, amount: 20, date: paymentDate }]
++    }), tx);
++    expect(guard.assertOpen).toHaveBeenCalledWith(4, [orderDate, paymentDate]);
++  });
++
++  it("checks the actual initial shipment date for a fully shipped sale", async () => {
++    const tx = txManager();
++    const guard = rejectingGuard();
++    const orderDate = new Date("2026-09-02");
++    const shipmentDate = new Date("2026-08-31");
++    await expectGuarded(createSale(guard, tx).execute({
++      companyId: 4,
++      customerId: 2,
++      orderNo: "SO-3",
++      orderDate,
++      shipmentDate,
++      shipmentOption: ShipmentOption.SHIPPED_ALL,
++      branchId: 1,
++      items: [{ productId: 5, quantityOrdered: 2, unitPrice: 10 }]
++    }), tx);
++    expect(guard.assertOpen).toHaveBeenCalledWith(4, [orderDate, shipmentDate]);
++  });
++
++  it("uses the order date as the initial shipment date when none is supplied", async () => {
++    const tx = txManager();
++    const guard = rejectingGuard();
++    const orderDate = new Date("2026-08-31");
++    await expectGuarded(createSale(guard, tx).execute({
++      companyId: 4,
++      customerId: 2,
++      orderNo: "SO-4",
++      orderDate,
++      shipmentOption: ShipmentOption.SHIPPED_ALL,
++      branchId: 1,
++      items: [{ productId: 5, quantityOrdered: 2, unitPrice: 10 }]
++    }), tx);
++    expect(guard.assertOpen).toHaveBeenCalledWith(4, [orderDate, orderDate]);
++  });
++
++  it("does not treat a planned shipment date as posted activity for ship-later orders", async () => {
++    const tx = txManager();
++    const guard = rejectingGuard();
++    const orderDate = new Date("2026-09-05");
++    const plannedDate = new Date("2026-08-31");
++    await expectGuarded(createSale(guard, tx).execute({
++      companyId: 4,
++      customerId: 2,
++      orderNo: "SO-5",
++      orderDate,
++      shipmentDate: plannedDate,
++      shipmentOption: ShipmentOption.SHIP_LATER,
++      branchId: 1,
++      items: [{ productId: 5, quantityOrdered: 2, unitPrice: 10 }]
++    }), tx);
++    expect(guard.assertOpen).toHaveBeenCalledWith(4, [orderDate]);
++  });
++
++  it("checks a partial initial shipment when a shipped quantity is supplied", async () => {
++    const tx = txManager();
++    const guard = rejectingGuard();
++    const orderDate = new Date("2026-09-05");
++    const shipmentDate = new Date("2026-08-31");
++    await expectGuarded(createSale(guard, tx).execute({
++      companyId: 4,
++      customerId: 2,
++      orderNo: "SO-6",
++      orderDate,
++      shipmentDate,
++      shipmentOption: ShipmentOption.SHIPPED_PARTIALLY,
++      branchId: 1,
++      items: [{ productId: 5, quantityOrdered: 2, quantityShipped: 1, unitPrice: 10 }]
++    }), tx);
++    expect(guard.assertOpen).toHaveBeenCalledWith(4, [orderDate, shipmentDate]);
++  });
++
++  it("checks every line date when adding a sale payment", async () => {
++    const tx = txManager();
++    const guard = rejectingGuard();
++    const first = new Date("2026-08-31");
++    const second = new Date("2026-09-02");
++    const useCase = new RecordSalePaymentUseCase(tx, null as any, null as any, null as any, null as any, guard);
++    await expectGuarded(useCase.execute({
++      companyId: 4,
++      saleOrderId: 9,
++      lines: [
++        { method: SalePaymentMethod.CASH, accountId: 1, amount: 10, date: first },
++        { method: SalePaymentMethod.PARTNER, partnerId: 2, amount: 12, date: second }
++      ]
++    }), tx);
++    expect(guard.assertOpen).toHaveBeenCalledWith(4, [first, second]);
++  });
++
++  it("checks shipment date before recording a later shipment", async () => {
++    const tx = txManager();
++    const guard = rejectingGuard();
++    const shipmentDate = new Date("2026-08-31");
++    const useCase = new RecordShipmentUseCase(
++      tx, null as any, null as any, null as any, null as any,
++      null as any, null as any, null as any, null as any, guard
++    );
++    await expectGuarded(useCase.execute({
++      companyId: 4,
++      saleOrderId: 9,
++      branchId: 1,
++      shipmentDate,
++      items: [{ saleOrderItemId: 2, productId: 5, quantityShipped: 1, unit: "pcs" }]
++    }), tx);
++    expect(guard.assertOpen).toHaveBeenCalledWith(4, [shipmentDate]);
++  });
++});
++
++describe("purchase mutation period locks", () => {
++  function createPurchase(guard: any, tx: any) {
++    return new CreatePurchaseOrderUseCase(
++      tx, null as any, null as any, null as any, null as any,
++      null as any, null as any, null as any, guard
++    );
++  }
++
++  it("checks the order date when creating a purchase order", async () => {
++    const tx = txManager();
++    const guard = rejectingGuard();
++    const orderDate = new Date("2026-08-31");
++    await expectGuarded(createPurchase(guard, tx).execute({
++      companyId: 6,
++      supplierId: 2,
++      orderNo: "PO-1",
++      orderDate,
++      receiveOption: ReceiveOption.RECEIVE_LATER,
++      branchId: 1,
++      items: [{ productId: 5, quantityOrdered: 2, unitCost: 10 }]
++    }), tx);
++    expect(guard.assertOpen).toHaveBeenCalledWith(6, [orderDate]);
++  });
++
++  it("checks nested purchase payment dates during order creation", async () => {
++    const tx = txManager();
++    const guard = rejectingGuard();
++    const orderDate = new Date("2026-09-04");
++    const paymentDate = new Date("2026-08-31");
++    await expectGuarded(createPurchase(guard, tx).execute({
++      companyId: 6,
++      supplierId: 2,
++      orderNo: "PO-2",
++      orderDate,
++      receiveOption: ReceiveOption.RECEIVE_LATER,
++      branchId: 1,
++      items: [{ productId: 5, quantityOrdered: 2, unitCost: 10 }],
++      payments: [{ method: PurchasePaymentMethod.CASH, accountId: 7, amount: 20, date: paymentDate }]
++    }), tx);
++    expect(guard.assertOpen).toHaveBeenCalledWith(6, [orderDate, paymentDate]);
++  });
++
++  it("checks the actual initial receipt date for a fully received purchase", async () => {
++    const tx = txManager();
++    const guard = rejectingGuard();
++    const orderDate = new Date("2026-09-04");
++    const receiveDate = new Date("2026-08-31");
++    await expectGuarded(createPurchase(guard, tx).execute({
++      companyId: 6,
++      supplierId: 2,
++      orderNo: "PO-3",
++      orderDate,
++      expectedReceiveDate: receiveDate,
++      receiveOption: ReceiveOption.RECEIVED_ALL,
++      branchId: 1,
++      items: [{ productId: 5, quantityOrdered: 2, unitCost: 10 }]
++    }), tx);
++    expect(guard.assertOpen).toHaveBeenCalledWith(6, [orderDate, receiveDate]);
++  });
++
++  it("uses order date for an immediate receipt with no expected date", async () => {
++    const tx = txManager();
++    const guard = rejectingGuard();
++    const orderDate = new Date("2026-08-31");
++    await expectGuarded(createPurchase(guard, tx).execute({
++      companyId: 6,
++      supplierId: 2,
++      orderNo: "PO-4",
++      orderDate,
++      receiveOption: ReceiveOption.RECEIVED_ALL,
++      branchId: 1,
++      items: [{ productId: 5, quantityOrdered: 2, unitCost: 10 }]
++    }), tx);
++    expect(guard.assertOpen).toHaveBeenCalledWith(6, [orderDate, orderDate]);
++  });
++
++  it("does not treat a planned receive date as posted activity for receive-later orders", async () => {
++    const tx = txManager();
++    const guard = rejectingGuard();
++    const orderDate = new Date("2026-09-04");
++    const plannedDate = new Date("2026-08-31");
++    await expectGuarded(createPurchase(guard, tx).execute({
++      companyId: 6,
++      supplierId: 2,
++      orderNo: "PO-5",
++      orderDate,
++      expectedReceiveDate: plannedDate,
++      receiveOption: ReceiveOption.RECEIVE_LATER,
++      branchId: 1,
++      items: [{ productId: 5, quantityOrdered: 2, unitCost: 10 }]
++    }), tx);
++    expect(guard.assertOpen).toHaveBeenCalledWith(6, [orderDate]);
++  });
++
++  it("checks a partial initial receipt when a received quantity is supplied", async () => {
++    const tx = txManager();
++    const guard = rejectingGuard();
++    const orderDate = new Date("2026-09-04");
++    const receiveDate = new Date("2026-08-31");
++    await expectGuarded(createPurchase(guard, tx).execute({
++      companyId: 6,
++      supplierId: 2,
++      orderNo: "PO-6",
++      orderDate,
++      expectedReceiveDate: receiveDate,
++      receiveOption: ReceiveOption.RECEIVED_PARTIALLY,
++      branchId: 1,
++      items: [{ productId: 5, quantityOrdered: 2, quantityReceived: 1, unitCost: 10 }]
++    }), tx);
++    expect(guard.assertOpen).toHaveBeenCalledWith(6, [orderDate, receiveDate]);
++  });
++
++  it("checks every line date when adding a purchase payment", async () => {
++    const tx = txManager();
++    const guard = rejectingGuard();
++    const first = new Date("2026-08-31");
++    const second = new Date("2026-09-01");
++    const useCase = new RecordPurchasePaymentUseCase(tx, null as any, null as any, null as any, null as any, guard);
++    await expectGuarded(useCase.execute({
++      companyId: 6,
++      purchaseOrderId: 9,
++      lines: [
++        { method: PurchasePaymentMethod.CASH, accountId: 1, amount: 10, date: first },
++        { method: PurchasePaymentMethod.PARTNER, partnerId: 2, amount: 12, date: second }
++      ]
++    }), tx);
++    expect(guard.assertOpen).toHaveBeenCalledWith(6, [first, second]);
++  });
++
++  it("checks receive date before recording a later purchase receipt", async () => {
++    const tx = txManager();
++    const guard = rejectingGuard();
++    const receiveDate = new Date("2026-08-31");
++    const useCase = new RecordPurchaseReceiveUseCase(
++      tx, null as any, null as any, null as any, null as any, null as any, null as any, guard
++    );
++    await expectGuarded(useCase.execute({
++      companyId: 6,
++      purchaseOrderId: 9,
++      branchId: 1,
++      receiveDate,
++      items: [{ purchaseOrderItemId: 2, productId: 5, quantityReceived: 1, unitCost: 10 }]
++    }), tx);
++    expect(guard.assertOpen).toHaveBeenCalledWith(6, [receiveDate]);
++  });
++});
++
++describe("inventory and finance mutation period locks", () => {
++  it("checks inventory adjustment order date before persisting the adjustment", async () => {
++    const tx = txManager();
++    const guard = rejectingGuard();
++    const orderDate = new Date("2026-08-31");
++    const useCase = new CreateInventoryAdjustmentUseCase(tx, null as any, null as any, guard);
++    await expectGuarded(useCase.execute({
++      companyId: 8,
++      branchId: 1,
++      orderDate,
++      adjustmentType: AdjustmentType.POSITIVE,
++      items: [{ productId: 3, quantity: 1 }]
++    }), tx);
++    expect(guard.assertOpen).toHaveBeenCalledWith(8, [orderDate]);
++  });
++
++  it("checks direct-loan date before any account or partner ledger write", async () => {
++    const tx = txManager();
++    const guard = rejectingGuard();
++    const date = new Date("2026-08-31");
++    const useCase = new RecordDirectLoanUseCase(tx, null as any, null as any, null as any, null as any, guard);
++    await expectGuarded(useCase.execute({
++      companyId: 8,
++      loanDirection: "TAKEN",
++      primaryPartnerId: 4,
++      accountId: 2,
++      date,
++      amount: 50
++    }), tx);
++    expect(guard.assertOpen).toHaveBeenCalledWith(8, [date]);
++  });
++
++  it("checks partner-to-partner loan date before either ledger leg", async () => {
++    const tx = txManager();
++    const guard = rejectingGuard();
++    const date = new Date("2026-08-31");
++    const useCase = new RecordPartnerToPartnerLoanUseCase(tx, null as any, null as any, null as any, guard);
++    await expectGuarded(useCase.execute({
++      companyId: 8,
++      loanDirection: "LENT",
++      primaryPartnerId: 4,
++      relatedPartnerId: 5,
++      date,
++      amount: 50
++    }), tx);
++    expect(guard.assertOpen).toHaveBeenCalledWith(8, [date]);
++  });
++
++  it("checks historical-loan date before backdating a ledger adjustment", async () => {
++    const tx = txManager();
++    const guard = rejectingGuard();
++    const date = new Date("2026-08-31");
++    const useCase = new RecordHistoricalLoanUseCase(tx, null as any, null as any, null as any, guard);
++    await expectGuarded(useCase.execute({
++      companyId: 8,
++      loanDirection: "LENT",
++      primaryPartnerId: 4,
++      date,
++      amount: 50
++    }), tx);
++    expect(guard.assertOpen).toHaveBeenCalledWith(8, [date]);
++  });
++});
+diff --git a/src/modules/reporting/domain/__tests__/ReportingPeriodClose.behavior.test.ts b/src/modules/reporting/domain/__tests__/ReportingPeriodClose.behavior.test.ts
+new file mode 100644
+index 0000000..f3c74c0
+--- /dev/null
++++ b/src/modules/reporting/domain/__tests__/ReportingPeriodClose.behavior.test.ts
+@@ -0,0 +1,190 @@
++import { ValidationError } from "../../../../shared/domain/DomainError";
++import {
++  ReportingPeriodAlreadyClosedError,
++  ReportingPeriodCloseBlockedError,
++  ReportingPeriodClosedError,
++  ReportingPeriodState,
++  compareBusinessDates,
++  formatBusinessDate,
++  normalizeBusinessDate
++} from "../ReportingPeriodClose";
++
++describe("reporting period calendar-day rules", () => {
++  it("normalizes a timestamp to its UTC calendar day", () => {
++    const result = normalizeBusinessDate(new Date("2026-08-31T23:59:59.999Z"));
++    expect(result.toISOString()).toBe("2026-08-31T00:00:00.000Z");
++  });
++
++  it("formats a business date as YYYY-MM-DD", () => {
++    expect(formatBusinessDate(new Date("2026-02-03T15:20:00Z"))).toBe("2026-02-03");
++  });
++
++  it("compares two timestamps on the same business day as equal", () => {
++    expect(compareBusinessDates(
++      new Date("2026-07-15T00:01:00Z"),
++      new Date("2026-07-15T22:30:00Z")
++    )).toBe(0);
++  });
++
++  it("orders an earlier business day before a later day", () => {
++    expect(compareBusinessDates(new Date("2026-07-14"), new Date("2026-07-15"))).toBe(-1);
++  });
++
++  it("orders a later business day after an earlier day", () => {
++    expect(compareBusinessDates(new Date("2026-07-16"), new Date("2026-07-15"))).toBe(1);
++  });
++
++  it("rejects invalid Date objects instead of comparing them", () => {
++    expect(() => normalizeBusinessDate(new Date("not-a-date"))).toThrow(ValidationError);
++  });
++});
++
++describe("ReportingPeriodState", () => {
++  const record = () => ({
++    id: 9,
++    companyId: 12,
++    closedThrough: new Date("2026-08-31T18:00:00Z"),
++    closedAt: new Date("2026-09-02T10:11:12Z"),
++    closedBy: 44
++  });
++
++  it("represents a company with no close boundary as open", () => {
++    const state = ReportingPeriodState.open(12);
++    expect(state.toPrimitives()).toEqual({
++      companyId: 12,
++      closedThrough: null,
++      closedAt: null,
++      closedBy: null
++    });
++  });
++
++  it("never locks dates when the company has not closed a period", () => {
++    const state = ReportingPeriodState.open(12);
++    expect(state.isClosed(new Date("2001-01-01"))).toBe(false);
++    expect(() => state.assertOpen(new Date("2001-01-01"))).not.toThrow();
++  });
++
++  it("hydrates the current boundary and keeps close audit fields", () => {
++    const state = ReportingPeriodState.hydrate(record());
++    const props = state.toPrimitives();
++    expect(props.companyId).toBe(12);
++    expect(props.closedThrough?.toISOString()).toBe("2026-08-31T00:00:00.000Z");
++    expect(props.closedAt?.toISOString()).toBe("2026-09-02T10:11:12.000Z");
++    expect(props.closedBy).toBe(44);
++  });
++
++  it("treats the exact close boundary as closed", () => {
++    const state = ReportingPeriodState.hydrate(record());
++    expect(state.isClosed(new Date("2026-08-31T23:59:59Z"))).toBe(true);
++  });
++
++  it("treats every earlier date as closed", () => {
++    const state = ReportingPeriodState.hydrate(record());
++    expect(state.isClosed(new Date("2026-01-01"))).toBe(true);
++  });
++
++  it("allows the day immediately after the close boundary", () => {
++    const state = ReportingPeriodState.hydrate(record());
++    expect(state.isClosed(new Date("2026-09-01"))).toBe(false);
++    expect(() => state.assertOpen(new Date("2026-09-01"))).not.toThrow();
++  });
++
++  it("throws a reporting-period-closed conflict for a boundary-day write", () => {
++    const state = ReportingPeriodState.hydrate(record());
++    expect(() => state.assertOpen(new Date("2026-08-31"))).toThrow(ReportingPeriodClosedError);
++  });
++
++  it("throws a reporting-period-closed conflict for a backdated write", () => {
++    const state = ReportingPeriodState.hydrate(record());
++    expect(() => state.assertOpen(new Date("2026-08-01"))).toThrow(ReportingPeriodClosedError);
++  });
++
++  it("does not allow a close request to repeat the current boundary", () => {
++    const state = ReportingPeriodState.hydrate(record());
++    expect(() => state.assertCanAdvanceTo(new Date("2026-08-31"))).toThrow(ReportingPeriodAlreadyClosedError);
++  });
++
++  it("does not allow a close request to move the boundary backwards", () => {
++    const state = ReportingPeriodState.hydrate(record());
++    expect(() => state.assertCanAdvanceTo(new Date("2026-07-31"))).toThrow(ReportingPeriodAlreadyClosedError);
++  });
++
++  it("allows a close request to move the boundary forward", () => {
++    const state = ReportingPeriodState.hydrate(record());
++    expect(() => state.assertCanAdvanceTo(new Date("2026-09-30"))).not.toThrow();
++  });
++
++  it("rejects an invalid company id for an open state", () => {
++    expect(() => ReportingPeriodState.open(0)).toThrow(ValidationError);
++  });
++
++  it("rejects a fractional company id", () => {
++    expect(() => ReportingPeriodState.open(1.5)).toThrow(ValidationError);
++  });
++
++  it("rejects an invalid company id when hydrating a close", () => {
++    expect(() => ReportingPeriodState.hydrate({ ...record(), companyId: -2 })).toThrow(ValidationError);
++  });
++
++  it("rejects an invalid closed-through date when hydrating", () => {
++    expect(() => ReportingPeriodState.hydrate({ ...record(), closedThrough: new Date("bad") })).toThrow(ValidationError);
++  });
++
++  it("rejects an invalid closed-at timestamp when hydrating", () => {
++    expect(() => ReportingPeriodState.hydrate({ ...record(), closedAt: new Date("bad") })).toThrow(ValidationError);
++  });
++
++  it("returns copies of stored Date values from primitives", () => {
++    const state = ReportingPeriodState.hydrate(record());
++    const first = state.toPrimitives();
++    first.closedThrough!.setUTCDate(1);
++    first.closedAt!.setUTCFullYear(2000);
++    const second = state.toPrimitives();
++    expect(second.closedThrough?.toISOString()).toBe("2026-08-31T00:00:00.000Z");
++    expect(second.closedAt?.getUTCFullYear()).toBe(2026);
++  });
++});
++
++describe("reporting period conflict errors", () => {
++  it("uses the public closed-period code and HTTP 409", () => {
++    const error = new ReportingPeriodClosedError(new Date("2026-08-20"), new Date("2026-08-31"));
++    expect(error.code).toBe("REPORTING_PERIOD_CLOSED");
++    expect(error.status).toBe(409);
++  });
++
++  it("includes both the attempted date and close boundary in the closed-period message", () => {
++    const error = new ReportingPeriodClosedError(new Date("2026-08-20"), new Date("2026-08-31"));
++    expect(error.message).toContain("2026-08-20");
++    expect(error.message).toContain("2026-08-31");
++  });
++
++  it("uses the public already-closed code and HTTP 409", () => {
++    const error = new ReportingPeriodAlreadyClosedError(new Date("2026-07-31"), new Date("2026-08-31"));
++    expect(error.code).toBe("PERIOD_ALREADY_CLOSED");
++    expect(error.status).toBe(409);
++  });
++
++  it("uses the public close-blocked code and HTTP 409", () => {
++    const error = new ReportingPeriodCloseBlockedError([{ type: "OPEN_SALES", count: 2 }]);
++    expect(error.code).toBe("PERIOD_CLOSE_BLOCKED");
++    expect(error.status).toBe(409);
++  });
++
++  it("summarizes positive blocker counts in the close-blocked message", () => {
++    const error = new ReportingPeriodCloseBlockedError([
++      { type: "OPEN_SALES", count: 2 },
++      { type: "OPEN_PURCHASES", count: 3 }
++    ]);
++    expect(error.message).toContain("OPEN_SALES:2");
++    expect(error.message).toContain("OPEN_PURCHASES:3");
++  });
++
++  it("does not put zero-count blockers in the close-blocked message", () => {
++    const error = new ReportingPeriodCloseBlockedError([
++      { type: "OPEN_SALES", count: 0 },
++      { type: "OPEN_PURCHASES", count: 1 }
++    ]);
++    expect(error.message).not.toContain("OPEN_SALES");
++    expect(error.blockers).toHaveLength(2);
++  });
++});
+diff --git a/src/modules/reporting/presentation/__tests__/ReportingPeriodCloseSchemas.behavior.test.ts b/src/modules/reporting/presentation/__tests__/ReportingPeriodCloseSchemas.behavior.test.ts
+new file mode 100644
+index 0000000..cc01aa8
+--- /dev/null
++++ b/src/modules/reporting/presentation/__tests__/ReportingPeriodCloseSchemas.behavior.test.ts
+@@ -0,0 +1,68 @@
++import {
++  CloseReportingPeriodBodySchema,
++  ReportingPeriodCloseEligibilityQuerySchema
++} from "../ReportingPeriodCloseSchemas";
++
++describe("reporting period close request dates", () => {
++  it("accepts a date-only eligibility throughDate", () => {
++    const parsed = ReportingPeriodCloseEligibilityQuerySchema.parse({ throughDate: "2026-08-31" });
++    expect(parsed.throughDate.toISOString()).toBe("2026-08-31T00:00:00.000Z");
++  });
++
++  it("accepts leap day in a leap year", () => {
++    const parsed = CloseReportingPeriodBodySchema.parse({ throughDate: "2028-02-29" });
++    expect(parsed.throughDate.toISOString()).toBe("2028-02-29T00:00:00.000Z");
++  });
++
++  it("accepts the first calendar day of a year", () => {
++    expect(CloseReportingPeriodBodySchema.safeParse({ throughDate: "2027-01-01" }).success).toBe(true);
++  });
++
++  it("accepts the last calendar day of a year", () => {
++    expect(CloseReportingPeriodBodySchema.safeParse({ throughDate: "2027-12-31" }).success).toBe(true);
++  });
++
++  it("rejects an impossible day of month", () => {
++    expect(CloseReportingPeriodBodySchema.safeParse({ throughDate: "2026-02-30" }).success).toBe(false);
++  });
++
++  it("rejects leap day in a non-leap year", () => {
++    expect(CloseReportingPeriodBodySchema.safeParse({ throughDate: "2027-02-29" }).success).toBe(false);
++  });
++
++  it("rejects month zero", () => {
++    expect(CloseReportingPeriodBodySchema.safeParse({ throughDate: "2026-00-10" }).success).toBe(false);
++  });
++
++  it("rejects month thirteen", () => {
++    expect(CloseReportingPeriodBodySchema.safeParse({ throughDate: "2026-13-10" }).success).toBe(false);
++  });
++
++  it("rejects day zero", () => {
++    expect(CloseReportingPeriodBodySchema.safeParse({ throughDate: "2026-08-00" }).success).toBe(false);
++  });
++
++  it("rejects timestamps because the public close boundary is date-only", () => {
++    expect(CloseReportingPeriodBodySchema.safeParse({ throughDate: "2026-08-31T00:00:00Z" }).success).toBe(false);
++  });
++
++  it("rejects slash-separated dates", () => {
++    expect(CloseReportingPeriodBodySchema.safeParse({ throughDate: "2026/08/31" }).success).toBe(false);
++  });
++
++  it("rejects non-padded dates", () => {
++    expect(CloseReportingPeriodBodySchema.safeParse({ throughDate: "2026-8-1" }).success).toBe(false);
++  });
++
++  it("requires throughDate in the close body", () => {
++    expect(CloseReportingPeriodBodySchema.safeParse({}).success).toBe(false);
++  });
++
++  it("requires throughDate in the eligibility query", () => {
++    expect(ReportingPeriodCloseEligibilityQuerySchema.safeParse({}).success).toBe(false);
++  });
++
++  it("rejects non-string query values", () => {
++    expect(ReportingPeriodCloseEligibilityQuerySchema.safeParse({ throughDate: 20260831 }).success).toBe(false);
++  });
++});

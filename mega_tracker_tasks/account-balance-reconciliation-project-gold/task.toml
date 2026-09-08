@@ -1,0 +1,17 @@
+version = "1"
+
+[task]
+name = "account-balance-reconciliation"
+category = "bug"
+display_title = "Account balance reconciliation"
+description = "Rebuild account balances from ledger postings, expose drift diagnostics, and safely repair stale stored balances."
+base_commit = "0b40f7e7515a05dbcadff4942d353af4ef02954f"
+attempt_timeout_seconds = 5400
+verification_timeout_seconds = 1800
+
+[repository]
+workdir = "/app"
+
+[verifier]
+config = "tests/config.json"
+test_script = "tests/test.sh"

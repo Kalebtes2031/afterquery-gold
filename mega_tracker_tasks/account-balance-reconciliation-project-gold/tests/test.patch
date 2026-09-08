@@ -1,0 +1,836 @@
+diff --git a/src/modules/finance/application/__tests__/AccountBalanceReconciliation.behavior.test.ts b/src/modules/finance/application/__tests__/AccountBalanceReconciliation.behavior.test.ts
+new file mode 100644
+index 0000000..7e92a30
+--- /dev/null
++++ b/src/modules/finance/application/__tests__/AccountBalanceReconciliation.behavior.test.ts
+@@ -0,0 +1,707 @@
++import * as financeUseCases from "../ListFinanceUseCase";
++import { Account } from "../../../accounts/domain/Account";
++import { AccountTransaction } from "../../domain/AccountTransaction";
++import { EntityNotFoundError } from "../../../../shared/domain/DomainError";
++
++function account(overrides: Record<string, unknown> = {}) {
++  return Account.hydrate({
++    id: 1,
++    companyId: 7,
++    accountHolderName: "Operating Account",
++    accountNumber: "001",
++    bankName: "Example Bank",
++    bankBranch: null,
++    accountType: "BANK",
++    openingBalance: 100,
++    balance: 100,
++    isActive: true,
++    createdAt: new Date("2026-01-01T00:00:00.000Z"),
++    ...overrides,
++  } as any);
++}
++
++function transaction(
++  amount: number,
++  overrides: Record<string, unknown> = {}
++) {
++  return AccountTransaction.hydrate({
++    id: 1,
++    companyId: 7,
++    accountId: 1,
++    date: new Date("2026-02-01T00:00:00.000Z"),
++    amount,
++    balanceBefore: null,
++    balanceAfter: null,
++    description: "movement",
++    sourceType: "SALE_PAYMENT",
++    sourceId: null,
++    performedBy: null,
++    createdAt: new Date("2026-02-01T00:00:00.000Z"),
++    ...overrides,
++  } as any);
++}
++
++function reportUseCase(accountRepo: any, accountTxRepo: any) {
++  const Constructor = (financeUseCases as any).GetAccountBalanceReconciliationUseCase;
++  expect(Constructor).toBeDefined();
++  return new Constructor(accountRepo, accountTxRepo);
++}
++
++function repairUseCase(accountRepo: any, accountTxRepo: any, txManager: any) {
++  const Constructor = (financeUseCases as any).ReconcileAccountBalanceUseCase;
++  expect(Constructor).toBeDefined();
++  return new Constructor(accountRepo, accountTxRepo, txManager);
++}
++
++function immediateTransactionManager(client: any = { transaction: "client" }) {
++  return {
++    run: jest.fn(async (callback: (client: any) => Promise<any>) => callback(client)),
++  };
++}
++
++function standardReportRepos(accounts: Account[], transactions: AccountTransaction[]) {
++  return {
++    accountRepo: {
++      findById: jest.fn(async (_companyId: number, id: number) =>
++        accounts.find((item) => item.id === id) ?? null
++      ),
++      listByCompany: jest.fn(async () => accounts),
++    },
++    accountTxRepo: {
++      listForReconciliation: jest.fn(async () => transactions),
++    },
++  };
++}
++
++describe("current account balance read behavior", () => {
++  it("reconstructs the current balance instead of returning a stale stored value", async () => {
++    const acc = account({ openingBalance: 100, balance: 999 });
++    const accountRepo = { findById: jest.fn().mockResolvedValue(acc) };
++    const accountTxRepo = {
++      getBalance: jest.fn().mockResolvedValue(999),
++      listForReconciliation: jest.fn().mockResolvedValue([transaction(25)]),
++    };
++
++    const result = await new financeUseCases.GetAccountBalanceUseCase(
++      accountRepo as any,
++      accountTxRepo as any
++    ).execute(7, 1);
++
++    expect(result).toEqual({ balance: 125 });
++    expect(accountTxRepo.listForReconciliation).toHaveBeenCalledWith(7, [1]);
++  });
++
++  it("does not double count an OPENING_BALANCE row in the current balance read", async () => {
++    const acc = account({ openingBalance: 80, balance: 999 });
++    const accountRepo = { findById: jest.fn().mockResolvedValue(acc) };
++    const accountTxRepo = {
++      getBalance: jest.fn().mockResolvedValue(999),
++      listForReconciliation: jest.fn().mockResolvedValue([
++        transaction(80, { sourceType: "OPENING_BALANCE" }),
++        transaction(20, { id: 2 }),
++      ]),
++    };
++
++    const result = await new financeUseCases.GetAccountBalanceUseCase(
++      accountRepo as any,
++      accountTxRepo as any
++    ).execute(7, 1);
++
++    expect(result.balance).toBe(100);
++  });
++
++  it("supports legacy current-balance reads with no opening audit row", async () => {
++    const acc = account({ openingBalance: 75, balance: 999 });
++    const accountRepo = { findById: jest.fn().mockResolvedValue(acc) };
++    const accountTxRepo = {
++      getBalance: jest.fn().mockResolvedValue(999),
++      listForReconciliation: jest.fn().mockResolvedValue([transaction(-10)]),
++    };
++
++    const result = await new financeUseCases.GetAccountBalanceUseCase(
++      accountRepo as any,
++      accountTxRepo as any
++    ).execute(7, 1);
++
++    expect(result.balance).toBe(65);
++  });
++
++  it("ignores foreign transactions when reconstructing the current balance", async () => {
++    const acc = account({ openingBalance: 100, balance: 999 });
++    const accountRepo = { findById: jest.fn().mockResolvedValue(acc) };
++    const accountTxRepo = {
++      getBalance: jest.fn().mockResolvedValue(999),
++      listForReconciliation: jest.fn().mockResolvedValue([
++        transaction(500, { companyId: 88 }),
++        transaction(300, { id: 2, accountId: 2 }),
++        transaction(10, { id: 3 }),
++      ]),
++    };
++
++    const result = await new financeUseCases.GetAccountBalanceUseCase(
++      accountRepo as any,
++      accountTxRepo as any
++    ).execute(7, 1);
++
++    expect(result.balance).toBe(110);
++  });
++});
++
++describe("account balance reconciliation report behavior", () => {
++  it("counts the immutable opening balance exactly once when an opening ledger row exists", async () => {
++    const acc = account({ openingBalance: 100, balance: 150 });
++    const txs = [
++      transaction(100, { id: 10, sourceType: "OPENING_BALANCE" }),
++      transaction(50, { id: 11, sourceType: "SALE_PAYMENT" }),
++    ];
++    const { accountRepo, accountTxRepo } = standardReportRepos([acc], txs);
++
++    const result = await reportUseCase(accountRepo, accountTxRepo).execute(7);
++
++    expect(result.accounts[0]).toEqual(expect.objectContaining({
++      openingBalance: 100,
++      storedBalance: 150,
++      ledgerBalance: 150,
++      drift: 0,
++      inSync: true,
++    }));
++  });
++
++  it("reconstructs legacy accounts that have no opening-balance transaction", async () => {
++    const acc = account({ openingBalance: 125, balance: 160 });
++    const txs = [transaction(35, { sourceType: "SALE_PAYMENT" })];
++    const { accountRepo, accountTxRepo } = standardReportRepos([acc], txs);
++
++    const result = await reportUseCase(accountRepo, accountTxRepo).execute(7);
++
++    expect(result.accounts[0].ledgerBalance).toBe(160);
++    expect(result.accounts[0].inSync).toBe(true);
++  });
++
++  it("ignores duplicate opening-balance audit rows instead of double counting them", async () => {
++    const acc = account({ openingBalance: 80, balance: 105 });
++    const txs = [
++      transaction(80, { id: 1, sourceType: "OPENING_BALANCE" }),
++      transaction(80, { id: 2, sourceType: "OPENING_BALANCE" }),
++      transaction(25, { id: 3, sourceType: "ACCOUNT_TRANSFER" }),
++    ];
++    const { accountRepo, accountTxRepo } = standardReportRepos([acc], txs);
++
++    const result = await reportUseCase(accountRepo, accountTxRepo).execute(7);
++
++    expect(result.accounts[0].ledgerBalance).toBe(105);
++  });
++
++  it("uses the account opening amount even when an opening audit row contains a different amount", async () => {
++    const acc = account({ openingBalance: 90, balance: 120 });
++    const txs = [
++      transaction(999, { sourceType: "OPENING_BALANCE" }),
++      transaction(30, { id: 2, sourceType: "EXPENSE" }),
++    ];
++    const { accountRepo, accountTxRepo } = standardReportRepos([acc], txs);
++
++    const result = await reportUseCase(accountRepo, accountTxRepo).execute(7);
++
++    expect(result.accounts[0].ledgerBalance).toBe(120);
++  });
++
++  it("adds positive ledger movements to the opening balance", async () => {
++    const acc = account({ openingBalance: 10, balance: 70 });
++    const txs = [transaction(20), transaction(40, { id: 2 })];
++    const { accountRepo, accountTxRepo } = standardReportRepos([acc], txs);
++
++    const result = await reportUseCase(accountRepo, accountTxRepo).execute(7);
++
++    expect(result.accounts[0].ledgerBalance).toBe(70);
++  });
++
++  it("subtracts negative ledger movements from the opening balance", async () => {
++    const acc = account({ openingBalance: 200, balance: 125 });
++    const txs = [transaction(-50), transaction(-25, { id: 2 })];
++    const { accountRepo, accountTxRepo } = standardReportRepos([acc], txs);
++
++    const result = await reportUseCase(accountRepo, accountTxRepo).execute(7);
++
++    expect(result.accounts[0].ledgerBalance).toBe(125);
++  });
++
++  it("includes ordinary transactions whose source type is null", async () => {
++    const acc = account({ openingBalance: 40, balance: 55 });
++    const txs = [transaction(15, { sourceType: null })];
++    const { accountRepo, accountTxRepo } = standardReportRepos([acc], txs);
++
++    const result = await reportUseCase(accountRepo, accountTxRepo).execute(7);
++
++    expect(result.accounts[0].ledgerBalance).toBe(55);
++  });
++
++  it("normalizes reconstructed money to cents so floating point noise is not reported as drift", async () => {
++    const acc = account({ openingBalance: 0.1, balance: 0.3 });
++    const txs = [transaction(0.2)];
++    const { accountRepo, accountTxRepo } = standardReportRepos([acc], txs);
++
++    const result = await reportUseCase(accountRepo, accountTxRepo).execute(7);
++
++    expect(result.accounts[0].ledgerBalance).toBe(0.3);
++    expect(result.accounts[0].drift).toBe(0);
++    expect(result.accounts[0].inSync).toBe(true);
++  });
++
++  it("reports positive drift when the stored balance is above the ledger", async () => {
++    const acc = account({ openingBalance: 100, balance: 160 });
++    const txs = [transaction(40)];
++    const { accountRepo, accountTxRepo } = standardReportRepos([acc], txs);
++
++    const result = await reportUseCase(accountRepo, accountTxRepo).execute(7);
++
++    expect(result.accounts[0]).toEqual(expect.objectContaining({
++      storedBalance: 160,
++      ledgerBalance: 140,
++      drift: 20,
++      inSync: false,
++    }));
++  });
++
++  it("reports negative drift when the stored balance is below the ledger", async () => {
++    const acc = account({ openingBalance: 100, balance: 80 });
++    const txs = [transaction(25)];
++    const { accountRepo, accountTxRepo } = standardReportRepos([acc], txs);
++
++    const result = await reportUseCase(accountRepo, accountTxRepo).execute(7);
++
++    expect(result.accounts[0].drift).toBe(-45);
++    expect(result.accounts[0].inSync).toBe(false);
++  });
++
++  it("preserves identifying account fields in each reconciliation row", async () => {
++    const acc = account({
++      id: 9,
++      accountHolderName: "Petty Cash",
++      accountType: "CASH",
++      isActive: false,
++      openingBalance: 12,
++      balance: 12,
++    });
++    const { accountRepo, accountTxRepo } = standardReportRepos([acc], []);
++
++    const result = await reportUseCase(accountRepo, accountTxRepo).execute(7);
++
++    expect(result.accounts[0]).toEqual(expect.objectContaining({
++      accountId: 9,
++      accountHolderName: "Petty Cash",
++      accountType: "CASH",
++      isActive: false,
++      openingBalance: 12,
++    }));
++  });
++
++  it("summarizes stored totals, ledger totals, drift counts and signed net drift", async () => {
++    const first = account({ id: 1, openingBalance: 100, balance: 150 });
++    const second = account({ id: 2, openingBalance: 50, balance: 40, accountHolderName: "Cash" });
++    const txs = [
++      transaction(25, { accountId: 1 }),
++      transaction(-5, { id: 2, accountId: 2 }),
++    ];
++    const { accountRepo, accountTxRepo } = standardReportRepos([first, second], txs);
++
++    const result = await reportUseCase(accountRepo, accountTxRepo).execute(7);
++
++    expect(result.summary).toEqual({
++      totalAccounts: 2,
++      driftedAccounts: 2,
++      storedTotal: 190,
++      ledgerTotal: 170,
++      netDrift: 20,
++    });
++  });
++
++  it("rounds summary accumulation to cents", async () => {
++    const first = account({ id: 1, openingBalance: 0.1, balance: 0.3 });
++    const second = account({ id: 2, openingBalance: 0.2, balance: 0.5 });
++    const txs = [
++      transaction(0.2, { accountId: 1 }),
++      transaction(0.3, { id: 2, accountId: 2 }),
++    ];
++    const { accountRepo, accountTxRepo } = standardReportRepos([first, second], txs);
++
++    const result = await reportUseCase(accountRepo, accountTxRepo).execute(7);
++
++    expect(result.summary.storedTotal).toBe(0.8);
++    expect(result.summary.ledgerTotal).toBe(0.8);
++    expect(result.summary.netDrift).toBe(0);
++  });
++
++  it("returns only drifted rows when driftOnly is enabled", async () => {
++    const clean = account({ id: 1, openingBalance: 100, balance: 110 });
++    const drifted = account({ id: 2, openingBalance: 50, balance: 99 });
++    const txs = [
++      transaction(10, { accountId: 1 }),
++      transaction(20, { id: 2, accountId: 2 }),
++    ];
++    const { accountRepo, accountTxRepo } = standardReportRepos([clean, drifted], txs);
++
++    const result = await reportUseCase(accountRepo, accountTxRepo).execute(7, { driftOnly: true });
++
++    expect(result.accounts).toHaveLength(1);
++    expect(result.accounts[0].accountId).toBe(2);
++  });
++
++  it("keeps summary totals for the full scan when driftOnly filters the rows", async () => {
++    const clean = account({ id: 1, openingBalance: 100, balance: 110 });
++    const drifted = account({ id: 2, openingBalance: 50, balance: 99 });
++    const txs = [
++      transaction(10, { accountId: 1 }),
++      transaction(20, { id: 2, accountId: 2 }),
++    ];
++    const { accountRepo, accountTxRepo } = standardReportRepos([clean, drifted], txs);
++
++    const result = await reportUseCase(accountRepo, accountTxRepo).execute(7, { driftOnly: true });
++
++    expect(result.summary.totalAccounts).toBe(2);
++    expect(result.summary.driftedAccounts).toBe(1);
++  });
++
++  it("filters the scan to one company account when accountId is supplied", async () => {
++    const selected = account({ id: 22, openingBalance: 20, balance: 30 });
++    const accountRepo = {
++      findById: jest.fn().mockResolvedValue(selected),
++      listByCompany: jest.fn(),
++    };
++    const accountTxRepo = {
++      listForReconciliation: jest.fn().mockResolvedValue([
++        transaction(10, { accountId: 22 }),
++      ]),
++    };
++
++    const result = await reportUseCase(accountRepo, accountTxRepo).execute(7, { accountId: 22 });
++
++    expect(accountRepo.findById).toHaveBeenCalledWith(7, 22);
++    expect(accountRepo.listByCompany).not.toHaveBeenCalled();
++    expect(accountTxRepo.listForReconciliation).toHaveBeenCalledWith(7, [22]);
++    expect(result.accounts).toHaveLength(1);
++    expect(result.accounts[0].accountId).toBe(22);
++  });
++
++  it("returns not found when an accountId filter points outside the company", async () => {
++    const accountRepo = {
++      findById: jest.fn().mockResolvedValue(null),
++      listByCompany: jest.fn(),
++    };
++    const accountTxRepo = { listForReconciliation: jest.fn() };
++
++    await expect(
++      reportUseCase(accountRepo, accountTxRepo).execute(7, { accountId: 999 })
++    ).rejects.toBeInstanceOf(EntityNotFoundError);
++
++    expect(accountTxRepo.listForReconciliation).not.toHaveBeenCalled();
++  });
++
++  it("loads every company account when no account filter is supplied", async () => {
++    const accounts = [account({ id: 1 }), account({ id: 2, accountHolderName: "Reserve" })];
++    const { accountRepo, accountTxRepo } = standardReportRepos(accounts, []);
++
++    await reportUseCase(accountRepo, accountTxRepo).execute(7);
++
++    expect(accountRepo.listByCompany).toHaveBeenCalledWith(7);
++    expect(accountRepo.findById).not.toHaveBeenCalled();
++    expect(accountTxRepo.listForReconciliation).toHaveBeenCalledWith(7, [1, 2]);
++  });
++
++  it("returns an empty zeroed report without asking for transactions when the company has no accounts", async () => {
++    const accountRepo = {
++      listByCompany: jest.fn().mockResolvedValue([]),
++      findById: jest.fn(),
++    };
++    const accountTxRepo = { listForReconciliation: jest.fn() };
++
++    const result = await reportUseCase(accountRepo, accountTxRepo).execute(7);
++
++    expect(accountTxRepo.listForReconciliation).not.toHaveBeenCalled();
++    expect(result).toEqual({
++      summary: {
++        totalAccounts: 0,
++        driftedAccounts: 0,
++        storedTotal: 0,
++        ledgerTotal: 0,
++        netDrift: 0,
++      },
++      accounts: [],
++    });
++  });
++
++  it("does not let a transaction from another company affect the reconstruction", async () => {
++    const acc = account({ openingBalance: 100, balance: 100 });
++    const txs = [transaction(500, { companyId: 8, accountId: 1 })];
++    const { accountRepo, accountTxRepo } = standardReportRepos([acc], txs);
++
++    const result = await reportUseCase(accountRepo, accountTxRepo).execute(7);
++
++    expect(result.accounts[0].ledgerBalance).toBe(100);
++    expect(result.accounts[0].inSync).toBe(true);
++  });
++
++  it("does not let a transaction for a different account affect a reconciliation row", async () => {
++    const acc = account({ id: 1, openingBalance: 100, balance: 100 });
++    const txs = [transaction(500, { accountId: 2 })];
++    const { accountRepo, accountTxRepo } = standardReportRepos([acc], txs);
++
++    const result = await reportUseCase(accountRepo, accountTxRepo).execute(7);
++
++    expect(result.accounts[0].ledgerBalance).toBe(100);
++  });
++});
++
++describe("stored account balance repair behavior", () => {
++  it("runs the repair inside the transaction manager and locks the account", async () => {
++    const client = { id: "client" };
++    const acc = account({ balance: 999, openingBalance: 100 });
++    const accountRepo = {
++      findByIdWithLock: jest.fn().mockResolvedValue(acc),
++      save: jest.fn().mockImplementation(async (value: Account) => value),
++    };
++    const accountTxRepo = {
++      listForReconciliation: jest.fn().mockResolvedValue([transaction(20)]),
++    };
++    const txManager = immediateTransactionManager(client);
++
++    await repairUseCase(accountRepo, accountTxRepo, txManager).execute(7, 1);
++
++    expect(txManager.run).toHaveBeenCalledTimes(1);
++    expect(accountRepo.findByIdWithLock).toHaveBeenCalledWith(7, 1, client);
++    expect(accountTxRepo.listForReconciliation).toHaveBeenCalledWith(7, [1], client);
++    expect(accountRepo.save).toHaveBeenCalledWith(acc, client);
++  });
++
++  it("repairs a stored balance that is above the reconstructed ledger", async () => {
++    const acc = account({ balance: 180, openingBalance: 100 });
++    const accountRepo = {
++      findByIdWithLock: jest.fn().mockResolvedValue(acc),
++      save: jest.fn().mockImplementation(async (value: Account) => value),
++    };
++    const accountTxRepo = {
++      listForReconciliation: jest.fn().mockResolvedValue([transaction(30)]),
++    };
++
++    const result = await repairUseCase(
++      accountRepo,
++      accountTxRepo,
++      immediateTransactionManager()
++    ).execute(7, 1);
++
++    expect(acc.balance).toBe(130);
++    expect(result).toEqual({
++      accountId: 1,
++      previousStoredBalance: 180,
++      ledgerBalance: 130,
++      balance: 130,
++      drift: 50,
++      repaired: true,
++    });
++  });
++
++  it("repairs a stored balance that is below the reconstructed ledger", async () => {
++    const acc = account({ balance: 40, openingBalance: 100 });
++    const accountRepo = {
++      findByIdWithLock: jest.fn().mockResolvedValue(acc),
++      save: jest.fn(),
++    };
++    const accountTxRepo = {
++      listForReconciliation: jest.fn().mockResolvedValue([transaction(-15)]),
++    };
++
++    const result = await repairUseCase(
++      accountRepo,
++      accountTxRepo,
++      immediateTransactionManager()
++    ).execute(7, 1);
++
++    expect(acc.balance).toBe(85);
++    expect(result.drift).toBe(-45);
++    expect(result.balance).toBe(85);
++    expect(result.repaired).toBe(true);
++  });
++
++  it("does not save an account that is already in sync", async () => {
++    const acc = account({ balance: 125, openingBalance: 100 });
++    const accountRepo = {
++      findByIdWithLock: jest.fn().mockResolvedValue(acc),
++      save: jest.fn(),
++    };
++    const accountTxRepo = {
++      listForReconciliation: jest.fn().mockResolvedValue([transaction(25)]),
++    };
++
++    const result = await repairUseCase(
++      accountRepo,
++      accountTxRepo,
++      immediateTransactionManager()
++    ).execute(7, 1);
++
++    expect(accountRepo.save).not.toHaveBeenCalled();
++    expect(result).toEqual({
++      accountId: 1,
++      previousStoredBalance: 125,
++      ledgerBalance: 125,
++      balance: 125,
++      drift: 0,
++      repaired: false,
++    });
++  });
++
++  it("returns not found without reading the ledger when the locked account is missing", async () => {
++    const accountRepo = {
++      findByIdWithLock: jest.fn().mockResolvedValue(null),
++      save: jest.fn(),
++    };
++    const accountTxRepo = { listForReconciliation: jest.fn() };
++
++    await expect(
++      repairUseCase(accountRepo, accountTxRepo, immediateTransactionManager()).execute(7, 404)
++    ).rejects.toBeInstanceOf(EntityNotFoundError);
++
++    expect(accountTxRepo.listForReconciliation).not.toHaveBeenCalled();
++    expect(accountRepo.save).not.toHaveBeenCalled();
++  });
++
++  it("ignores the opening-balance audit row while repairing", async () => {
++    const acc = account({ openingBalance: 75, balance: 500 });
++    const accountRepo = {
++      findByIdWithLock: jest.fn().mockResolvedValue(acc),
++      save: jest.fn(),
++    };
++    const accountTxRepo = {
++      listForReconciliation: jest.fn().mockResolvedValue([
++        transaction(75, { sourceType: "OPENING_BALANCE" }),
++        transaction(10, { id: 2, sourceType: "SALE_PAYMENT" }),
++      ]),
++    };
++
++    const result = await repairUseCase(
++      accountRepo,
++      accountTxRepo,
++      immediateTransactionManager()
++    ).execute(7, 1);
++
++    expect(result.ledgerBalance).toBe(85);
++    expect(acc.balance).toBe(85);
++  });
++
++  it("does not use a foreign-company movement while repairing", async () => {
++    const acc = account({ openingBalance: 75, balance: 500 });
++    const accountRepo = {
++      findByIdWithLock: jest.fn().mockResolvedValue(acc),
++      save: jest.fn(),
++    };
++    const accountTxRepo = {
++      listForReconciliation: jest.fn().mockResolvedValue([
++        transaction(300, { companyId: 99 }),
++        transaction(10, { id: 2 }),
++      ]),
++    };
++
++    const result = await repairUseCase(
++      accountRepo,
++      accountTxRepo,
++      immediateTransactionManager()
++    ).execute(7, 1);
++
++    expect(result.ledgerBalance).toBe(85);
++  });
++
++  it("does not use another account's movement while repairing", async () => {
++    const acc = account({ openingBalance: 75, balance: 500 });
++    const accountRepo = {
++      findByIdWithLock: jest.fn().mockResolvedValue(acc),
++      save: jest.fn(),
++    };
++    const accountTxRepo = {
++      listForReconciliation: jest.fn().mockResolvedValue([
++        transaction(300, { accountId: 2 }),
++        transaction(10, { id: 2, accountId: 1 }),
++      ]),
++    };
++
++    const result = await repairUseCase(
++      accountRepo,
++      accountTxRepo,
++      immediateTransactionManager()
++    ).execute(7, 1);
++
++    expect(result.ledgerBalance).toBe(85);
++  });
++
++  it("normalizes repaired balances to cents", async () => {
++    const acc = account({ openingBalance: 0.1, balance: 9 });
++    const accountRepo = {
++      findByIdWithLock: jest.fn().mockResolvedValue(acc),
++      save: jest.fn(),
++    };
++    const accountTxRepo = {
++      listForReconciliation: jest.fn().mockResolvedValue([transaction(0.2)]),
++    };
++
++    const result = await repairUseCase(
++      accountRepo,
++      accountTxRepo,
++      immediateTransactionManager()
++    ).execute(7, 1);
++
++    expect(result.ledgerBalance).toBe(0.3);
++    expect(result.balance).toBe(0.3);
++    expect(acc.balance).toBe(0.3);
++  });
++
++  it("propagates a ledger read failure and never saves a guessed balance", async () => {
++    const acc = account({ balance: 500 });
++    const accountRepo = {
++      findByIdWithLock: jest.fn().mockResolvedValue(acc),
++      save: jest.fn(),
++    };
++    const accountTxRepo = {
++      listForReconciliation: jest.fn().mockRejectedValue(new Error("ledger unavailable")),
++    };
++
++    await expect(
++      repairUseCase(accountRepo, accountTxRepo, immediateTransactionManager()).execute(7, 1)
++    ).rejects.toThrow("ledger unavailable");
++
++    expect(accountRepo.save).not.toHaveBeenCalled();
++    expect(acc.balance).toBe(500);
++  });
++
++  it("propagates a persistence failure so the enclosing transaction can roll back", async () => {
++    const acc = account({ openingBalance: 10, balance: 500 });
++    const accountRepo = {
++      findByIdWithLock: jest.fn().mockResolvedValue(acc),
++      save: jest.fn().mockRejectedValue(new Error("write failed")),
++    };
++    const accountTxRepo = {
++      listForReconciliation: jest.fn().mockResolvedValue([transaction(5)]),
++    };
++
++    await expect(
++      repairUseCase(accountRepo, accountTxRepo, immediateTransactionManager()).execute(7, 1)
++    ).rejects.toThrow("write failed");
++  });
++
++  it("reports the pre-repair signed drift rather than zeroing the response after correction", async () => {
++    const acc = account({ openingBalance: 100, balance: 150 });
++    const accountRepo = {
++      findByIdWithLock: jest.fn().mockResolvedValue(acc),
++      save: jest.fn(),
++    };
++    const accountTxRepo = {
++      listForReconciliation: jest.fn().mockResolvedValue([transaction(20)]),
++    };
++
++    const result = await repairUseCase(
++      accountRepo,
++      accountTxRepo,
++      immediateTransactionManager()
++    ).execute(7, 1);
++
++    expect(result.drift).toBe(30);
++    expect(result.previousStoredBalance).toBe(150);
++    expect(result.balance).toBe(120);
++  });
++});
+diff --git a/src/modules/finance/presentation/__tests__/AccountReconciliationSchemas.behavior.test.ts b/src/modules/finance/presentation/__tests__/AccountReconciliationSchemas.behavior.test.ts
+new file mode 100644
+index 0000000..92991f0
+--- /dev/null
++++ b/src/modules/finance/presentation/__tests__/AccountReconciliationSchemas.behavior.test.ts
+@@ -0,0 +1,117 @@
++import * as schemas from "../FinanceSchemas";
++
++function reconciliationSchema() {
++  const schema = (schemas as any).accountReconciliationQuerySchema;
++  expect(schema).toBeDefined();
++  return schema;
++}
++
++describe("account reconciliation query behavior", () => {
++  it("defaults a missing accountId to null", () => {
++    const parsed = reconciliationSchema().parse({});
++    expect(parsed.accountId).toBeNull();
++  });
++
++  it("defaults driftOnly to false", () => {
++    const parsed = reconciliationSchema().parse({});
++    expect(parsed.driftOnly).toBe(false);
++  });
++
++  it("coerces a positive accountId query string", () => {
++    const parsed = reconciliationSchema().parse({ accountId: "42" });
++    expect(parsed.accountId).toBe(42);
++  });
++
++  it("accepts an already numeric positive accountId", () => {
++    const parsed = reconciliationSchema().parse({ accountId: 8 });
++    expect(parsed.accountId).toBe(8);
++  });
++
++  it("treats an empty accountId as omitted", () => {
++    const parsed = reconciliationSchema().parse({ accountId: "" });
++    expect(parsed.accountId).toBeNull();
++  });
++
++  it("treats a null accountId as omitted", () => {
++    const parsed = reconciliationSchema().parse({ accountId: null });
++    expect(parsed.accountId).toBeNull();
++  });
++
++  it("rejects zero as an accountId", () => {
++    expect(() => reconciliationSchema().parse({ accountId: "0" })).toThrow();
++  });
++
++  it("rejects a negative accountId", () => {
++    expect(() => reconciliationSchema().parse({ accountId: "-4" })).toThrow();
++  });
++
++  it("rejects a fractional accountId", () => {
++    expect(() => reconciliationSchema().parse({ accountId: "2.5" })).toThrow();
++  });
++
++  it("rejects a non-numeric accountId", () => {
++    expect(() => reconciliationSchema().parse({ accountId: "bank" })).toThrow();
++  });
++
++  it("parses driftOnly=true", () => {
++    const parsed = reconciliationSchema().parse({ driftOnly: "true" });
++    expect(parsed.driftOnly).toBe(true);
++  });
++
++  it("parses driftOnly=false", () => {
++    const parsed = reconciliationSchema().parse({ driftOnly: "false" });
++    expect(parsed.driftOnly).toBe(false);
++  });
++
++  it("parses driftOnly=1 as true", () => {
++    const parsed = reconciliationSchema().parse({ driftOnly: "1" });
++    expect(parsed.driftOnly).toBe(true);
++  });
++
++  it("parses driftOnly=0 as false", () => {
++    const parsed = reconciliationSchema().parse({ driftOnly: "0" });
++    expect(parsed.driftOnly).toBe(false);
++  });
++
++  it("accepts a boolean true value", () => {
++    const parsed = reconciliationSchema().parse({ driftOnly: true });
++    expect(parsed.driftOnly).toBe(true);
++  });
++
++  it("accepts a boolean false value", () => {
++    const parsed = reconciliationSchema().parse({ driftOnly: false });
++    expect(parsed.driftOnly).toBe(false);
++  });
++
++  it("treats an empty driftOnly query as false", () => {
++    const parsed = reconciliationSchema().parse({ driftOnly: "" });
++    expect(parsed.driftOnly).toBe(false);
++  });
++
++  it("treats a null driftOnly query as false", () => {
++    const parsed = reconciliationSchema().parse({ driftOnly: null });
++    expect(parsed.driftOnly).toBe(false);
++  });
++
++  it("rejects an arbitrary driftOnly word", () => {
++    expect(() => reconciliationSchema().parse({ driftOnly: "yes" })).toThrow();
++  });
++
++  it("rejects uppercase TRUE instead of silently widening accepted values", () => {
++    expect(() => reconciliationSchema().parse({ driftOnly: "TRUE" })).toThrow();
++  });
++
++  it("rejects an array supplied for driftOnly", () => {
++    expect(() => reconciliationSchema().parse({ driftOnly: ["true", "false"] })).toThrow();
++  });
++
++  it("parses accountId and driftOnly together", () => {
++    const parsed = reconciliationSchema().parse({ accountId: "17", driftOnly: "true" });
++    expect(parsed).toEqual({ accountId: 17, driftOnly: true });
++  });
++
++  it("keeps accountId null while enabling driftOnly", () => {
++    const parsed = reconciliationSchema().parse({ accountId: "", driftOnly: "1" });
++    expect(parsed).toEqual({ accountId: null, driftOnly: true });
++  });
++});
